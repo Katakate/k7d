@@ -1,0 +1,18 @@
+[package]
+name = "k7-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "k7-agent"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "containerd-shim-k7-v1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "containerd-shim-k7-v1"
+path = "src/main.rs"
+
+[dependencies]
+k7d = { path = "../k7d", version = "=0.1.0" }
+containerd-shim = { version = "=0.10.0", features = ["async"] }
+containerd-shim-protos = { version = "=0.10.0", features = ["async"] }
+async-trait = "=0.1.88"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+nix = { version = "=0.29.0", features = ["signal", "fs"] }
+oci-spec = "=0.7.1"

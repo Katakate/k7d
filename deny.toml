@@ -1,0 +1,31 @@
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+# time 0.3.41 has RUSTSEC-2026-0009 (DoS via RFC 2822 parsing), but the fix
+# (0.3.47) requires Rust 1.88 and we're on 1.85. We don't parse RFC 2822
+# input — time is a transitive dep from containerd-shim.
+ignore = ["RUSTSEC-2026-0009"]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

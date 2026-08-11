@@ -1,0 +1,21 @@
+name = "verif"
+defaultTargets = ["Verif"]
+
+# Aeneas Lean backend (provides `Aeneas` library + tactics + monad infra).
+# We pin a known-good revision in `lean-toolchain` so the proofs in `Verif/`
+# stay reproducible. To bump: update `lean-toolchain` to match
+# `aeneas/backends/lean/lean-toolchain` at the new pin and re-run
+# `make verif-build`.
+[[require]]
+name = "aeneas"
+git  = "https://github.com/AeneasVerif/aeneas"
+subDir = "backends/lean"
+# Pin to the same commit the node's `~/aeneas` checkout is built from —
+# see `Makefile`'s `remote-install-verif` target (internal notes
+# task 0). If `lake build` complains about a version mismatch, update
+# both this `rev` and the matching `aeneas` checkout on the node
+# together (`AENEAS_REV=<sha> utils/install-aeneas.sh`).
+rev = "044c73b72171670cbe3a245ee7bccc4d626f0113"
+
+[[lean_lib]]
+name = "Verif"

@@ -1,0 +1,24 @@
+# Aeneas axiom allowlist for verif/Verif/K7d.lean.
+#
+# `make remote-verif` regenerates K7d.lean then runs
+# utils/check-verif-axioms.sh. Any axiom name present in the generated
+# file but absent here fails the build. Entries here MUST only be
+# pulled in by unverified code paths (Debug/Display/format glue) —
+# never by the Group A–F helpers that have `_rust` equivalence
+# corollaries. See CHALLENGES.md #24.
+#
+# One axiom name per line. `#` starts a comment.
+
+# DeltaError::message format! → alloc::fmt::format (unverified; codec
+# proofs use k7dl_* encode/parse only, never message()).
+alloc.fmt.format
+
+# DeltaError::message wraps format! with core::hint::must_use.
+core.hint.must_use
+
+# DeltaError::message format args use Display for &T (Shared0T).
+Shared0T.Insts.CoreFmtDisplay.fmt
+
+# #[derive(Debug)] on NodeInfo (Option<field> Debug) — Debug fmt is
+# never called from verified helpers.
+core.option.Option.Insts.CoreFmtDebug.fmt

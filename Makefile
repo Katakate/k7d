@@ -1,0 +1,262 @@
+.PHONY: build build-agent build-guest-kernel build-guest-rootfs \
+       test test-integration lint fmt-check deny bench check \
+       miri fuzz kani kani-harness verif-gen verif-build \
+       rsync remote-check remote-build remote-test-integration remote-bench \
+       remote-install-rust remote-miri remote-fuzz remote-kani \
+       remote-install-verif remote-verif remote-release reference release
+
+REFERENCE_DIR := reference
+REMOTE_DIR := /root/k7d
+VERSION := 0.1.0
+RELEASE_NAME := k7d-v$(VERSION)-x86_64-linux
+RELEASE_TGZ := dist/$(RELEASE_NAME).tar.gz
+
+# --- SSH setup (used by all remote-* targets) ---
+# Set K7_NODE_IP to your Linux/KVM build host.
+define ssh_setup
+: "$${K7_NODE_IP:?set K7_NODE_IP to your Linux/KVM build host}"; \
+SSH_PRIVKEY="$${K7_SSH_KEY_FILE:-$$HOME/.ssh/id_ed25519}"; \
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -i "$$SSH_PRIVKEY"); \
+NODE="$${K7_NODE_USER:-root}@$$K7_NODE_IP";
+endef
+
+# --- Local targets (formatting only -- rust-vmm crates are Linux-only) ---
+
+fmt-check:
+	cargo fmt --check
+
+# --- Targets that run ON the node (require Linux + KVM) ---
+
+build:
+	cargo build --release
+
+build-agent:
+	cargo build --release --target x86_64-unknown-linux-musl -p k7-agent
+
+build-guest-kernel:
+	cd guest/kernel && ./build.sh
+
+build-guest-rootfs:
+	cd guest/rootfs && ./build.sh
+
+deny:
+	cargo deny check
+
+lint:
+	cargo fmt --check
+	cargo deny check
+	cargo clippy -- -D warnings
+
+# internal notes: rebuild the guest agent + initramfs before testing so the
+# suite never runs against a stale guest (rsync excludes the initramfs
+# artifact; both builds are no-op-fast when nothing changed).
+test: build-agent build-guest-rootfs
+	-kubectl delete pod -l '!component' --field-selector=status.phase!=Succeeded --force --grace-period=0 -A 2>/dev/null
+	-pkill -9 virtiofsd 2>/dev/null
+	-pkill -9 -f containerd-shim-k7-v1 2>/dev/null
+	-mount | awk '/k7d-shim/ {print $$3}' | sort -ru | xargs -r umount -l 2>/dev/null
+	-rm -rf /tmp/k7d-shim-* /tmp/k7d-virtiofs-* /tmp/k7d-fork-* 2>/dev/null
+	sleep 2
+	cargo test -- --test-threads=1
+
+test-integration:
+	cargo test --test '*' -- --ignored --test-threads=1
+
+bench:
+	cargo bench
+
+check: lint test
+
+miri:
+	# Miri runs on pure unit tests only — integration tests touch KVM, the
+	# filesystem, virtiofsd, etc. and trip Miri's isolation. The pure unit
+	# tests in `tree_model` and similar pure modules are what Miri can
+	# meaningfully check.
+	cargo +nightly miri test --lib -p k7d -- tree_model
+
+fuzz:
+	cd fuzz && cargo +nightly fuzz run agent_protocol -- -max_total_time=150
+	cd fuzz && cargo +nightly fuzz run blk_request -- -max_total_time=150
+
+kani:
+	cargo kani -p k7d
+
+kani-harness:
+	cargo kani -p k7d --harness $(HARNESS)
+
+# --- Aeneas / Lean verification ---
+
+# Regenerate Verif/TreeModel.lean from crates/k7d/src/tree_model.rs via
+# Charon + Aeneas. Honors $$HOME/aeneas/{bin/aeneas,charon/bin/charon} if
+# present (the layout produced by `make remote-install-verif`).
+verif-gen:
+	@CHARON_BIN="$${CHARON:-$$HOME/aeneas/charon/bin/charon}"; \
+	AENEAS_BIN="$${AENEAS:-$$HOME/aeneas/bin/aeneas}"; \
+	$(MAKE) -C verif gen CHARON="$$CHARON_BIN" AENEAS="$$AENEAS_BIN"
+	@# internal notes: fail loudly on new Aeneas axioms before lake build
+	@bash utils/check-verif-axioms.sh
+
+# Run the Lean theorems against the regenerated model.
+verif-build:
+	$(MAKE) -C verif build
+
+# Build release tarball (run ON a Linux/KVM host, or via `make remote-release`).
+# Produces dist/k7d-v0.1.0-x86_64-linux.tar.gz with binaries, guest assets,
+# and packaging/install.sh (optional --with-k3s RuntimeClass).
+release: build build-agent build-guest-kernel build-guest-rootfs
+	@test -f guest/kernel/vmlinux || { echo "missing guest/kernel/vmlinux" >&2; exit 1; }
+	@test -f guest/rootfs/initramfs.cpio.gz || { echo "missing guest/rootfs/initramfs.cpio.gz" >&2; exit 1; }
+	@test -x target/release/k7d || { echo "missing target/release/k7d" >&2; exit 1; }
+	@test -x target/release/containerd-shim-k7-v1 || { echo "missing shim binary" >&2; exit 1; }
+	rm -rf "dist/$(RELEASE_NAME)"
+	mkdir -p "dist/$(RELEASE_NAME)"
+	cp target/release/k7d "dist/$(RELEASE_NAME)/"
+	cp target/release/containerd-shim-k7-v1 "dist/$(RELEASE_NAME)/"
+	cp guest/kernel/vmlinux "dist/$(RELEASE_NAME)/"
+	cp guest/rootfs/initramfs.cpio.gz "dist/$(RELEASE_NAME)/"
+	cp packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
+	chmod 755 "dist/$(RELEASE_NAME)/install.sh" \
+	  "dist/$(RELEASE_NAME)/k7d" \
+	  "dist/$(RELEASE_NAME)/containerd-shim-k7-v1"
+	tar -C dist -czf "$(RELEASE_TGZ)" "$(RELEASE_NAME)"
+	@echo "==> $(RELEASE_TGZ)"
+	@tar -tzf "$(RELEASE_TGZ)"
+
+# --- Remote targets (rsync + run on bare-metal node via SSH) ---
+
+rsync:
+	@bash -c '$(ssh_setup) \
+	echo "==> Rsyncing to $$NODE:$(REMOTE_DIR)" && \
+	rsync -az --delete \
+	  --exclude target --exclude .git --exclude reference \
+	  --exclude tmp --exclude dist \
+	  --exclude "guest/kernel/linux-*" --exclude "guest/kernel/vmlinux" \
+	  --exclude "guest/rootfs/initramfs.cpio.gz" \
+	  --exclude "guest/rootfs/runc.amd64" \
+	  --exclude "verif/.lake" --exclude "verif/build" \
+	  -e "ssh $${SSH_OPTS[*]}" \
+	  ./ "$$NODE:$(REMOTE_DIR)/"'
+
+remote-check: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running check on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make check"'
+
+remote-build: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Building on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make build"'
+
+remote-release: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Building release tarball on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make release" && \
+	mkdir -p dist && \
+	rsync -az -e "ssh $${SSH_OPTS[*]}" \
+	  "$$NODE:$(REMOTE_DIR)/$(RELEASE_TGZ)" "$(RELEASE_TGZ)" && \
+	echo "==> fetched $(RELEASE_TGZ)"'
+
+remote-test-integration: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running integration tests on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make test-integration"'
+
+remote-bench: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running benchmarks on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make bench"'
+
+remote-miri: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running Miri on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make miri"'
+
+remote-fuzz: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running fuzzer on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make fuzz"'
+
+remote-kani: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running Kani on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make kani"'
+
+remote-install-rust:
+	@bash -c '$(ssh_setup) \
+	echo "==> Installing Rust toolchain on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+	   source ~/.cargo/env && \
+	   rustup target add x86_64-unknown-linux-musl"'
+
+# --- Aeneas / Charon / Lean install on the node ---
+#
+# Idempotent: re-running on a partially-installed node just no-ops the
+# bits that are already there. After a node reset, run this once before
+# `make remote-verif`.
+#
+# Installs:
+#   * apt deps (opam, ocaml-base toolchain, gmp, m4, pkg-config, ...)
+#   * an OCaml 5.3.0 opam switch + the Aeneas package list
+#   * Charon (cloned by `aeneas/Makefile`'s `setup-charon` target, built
+#     against rustup's nightly)
+#   * Aeneas itself (built with `make` in ~/aeneas)
+#   * elan + the Lean toolchain pinned in `verif/lean-toolchain`
+#
+# The script is intentionally chatty so progress is visible in the
+# tmux pane this is launched from.
+#
+# Aeneas rev pin: the node checkout and
+# `verif/lakefile.toml` must reference the SAME commit —
+#   044c73b72171670cbe3a245ee7bccc4d626f0113
+# `install-aeneas.sh` reads it from AENEAS_REV; bump both together.
+remote-install-verif: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Installing Aeneas + Charon + Lean on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "bash $(REMOTE_DIR)/utils/install-aeneas.sh"'
+
+remote-verif: rsync
+	@bash -c '$(ssh_setup) \
+	echo "==> Running Aeneas + Lean verification on $$NODE" && \
+	ssh "$${SSH_OPTS[@]}" "$$NODE" \
+	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; \
+	    source ~/.elan/env 2>/dev/null; \
+	    export PATH=\$$HOME/aeneas/bin:\$$HOME/aeneas/charon/bin:\$$PATH; \
+	    make verif-gen && make verif-build"'
+
+# --- Reference repos (for agent exploration, not tracked in git) ---
+
+reference: $(REFERENCE_DIR)/cloud-hypervisor $(REFERENCE_DIR)/firecracker $(REFERENCE_DIR)/kata-containers $(REFERENCE_DIR)/firecracker-containerd $(REFERENCE_DIR)/containerd-cloudhypervisor $(REFERENCE_DIR)/zeroboot $(REFERENCE_DIR)/virtiofsd $(REFERENCE_DIR)/cubesandbox
+
+$(REFERENCE_DIR)/cloud-hypervisor:
+	git clone --depth 1 https://github.com/cloud-hypervisor/cloud-hypervisor.git $@
+
+$(REFERENCE_DIR)/firecracker:
+	git clone --depth 1 https://github.com/firecracker-microvm/firecracker.git $@
+
+$(REFERENCE_DIR)/kata-containers:
+	git clone --depth 1 https://github.com/kata-containers/kata-containers.git $@
+
+$(REFERENCE_DIR)/firecracker-containerd:
+	git clone --depth 1 https://github.com/firecracker-microvm/firecracker-containerd.git $@
+
+$(REFERENCE_DIR)/containerd-cloudhypervisor:
+	git clone --depth 1 https://github.com/devigned/containerd-cloudhypervisor.git $@
+
+$(REFERENCE_DIR)/zeroboot:
+	git clone --depth 1 https://github.com/zerobootdev/zeroboot.git $@
+
+$(REFERENCE_DIR)/virtiofsd:
+	git clone --depth 1 https://gitlab.com/virtio-fs/virtiofsd.git $@
+
+$(REFERENCE_DIR)/cubesandbox:
+	git clone --depth 1 https://github.com/tencentcloud/CubeSandbox.git $@

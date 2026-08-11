@@ -1,0 +1,45 @@
+[package]
+name = "k7d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "k7d"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k7d"
+path = "src/main.rs"
+
+[dependencies]
+kvm-ioctls.workspace = true
+kvm-bindings = { workspace = true, features = ["fam-wrappers"] }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+linux-loader = { workspace = true, features = ["elf", "bzimage"] }
+vm-superio.workspace = true
+vmm-sys-util.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+# When enabled, hides every non-`tree_model` module from the build (lib.rs
+# gates them with `#[cfg(not(feature = "verif"))]`) so Charon and Aeneas only
+# see the pure subset translated to Lean for internal notes
+# and thiserror proc-macro derives in `tree_model`. See internal notes.
+verif = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dev-dependencies]
+tempfile = "3"
+env_logger.workspace = true
