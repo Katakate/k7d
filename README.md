@@ -6,6 +6,9 @@
 
 <p align="center">
   <a href="https://github.com/Katakate/k7d/stargazers"><img src="https://img.shields.io/github/stars/Katakate/k7d?style=social" alt="GitHub stars"/></a>
+  <a href="https://docs.katakate.org">
+    <img src="https://img.shields.io/badge/docs-docs.katakate.org-blue" alt="docs"/>
+  </a>
   <a href="https://deepwiki.com/Katakate/k7d"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/VMM%2Bshim-%E2%89%A425k%20LOC-lightgrey" alt="VMM + shim ≤25k LOC"/>
