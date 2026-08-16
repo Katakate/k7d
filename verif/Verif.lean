@@ -1,7 +1,7 @@
 -- Top-level entry point for the Aeneas-translated proofs of
 -- `crates/k7d/src/tree_model.rs`.
 --
--- Each file under `Verif/` holds the theorems for one internal notes"Step 4"
+-- Each file under `Verif/` holds the theorems for one
 -- group. `TreeModel` is the Aeneas-generated functional model (regenerated
 -- by `make verif-gen`; do not hand-edit). The other files are hand-written
 -- proofs against that model.

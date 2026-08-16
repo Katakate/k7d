@@ -1,4 +1,4 @@
-//! Integration test for Milestone 5: Container lifecycle inside VM.
+//! Integration test: container lifecycle inside the VM.
 //! Requires KVM (/dev/kvm), vhost-vsock, virtiofsd, runc in guest rootfs,
 //! built guest kernel with namespaces/cgroups, and built initramfs.
 
@@ -150,7 +150,7 @@ fn test_run_container_inside_vm() {
         // already in use`. Allocate a unique CID from the 100+
         // pool. Same brittleness affects other test files; this PR
         // only fixes the one that was reproducibly failing in the
-        // 10a follow-up cycle — broader fix (and a real fix to the
+        // CNI follow-up cycle — broader fix (and a real fix to the
         // shim's hardcoded CID) lands separately.
         .guest_cid(allocate_cid())
         .virtiofs(state_dir.path(), "/mnt/state")
@@ -240,7 +240,7 @@ fn test_multi_container_sidecar() {
         // already in use`. Allocate a unique CID from the 100+
         // pool. Same brittleness affects other test files; this PR
         // only fixes the one that was reproducibly failing in the
-        // 10a follow-up cycle — broader fix (and a real fix to the
+        // CNI follow-up cycle — broader fix (and a real fix to the
         // shim's hardcoded CID) lands separately.
         .guest_cid(allocate_cid())
         .virtiofs(state_dir.path(), "/mnt/state")
@@ -318,7 +318,7 @@ fn test_container_error_paths() {
         // already in use`. Allocate a unique CID from the 100+
         // pool. Same brittleness affects other test files; this PR
         // only fixes the one that was reproducibly failing in the
-        // 10a follow-up cycle — broader fix (and a real fix to the
+        // CNI follow-up cycle — broader fix (and a real fix to the
         // shim's hardcoded CID) lands separately.
         .guest_cid(allocate_cid())
         .virtiofs(state_dir.path(), "/mnt/state")
@@ -444,7 +444,7 @@ fn pty_wait_exit(s: &mut PtyExecSession, timeout: Duration) -> i32 {
     panic!("timeout waiting for PTY exec exit event");
 }
 
-/// internal notes: `container_exec_pty` over vsock
+/// Protocol-level coverage: `container_exec_pty` over vsock
 /// against a real VM — window size + resize (TIOCSWINSZ/SIGWINCH),
 /// Ctrl+C through the line discipline, exit-code propagation, detach
 /// (`eof` ⇒ SIGHUP), concurrent isolated sessions, and the
@@ -634,7 +634,7 @@ fn test_container_stdout_streamed_to_host() {
         // already in use`. Allocate a unique CID from the 100+
         // pool. Same brittleness affects other test files; this PR
         // only fixes the one that was reproducibly failing in the
-        // 10a follow-up cycle — broader fix (and a real fix to the
+        // CNI follow-up cycle — broader fix (and a real fix to the
         // shim's hardcoded CID) lands separately.
         .guest_cid(allocate_cid())
         .virtiofs(state_dir.path(), "/mnt/state")

@@ -6,7 +6,7 @@
 --     Live nodes; `usage_ram_is_sum_of_live` recovers the plain sum under
 --     the honest `sum ≤ u64::MAX` side condition.
 --   * `usage_vm_count_is_sat_sum_of_live` / `usage_vm_count_is_sum_of_live`
---     — the same pair for `live_vm_count` (internal notes: an N-VM
+--     — the same pair for `live_vm_count` (an N-VM
 --     cluster node counts as N; `usize::saturating_add`).
 --   * `usage_count_is_count_of_live` — `usage().live_node_count` is
 --     exactly the number of Live nodes (plain `+= 1` in the Rust; no

@@ -4,7 +4,7 @@
 --   * base — `dirty_pages = 0` ⇒ result equals `FORK_WARM_BASE_NS`.
 --   * monotone — `a ≤ b` ⇒ `forkWarmBudgetNs a ≤ forkWarmBudgetNs b`.
 --
--- internal notes: the Rust source is raw `u64` nanoseconds (the original
+-- The Rust source is raw `u64` nanoseconds (the original
 -- `Duration`-typed `fork_warm_budget` blocked equivalence — Aeneas models
 -- `std::time::Duration` opaquely; `latency.rs` keeps the `Duration`
 -- wrapper for callers). The mirror below is **saturation-exact**: the

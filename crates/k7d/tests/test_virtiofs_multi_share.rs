@@ -1,4 +1,4 @@
-//! internal notes: multi-share virtiofs.
+//! Chunk 1: multi-share virtiofs.
 //!
 //! Boots a single VM with **three** virtiofs shares — primary
 //! (`k7fs` at `/mnt/state`, rw), a second rw share (`k7fs1` at
@@ -11,9 +11,9 @@
 //! 3. Guest writes propagate back to the host on the two rw shares.
 //! 4. Guest writes are refused (`EROFS`) on the ro share.
 //!
-//! This is the chunk-1 acceptance test for internal notes� the
+//! This is the chunk-1 acceptance test for — the
 //! plumbing must support arbitrary `(host_dir, guest_mount, ro)`
-//! triples before the spec-10b chunk-2 `volumes.rs` /
+//! triples before the `volumes.rs` /
 //! `PodVolumes::prepare_from_spec` can stand on top of it.
 
 use std::path::PathBuf;

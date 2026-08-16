@@ -1,4 +1,4 @@
-//! Warm VM pool (internal notes/ internal notes, adapted
+//! Warm VM pool (adapted
 //! to the daemon architecture): the daemon keeps `size` pre-booted,
 //! agent-ready VMs so a pool-compatible `create_vm` hands out a running
 //! VM in well under 100 ms ([`crate::latency::POOL_ACQUIRE`]) instead
@@ -11,7 +11,7 @@
 //! for snapshotted shares (see `fork.rs`). Swapping the vhost-user
 //! backend under a placeholder share would require implementing
 //! vhost-user session re-negotiation in the VMM — real surgery, out of
-//! scope for this increment. So the pool serves **fork/tree-style
+//! scope for now. So the pool serves **fork/tree-style
 //! workloads only**: vsock-only VMs with no virtiofs shares and no
 //! network. `create_vm` requests carrying `virtiofs` entries or a
 //! `network` config bypass the pool and cold-boot exactly as before
@@ -111,12 +111,15 @@ impl Pool {
     /// vsock-only (no virtiofs, no virtio-blk, no guest dirs, no
     /// network — see the module docs for why; block devices and
     /// `k7d.mkdir=` dirs are declared on the kernel cmdline at boot,
-    /// which a pre-booted VM can't retrofit — internal notes), same
+    /// which a pre-booted VM can't retrofit —), same
     /// memory size, same vCPU count as the pool's prefill config
-    /// (internal notes: the operator chooses the pool's vCPU count via
-    /// `K7D_POOL_VCPUS`; default 1), no CPU cap (internal notes: pooled VMs
+    /// (the operator chooses the pool's vCPU count via
+    /// `K7D_POOL_VCPUS`; default 1), no CPU cap (pooled VMs
     /// are pre-booted uncapped; a request carrying a quota must
-    /// cold-boot so the cap is actually applied), and the same
+    /// cold-boot so the cap is actually applied), no scratch disk
+    /// (the scratch device is another boot-time virtio-blk
+    /// declaration, and serving such a request from the pool would
+    /// hand back a VM whose containers write to RAM), and the same
     /// kernel/initrd the template booted.
     #[must_use]
     pub fn compatible(&self, config: &VmConfig) -> bool {
@@ -124,6 +127,8 @@ impl Pool {
             || !config.virtiofs.is_empty()
             || !config.block_devices.is_empty()
             || !config.guest_dirs.is_empty()
+            || config.scratch_size_bytes.is_some()
+            || !config.container_scratch.is_empty()
             || config.network.is_some()
             || config.memory_mb != self.config.memory_mb
             || config.vcpus != self.config.vcpus
@@ -314,7 +319,7 @@ fn boot_template(config: &PoolConfig, shared: &PoolShared) -> Result<Option<Vm>,
 
     // Keep the agent connection open across the fork-source snapshot so
     // the guest's vsock state has an established connection for the
-    // injected TRANSPORT_RESET to reset (the internal notes�
+    // injected TRANSPORT_RESET to reset (the pattern —
     // see `Daemon::boot_tree_member`), then drop it.
     vm.prepare_fork_source()
         .map_err(|e| format!("prepare template as fork source: {e}"))?;

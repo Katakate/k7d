@@ -54,7 +54,7 @@ impl VirtiofsdProcess {
 
     /// Spawn virtiofsd with explicit `readonly` flag.
     ///
-    /// Read-only enforcement for internal notes's `ConfigMap` / `Secret` /
+    /// Read-only enforcement for `ConfigMap` / `Secret` /
     /// projected / `downwardAPI` shares lives **in-guest only** today:
     /// the agent issues `mount -t virtiofs -o ro <tag> <mount>` when
     /// it sees `:ro` in the `k7d.virtiofs=` cmdline param, and the
@@ -88,12 +88,12 @@ impl VirtiofsdProcess {
             .arg("none")
             // virtiofsd >= 1.13 defaults to --announce-submounts, which
             // makes every host mount point inside the share (e.g. the
-            // per-volume bind mounts in the spec-10b volumes-rw scratch
+            // per-volume bind mounts in the volumes-rw scratch
             // tree) a separate FUSE submount in the guest. Each container
             // traversal then automounts its OWN superblock, so two
             // containers binding the same emptyDir get distinct inode
             // objects — files still flow, but unix-socket connect() across
-            // containers fails with ECONNREFUSED (internal notes's CRI socket
+            // containers fails with ECONNREFUSED (the CRI socket
             // over /cri). One superblock per share restores kubelet-like
             // emptyDir semantics.
             .arg("--no-announce-submounts");
@@ -107,7 +107,7 @@ impl VirtiofsdProcess {
             .spawn()
             .map_err(|e| format!("failed to spawn virtiofsd: {e}"))?;
 
-        // Wait for the socket to appear. internal notes: the
+        // Wait for the socket to appear. The
         // deadline lives in `crate::latency` (single source of truth)
         // and is generous because a multi-share pod spawns several
         // virtiofsd children sequentially and 5 s was too tight on a

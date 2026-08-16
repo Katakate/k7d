@@ -1,4 +1,4 @@
--- internal notes"What to build / 1" — the abstraction layer between the
+-- The abstraction layer between the
 -- Aeneas-generated translation of `crates/k7d/src/tree_model.rs`
 -- (`Verif/K7d.lean`, imported through `Verif/TreeModel.lean`) and the
 -- hand-written mirrors in `Verif/{TreeShape,TreeBudget,TreeEviction}.lean`.
@@ -72,7 +72,7 @@ def absIds (v : alloc.vec.Vec Std.U64) : List Nat := v.val.map (·.val)
 def absSlice (s : Slice Std.U64) : List Nat := s.val.map (·.val)
 
 /-- Abstraction: fixed-size byte array → `BitVec 8` list (the
-`K7dlCodec` mirror's `Byte` representation) — internal notes/
+`K7dlCodec` mirror's `Byte` representation) — Group E. -/
 def absBytes {n : Std.Usize} (a : Array Std.U8 n) : List (BitVec 8) :=
   a.val.map Std.U8.bv
 

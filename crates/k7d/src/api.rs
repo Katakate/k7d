@@ -30,7 +30,7 @@ enum Request {
         id: String,
         args: Vec<String>,
     },
-    /// internal notes: interactive PTY exec handshake. After the agent's
+    /// Interactive PTY exec handshake. After the agent's
     /// `container_exec_pty_result` the connection switches to the
     /// streaming mode driven by [`PtyExecSession`].
     #[serde(rename = "container_exec_pty")]
@@ -56,14 +56,16 @@ enum Request {
     },
     #[serde(rename = "container_wait")]
     ContainerWait { name: String },
-    /// internal notes: non-blocking exit probe — the shim's exit
+    /// Non-blocking exit probe — the shim's exit
     /// watcher polls this (the blocking `container_wait` cannot outlive
     /// the 30s per-request read deadline for long-running containers).
     #[serde(rename = "container_wait_poll")]
     ContainerWaitPoll { name: String },
     #[serde(rename = "container_signal")]
     ContainerSignal { name: String, signal: i32 },
-    /// internal notes: mount a virtio-blk device whose backing file
+    #[serde(rename = "container_usage")]
+    ContainerUsage { name: String },
+    /// Mount a virtio-blk device whose backing file
     /// the host filled after boot (image slot). The agent issues
     /// `BLKFLSBUF` first to drop pages the kernel cached from the
     /// boot-time partition scan of the then-empty device.
@@ -123,6 +125,22 @@ pub struct ContainerExecResponse {
 pub struct ContainerListResponse {
     /// Names of running containers.
     pub containers: Vec<String>,
+}
+
+/// A container's writable-layer usage as measured inside the
+/// guest, from [`AgentClient::container_usage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerUsage {
+    /// Bytes the container's writable layer occupies right now.
+    pub used_bytes: u64,
+    /// Capacity of the filesystem holding that layer.
+    pub capacity_bytes: u64,
+    /// Whether that capacity is the container's alone. `false` means
+    /// the pod's shared scratch disk, so `capacity_bytes` is a
+    /// pod-level number and NOT a limit on this container — give the
+    /// container its own image
+    /// (`k7d.katakate.org/container-scratch-size`) to make it one.
+    pub dedicated: bool,
 }
 
 /// Container output (stdout/stderr from main process) from agent.
@@ -209,6 +227,14 @@ enum RawResponse {
     },
     #[serde(rename = "container_signal_result")]
     ContainerSignalResult { ok: bool, error: String },
+    #[serde(rename = "container_usage_result")]
+    ContainerUsageResult {
+        ok: bool,
+        used_bytes: u64,
+        capacity_bytes: u64,
+        dedicated: bool,
+        error: String,
+    },
     #[serde(rename = "mount_blk_result")]
     MountBlkResult { ok: bool, error: String },
 }
@@ -480,8 +506,8 @@ impl AgentClient {
         }
     }
 
-    /// Mount a virtio-blk device inside the guest (internal notes�
-    /// image-slot attach): the agent flushes the device's buffer
+    /// Mount a virtio-blk device inside the guest (image-slot
+    /// attach): the agent flushes the device's buffer
     /// cache (`BLKFLSBUF`) and mounts it at `mountpoint`.
     pub fn mount_blk(
         &mut self,
@@ -652,8 +678,8 @@ impl AgentClient {
         }
     }
 
-    /// Non-blocking probe for a container's natural exit (internal notes
-    /// Inc 2). `Ok(None)` while the init process runs, `Ok(Some(code))`
+    /// Non-blocking probe for a container's natural exit.
+    /// `Ok(None)` while the init process runs, `Ok(Some(code))`
     /// once it exited — the real exit code, reaped by the agent
     /// (guest PID 1) via `waitpid`.
     pub fn container_wait_poll(&mut self, name: &str) -> Result<Option<i32>, AgentError> {
@@ -692,7 +718,42 @@ impl AgentClient {
         }
     }
 
-    /// internal notes: open a dedicated PTY exec session (interactive
+    /// Writable-layer usage of a container, measured inside
+    /// the guest.
+    ///
+    /// This is the surface that makes ephemeral-storage usage
+    /// observable from outside the guest: any host process that knows
+    /// the VM's vsock CID (`k7d::control::Request::ListVms` reports it)
+    /// can ask. It deliberately does not ride the CRI stats path —
+    /// containerd only decodes a cgroups `Metrics` payload there, and
+    /// that message has no field for filesystem usage.
+    pub fn container_usage(&mut self, name: &str) -> Result<ContainerUsage, AgentError> {
+        let req = Request::ContainerUsage {
+            name: name.to_string(),
+        };
+        match self.send_request(&req)? {
+            RawResponse::ContainerUsageResult {
+                ok,
+                used_bytes,
+                capacity_bytes,
+                dedicated,
+                error,
+            } => {
+                if ok {
+                    Ok(ContainerUsage {
+                        used_bytes,
+                        capacity_bytes,
+                        dedicated,
+                    })
+                } else {
+                    Err(AgentError::Remote(error))
+                }
+            }
+            _ => Err(AgentError::UnexpectedResponse),
+        }
+    }
+
+    /// Open a dedicated PTY exec session (interactive
     /// `kubectl exec -it`). Establishes its own vsock connection,
     /// performs the `container_exec_pty` handshake, and returns the
     /// streaming session. Vsock only — PTY exec is not supported over
@@ -780,7 +841,7 @@ impl AgentClient {
     }
 }
 
-/// internal notes: event streamed from a PTY exec session.
+/// Event streamed from a PTY exec session.
 #[derive(Debug)]
 pub enum PtyEvent {
     /// Bytes the exec process wrote to its terminal.
@@ -800,7 +861,7 @@ enum PtyStreamMsg {
     Exit { code: i32 },
 }
 
-/// internal notes: thread-safe write handle of a PTY exec session. Cloneable
+/// Thread-safe write handle of a PTY exec session. Cloneable
 /// so e.g. the shim's `ResizePty` handler can inject `winch` messages
 /// while the bridge thread pumps stdin.
 #[derive(Clone)]
@@ -835,7 +896,7 @@ impl PtyExecWriter {
     }
 }
 
-/// internal notes: a live PTY exec session (post-handshake). Owns the read
+/// A live PTY exec session (post-handshake). Owns the read
 /// half of the dedicated vsock connection; writes go through the
 /// shared [`PtyExecWriter`].
 pub struct PtyExecSession {

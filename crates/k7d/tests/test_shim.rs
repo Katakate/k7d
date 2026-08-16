@@ -1,4 +1,4 @@
-//! Integration tests for milestone 6: containerd shim.
+//! Integration tests for the containerd shim.
 //!
 //! **Unit tests** (run with `cargo test`): OCI annotation parsing,
 //! agent protocol serialization — no KVM needed.
@@ -580,7 +580,7 @@ fn test_boot_timing_breakdown() {
         "Agent connect (host-side wall clock)", agent_connect_time
     );
     eprintln!();
-    eprintln!("  Kernel dmesg (key boot milestones):");
+    eprintln!("  Kernel dmesg (key boot stages):");
     for line in dmesg.stdout.lines() {
         let is_milestone = line.contains("Linux version")
             || line.contains("Freeing")
@@ -650,7 +650,7 @@ mod common;
 fn ensure_shim_installed() -> common::LeakGuard {
     use std::process::Command;
 
-    // internal notes, Milestone 2: best-effort teardown of orphan
+    // Best-effort teardown of orphan
     // virtiofsd/shim processes and stale /tmp/k7d-shim mounts left by
     // earlier tests/binaries before we (re)install the shim.
     common::cleanup_k7_runtime_leaks();
@@ -665,8 +665,8 @@ fn ensure_shim_installed() -> common::LeakGuard {
     // Always build: cargo no-ops in ~a second when the binary is
     // fresh, and skipping the build when `shim_src` merely *exists*
     // deploys a stale shim after source edits (bit us twice — the
-    // increment-4 crash-recovery hooks were first tested against the
-    // increment-3 binary; see `ensure_k7d_daemon_running` for the
+    // crash-recovery hooks were first tested against a stale
+    // binary; see `ensure_k7d_daemon_running` for the
     // first time).
     let status = Command::new("cargo")
         .args(["build", "--release", "-p", "containerd-shim-k7-v1"])
@@ -723,7 +723,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
             .expect("create RuntimeClass");
     }
 
-    // internal notes: the shim's sandbox Create now requires a running k7d
+    // The shim's sandbox Create now requires a running k7d
     // daemon (it owns the VMs); install and start it.
     common::ensure_k7d_daemon_running();
 
@@ -755,8 +755,8 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
     }
 }
 
-/// internal notes, Phase B0 — defence-in-depth alongside the spec-10h
-/// product fix that unblocks the test_volumes trio.
+/// Defence-in-depth alongside the product fix that unblocks the
+/// test_volumes trio.
 ///
 /// `--force --grace-period=0` historically removed the API object
 /// instantly but left the node-side sandbox + shim + virtiofsd to
@@ -922,7 +922,7 @@ spec:
         );
     });
 
-    // internal notes: a volume-less kubectl pod rides the block path —
+    // A volume-less kubectl pod rides the block path —
     // ZERO virtiofs shares (rootfs is a cached erofs image on
     // virtio-blk, runc comes from the tools erofs image), so the pod
     // stays CoW-warm-forkable.
@@ -938,6 +938,74 @@ spec:
             vm.block_devices
         );
         assert!(!vm.fork_memory_full_copy, "cold boot is never a full copy");
+        // The guest is the daemon's to choose: the kernel this pod
+        // booted must be the one `k7d.service` names, not a path some
+        // other process worked out for itself. The suite installs the
+        // guest it built into that location (common::ensure_k7d_daemon_running)
+        // precisely so the two paths differ and this assertion has
+        // teeth — a shim that resolves guest artifacts again would boot
+        // its own compile-time workspace copy and fail here instead of
+        // silently running a guest nobody deployed (CHALLENGES #72).
+        assert_eq!(
+            vm.kernel,
+            common::daemon_kernel_path(),
+            "pod VM booted a kernel the daemon was not configured with"
+        );
+    });
+
+    // …and that kernel is the one guest/kernel/config-minimal
+    // describes. It carries its own config (CONFIG_IKCONFIG_PROC), so
+    // the guest can be asked directly rather than inferred from the
+    // features that happen to be exercised. The nf_tables address
+    // families are the load-bearing ones: with none of them, nf_tables
+    // still loads, `iptables -t nat -L` still prints, and every write
+    // fails with "TABLE_ADD failed (Not supported)" — which is how a
+    // guest missing them stayed invisible until nested dockerd died on
+    // it (CHALLENGES #72).
+    timed!("guest kernel config: nf_tables address families", {
+        let cfg = kubectl_exec(
+            "test-k7d-shim",
+            &[
+                "sh",
+                "-c",
+                "zcat /proc/config.gz | grep -E '^CONFIG_NF_TABLES(_INET|_IPV4|_IPV6)?='",
+            ],
+        )
+        .expect("guest kernel should expose /proc/config.gz");
+        for want in [
+            "CONFIG_NF_TABLES=y",
+            "CONFIG_NF_TABLES_INET=y",
+            "CONFIG_NF_TABLES_IPV4=y",
+            "CONFIG_NF_TABLES_IPV6=y",
+        ] {
+            assert!(
+                cfg.lines().any(|l| l.trim() == want),
+                "booted guest kernel is missing {want}: {cfg}"
+            );
+        }
+    });
+
+    // The pod's guest reads the clock k7d can move. Asking the config
+    // whether kvmclock was compiled in is not the same question: the
+    // guest also has to have detected the hypervisor (CPUID.1:ECX[31],
+    // which k7d sets in `patch_cpuid_for_kvm_guest`) and preferred
+    // kvm-clock over the TSC. Miss either and the pod boots fine and
+    // keeps perfect time right up until it is restored from a snapshot,
+    // which is where the clock silently stops.
+    timed!("guest clocksource is kvm-clock", {
+        let clocksource = kubectl_exec(
+            "test-k7d-shim",
+            &[
+                "cat",
+                "/sys/devices/system/clocksource/clocksource0/current_clocksource",
+            ],
+        )
+        .expect("guest should expose its current clocksource");
+        assert_eq!(
+            clocksource.trim(),
+            "kvm-clock",
+            "pod guest is not reading the clock k7d owns"
+        );
     });
 
     timed!("kubectl delete pod", {
@@ -958,7 +1026,336 @@ spec:
     eprintln!();
 }
 
-/// internal notes: a kubectl pod with only block-supported volume
+////18d: OCI `cgroup`/`cgroup2` mounts are translated to a
+/// guest cgroup2 mount instead of stripped, and (18d) the cgroup
+/// namespace is KEPT, so every container sees a private namespaced
+/// subtree — `/proc/self/cgroup` reads `0::/` and siblings are
+/// invisible, exactly like Kata/stock k8s. A plain container sees a
+/// read-only `/sys/fs/cgroup`, a privileged one a writable subtree
+/// (what nested daemons like dockerd need). Also asserts the
+/// guest IPv6 contract: CONFIG_IPV6 (+ ip6tables) is baked into the
+/// minimal kernel so dockerd 27+ no longer needs `--ip6tables=false`.
+#[test]
+fn test_kubectl_cgroup2_mount_and_ipv6_in_guest() {
+    let _leak_guard = ensure_shim_installed();
+    let _ = kubectl_delete("pod", "test-k7d-cg-ipv6");
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-k7d-cg-ipv6
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: plain
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+  - name: priv
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    securityContext:
+      privileged: true
+"#,
+    ))
+    .unwrap();
+    wait_for_pod_ready("test-k7d-cg-ipv6", Duration::from_secs(120)).unwrap();
+
+    // Plain container: cgroup2 mounted read-only at /sys/fs/cgroup with
+    // a populated controllers file (previously the mount was stripped
+    // and the directory was empty).
+    let mounts = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "plain",
+        &["sh", "-c", "grep ' /sys/fs/cgroup cgroup2 ' /proc/mounts"],
+    )
+    .unwrap();
+    assert!(
+        mounts.contains("ro,"),
+        "non-privileged cgroup2 mount should be read-only: {mounts}"
+    );
+    let controllers = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "plain",
+        &["cat", "/sys/fs/cgroup/cgroup.controllers"],
+    )
+    .unwrap();
+    assert!(
+        controllers.contains("memory"),
+        "guest cgroup2 controllers should include memory: {controllers}"
+    );
+
+    // Namespaced view: each container's cgroup2 mount is its
+    // OWN subtree root — /proc/self/cgroup reads `0::/`, and the guest
+    // root hierarchy (e.g. init.sh's /init leaf) is invisible.
+    let out = kubectl_exec_c("test-k7d-cg-ipv6", "plain", &["cat", "/proc/self/cgroup"]).unwrap();
+    assert_eq!(
+        out.trim(),
+        "0::/",
+        "container should be at its own namespaced cgroup root"
+    );
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "plain",
+        &["sh", "-c", "test ! -d /sys/fs/cgroup/init && echo NS-OK"],
+    )
+    .unwrap();
+    assert!(
+        out.contains("NS-OK"),
+        "guest root hierarchy (init leaf) must not be visible in a namespaced container: {out}"
+    );
+
+    // Privileged container: writable cgroup2 — creating (and removing)
+    // a child cgroup must work, which is what dockerd does at startup.
+    let mounts = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "priv",
+        &["sh", "-c", "grep ' /sys/fs/cgroup cgroup2 ' /proc/mounts"],
+    )
+    .unwrap();
+    assert!(
+        mounts.contains("rw,"),
+        "privileged cgroup2 mount should be read-write: {mounts}"
+    );
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "priv",
+        &[
+            "sh",
+            "-c",
+            "mkdir /sys/fs/cgroup/k7d-18d-test && \
+             cat /sys/fs/cgroup/k7d-18d-test/cgroup.procs && \
+             echo CGWRITE-OK",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("CGWRITE-OK"),
+        "privileged container should create a cgroup: {out}"
+    );
+    // Sibling invisibility: the cgroup dir the privileged container
+    // just created must NOT appear in the plain container's view.
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "plain",
+        &[
+            "sh",
+            "-c",
+            "test ! -d /sys/fs/cgroup/k7d-18d-test && echo SIBLING-HIDDEN",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("SIBLING-HIDDEN"),
+        "sibling container's cgroup dir must not be visible: {out}"
+    );
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "priv",
+        &[
+            "sh",
+            "-c",
+            "rmdir /sys/fs/cgroup/k7d-18d-test && echo CGRM-OK",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("CGRM-OK"),
+        "privileged container should remove its cgroup: {out}"
+    );
+
+    // Guest IPv6 contract: the stack is compiled in (proc entries
+    // exist) and eth0 got a link-local inet6 address.
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "plain",
+        &[
+            "sh",
+            "-c",
+            "test -d /proc/sys/net/ipv6 && cat /proc/net/if_inet6 && echo IPV6-OK",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("IPV6-OK"),
+        "guest kernel should have IPv6 enabled: {out}"
+    );
+    assert!(
+        out.lines().any(|l| l.contains("eth0")),
+        "eth0 should have an inet6 (link-local) address: {out}"
+    );
+    // ip6tables support (dockerd 27+ programs ip6tables NAT rules): the
+    // ip6_tables proc registry exists in the guest kernel.
+    let out = kubectl_exec_c(
+        "test-k7d-cg-ipv6",
+        "priv",
+        &[
+            "sh",
+            "-c",
+            "test -e /proc/net/ip6_tables_names && echo IP6TABLES-OK",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("IP6TABLES-OK"),
+        "guest kernel should have ip6_tables support: {out}"
+    );
+
+    kubectl_delete("pod", "test-k7d-cg-ipv6").unwrap();
+    wait_for_pod_gone("test-k7d-cg-ipv6", Duration::from_secs(30)).unwrap();
+}
+
+/// A STOCK `docker:27.5-dind` sidecar works in-guest with no
+/// wrapper script and no `--ip6tables=false` — the upstream proof that
+/// k7's docker-sidecar quirks (manual `mount -t cgroup2` entrypoint
+/// wrap, ip6tables opt-out) are dead code. The dind image's own
+/// entrypoint does the standard cgroup2 nesting evacuation (moby
+/// hack/dind), which the namespaced cgroup view + full root delegation
+/// (init.sh) now supports. A client container shares the docker socket
+/// over an emptyDir; `docker info` and a `docker run` round-trip must
+/// both succeed.
+#[test]
+fn test_kubectl_stock_dind_sidecar() {
+    let _leak_guard = ensure_shim_installed();
+    let _ = kubectl_delete("pod", "test-k7d-stock-dind");
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-k7d-stock-dind
+spec:
+  runtimeClassName: k7
+  restartPolicy: Never
+  containers:
+  - name: dind
+    image: docker:27.5-dind
+    imagePullPolicy: IfNotPresent
+    args: ["--host=unix:///dockersock/docker.sock"]
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    securityContext:
+      privileged: true
+    resources:
+      limits:
+        memory: 768Mi
+    volumeMounts:
+    - name: dockersock
+      mountPath: /dockersock
+  - name: client
+    image: docker:27.5-cli
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "infinity"]
+    env:
+    - name: DOCKER_HOST
+      value: unix:///dockersock/docker.sock
+    resources:
+      limits:
+        memory: 256Mi
+    volumeMounts:
+    - name: dockersock
+      mountPath: /dockersock
+  volumes:
+  - name: dockersock
+    emptyDir: {}
+"#,
+    ))
+    .unwrap();
+    wait_for_pod_ready("test-k7d-stock-dind", Duration::from_secs(180)).unwrap();
+
+    // dockerd takes a few seconds to come up; poll `docker info`.
+    let start = Instant::now();
+    let info = loop {
+        match kubectl_exec_c("test-k7d-stock-dind", "client", &["docker", "info"]) {
+            Ok(out) if out.contains("Server Version") => break out,
+            attempt => {
+                if start.elapsed() > Duration::from_secs(120) {
+                    let logs = std::process::Command::new("kubectl")
+                        .args(["logs", "test-k7d-stock-dind", "-c", "dind", "--tail=100"])
+                        .output()
+                        .expect("kubectl logs dind");
+                    let _ = kubectl_delete("pod", "test-k7d-stock-dind");
+                    panic!(
+                        "stock dind never answered docker info (last: {attempt:?})\ndind logs:\n{}",
+                        String::from_utf8_lossy(&logs.stdout)
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    };
+    eprintln!("docker info OK: {}", info.lines().next().unwrap_or(""));
+
+    // dockerd's first act is to program NAT, and an in-guest kernel
+    // without an nf_tables ipv4 family fails that write while every
+    // read still succeeds — dockerd dies, the sidecar CrashLoops, and
+    // `docker info` above would have been answered by a *restarted*
+    // daemon. Assert both halves: nobody restarted, and a NAT table
+    // write from inside the guest works.
+    let restarts = std::process::Command::new("kubectl")
+        .args([
+            "get",
+            "pod",
+            "test-k7d-stock-dind",
+            "-o",
+            "jsonpath={.status.containerStatuses[?(@.name=='dind')].restartCount}",
+        ])
+        .output()
+        .expect("kubectl get restartCount");
+    assert_eq!(
+        String::from_utf8_lossy(&restarts.stdout).trim(),
+        "0",
+        "stock dind must not CrashLoop: {}",
+        kubectl_logs_c("test-k7d-stock-dind", "dind").unwrap_or_default()
+    );
+    let out = kubectl_exec_c(
+        "test-k7d-stock-dind",
+        "dind",
+        &[
+            "sh",
+            "-c",
+            "iptables -t nat -N K7D-NAT-PROBE 2>&1; echo rc=$?; \
+             iptables -t nat -X K7D-NAT-PROBE 2>&1; echo rc=$?",
+        ],
+    )
+    .expect("iptables exec");
+    assert_eq!(
+        out.matches("rc=0").count(),
+        2,
+        "creating and removing a nat chain in the guest must succeed: {out}"
+    );
+
+    // Full round-trip: pull + run a container inside the guest dockerd
+    // (exercises evacuation, vfs graph driver, and in-guest ip(6)tables
+    // NAT — all with the stock entrypoint).
+    let out = kubectl_exec_c(
+        "test-k7d-stock-dind",
+        "client",
+        &[
+            "docker",
+            "run",
+            "--rm",
+            "busybox:1.36",
+            "echo",
+            "K7D-DIND-OK",
+        ],
+    )
+    .unwrap();
+    assert!(
+        out.contains("K7D-DIND-OK"),
+        "docker run inside stock dind should echo the marker: {out}"
+    );
+
+    kubectl_delete("pod", "test-k7d-stock-dind").unwrap();
+    wait_for_pod_gone("test-k7d-stock-dind", Duration::from_secs(30)).unwrap();
+}
+
+/// A kubectl pod with only block-supported volume
 /// classes (emptyDir here) warm-forks on the CoW path end to end
 /// through the daemon — the fork's memory is `MAP_PRIVATE` CoW over
 /// the source snapshot, NOT a full memfd copy, and the forked guest
@@ -998,7 +1395,7 @@ spec:
         "emptyDir pod must be block-backed (zero virtiofs)"
     );
 
-    // Fork through the daemon. internal notes: preparing a share-less
+    // Fork through the daemon. Preparing a share-less
     // fork source swaps the VM for a restored copy on the SAME vsock
     // CID (historically a new CID — CHALLENGES.md #39 — which broke
     // every later kubectl exec against the source); the post-fork
@@ -1007,6 +1404,7 @@ spec:
     let forked = daemon
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
+            sandbox_id: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -1016,7 +1414,7 @@ spec:
         other => panic!("unexpected fork_vm response: {other:?}"),
     };
 
-    // The CoW invariant this whole spec exists for: no virtiofs ⇒
+    // The CoW invariant this whole design exists for: no virtiofs ⇒
     // the fork must NOT be a full memory copy.
     let fork = common::vm_state(&fork_id);
     assert!(
@@ -1114,7 +1512,7 @@ fn wait_for_all_containers_ready(name: &str, timeout: Duration) -> Result<(), St
     }
 }
 
-/// internal notes: a kubectl pod with two containers of DISTINCT
+/// A kubectl pod with two containers of DISTINCT
 /// images. The VM boots at the first workload Create with only that
 /// container's rootfs attached; the second image arrives post-boot
 /// and rides a spare image slot (host FICLONE/copy fill + agent
@@ -1217,7 +1615,7 @@ spec:
     kubectl_delete("pod", "test-k7d-twoimg").unwrap();
 }
 
-/// internal notes: a two-distinct-image pod on the zero-virtiofs
+/// A two-distinct-image pod on the zero-virtiofs
 /// block path warm-forks via the daemon on the CoW path
 /// (`fork_memory_full_copy == false`). Image slots are RO virtio-blk
 /// by construction and must not force a full memfd copy; the forked
@@ -1273,6 +1671,7 @@ spec:
     let forked = daemon
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
+            sandbox_id: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -1328,7 +1727,7 @@ spec:
     let _ = kubectl_delete("pod", "test-k7d-mimg-cow");
 }
 
-/// internal notes: more distinct images than spare slots must fail
+/// More distinct images than spare slots must fail
 /// LOUD, with the workload Create error naming the
 /// `k7d.katakate.org/image-slots` annotation (visible in pod events).
 #[test]
@@ -1387,7 +1786,7 @@ spec:
         );
         std::thread::sleep(Duration::from_secs(2));
     };
-    // The error must name the annotation knob.
+    // The error must name the annotation knob (success criterion).
     let event_tail = describe
         .split("no free image slot")
         .nth(1)
@@ -1408,7 +1807,7 @@ fn pod_jsonpath(name: &str, path: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// internal notes: a container that exits ON ITS OWN (no Kill) must be
+/// A container that exits ON ITS OWN (no Kill) must be
 /// reported Terminated with its REAL exit code, and
 /// `restartPolicy: Always` must then restart it (new containerd id;
 /// the same image dedupes onto the existing erofs mount).
@@ -1513,10 +1912,10 @@ spec:
     kubectl_delete("pod", "test-k7d-natexit").unwrap();
 }
 
-/// internal notes: init containers sequence end-to-end with NO shim
+/// Init containers sequence end-to-end with NO shim
 /// special-casing — kubelet drives plain CRI Create/Start/Wait off
-/// the natural-exit observation (Inc 2) and the distinct init image
-/// rides a spare slot (Inc 1). Two init containers run IN ORDER
+/// the natural-exit observation and the distinct init image
+/// rides a spare slot. Two init containers run IN ORDER
 /// before the main container:
 ///
 ///   1. `init-marker` (busybox — the FIRST workload, boots the VM)
@@ -1572,7 +1971,7 @@ spec:
     wait_for_all_containers_ready("test-k7d-initseq", Duration::from_secs(60)).unwrap();
 
     // Both init containers report Terminated/Completed with the REAL
-    // exit code 0 (Inc 2 natural-exit observation).
+    // exit code 0 (natural-exit observation).
     for (idx, name) in [(0, "init-marker"), (1, "init-same")] {
         let got_name = pod_jsonpath(
             "test-k7d-initseq",
@@ -1709,11 +2108,20 @@ spec:
     kubectl_delete("pod", "test-k7d-initseq").unwrap();
 }
 
-/// internal notes: two containers with different memory limits.
-/// Guest runc enforces each cgroup independently — a 40 Mi write
-/// OOMs inside the 32Mi container but succeeds in the 256Mi sibling.
-/// (Assert via kubectl exec rather than kubelet OOMKilled: Inc 2
-/// exit observation is not required for limit enforcement.)
+/// Two containers with different memory limits.
+/// Guest runc enforces each cgroup independently — a 40 Mi
+/// *anonymous* allocation OOMs inside the 32Mi container but succeeds
+/// in the 256Mi sibling. (Assert via kubectl exec rather than kubelet
+/// OOMKilled: exit observation is not required for limit
+/// enforcement.)
+///
+/// The allocation is `dd`'s own 40 MiB I/O buffer, written to
+/// `/dev/null`. It used to be a 40 MiB *file* under `/tmp`, which
+/// worked only because the container's writable layer was a guest
+/// tmpfs whose pages are charged to the memory cgroup and cannot be
+/// reclaimed. moved that layer onto a host-backed virtio-blk
+/// scratch disk, so file writes are now reclaimable page cache and a
+/// 40 MiB write no longer says anything about a 32 MiB memory limit.
 #[test]
 fn test_kubectl_pod_per_container_memory_limits() {
     let _leak_guard = ensure_shim_installed();
@@ -1748,16 +2156,14 @@ spec:
     wait_for_pod_ready("test-k7d-ctrmem", Duration::from_secs(180)).unwrap();
     wait_for_all_containers_ready("test-k7d-ctrmem", Duration::from_secs(60)).unwrap();
 
-    // 40 Mi into the overlay tmpfs: over small's 32Mi cgroup limit,
-    // under big's 256Mi. Guest OOM kills the small exec (exit 137).
-    let small_hog = kubectl_exec_c(
-        "test-k7d-ctrmem",
-        "small",
-        &["dd", "if=/dev/zero", "of=/tmp/hog", "bs=1M", "count=40"],
-    );
+    // A single 40 MiB dd buffer, faulted in by the read: over small's
+    // 32Mi cgroup limit, under big's 256Mi. Guest OOM kills the small
+    // exec (exit 137).
+    let hog = ["dd", "if=/dev/zero", "of=/dev/null", "bs=40M", "count=1"];
+    let small_hog = kubectl_exec_c("test-k7d-ctrmem", "small", &hog);
     assert!(
         small_hog.is_err(),
-        "40Mi write in 32Mi cgroup must fail, got: {small_hog:?}"
+        "40Mi anonymous allocation in a 32Mi cgroup must fail, got: {small_hog:?}"
     );
     let err = small_hog.unwrap_err();
     assert!(
@@ -1765,14 +2171,10 @@ spec:
         "small hog should look like OOM/SIGKILL, got: {err}"
     );
 
-    // Same write in the sibling must succeed — proves the limits are
-    // per-container, not a shared VM-wide cap alone.
-    kubectl_exec_c(
-        "test-k7d-ctrmem",
-        "big",
-        &["dd", "if=/dev/zero", "of=/tmp/hog", "bs=1M", "count=40"],
-    )
-    .expect("40Mi write in 256Mi cgroup must succeed");
+    // The same allocation in the sibling must succeed — proves the
+    // limits are per-container, not a shared VM-wide cap alone.
+    kubectl_exec_c("test-k7d-ctrmem", "big", &hog)
+        .expect("40Mi anonymous allocation in a 256Mi cgroup must succeed");
     let out = kubectl_exec_c("test-k7d-ctrmem", "big", &["echo", "still-alive"]).unwrap();
     assert!(out.contains("still-alive"));
 
@@ -1923,7 +2325,7 @@ fn daemon_lookup_sandbox(sandbox_id: &str) -> k7d::control::Response {
         .expect("lookup_sandbox call")
 }
 
-/// internal notes� crash recovery: killing a pod's shim must
+/// Crash recovery: killing a pod's shim must
 /// not wedge the pod or leak its VM.
 ///
 /// Empirically (k3s 1.36 / containerd 2.3), containerd does NOT
@@ -1933,7 +2335,7 @@ fn daemon_lookup_sandbox(sandbox_id: &str) -> k7d::control::Response {
 /// asserts the two things a crashed shim must guarantee:
 ///
 /// 1. the orphaned VM is stopped in the k7d daemon and its reattach
-///    record removed (pre-increment-4 it leaked forever, and its
+///    record removed (it used to leak forever, and its
 ///    virtiofsd blocked every successor VM's socket — the pod
 ///    retry-stormed and never recovered);
 /// 2. the pod returns to Running with a working exec path on the
@@ -2129,7 +2531,7 @@ spec:
     eprintln!();
 }
 
-// ── internal notes: multi-vCPU kubectl / annotation path ───────────────────
+// ──: multi-vCPU kubectl / annotation path ───────────────────
 
 /// The k7d daemon's cgroup v2 directory (per-VM CPU cgroups live here).
 fn k7d_service_cgroup() -> std::path::PathBuf {
@@ -2167,7 +2569,7 @@ fn vcpu_comms_in_cgroup(cg: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// internal notes: a kubectl pod with `cpu: "2"` warm-forks via the daemon;
+/// A kubectl pod with `cpu: "2"` warm-forks via the daemon;
 /// the child sees 2 CPUs and both vCPU TIDs land in a CFS-capped
 /// cgroup (`vcpu0`/`vcpu1`). Also asserts the sandbox reattach record
 /// persisted `vcpus: 2`.
@@ -2233,6 +2635,7 @@ spec:
     let forked = daemon
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
+            sandbox_id: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -2281,7 +2684,7 @@ spec:
     let _ = kubectl_delete("pod", pod);
 }
 
-/// internal notes: annotation-driven cluster fork with mixed per-member vCPU
+/// Annotation-driven cluster fork with mixed per-member vCPU
 /// counts — kubectl pods sized `[1, 2, 1]` on one `cluster-id`, then a
 /// trigger pod's `tree-*` annotations adopt + fork. Per-member counts
 /// must survive on the fork.
@@ -2463,4 +2866,843 @@ spec:
     }
 
     teardown(&mut daemon);
+}
+
+/// / 18a: kubectl pod B with `fork-source-{cluster,vm}` pointing
+/// at Running pod A boots as a warm fork of A's VM (annotation-only
+/// drive path — no test-side `ForkVm`). Share-less emptyDir → CoW;
+/// source still execs (CID preserved across prepare swap).
+#[test]
+fn test_kubectl_fork_source_annotation() {
+    let _leak_guard = ensure_shim_installed();
+    common::ensure_pod_annotations_forwarded();
+
+    let src = "test-k7d-fsrc-a";
+    let fork = "test-k7d-fsrc-b";
+    let cluster_id = format!("fsrc{}", std::process::id() % 10_000);
+    assert!(
+        cluster_id.len() <= 9,
+        "cluster_id {cluster_id:?} too long for bridge name"
+    );
+
+    let _ = kubectl_delete("pod", src);
+    let _ = kubectl_delete("pod", fork);
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {src}
+  annotations:
+    k7d.katakate.org/cluster-id: {cluster_id}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: scratch
+      mountPath: /scratch
+  volumes:
+  - name: scratch
+    emptyDir: {{}}
+"#
+    )))
+    .expect("apply source");
+    wait_for_pod_ready(src, Duration::from_secs(120)).expect("source ready");
+
+    let src_state = common::pod_vm_state(src);
+    assert_eq!(
+        src_state.virtiofs_shares, 0,
+        "emptyDir source must be block-backed (zero virtiofs)"
+    );
+    let src_sandbox = common::pod_sandbox_id(src);
+
+    // Annotation-only drive path: the fork pod's Create performs
+    // LookupSandbox + ForkVm. `fork-source-vm` is the CRI sandbox id
+    // (LookupSandbox key); both annotations required together.
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {fork}
+  annotations:
+    k7d.katakate.org/fork-source-cluster: {cluster_id}
+    k7d.katakate.org/fork-source-vm: {src_sandbox}
+spec:
+  runtimeClassName: k7
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply fork");
+    wait_for_pod_ready(fork, Duration::from_secs(180)).expect("fork pod Running");
+
+    let fork_state = common::pod_vm_state(fork);
+    assert!(
+        !fork_state.fork_memory_full_copy,
+        "annotation fork of share-less source must be CoW, not full memfd copy"
+    );
+    assert_eq!(fork_state.virtiofs_shares, 0);
+    assert_ne!(
+        fork_state.vm_id, src_state.vm_id,
+        "fork must be a distinct VM id from the source"
+    );
+
+    let alive = kubectl_exec(fork, &["echo", "fork-alive"]).expect("exec in fork");
+    assert!(
+        alive.contains("fork-alive"),
+        "fork workload must answer kubectl exec: {alive:?}"
+    );
+
+    // CID stability (/ CHALLENGES #39): source still
+    // answers after the prepare swap triggered by the annotation fork.
+    let src_alive = kubectl_exec(src, &["echo", "src-alive"]).expect("exec in source");
+    assert!(
+        src_alive.contains("src-alive"),
+        "source must still exec after annotation ForkVm: {src_alive:?}"
+    );
+
+    let _ = kubectl_delete("pod", fork);
+    let _ = kubectl_delete("pod", src);
+}
+
+/// / 18a: half-specified `fork-source-*` annotations fail
+/// sandbox Create loudly (events name the annotation keys).
+#[test]
+fn test_kubectl_fork_source_half_specified_fails_loud() {
+    let _leak_guard = ensure_shim_installed();
+    common::ensure_pod_annotations_forwarded();
+
+    for (name, annotations) in [
+        (
+            "test-k7d-fsrc-half-vm",
+            r#"    k7d.katakate.org/fork-source-vm: "deadbeef""#,
+        ),
+        (
+            "test-k7d-fsrc-half-cl",
+            r#"    k7d.katakate.org/fork-source-cluster: "orphan""#,
+        ),
+    ] {
+        let _ = kubectl_delete("pod", name);
+        std::thread::sleep(Duration::from_secs(1));
+        kubectl_apply(&common::pin_to_local_node(&format!(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {name}
+  annotations:
+{annotations}
+spec:
+  runtimeClassName: k7
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+"#
+        )))
+        .unwrap_or_else(|e| panic!("apply {name}: {e}"));
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let describe = loop {
+            let output = std::process::Command::new("kubectl")
+                .args(["describe", "pod", name])
+                .output()
+                .expect("kubectl describe");
+            let describe = String::from_utf8_lossy(&output.stdout).to_string();
+            // Exact fail-loud message from sandbox_create_fork_adopt.
+            if describe.contains("must be set together") {
+                break describe;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "half-specified fork-source error never surfaced for {name}; describe:\n{describe}"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        };
+        assert!(
+            describe.contains("fork-source-vm") && describe.contains("fork-source-cluster"),
+            "error must name both annotation keys; describe:\n{describe}"
+        );
+        // Must never reach Running — Create failed.
+        let phase = pod_jsonpath(name, ".status.phase");
+        assert_ne!(
+            phase, "Running",
+            "half-specified fork-source pod must not become Running"
+        );
+        let _ = kubectl_delete("pod", name);
+    }
+}
+
+/// Pause/resume a kubectl sandbox VM over `/run/k7d/k7d.sock`
+/// (`PauseVm` / `ResumeVm`). While paused the guest agent must not
+/// answer; after resume kubectl exec works again and a CFS-capped VM
+/// keeps its vCPU TIDs in the cgroup.
+#[test]
+fn test_kubectl_pause_resume_over_socket() {
+    let _leak_guard = ensure_shim_installed();
+    let pod = "test-k7d-pause-sock";
+    let _ = kubectl_delete("pod", pod);
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        cpu: "2"
+"#
+    )))
+    .expect("kubectl apply");
+    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+
+    let pre = kubectl_exec(pod, &["echo", "pre-pause"]).expect("exec before pause");
+    assert!(pre.contains("pre-pause"));
+
+    let sandbox_id = common::pod_sandbox_id(pod);
+    let mut daemon = k7d::control::Client::connect_env().expect("connect k7d daemon");
+    let (vm_id, guest_cid) = match daemon
+        .call(&k7d::control::Request::LookupSandbox {
+            sandbox_id: sandbox_id.clone(),
+        })
+        .expect("lookup_sandbox")
+    {
+        k7d::control::Response::SandboxFound {
+            vm_id, guest_cid, ..
+        } => (vm_id, guest_cid),
+        other => panic!("unexpected LookupSandbox: {other:?}"),
+    };
+
+    match daemon
+        .call(&k7d::control::Request::PauseVm {
+            vm_id: vm_id.clone(),
+        })
+        .expect("pause_vm")
+    {
+        k7d::control::Response::Ok => {}
+        other => panic!("unexpected PauseVm: {other:?}"),
+    }
+
+    // Frozen vCPUs: a fresh vsock dial must time out (guest agent dead).
+    if let Ok(_agent) = k7d::api::AgentClient::connect_vsock(guest_cid, Duration::from_secs(2)) {
+        panic!("guest agent must not answer while VM is paused (cid {guest_cid})");
+    }
+
+    match daemon
+        .call(&k7d::control::Request::ResumeVm {
+            vm_id: vm_id.clone(),
+        })
+        .expect("resume_vm")
+    {
+        k7d::control::Response::Ok => {}
+        other => panic!("unexpected ResumeVm: {other:?}"),
+    }
+
+    let mut agent = k7d::api::AgentClient::connect_vsock(guest_cid, Duration::from_secs(10))
+        .expect("guest agent after resume");
+    let pong = agent.ping().expect("ping after resume");
+    assert!(!pong.version.is_empty());
+    drop(agent);
+
+    let post = kubectl_exec(pod, &["echo", "post-resume"]).expect("exec after resume");
+    assert!(post.contains("post-resume"));
+
+    // Invariant: resume re-attaches fresh vCPU TIDs to the CFS cgroup.
+    let cg = k7d_service_cgroup().join(format!("vm-{vm_id}"));
+    assert!(
+        cg.exists(),
+        "CPU cgroup missing after resume: {}",
+        cg.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(cg.join("cpu.max"))
+            .expect("read cpu.max")
+            .trim(),
+        "200000 100000"
+    );
+    assert_eq!(
+        vcpu_comms_in_cgroup(&cg),
+        ["vcpu0", "vcpu1"],
+        "both vCPU TIDs must be in the CFS cgroup after resume"
+    );
+
+    let _ = kubectl_delete("pod", pod);
+}
+
+/// / CHALLENGES #60: after an annotation-driven fork, deleting
+/// both pods must clear the *source* out of `Terminating` within
+/// seconds. Lifecycle suites used to pass while source pods wedged
+/// forever (Kill blocked on the dead pre-swap agent connection).
+#[test]
+fn test_kubectl_fork_source_teardown() {
+    let _leak_guard = ensure_shim_installed();
+    common::ensure_pod_annotations_forwarded();
+
+    let src = "test-k7d-fsrc-td-a";
+    let fork = "test-k7d-fsrc-td-b";
+    let cluster_id = format!("fstd{}", std::process::id() % 10_000);
+    assert!(cluster_id.len() <= 9);
+
+    let _ = kubectl_delete("pod", src);
+    let _ = kubectl_delete("pod", fork);
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {src}
+  annotations:
+    k7d.katakate.org/cluster-id: {cluster_id}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: scratch
+      mountPath: /scratch
+  volumes:
+  - name: scratch
+    emptyDir: {{}}
+"#
+    )))
+    .expect("apply source");
+    wait_for_pod_ready(src, Duration::from_secs(120)).expect("source ready");
+    let src_sandbox = common::pod_sandbox_id(src);
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {fork}
+  annotations:
+    k7d.katakate.org/fork-source-cluster: {cluster_id}
+    k7d.katakate.org/fork-source-vm: {src_sandbox}
+spec:
+  runtimeClassName: k7
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply fork");
+    wait_for_pod_ready(fork, Duration::from_secs(180)).expect("fork ready");
+
+    // Fire-and-forget delete of both; the regression is the source
+    // wedging in Terminating after prepare_fork_source swapped its
+    // vsock backend under the shim's cached agent connection.
+    let del = std::process::Command::new("kubectl")
+        .args([
+            "delete",
+            "pod",
+            src,
+            fork,
+            "--ignore-not-found",
+            "--wait=false",
+            "--grace-period=1",
+        ])
+        .output()
+        .expect("kubectl delete");
+    assert!(
+        del.status.success(),
+        "kubectl delete --wait=false failed: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    loop {
+        let gone = |name: &str| {
+            let o = std::process::Command::new("kubectl")
+                .args(["get", "pod", name, "--ignore-not-found", "-o", "name"])
+                .output()
+                .expect("kubectl get");
+            o.status.success() && o.stdout.is_empty()
+        };
+        if gone(src) && gone(fork) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fork-source teardown: pods still present after {:?}\n\
+             source={:?} fork={:?}\n\
+             (CHALLENGES #60: source stuck in Terminating = Kill on dead agent)",
+            start.elapsed(),
+            pod_jsonpath(src, ".status.phase"),
+            pod_jsonpath(fork, ".status.phase"),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let elapsed = start.elapsed();
+    eprintln!("  ⏱  fork-source teardown (both pods gone) ........ {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "source+fork must leave Terminating within 15s after delete, took {elapsed:?}"
+    );
+}
+
+/// Bytes actually allocated on the host for `path` — a sparse scratch
+/// image reports far less than its apparent length.
+fn allocated_bytes(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |m| m.blocks() * 512)
+}
+
+/// `k3s crictl stats -o json`, as (whole-call success, container ids
+/// reported). The whole-call success is the CHALLENGES #61 canary: one
+/// shim answering `Stats` with a payload containerd cannot decode fails
+/// the AGGREGATE ListContainerStats, so every pod on the node loses
+/// stats at once.
+fn crictl_stats() -> (bool, Vec<String>) {
+    let out = std::process::Command::new("k3s")
+        .args(["crictl", "stats", "-o", "json"])
+        .output()
+        .expect("k3s crictl stats should run");
+    if !out.status.success() {
+        eprintln!(
+            "  crictl stats failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return (false, Vec::new());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+    let ids = parsed
+        .get("stats")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    s.pointer("/attributes/id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (true, ids)
+}
+
+/// Container ids of a pod, per crictl.
+fn pod_container_ids(pod: &str) -> Vec<String> {
+    let out = std::process::Command::new("k3s")
+        .args(["crictl", "ps", "-q", "--pod", &common::pod_sandbox_id(pod)])
+        .output()
+        .expect("k3s crictl ps should run");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// End to end through kubectl: `k7d.katakate.org/
+/// container-scratch-size` gives the named container its own writable
+/// image, so filling it is that container's `ENOSPC` while its sibling
+/// keeps writing on the pod-wide disk that
+/// `k7d.katakate.org/scratch-size` sized. Polling `Stats` then makes the
+/// usage visible in the shim log — and never breaks the payload other
+/// pods on this node depend on.
+#[test]
+fn test_kubectl_pod_per_container_scratch_limits() {
+    let _leak_guard = ensure_shim_installed();
+    // Both annotations only reach the shim when containerd forwards
+    // k7d.katakate.org/* pod annotations into the OCI spec.
+    common::ensure_pod_annotations_forwarded();
+
+    // The node is shared and part of a live cluster: sample the
+    // non-k7 stats surface BEFORE our pod exists, so the assertion
+    // below is about our change and not about whatever else is running.
+    let (baseline_ok, baseline_ids) = crictl_stats();
+    assert!(
+        baseline_ok,
+        "crictl stats must work on this node before the test starts"
+    );
+
+    let pod = "test-k7d-cscratch";
+    let _ = kubectl_delete("pod", pod);
+    let _pod_guard = PodGuard(pod);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // 64Mi for `builder`, 1Gi shared for everyone else. Both numbers
+    // are storage, never memory: the pod's memory limit is deliberately
+    // smaller than the write below (CHALLENGES #65).
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+  annotations:
+    k7d.katakate.org/scratch-size: "1Gi"
+    k7d.katakate.org/container-scratch-size: "builder=64Mi"
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: builder
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        memory: 256Mi
+  - name: sidecar
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply per-container scratch pod");
+    wait_for_pod_ready(pod, Duration::from_secs(240)).expect("pod ready");
+    wait_for_all_containers_ready(pod, Duration::from_secs(120)).expect("both containers ready");
+
+    // Two images on the host: the pod's shared scratch and builder's own.
+    let vm_id = common::pod_vm_id(pod);
+    let shared =
+        std::path::PathBuf::from(k7d::disks::DISKS_DIR).join(format!("scratch-{vm_id}.img"));
+    let builder = std::path::PathBuf::from(k7d::disks::DISKS_DIR)
+        .join(format!("scratch-{vm_id}-c-builder.img"));
+    for image in [&shared, &builder] {
+        assert!(
+            image.exists(),
+            "no host image at {} for pod {pod}",
+            image.display()
+        );
+    }
+
+    // builder's writable layer is its own device: from inside the
+    // container the guest's `ext4` mount is out of namespace, but its
+    // rootfs overlay names the upper dir, and that is the mount point
+    // the daemon attached the image at.
+    let mount = k7d::disks::container_scratch_mount("builder");
+    let mounts =
+        kubectl_exec_c(pod, "builder", &["cat", "/proc/mounts"]).expect("read /proc/mounts");
+    assert!(
+        mounts
+            .lines()
+            .any(|l| l.contains("overlay") && l.contains(&format!("upperdir={mount}/"))),
+        "expected builder's rootfs overlay to write into its own image at {mount}, got:\n{mounts}"
+    );
+
+    // 256 MiB is 4x builder's limit and a quarter of the pod's shared
+    // disk: it must fail for builder and succeed for the sidecar.
+    // `; echo rc=` so the exec itself succeeds and dd's own complaint
+    // comes back on stdout — only the write is expected to fail.
+    let attempt = kubectl_exec_c(
+        pod,
+        "builder",
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/fill bs=1M count=256 conv=fsync 2>&1; echo rc=$?",
+        ],
+    )
+    .expect("the exec must succeed")
+    .to_ascii_lowercase();
+    assert!(
+        !attempt.contains("rc=0"),
+        "writing 4x builder's own limit must fail, got: {attempt}"
+    );
+    assert!(
+        attempt.contains("no space left"),
+        "builder must hit a clean ENOSPC on its own device, got: {attempt}"
+    );
+    kubectl_exec_c(
+        pod,
+        "sidecar",
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/big bs=1M count=256 conv=fsync",
+        ],
+    )
+    .expect("the sidecar must keep writing past the limit that stopped builder");
+
+    // Stats: the numbers reach the shim log (builder is over the
+    // high-water mark, having just filled its image), and the aggregate
+    // call still works for every container on the node — including the
+    // ones that were there before this pod.
+    let log = std::path::Path::new("/tmp/k7-shim.log");
+    let before = std::fs::metadata(log).map_or(0, |m| m.len());
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut saw_usage = false;
+    while Instant::now() < deadline && !saw_usage {
+        let (ok, ids) = crictl_stats();
+        assert!(ok, "crictl stats must keep working while k7 pods report");
+        for id in pod_container_ids(pod) {
+            assert!(
+                ids.contains(&id),
+                "container {id} of {pod} is missing from crictl stats"
+            );
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let tail = std::fs::read_to_string(log).unwrap_or_default();
+        saw_usage = tail
+            .get(before as usize..)
+            .unwrap_or(&tail)
+            .lines()
+            .any(|l| l.contains("ephemeral storage") && l.contains("%"));
+    }
+    assert!(
+        saw_usage,
+        "no per-container ephemeral-storage line in {} after polling Stats — \
+         a full writable layer would be invisible",
+        log.display()
+    );
+
+    // CHALLENGES #61 from the other direction: a pod that has nothing
+    // to do with k7 still reports stats.
+    let (ok, ids) = crictl_stats();
+    assert!(ok, "crictl stats must still succeed node-wide");
+    let surviving = baseline_ids.iter().filter(|id| ids.contains(id)).count();
+    assert!(
+        surviving > 0,
+        "no non-k7 container from the pre-test baseline ({} sampled) still reports stats — \
+         the shim's Stats payload is poisoning ListContainerStats node-wide",
+        baseline_ids.len()
+    );
+
+    // Both images are scratch: deleting the pod takes them with it.
+    kubectl_delete("pod", pod).expect("delete pod");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while shared.exists() || builder.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "host images survived pod deletion (leak): shared={} builder={}",
+            shared.exists(),
+            builder.exists()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A pod on the **stock** runtime keeps reporting container
+/// stats while a k7 pod on the same node is answering `Stats`. This is
+/// CHALLENGES #61's blast radius — the shim's payload is decoded inside
+/// containerd's node-wide `ListContainerStats`, so getting it wrong
+/// takes out pods that never went near k7. Both pods have to be running
+/// at once for the test to mean anything.
+#[test]
+fn test_non_k7_pod_still_reports_stats_beside_a_k7_pod() {
+    let _leak_guard = ensure_shim_installed();
+
+    let stock = "test-k7d-stock-stats";
+    let k7 = "test-k7d-stats-neighbour";
+    let _ = kubectl_delete("pod", stock);
+    let _ = kubectl_delete("pod", k7);
+    let _stock_guard = PodGuard(stock);
+    let _k7_guard = PodGuard(k7);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // No runtimeClassName: stock containerd + runc, pinned to this node.
+    kubectl_apply(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {stock}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: "{host}"
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+"#,
+        host = common::current_hostname()
+    ))
+    .expect("apply stock-runtime pod");
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {k7}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply k7 pod");
+    wait_for_pod_ready(stock, Duration::from_secs(180)).expect("stock pod ready");
+    wait_for_pod_ready(k7, Duration::from_secs(240)).expect("k7 pod ready");
+
+    let want = pod_container_ids(stock);
+    assert!(!want.is_empty(), "no CRI containers for {stock}");
+    let k7_containers = pod_container_ids(k7);
+    assert!(!k7_containers.is_empty(), "no CRI containers for {k7}");
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (ok, ids) = crictl_stats();
+        assert!(
+            ok,
+            "node-wide crictl stats must succeed while a k7 pod answers Stats — \
+             a malformed shim payload fails the whole aggregate call"
+        );
+        if want.iter().all(|id| ids.contains(id)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stock-runtime container(s) {want:?} never appeared in crictl stats \
+             ({} reported) while {k7} was running",
+            ids.len()
+        );
+        std::thread::sleep(Duration::from_secs(3));
+    }
+
+    kubectl_delete("pod", k7).expect("delete k7 pod");
+    kubectl_delete("pod", stock).expect("delete stock pod");
+}
+
+/// End to end through kubectl: a pod annotated with
+/// `k7d.katakate.org/scratch-size` writes more than its guest RAM to
+/// its container filesystem, reads it back intact, and the bytes land
+/// on a host image that is removed when the pod goes away — none of
+/// which the old RAM-backed `tmpfs` upper could do.
+#[test]
+fn test_kubectl_pod_scratch_disk_off_guest_ram() {
+    let _leak_guard = ensure_shim_installed();
+    // The scratch-size annotation only reaches the shim when containerd
+    // forwards k7d.katakate.org/* pod annotations into the OCI spec.
+    common::ensure_pod_annotations_forwarded();
+
+    let pod = "test-k7d-scratch";
+    let _ = kubectl_delete("pod", pod);
+    let _pod_guard = PodGuard(pod);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // 512Mi limit ⇒ a ~576 MB guest (adds 64 MB overhead), so
+    // the 1 GiB write below is comfortably more than guest RAM and more
+    // than double what a 50%-of-RAM tmpfs upper would have allowed.
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+  annotations:
+    k7d.katakate.org/scratch-size: "4Gi"
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        memory: 512Mi
+"#
+    )))
+    .expect("apply scratch pod");
+    wait_for_pod_ready(pod, Duration::from_secs(180)).expect("scratch pod ready");
+
+    // The daemon named the image after the VM it belongs to.
+    let vm_id = common::pod_vm_id(pod);
+    let image =
+        std::path::PathBuf::from(k7d::disks::DISKS_DIR).join(format!("scratch-{vm_id}.img"));
+    assert!(
+        image.exists(),
+        "no host scratch image at {} for pod {pod}",
+        image.display()
+    );
+
+    let mem_before = kubectl_exec(pod, &["grep", "MemAvailable", "/proc/meminfo"])
+        .expect("read guest MemAvailable");
+    let mem_before: u64 = mem_before
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("cannot parse MemAvailable out of {mem_before:?}"));
+    let allocated_before = allocated_bytes(&image);
+
+    let write_mib = 1024u32;
+    let digest_hot = kubectl_exec(
+        pod,
+        &[
+            "sh",
+            "-c",
+            &format!(
+                "dd if=/dev/urandom of=/big bs=1M count={write_mib} conv=fsync 2>/dev/null && \
+                 md5sum /big | cut -d' ' -f1"
+            ),
+        ],
+    )
+    .unwrap_or_else(|e| {
+        panic!("writing {write_mib} MiB into the container filesystem failed: {e}")
+    });
+    let digest_hot = digest_hot.trim().to_string();
+    assert!(!digest_hot.is_empty(), "md5sum produced no digest");
+
+    // Re-read it. The file is larger than the whole guest, so most of
+    // it necessarily comes back off the virtio-blk device rather than
+    // out of the page cache — a matching digest is proof the bytes are
+    // on the host image and intact.
+    let digest_cold = kubectl_exec(pod, &["sh", "-c", "md5sum /big | cut -d' ' -f1"])
+        .expect("re-read the file")
+        .trim()
+        .to_string();
+    assert_eq!(
+        digest_hot, digest_cold,
+        "{write_mib} MiB read back off the scratch disk does not match what was written"
+    );
+
+    let grew_mib = allocated_bytes(&image).saturating_sub(allocated_before) / (1024 * 1024);
+    assert!(
+        grew_mib >= u64::from(write_mib) * 9 / 10,
+        "host scratch image {} grew by only {grew_mib} MiB for a {write_mib} MiB write",
+        image.display()
+    );
+
+    let mem_after = kubectl_exec(pod, &["grep", "MemAvailable", "/proc/meminfo"])
+        .expect("read guest MemAvailable again");
+    let mem_after: u64 = mem_after
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("cannot parse MemAvailable out of {mem_after:?}"));
+    let dropped_mib = mem_before.saturating_sub(mem_after) / 1024;
+    assert!(
+        dropped_mib < 128,
+        "guest MemAvailable fell {dropped_mib} MiB while writing {write_mib} MiB \
+         (before={mem_before} kB after={mem_after} kB) — the writes are landing in RAM"
+    );
+
+    // Scratch is scratch: deleting the pod takes the host image with it.
+    kubectl_delete("pod", pod).expect("delete scratch pod");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while image.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "host scratch image {} survived pod deletion (leak)",
+            image.display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }

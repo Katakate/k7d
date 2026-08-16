@@ -4,7 +4,7 @@
 //! One sandbox = one pod = one VM. Multiple containers (pause + workload)
 //! share the same VM and agent connection.
 //!
-//! internal notes: the VM itself (KVM fds, guest memory,
+//! The VM itself (KVM fds, guest memory,
 //! virtiofsd children, TAP/bridge) lives in the **k7d daemon**; the
 //! shim only holds the daemon's `vm_id` and talks to the guest agent
 //! directly over vsock (CIDs are kernel-global).
@@ -30,8 +30,8 @@ pub struct RootfsDevice {
     pub guest_mount: String,
 }
 
-/// One spare "image slot" virtio-blk device declared at boot (spec
-/// 16a Inc 1): a fixed-capacity sparse RO backing file whose content
+/// One spare "image slot" virtio-blk device declared at boot: a
+/// fixed-capacity sparse RO backing file whose content
 /// the host fills (FICLONE reflink / `copy_file_range`) at a
 /// post-boot workload Create — the no-hotplug answer to
 /// multi-container pods with distinct images. Empty slots carry no
@@ -63,8 +63,7 @@ pub struct BlockStateSnapshot {
     pub rewrites: MountRewriteMap,
     /// Attached rootfs erofs devices, in device order.
     pub rootfs_devices: Vec<RootfsDevice>,
-    /// Attached RO-hostPath erofs devices, in device order (internal notes
-    /// Inc 5).
+    /// Attached RO-hostPath erofs devices, in device order.
     #[serde(default)]
     pub hostpath_devices: Vec<RootfsDevice>,
     /// Spare image-slot devices and their assignments.
@@ -75,6 +74,10 @@ pub struct BlockStateSnapshot {
     pub container_rootfs_keys: BTreeMap<String, String>,
     /// Host etc-file source → guest tmpfs path already pushed.
     pub etc_pushed: BTreeMap<String, String>,
+    /// Kubernetes container names that were given their own writable
+    /// image, with the capacity each was given.
+    #[serde(default)]
+    pub container_scratch: BTreeMap<String, u64>,
 }
 
 /// File name of the persisted [`BlockStateSnapshot`] in the state dir.
@@ -95,12 +98,12 @@ pub struct ProcessState {
     /// Stdin FIFO path from containerd.
     pub stdin: String,
     /// Exec argv parsed from the OCI process spec (exec processes
-    /// only; empty for init processes). internal notes: captured at `Exec`,
+    /// only; empty for init processes). Captured at `Exec`,
     /// consumed at `Start`.
     pub args: Vec<String>,
-    /// internal notes: containerd requested a TTY for this process.
+    /// Containerd requested a TTY for this process.
     pub terminal: bool,
-    /// internal notes: `$TERM` from the OCI process spec env (PTY execs).
+    /// `$TERM` from the OCI process spec env (PTY execs).
     pub term: String,
 }
 
@@ -128,8 +131,8 @@ pub struct SandboxState {
     /// `None` means a single-VM sandbox with a one-off bridge.
     pub cluster_id: Option<String>,
     /// True when the pod carried an explicit `k7d.katakate.org/cluster-id`
-    /// annotation. Such pods skip the
-    /// spec-10a CNI attach, so the Start path must configure the guest's
+    /// annotation (shared-bridge cluster mode). Such pods skip the
+    /// CNI attach, so the Start path must configure the guest's
     /// eth0 with its stable `10.200.0.{2 + vm_index}` identity directly on
     /// the shared host bridge.
     pub cluster_mode: bool,
@@ -137,19 +140,19 @@ pub struct SandboxState {
     pub vm_index: Option<u32>,
     /// Source cluster ID when this sandbox is the result of a cluster fork.
     pub fork_source_cluster: Option<String>,
-    /// internal notes: cluster snapshot tree this sandbox belongs to (from
+    /// Cluster snapshot tree this sandbox belongs to (from
     /// `k7d.katakate.org/tree-id`). `None` means the sandbox is not
-    /// managed by any cluster snapshot tree — the legacy spec-9d
+    /// managed by any cluster snapshot tree — the legacy
     /// behaviour. The actual tree-side fork / suspend / resume
     /// operations happen in the k7d daemon (a future PR will wire the
     /// shim's `tree_id` and `tree_source_node_id` through the daemon
     /// Unix-socket API to drive
     /// `ClusterSnapshotTree::{new_cluster, fork, suspend, resume}`).
     pub tree_id: Option<String>,
-    /// internal notes: source node within the named tree when this sandbox is
+    /// Source node within the named tree when this sandbox is
     /// a tree-fork. Only meaningful when `tree_id` is also set.
     pub tree_source_node_id: Option<String>,
-    /// internal notes: CNI-assigned pod netns path (from
+    /// CNI-assigned pod netns path (from
     /// `linux.namespaces[type=network].path` in the sandbox OCI
     /// bundle). Set only when the k7d daemon reported a successful
     /// pod-netns attach in its `create_vm` response — the Start path
@@ -158,7 +161,7 @@ pub struct SandboxState {
     pub pod_netns: Option<PathBuf>,
     /// Host directory shared into the VM via virtiofs.
     pub state_dir: Option<PathBuf>,
-    /// internal notes: per-pod kubelet volumes — bind-mount tree on the
+    /// Per-pod kubelet volumes — bind-mount tree on the
     /// host, virtiofs shares plumbed into the VM, and the
     /// host→in-VM rewrite map applied to each workload container's
     /// OCI `config.json` before runc consumes it.
@@ -171,7 +174,7 @@ pub struct SandboxState {
     /// shim) — consumers treat that the same as an empty rewrite
     /// map.
     pub pod_volumes: Option<PodVolumes>,
-    /// internal notes(block path): the `VmConfig` assembled at
+    /// (block path): the `VmConfig` assembled at
     /// sandbox Create but NOT yet submitted to the daemon. The VM
     /// boots at the FIRST workload Create instead — that is the
     /// earliest moment the container's rootfs erofs image (a
@@ -185,7 +188,7 @@ pub struct SandboxState {
     /// Rootfs erofs devices attached to the VM, in device order.
     pub rootfs_devices: Vec<RootfsDevice>,
     /// RO-hostPath erofs devices attached to the VM, in device order
-    /// (internal notes: `readOnly: true` hostPath mounts are packed
+    /// (`readOnly: true` hostPath mounts are packed
     /// into cached erofs images instead of forcing the virtiofs
     /// fallback — the pod stays on the `CoW` fast-fork path). Keyed
     /// like [`Self::rootfs_devices`] so a second mount of the same
@@ -194,7 +197,7 @@ pub struct SandboxState {
     /// Spare image-slot virtio-blk devices declared at sandbox Create
     /// and their post-boot image assignments.
     pub image_slots: Vec<ImageSlot>,
-    /// internal notes: container id → rootfs erofs key — the
+    /// Container id → rootfs erofs key — the
     /// guest-mount refcount. Containers of the same image share ONE
     /// erofs device + guest mount (dedupe by key), so `Delete` of an
     /// exited container (e.g. an init container whose image the main
@@ -205,6 +208,14 @@ pub struct SandboxState {
     /// Host etc-file source → guest tmpfs path already pushed over
     /// vsock (dedupe across workloads of the same pod).
     pub etc_pushed: BTreeMap<String, String>,
+    /// Kubernetes container name → capacity of the writable
+    /// image declared for it by
+    /// `k7d.katakate.org/container-scratch-size`. Recorded at sandbox
+    /// Create purely so each workload Create can say in the log which
+    /// side of the line it landed on — a name matching no container in
+    /// the pod (a typo) otherwise leaves that container silently
+    /// sharing the pod scratch.
+    pub container_scratch: BTreeMap<String, u64>,
     /// Vsock CID this sandbox's VM was created with.
     ///
     /// Captured from `vm.guest_cid()` in Create and read by the Start
@@ -226,6 +237,18 @@ pub struct SandboxState {
     /// like the legacy code in the unlikely case the field is
     /// missing.
     pub guest_cid: Option<u64>,
+    /// Source CRI sandbox id when this pod's VM was
+    /// warm-forked from a live sandbox VM (`k7d.katakate.org/
+    /// fork-source-{cluster,vm}` annotations) instead of cold-booted.
+    /// Fork pods ADOPT the workload container already running inside
+    /// the forked guest (see [`Self::guest_names`]) — they never push
+    /// a bundle or `container_start`.
+    pub fork_of: Option<String>,
+    /// Containerd container id → guest runc container name.
+    /// Only populated for fork-adopted containers (the inherited guest
+    /// container keeps the SOURCE pod's containerd id); identity for
+    /// everything else — resolve through [`Self::guest_name`].
+    pub guest_names: HashMap<String, String>,
     /// Next synthetic PID to hand out.
     next_pid: u32,
 }
@@ -253,9 +276,23 @@ impl SandboxState {
             image_slots: Vec::new(),
             container_rootfs_keys: BTreeMap::new(),
             etc_pushed: BTreeMap::new(),
+            container_scratch: BTreeMap::new(),
             guest_cid: None,
+            fork_of: None,
+            guest_names: HashMap::new(),
             next_pid: 100,
         }
+    }
+
+    /// Resolve a containerd container id to the guest runc container
+    /// name: the mapped source-container name for
+    /// fork-adopted containers, the id itself for everything else.
+    #[must_use]
+    pub fn guest_name(&self, container_id: &str) -> String {
+        self.guest_names
+            .get(container_id)
+            .cloned()
+            .unwrap_or_else(|| container_id.to_string())
     }
 
     /// Persist the block-path snapshot (rewrites, rootfs devices,
@@ -274,6 +311,7 @@ impl SandboxState {
             image_slots: self.image_slots.clone(),
             container_rootfs_keys: self.container_rootfs_keys.clone(),
             etc_pushed: self.etc_pushed.clone(),
+            container_scratch: self.container_scratch.clone(),
         };
         let json = serde_json::to_string_pretty(&snap)
             .map_err(|e| format!("serialize block state: {e}"))?;
@@ -299,10 +337,11 @@ impl SandboxState {
         self.image_slots = snap.image_slots;
         self.container_rootfs_keys = snap.container_rootfs_keys;
         self.etc_pushed = snap.etc_pushed;
+        self.container_scratch = snap.container_scratch;
         Ok(())
     }
 
-    /// internal notes: number of live containers whose rootfs rides
+    /// Number of live containers whose rootfs rides
     /// the erofs mount for `key`.
     #[must_use]
     pub fn rootfs_key_users(&self, key: &str) -> usize {
@@ -312,7 +351,7 @@ impl SandboxState {
             .count()
     }
 
-    /// internal notes: drop `container_id`'s claim on its rootfs
+    /// Drop `container_id`'s claim on its rootfs
     /// erofs key (container Delete). Returns the released key and the
     /// number of OTHER live containers still riding the same mount —
     /// `None` when the container had no recorded rootfs (the sandbox
@@ -355,7 +394,7 @@ impl SandboxState {
 
     /// Snapshot the per-pod rewrite map so the workload `Create`
     /// path can apply it without holding the `SandboxState` lock
-    /// across IO. internal notes: the union lives in
+    /// across IO. The union lives in
     /// [`Self::rewrites`]; any virtiofs-fallback binds
     /// ([`Self::pod_volumes`]) are merged in on top.
     #[must_use]
@@ -372,7 +411,7 @@ impl SandboxState {
 mod tests {
     use super::*;
 
-    /// internal notes: the rootfs erofs-key refcount — a same-image
+    /// The rootfs erofs-key refcount — a same-image
     /// init + main pair shares one key; deleting the init leaves one
     /// live user, so the mount must be reported as still referenced.
     #[test]

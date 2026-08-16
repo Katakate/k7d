@@ -1,7 +1,7 @@
-//! Pure model + pure helpers for the snapshot tree (internal notes, internal notes
+//! Pure model + pure helpers for the snapshot tree (Step 1
 //! `Vec<NodeInfo>` storage shape).
 //!
-//! This module is the **Aeneas translation target** for internal notes
+//! This module is the **Aeneas translation target** for. Everything
 //! here is:
 //!
 //! - Safe Rust (`#![forbid(unsafe_code)]`).
@@ -11,8 +11,8 @@
 //! - Deterministic on its inputs.
 //! - Free of `HashMap` / `HashSet` / iterator combinators / closures —
 //!   Aeneas's Lean backend has no models for those, which is why the
-//!   pre-9g helpers were `#[cfg(not(feature = "verif"))]`-gated. The
-//!   spec-9g rewrite to `Vec<NodeInfo>` keyed by `u64` (this file) is what
+//!   earlier helpers were `#[cfg(not(feature = "verif"))]`-gated. The
+//!   rewrite to `Vec<NodeInfo>` keyed by `u64` (this file) is what
 //!   made the whole surface translatable; everything below is ungated.
 //!
 //! The orchestrators ([`crate::tree::SnapshotTree`],
@@ -36,7 +36,7 @@
 //!   [`lru_evictable_leaf_subtree`], [`auto_evict_ram`].
 //! - The pure half of the K7DL delta codec: [`k7dl_header_bytes`],
 //!   [`k7dl_parse_header`], [`k7dl_encode_entry`], [`k7dl_parse_entry`].
-//! - The latency-budget model [`fork_warm_budget_ns`].
+//! - The latency-budget model [`fork_warm_budget_ns`] (Group F).
 //!
 //! ## What does NOT live here (kept in `tree.rs` / `cluster_tree.rs`)
 //!
@@ -49,8 +49,8 @@
 //!
 //! ## Verified properties (see `verif/Verif/`)
 //!
-//! The Lean theorems for internal notes
-//! mirrors of the functions in this file, and — since internal notes� each
+//! The Lean theorems for Groups A–D are proven against transparent
+//! mirrors of the functions in this file, and each
 //! mirror is machine-checked equivalent to the Aeneas translation of this
 //! file (`verif/Verif/Equiv/`). The theorems to cite are the `_rust`
 //! corollaries in `verif/Verif/Equiv/Transfer.lean`: they speak about the
@@ -58,8 +58,8 @@
 //! on the stated inputs. The mirrors live in `verif/Verif/TreeShape.lean`,
 //! `TreeBudget.lean`, `TreeEviction.lean`, `K7dlCodec.lean`,
 //! `Latency.lean` — **change a function here, update its mirror;
-//! `make remote-verif` re-checks the equivalence**. Since internal notes
-//! Groups E (K7DL codec) and F (latency budget) are machine-checked too.
+//! `make remote-verif` re-checks the equivalence**. Groups E (K7DL
+//! codec) and F (latency budget) are machine-checked too.
 
 #![forbid(unsafe_code)]
 
@@ -82,7 +82,7 @@ pub enum NodeState {
 /// What lives at a snapshot-tree node: a single VM, or a whole cluster of
 /// warm-forkable VMs sharing a per-cluster bridge.
 ///
-/// Defaults to [`PayloadKind::Vm`] so `tree.json` files written by pre-9g
+/// Defaults to [`PayloadKind::Vm`] so `tree.json` files written by earlier
 /// k7d still load — the absent `kind` field deserialises to `Vm` and the
 /// rest of the on-disk layout is unchanged for VM payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,7 +93,7 @@ pub enum PayloadKind {
     #[default]
     Vm,
     /// Cluster payload — `N` VMs sharing a per-cluster `ClusterNetwork`
-    ///.
+    /// (`ClusterPayload`).
     Cluster,
 }
 
@@ -120,7 +120,7 @@ impl TreeBudget {
     /// The saturating multiply is spelled out with an explicit guard
     /// (`x*85 > u64::MAX ⟺ x > u64::MAX/85`) instead of `saturating_mul`
     /// because Aeneas has no model for `saturating_mul` — it would land in
-    /// the generated Lean as a bodyless axiom, sinking the internal notes
+    /// the generated Lean as a bodyless axiom, sinking the
     /// equivalence proof (`saturating_add` has a model; `_mul` does not).
     ///
     /// Verified: `ram_soft_limit_below_max_rust` in
@@ -137,7 +137,7 @@ impl TreeBudget {
     }
 }
 
-/// Pure metadata about a tree node.
+/// Pure metadata about a tree node (shape: `u64`-keyed).
 ///
 /// The orchestrator keeps the `String`-shaped twin (`crate::tree::NodeInfo`,
 /// which also carries `label` / `created_at_unix` and the serde derives for
@@ -146,7 +146,7 @@ impl TreeBudget {
 /// `Clone` is hand-written (not derived) so the `parent: Option<u64>` field
 /// is a plain copy: the derive would call `Option::clone`, which Aeneas has
 /// no model for and would turn into a bodyless axiom threading through every
-/// rebuild loop (`add_child`, `touch`, …), sinking the internal notes
+/// rebuild loop (`add_child`, `touch`, …), sinking the
 /// equivalence proofs.
 #[derive(Debug)]
 pub struct NodeInfo {
@@ -157,7 +157,7 @@ pub struct NodeInfo {
     pub parent: Option<u64>,
     pub children: Vec<u64>,
     pub state: NodeState,
-    /// Payload kind (Vm or Cluster, internal notes).
+    /// Payload kind (Vm or Cluster).
     pub kind: PayloadKind,
     /// Number of *underlying* VMs this payload represents (1 for Vm, N for
     /// an N-member cluster). Budgeted against [`TreeBudget::max_live_vms`].
@@ -201,9 +201,9 @@ impl Clone for NodeInfo {
     }
 }
 
-/// Pure snapshot-tree model: `Vec` storage + budget.
+/// Pure snapshot-tree model: `Vec` storage + budget (shape).
 ///
-/// The `Vec` (instead of the pre-9g `HashMap`) is what makes the eviction
+/// The `Vec` (instead of the earlier `HashMap`) is what makes the eviction
 /// helpers translatable by Aeneas — see the module docs.
 #[derive(Debug, Clone)]
 pub struct TreeModel {
@@ -217,10 +217,10 @@ pub struct TreeModel {
 /// nodes — for a single-VM tree this equals `live_node_count`; for a
 /// cluster tree of N-VM clusters it is N × `live_node_count`. This is
 /// the field budgeted against [`TreeBudget::max_live_vms`] and matches
-/// internal notes's "an N-VM cluster node counts as N for `max_live_vms`."
+/// the rule "an N-VM cluster node counts as N for `max_live_vms`."
 ///
 /// `live_node_count` is the count of tree nodes in `Live` state,
-/// regardless of payload size — added in internal notes
+/// regardless of payload size — added in for callers that want
 /// "how many tree nodes are Live."
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TreeUsage {
@@ -234,7 +234,7 @@ pub struct TreeUsage {
     /// cluster payloads + `cluster.json`) sizes, in bytes.
     pub disk_bytes: u64,
     pub total_nodes: usize,
-    /// internal notes: count of tree nodes currently in `Live` state.
+    /// Count of tree nodes currently in `Live` state.
     pub live_node_count: usize,
 }
 
@@ -296,7 +296,7 @@ pub fn max_id(t: &TreeModel) -> u64 {
 /// already taken.
 ///
 /// Verified: `add_child_preserves_well_formed_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group A, on the Aeneas
 /// translation of this function).
 #[must_use]
 pub fn add_child(t: &TreeModel, parent: u64, new_id: u64, now: u64) -> TreeModel {
@@ -397,7 +397,7 @@ pub fn set_protected(t: &TreeModel, id: u64, p: bool) -> TreeModel {
 ///
 /// Verified: `usage_ram_is_sum_of_live_rust` /
 /// `usage_count_is_count_of_live_rust` in `verif/Verif/Equiv/Transfer.lean`
-///.
+/// (Group B, on the Aeneas translation of this function).
 #[must_use]
 pub fn usage(t: &TreeModel) -> TreeUsage {
     let mut live_vm_count: usize = 0;
@@ -487,7 +487,7 @@ pub fn ancestor_ids(t: &TreeModel, id: u64) -> Vec<u64> {
 /// protected node's parent chain is rejected before eviction).
 ///
 /// Verified: `implicitly_protected_includes_ancestors_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group C, on the Aeneas
 /// translation of this function).
 #[must_use]
 pub fn implicitly_protected(t: &TreeModel) -> Vec<u64> {
@@ -517,7 +517,7 @@ pub fn implicitly_protected(t: &TreeModel) -> Vec<u64> {
 /// protection" condition).
 ///
 /// Verified: `lru_victim_is_minimum_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group C, on the Aeneas
 /// translation of this function).
 // `manual_map`: the closure `Option::map` wants is not Aeneas-translatable;
 // the explicit `match` is what the Lean mirror mirrors.
@@ -582,11 +582,11 @@ pub fn subtree_isolated(t: &TreeModel, root: u64) -> bool {
 /// leaf subtrees are safe to delete from disk. Note that a protected node
 /// anywhere in `root`'s subtree makes `root` itself implicitly protected
 /// (ancestors of protected nodes are protected), so the
-/// `implicitly_protected` check subsumes the pre-9g "no protected node in
+/// `implicitly_protected` check subsumes the earlier "no protected node in
 /// the subtree" scan.
 ///
 /// Verified: `leaf_subtree_has_no_live_descendants_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group C, on the Aeneas
 /// translation of this function).
 // `manual_map`: see `lru_live_victim`.
 #[allow(clippy::manual_map)]
@@ -628,7 +628,7 @@ pub fn lru_evictable_leaf_subtree(t: &TreeModel) -> Option<u64> {
 /// Live node, so at most `nodes.len()` iterations can ever run — the fuel
 /// never cuts the loop short
 /// (`auto_evict_ram_terminates_rust` + `auto_evict_ram_post_rust` in
-/// `verif/Verif/Equiv/Transfer.lean`, internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` Group D, on the Aeneas
 /// translation of this function).
 #[must_use]
 pub fn auto_evict_ram(t: &TreeModel, exempt: &[u64]) -> TreeModel {
@@ -651,9 +651,9 @@ pub fn auto_evict_ram(t: &TreeModel, exempt: &[u64]) -> TreeModel {
 
 // --- Latency budget (Group F target) ---
 //
-// Pulled in from `crate::latency` per internal notes/ Group F so that Aeneas
-// sees the warm-fork budget as part of the verified subset. internal notes
-// rewrote this block to raw `u64` nanoseconds: Aeneas models
+// Pulled in from `crate::latency` (Group F) so that Aeneas sees the
+// warm-fork budget as part of the verified subset. This block is raw
+// `u64` nanoseconds rather than `Duration`: Aeneas models
 // `std::time::Duration` opaquely (bodyless axioms), which blocked the Group F
 // mirror ↔ Aeneas equivalence proof. `latency.rs` wraps these back into
 // `Duration` (`fork_warm_budget`, `FORK_WARM_BASE`, `FORK_WARM_PER_PAGE`),
@@ -776,7 +776,7 @@ impl DeltaError {
 /// [`k7dl_parse_header`].
 ///
 /// Verified: `k7dl_header_roundtrip_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group E, on the Aeneas
 /// translation of this function) — encode-then-parse is the identity
 /// and neither half panics.
 #[must_use]
@@ -793,14 +793,14 @@ pub fn k7dl_header_bytes(page_count: u32, mem_size: u64) -> [u8; K7DL_HEADER_SIZ
 /// Decode a 28-byte K7DL header. Returns `(page_count, mem_size)` on success.
 ///
 /// Verified: `k7dl_parse_header_equiv` in `verif/Verif/Equiv/K7dl.lean`
-/// — the Aeneas translation of this function computes
+/// (Group E) — the Aeneas translation of this function computes
 /// the `K7dlCodec.parseHeader` mirror, `DeltaError` variants included;
 /// `k7dl_header_roundtrip_rust` in `verif/Verif/Equiv/Transfer.lean`
 /// derives the round-trip with [`k7dl_header_bytes`].
 pub fn k7dl_parse_header(b: &[u8; K7DL_HEADER_SIZE]) -> Result<(u32, u64), DeltaError> {
     // Byte-wise magic compare: `&b[0..4] != K7DL_MAGIC` would go through
     // `core::array::equality`'s Slice-vs-Array `PartialEq`, which Aeneas
-    // leaves as a bodyless axiom — sinking the internal notes
+    // leaves as a bodyless axiom — sinking the Group E
     // equivalence proof (CHALLENGES.md #24 standing rule).
     if b[0] != K7DL_MAGIC[0]
         || b[1] != K7DL_MAGIC[1]
@@ -824,7 +824,7 @@ pub fn k7dl_parse_header(b: &[u8; K7DL_HEADER_SIZE]) -> Result<(u32, u64), Delta
 /// the 4096-byte page. Inverse of [`k7dl_parse_entry`].
 ///
 /// Verified: `k7dl_entry_roundtrip_rust` in
-/// `verif/Verif/Equiv/Transfer.lean` (internal notes, on the Aeneas
+/// `verif/Verif/Equiv/Transfer.lean` (Group E, on the Aeneas
 /// translation of this function) — encode-then-parse returns the exact
 /// `(page_idx, page)` pair and neither half panics.
 #[must_use]
@@ -838,7 +838,7 @@ pub fn k7dl_encode_entry(page_idx: u32, page: &[u8; 4096]) -> [u8; K7DL_ENTRY_SI
 /// Decode a single K7DL entry. Returns `(page_idx, page)`.
 ///
 /// Verified: `k7dl_parse_entry_equiv` in `verif/Verif/Equiv/K7dl.lean`
-/// — the Aeneas translation of this function computes
+/// (Group E) — the Aeneas translation of this function computes
 /// the `K7dlCodec.parseEntry` mirror; `k7dl_entry_roundtrip_rust` in
 /// `verif/Verif/Equiv/Transfer.lean` derives the round-trip with
 /// [`k7dl_encode_entry`].

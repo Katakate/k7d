@@ -155,7 +155,7 @@ pub fn cached_erofs_image(
 }
 
 /// Derive a stable cache key from an opaque snapshot identity string
-/// (internal notes: the shim keys container rootfs images by the
+/// (the shim keys container rootfs images by the
 /// containerd overlayfs `lowerdir` chain — stable per image on a
 /// node — instead of re-walking hundreds of MB of rootfs per pod).
 #[must_use]

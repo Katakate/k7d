@@ -13,17 +13,17 @@ bare-metal node (currently AMD Ryzen 5 3600, 64 GB, NVMe — see
 | Operation | Budget | Typical | Test |
 |---|---|---|---|
 | VM build (KVM + memfd + virtiofsd) | 150 ms | ~62 ms | `test_latency_vm_build` |
-| VM boot → agent ready | 250 ms | ~163 ms | `test_latency_vm_boot_to_agent` |
+| VM boot → agent ready | 250 ms | ~194–205 ms (was ~225–235 ms; the kvmclock kernel rebuild in 19f took ~18 ms off it) | `test_latency_vm_boot_to_agent` |
 | Agent ping RTT | 1 ms | ~0.2 ms | `test_latency_agent_ping` |
 | Agent exec RTT | 2 ms | ~0.5 ms | `test_latency_agent_exec` |
 | 5× sequential exec | 5 ms | ~2 ms | `test_latency_exec_sequential_5x` |
 | Virtiofs read | 2 ms | ~1 ms | `test_latency_virtiofs_read` |
-| Virtiofs write | 2 ms | ~0.9 ms | `test_latency_virtiofs_write` |
+| Virtiofs write | 2 ms | ~1.14 ms mean / 1.26 ms max with guest haltpoll 200 µs window (`cpuidle_haltpoll.force=1`, 50 ms settle + 2 warmups); was ~1.16 ms / 1.23 ms at a 2 ms window, ~1.2 ms under `idle=poll`, ~1.7 ms (2 of 10 over budget) with plain HLT | `test_latency_virtiofs_write` |
 | Snapshot 256 MB VM | 500 ms | ~228 ms | `test_latency_snapshot_256mb` |
 | CoW restore from snapshot | 10 ms | ~3 ms | `test_latency_restore_cow` |
 | Agent reconnect after restore | 5000 ms | ~500 ms | `test_latency_restore_agent_reconnect` |
 | Fork (cold source) | 600 ms | ~250 ms | `test_latency_fork_cold` |
-| Warm fork — `<25%` dirty | 50 ms | ~5 ms | `test_fork_warm_under_50ms` |
+| Warm fork (part 1) — `<25%` dirty | 50 ms | ~5 ms | `test_fork_warm_under_50ms` |
 | Warm fork of a 2-vCPU source | 75 ms | TBD (start generous, tighten after measuring) | `test_fork_warm_multi_vcpu` |
 | CoW restore of a 2-vCPU snapshot | 35 ms | TBD | `test_multi_vcpu_snapshot_restore_roundtrip` |
 | 10× warm fork batch | 200 ms | ~15 ms | `test_fork_warm_batch_10` |
@@ -42,11 +42,10 @@ bare-metal node (currently AMD Ryzen 5 3600, 64 GB, NVMe — see
 | Virtiofsd socket appear — ceiling, multi-share spawn | 15 s | sub-second | (asserted via `VIRTIOFSD_SOCKET_APPEAR`) |
 
 The three cluster-tree budgets are intentionally generous (750 ms vs.
-the ~75 ms / ~25 ms / ~40 ms internal notes"Latency expectations" projects
-on a quiet host). On the bare-metal node the actual on-host operations
+the ~75 ms / ~25 ms / ~40 ms the design projects on a quiet host). On the bare-metal node the actual on-host operations
 take well under those projections in isolation, but `make remote-check`
 runs the full integration suite serially with KVM state shared across
 tests, and `test_cluster_fork_warm_3vm_under_50ms` already swings up to
 ~500 ms in that mode (vs. ~25 ms run alone). Tightening the budgets
-back to the spec-projected numbers is a follow-up once `remote-check`
+back to the projected numbers is a follow-up once `remote-check`
 enforces a clean inter-test KVM/bridge state.

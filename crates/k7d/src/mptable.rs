@@ -1,5 +1,5 @@
 //! Intel MP (`MultiProcessor` Specification 1.4) table for SMP CPU
-//! discovery — internal notes
+//! discovery —.
 //!
 //! The guest kernel has ACPI compiled out, so the only way for Linux to
 //! discover secondary CPUs is the legacy MP table. We write a Floating

@@ -1,6 +1,6 @@
--- internal notes"What to build / 3.5" — equivalence for the protection
+-- Equivalence for the protection
 -- and LRU-selection group: `implicitly_protected` (the nested loop — the
--- hardest single proof in the spec), `subtree_isolated`,
+-- hardest single proof here), `subtree_isolated`,
 -- `lru_live_victim`, and `lru_evictable_leaf_subtree`.
 --
 -- Side conditions: everything that walks ancestor chains inherits the

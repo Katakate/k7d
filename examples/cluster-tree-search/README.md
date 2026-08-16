@@ -13,7 +13,7 @@ k7d forks a *whole Kubernetes cluster*, not a process sandbox.
 | Mode | Command | What it does | Wall-clock focus |
 |---|---|---|---|
 | `busybox` (default) | `python3 run_demo.py --mode busybox` | `TreeCreateCluster(3)` + `tree_fork_batch` | Fast. Measured **~262 ms** for a 4×3-VM CoW batch on the pinned node (2026-08-07). |
-| `inner-k3s` | `python3 run_demo.py --mode inner-k3s` | Adopt the live 3-node inner-k3s pods (pause Deployment + API churn, internal notes) + batch-fork; reward = `/readyz` + `inner-load` Ready | Headline path (~104 ms under churn, 1 s budget). |
+| `inner-k3s` | `python3 run_demo.py --mode inner-k3s` | Adopt the live 3-node inner-k3s pods (pause Deployment + API churn) + batch-fork; reward = `/readyz` + `inner-load` Ready | Headline path (~104 ms under churn, 1 s budget). |
 
 ## Prerequisites
 

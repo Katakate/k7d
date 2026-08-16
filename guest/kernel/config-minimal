@@ -7,23 +7,62 @@
 CONFIG_64BIT=y
 # CONFIG_RELOCATABLE is not set
 # CONFIG_RANDOMIZE_BASE is not set
-CONFIG_PHYSICAL_START=0x100000
-CONFIG_PHYSICAL_ALIGN=0x100000
+# The values kconfig enforces on x86_64: PHYSICAL_START has no prompt
+# outside EXPERT/CRASH_DUMP, and PHYSICAL_ALIGN's range starts at
+# 0x200000. Asking for 0x100000 got these anyway, silently.
+CONFIG_PHYSICAL_START=0x1000000
+CONFIG_PHYSICAL_ALIGN=0x200000
 
 # ── Boot ──
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_BINFMT_ELF=y
 CONFIG_SMP=y
-# internal notes: multi-vCPU pods (vcpus = ceil(cpu-quota/period), internal notes).
+# Multi-vCPU pods (vcpus = ceil(cpu-quota/period)).
 # CPU discovery is via the MP table k7d writes at 0x9fc00 (ACPI is off),
 # so CONFIG_X86_MPPARSE must land in the built config (defaults on for
 # SMP + LOCAL_APIC — verified after `make build-guest-kernel`).
 CONFIG_NR_CPUS=16
+# Paravirt guest support. KVM_GUEST and PARAVIRT both live under
+# `if HYPERVISOR_GUEST` in arch/x86/Kconfig, so with HYPERVISOR_GUEST
+# unset olddefconfig dropped both of them and every guest ever booted
+# ran without kvmclock while this file claimed otherwise.
+# kvmclock is what gives a guest with no RTC the right wall clock at
+# boot, and the clock the host re-bases with KVM_SET_CLOCK on restore.
+CONFIG_HYPERVISOR_GUEST=y
 CONFIG_KVM_GUEST=y
 CONFIG_PARAVIRT=y
+# Guest haltpoll: poll briefly in guest mode, then HLT. Replaces
+# `idle=poll`, which burned a whole host core per idle vCPU.
+# KVM_GUEST already selects ARCH_CPUIDLE_HALTPOLL; CPU_IDLE is the
+# missing half that makes the driver reachable. Built in, not a
+# module — this guest has no module loader. The driver still refuses
+# to install unless KVM_HINTS_REALTIME is advertised or
+# `cpuidle_haltpoll.force=1` is on the cmdline; k7d uses force=1
+# rather than claiming every vCPU has a dedicated host CPU.
+CONFIG_CPU_IDLE=y
+CONFIG_CPU_IDLE_GOV_HALTPOLL=y
+CONFIG_HALTPOLL_CPUIDLE=y
+# Tickless idle so a haltpoll window is not charged once per HZ=250
+# tick. Without NO_HZ_IDLE, a 2 ms window would be 50% of a core on a
+# parked vCPU. HIGH_RES_TIMERS is what actually lets the tick *try*
+# to stop. Even with both, a leftover PIT IRQ at ~43 Hz still charges
+# the window because this guest boots `noapic` and the 8254 oneshot
+# stop is weak. A 2 ms window cost ~8.6% of a core; this is the
+# vanilla 200 µs (predicted ~0.86%, measured 1.0%), which the
+# virtiofs latency test keeps honest by measuring the warm path.
+CONFIG_NO_HZ_IDLE=y
+CONFIG_HIGH_RES_TIMERS=y
 CONFIG_PRINTK=y
 CONFIG_EARLY_PRINTK=y
 CONFIG_PRINTK_TIME=y
+
+# The kernel keeps a gzipped copy of its own .config at
+# /proc/config.gz. It costs ~3 KB of image and answers, from inside any
+# guest, the two questions that cost this project a day: which kernel is
+# this VM running, and does it have the options config-minimal asks for.
+# The e2e suite asserts against it (test_shim.rs).
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
 
 # ── Debug: NONE (critical for small vmlinux) ──
 CONFIG_DEBUG_INFO_NONE=y
@@ -43,7 +82,7 @@ CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_TTY=y
-# internal notes: UNIX98 PTYs (devpts) for interactive exec. olddefconfig
+# UNIX98 PTYs (devpts) for interactive exec. olddefconfig
 # already defaults this on, but pin it so a config edit can't silently
 # drop PTY support.
 CONFIG_UNIX98_PTYS=y
@@ -60,7 +99,7 @@ CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_FS=y
 CONFIG_VIRTIO_VSOCKETS=y
 # virtio-blk for the raw-image block device — the erofs
-# rootfs (Inc 2) mounts on /dev/vda.
+# rootfs mounts on /dev/vda.
 CONFIG_VIRTIO_BLK=y
 
 # ── Networking (minimal) ──
@@ -73,7 +112,12 @@ CONFIG_VSOCKETS=y
 # CONFIG_WIRELESS is not set
 # CONFIG_WLAN is not set
 # CONFIG_BT is not set
-# CONFIG_IPV6 is not set
+# IPv6 enabled so nested daemons work unmodified — dockerd
+# 27+ defaults to --ip6tables=true and fails hard on a no-IPv6 kernel
+# (the k7 repo had to pass --ip6tables=false). Measured boot cost on
+# the bare-metal node: none — boot-to-agent stays 223–234 ms across 5
+# runs, same range as the no-IPV6 kernel (budget 250 ms).
+CONFIG_IPV6=y
 
 # ── Inner-pod networking ──
 # A real multi-node k3s cluster inside the guests needs netfilter for
@@ -89,6 +133,11 @@ CONFIG_NF_CONNTRACK=y
 CONFIG_NF_NAT=y
 CONFIG_NF_TABLES=y
 CONFIG_NF_TABLES_INET=y
+# Without the ipv4 family, olddefconfig silently drops NFT_NAT/NFT_MASQ/
+# NFT_REDIR below and iptables-nft inside the guest fails with
+# "TABLE_ADD failed (Not supported): table nat" — which breaks any nested
+# container runtime that sets up bridge NAT (docker-in-VM sidecar, k3s).
+CONFIG_NF_TABLES_IPV4=y
 CONFIG_NFT_COMPAT=y
 CONFIG_NFT_CT=y
 CONFIG_NFT_NAT=y
@@ -113,6 +162,18 @@ CONFIG_IP_NF_MANGLE=y
 CONFIG_IP_NF_RAW=y
 CONFIG_IP_NF_TARGET_MASQUERADE=y
 CONFIG_IP_NF_TARGET_REJECT=y
+# IPv6 counterparts: dockerd 27+ and kube-proxy program
+# ip6tables filter/nat/mangle rules when IPv6 is available; without
+# these, iptables-nft/ip6tables fail with "Not supported" exactly like
+# the IPv4 case above.
+CONFIG_NF_TABLES_IPV6=y
+CONFIG_IP6_NF_IPTABLES=y
+CONFIG_IP6_NF_FILTER=y
+CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_MANGLE=y
+CONFIG_IP6_NF_RAW=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
+CONFIG_IP6_NF_TARGET_REJECT=y
 CONFIG_VETH=y
 CONFIG_BRIDGE=y
 CONFIG_BRIDGE_NETFILTER=y
@@ -122,8 +183,8 @@ CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
 CONFIG_TMPFS=y
 # trusted.overlay.* xattrs on tmpfs — required for the overlay
-# snapshotter of a containerd running inside the guest (internal notes;
-# its image root is in-guest tmpfs because virtiofs `--cache never`
+# snapshotter of a containerd running inside the guest (its image
+# root is in-guest tmpfs because virtiofs `--cache never`
 # rejects the shared mmap bolt needs, see CHALLENGES.md #34).
 CONFIG_TMPFS_XATTR=y
 CONFIG_DEVTMPFS=y
@@ -133,10 +194,17 @@ CONFIG_FUSE_FS=y
 # instead of the slow `native` one.
 CONFIG_OVERLAY_FS=y
 # CONFIG_NFS_FS is not set
-# ext4 for read-write virtio-blk images and erofs
+# ext4 for read-write virtio-blk images (tests) and erofs
 # for the immutable container rootfs images.
 CONFIG_EXT4_FS=y
 CONFIG_EROFS_FS=y
+# Disk quota support, for ext4 project quotas: bounding one container's
+# writable space on a shared scratch image needs them, and 19c had to
+# rule that out only because no guest kernel rebuild was in flight to
+# carry the options. This is that rebuild; nothing enforces quotas yet.
+CONFIG_QUOTA=y
+CONFIG_QUOTA_TREE=y
+CONFIG_QFMT_V2=y
 # CONFIG_XFS_FS is not set
 # CONFIG_BTRFS_FS is not set
 
@@ -158,7 +226,7 @@ CONFIG_CPUSETS=y
 CONFIG_CGROUP_SCHED=y
 CONFIG_FAIR_GROUP_SCHED=y
 # CFS bandwidth exposes cgroup v2 `cpu.max`. Nested runc (inner-k3s
-# pause pods, internal notes) fails with `openat2 …/cpu.max: no such file`
+# pause pods) fails with `openat2 …/cpu.max: no such file`
 # without it — weight-only cpu controller is not enough.
 CONFIG_CFS_BANDWIDTH=y
 CONFIG_CGROUP_PIDS=y

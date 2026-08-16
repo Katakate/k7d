@@ -91,7 +91,7 @@ let features = vhost_features & !(1u64 << 33);
 
 ---
 
-## 7. Shim dies at startup on containerd 2.x: `Protobuf(WireError(IncorrectTag(46)))`
+## 7. Shim dies at startup on containerd 2.x: `Protobuf(WireError(IncorrectTag(46)))` (spec 11a bring-up)
 
 **Symptom:** On k3s v1.36 (containerd 2.3), every k7 pod fails at sandbox creation. containerd logs show the shim's `start` command exiting with `Protobuf(Error(WireError(IncorrectTag(46))))` before our code ever runs. The same shim binary worked on k3s v1.32 (containerd 1.7).
 
@@ -105,7 +105,7 @@ let features = vhost_features & !(1u64 << 33);
 
 ---
 
-## 8. One k7 pod start breaks *every* ClusterIP on the node
+## 8. One k7 pod start breaks *every* ClusterIP on the node (spec 10a Flow 4)
 
 **Symptom:** `test_cni` Flow 4 (VM → Service IP `10.43.0.10:53`) times out, while VM → CoreDNS *pod IP* works, VM → host gateway works, VM → internet works. Weirder: after any k7 pod has run, even a plain **runc** busybox pod can no longer reach any Service IP.
 
@@ -119,13 +119,13 @@ let features = vhost_features & !(1u64 << 33);
 
 ---
 
-## 9. Shared cluster bridge: per-pod shims collide and race on teardown
+## 9. Shared cluster bridge: per-pod shims collide and race on teardown (spec 11a increment 2)
 
 **Symptom:** Two k7 pods in the same cluster both got `vm_index` 0 (duplicate guest IP `10.200.0.2` and MAC — an L2 identity collision). Separately, deleting the *first* pod destroyed the shared `k7-br-*` bridge under the surviving pod's VM.
 
 **Root cause:** The bridge and `vm_index` allocator lived in per-shim process memory (`ClusterNetwork` in `SandboxState`). Every shim process independently "created" the bridge (idempotent), started counting indices from 0, and dropped the bridge on its own sandbox Delete. No cross-process coordination existed.
 
-**Fix:** This was a main driver for the daemon architecture. The k7d daemon holds one refcounted `BridgeEntry` per `cluster_id`: first `create_vm` creates the bridge, later VMs join and get unique indices, `stop_vm` frees the index (`ClusterNetwork::remove_entry`) and destroys the bridge only when the refcount hits zero.
+**Fix:** This was a main driver for the daemon architecture (spec 11a). The k7d daemon holds one refcounted `BridgeEntry` per `cluster_id`: first `create_vm` creates the bridge, later VMs join and get unique indices, `stop_vm` frees the index (`ClusterNetwork::remove_entry`) and destroys the bridge only when the refcount hits zero.
 
 **Reference:** None — architectural. The lesson: any resource shared across pods (bridges, warm pools, snapshot trees) cannot be owned by a per-pod process.
 
@@ -142,7 +142,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 11. Killing a shim does NOT make containerd respawn it
+## 11. Killing a shim does NOT make containerd respawn it (spec 11a increment 4)
 
 **Symptom:** The crash-recovery plan assumed `pkill -9` of a pod's shim → containerd respawns the shim → new shim calls `Connect` and reattaches to the running VM. Empirically: no shim respawn ever happened. Instead kubelet reported the sandbox dead, tore it down, and recreated the pod under a **new** sandbox id, while the original VM stayed orphaned in the k7d daemon.
 
@@ -156,7 +156,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 12. One virtiofsd socket path per *process* breaks the second VM
+## 12. One virtiofsd socket path per *process* breaks the second VM (spec 11a increment 4)
 
 **Symptom:** After a shim kill, kubelet's replacement sandboxes failed forever: `virtiofsd socket did not appear within 15s`, virtiofsd logging "Resource temporarily unavailable". The retry storm (new sandbox every few seconds, each leaking a virtiofsd) drove node load past 4 and nearly wedged SSH.
 
@@ -168,7 +168,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 13. Dashboard `K7_NODE_IP` secret points at a foreign node
+## 13. Dashboard `K7_NODE_IP` secret points at a foreign node (spec 11a increment 5)
 
 **Symptom:** Every `ssh` / `make remote-*` from a Cloud agent failed with `Permission denied (publickey)` even though `K7_SSH_KEY` reconstructed to a valid ED25519 key (`ssh-keygen -y` succeeded) and the key was offered (`ssh -v`: "Offering public key ... explicit").
 
@@ -180,7 +180,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 14. Pooled `create_vm` round trip is ~50 ms — the control socket's accept poll, not the pool
+## 14. Pooled `create_vm` round trip is ~50 ms — the control socket's accept poll, not the pool (spec 11a increment 5)
 
 **Symptom:** `test_pool_fills_and_acquire_is_fast` measured ~50 ms for a pooled `create_vm` where the daemon-side work (pop idle VM + registry insert + sandbox-record write) is ~1 ms. Uncomfortably close to the 100 ms `POOL_ACQUIRE` ceiling for no obvious reason.
 
@@ -192,7 +192,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 15. Aeneas "Could not match the contexts" on borrows held across branches
+## 15. Aeneas "Could not match the contexts" on borrows held across branches (spec 9f Groups A–D)
 
 **Symptom:** After the `HashMap → Vec<NodeInfo>` rewrite of `tree_model.rs`, `cargo build` and `cargo test` were green but `make remote-verif` failed in Aeneas's symbolic-execution phase with `Could not match the contexts` for `usage`, `lru_live_victim`, and `lru_evictable_leaf_subtree` — functions whose loops read several fields off `&t.nodes[i]` inside `if` branches and short-circuit `&&` chains.
 
@@ -206,7 +206,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 16. `install-aeneas.sh` bit-rot: aeneas `main` grew an OCaml dep and moved to a newer Lean
+## 16. `install-aeneas.sh` bit-rot: aeneas `main` grew an OCaml dep and moved to a newer Lean (spec 9f Groups A–D)
 
 **Symptom:** The pinned node had been reset, so the Aeneas toolchain had to be reinstalled. `make remote-install-verif` failed mid-build with `Error: Library "ppx_deriving_yojson" not found`. After fixing that and regenerating, `lake build` then died inside the *proofwidgets* dependency with `Unknown constant 'Lake.Hash.ofHashable'`.
 
@@ -220,7 +220,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 17. `rsync --delete` silently deletes node-side generated files that are gitignored locally
+## 17. `rsync --delete` silently deletes node-side generated files that are gitignored locally (spec 9f Groups A–D)
 
 **Symptom:** Directly after a successful baseline `lake build` on the node, running `make rsync` from the sandbox broke the next build in confusing ways (see challenge 16's proofwidgets error; `verif/lake-manifest.json` would also have been re-resolved against upstream `main`).
 
@@ -234,7 +234,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 18. Foreground `runc exec` without `-t` gives the container pipes, not our PTY
+## 18. Foreground `runc exec` without `-t` gives the container pipes, not our PTY (spec 10e)
 
 **Symptom:** The agent allocated a PTY pair, spawned `runc exec` with the slave as stdio (plus `setsid` + `TIOCSCTTY` in `pre_exec`), and the guest-side shell still saw `stty: standard input: Inappropriate ioctl for device` — stdin inside the container was a pipe.
 
@@ -248,7 +248,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 19. containerd's CRI never tells the runtime that a *tty* exec client detached
+## 19. containerd's CRI never tells the runtime that a *tty* exec client detached (spec 10e)
 
 **Symptom:** `kubectl exec -it pod -- sh -c 'exec sleep 31337'`, SIGKILL the kubectl client → the exec process lives forever inside the guest. The shim's two detach detectors — stdin-FIFO EOF and the `CloseIO` ttrpc — never fired. Protocol-level detach (vsock `eof`) worked fine.
 
@@ -262,7 +262,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 20. Initial PTY window size races the first command through the double-PTY chain
+## 20. Initial PTY window size races the first command through the double-PTY chain (spec 10e)
 
 **Symptom:** Protocol test sent `stty size` immediately after the PTY handshake and got `0 0`-flavoured failure output (busybox dies with errno-less `stty: standard input` when `TIOCGWINSZ` returns rows=0), even though the same session resized correctly moments later. A host-side runc repro with a 1 s warm-up worked every time.
 
@@ -274,7 +274,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 21. `test_cni` "regression" that was actually node contamination — and a `LeakGuard` that kills live VMs
+## 21. `test_cni` "regression" that was actually node contamination — and a `LeakGuard` that kills live VMs (spec 10e collateral)
 
 **Symptom:** During final `make remote-check`, `test_cni` failed Flow 2 (host → pod-IP curl timeout) — reproducibly, in isolation, *and on unmodified `main`*. The pod showed `RESTARTS 1` with kubelet `SandboxChanged` events; host ARP for the pod IP sat in `FAILED`; attaching tcpdump to `cni0` (promiscuous mode) made the very same curl succeed.
 
@@ -288,7 +288,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 22. Sharing one cargo `target/` between two worktrees bakes the wrong `CARGO_MANIFEST_DIR` into installed binaries
+## 22. Sharing one cargo `target/` between two worktrees bakes the wrong `CARGO_MANIFEST_DIR` into installed binaries (spec 10e collateral)
 
 **Symptom:** After comparing the branch against a `main` checkout on the node (`/root/k7d-main` with `target` symlinked to `/root/k7d/target` to reuse the build cache), the next `make remote-check` first failed to *compile* (shim resolving `k7d::api` against `/root/k7d-main/crates/k7d/src/api.rs`), then — after a package-level `cargo clean` — every k7 pod failed with `k7d create_vm: … failed to open kernel file`. The freshness check in `ensure_k7d_daemon_running` (size + mtime) considered the installed daemon current, so it never reinstalled.
 
@@ -302,7 +302,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 23. Every pod teardown was a silent containerd deadlock — the shim never closed its stdio FIFOs on task exit
+## 23. Every pod teardown was a silent containerd deadlock — the shim never closed its stdio FIFOs on task exit (spec 10c)
 
 **Symptom:** `test_pod_cpu_limit_caps_host_usage` failed only its final assertion: the per-VM CPU cgroup was not removed within 15 s of `kubectl delete pod`. Manual probing made it worse: a capped pod hung in `Terminating` for 15+ minutes, kubelet logged `StopContainer … DeadlineExceeded`, and — the key control experiment — an *uncapped* pod hung exactly the same way, exonerating the new cgroup code.
 
@@ -318,13 +318,13 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 24. Aeneas axiomatizes `u64::saturating_mul` and derived `Option::clone` — equivalence proofs hit opaque constants
+## 24. Aeneas axiomatizes `u64::saturating_mul` and derived `Option::clone` — equivalence proofs hit opaque constants (spec 9f-inc2)
 
 **Symptom:** The `ram_soft_limit` equivalence proof stalled on `core.num.U64.saturating_mul`, and the `auto_evict_ram` prologue (`self.clone()`) stalled on the `Clone` instance for `Option<u64>` — both were `axiom`s in the generated Lean, so no tactic could reduce them and "never panics" was unprovable.
 
 **Root cause:** Aeneas's Lean stdlib models `saturating_add` but not `saturating_mul`, and the *derived* `Clone` for a struct containing `Option<u64>` goes through `Option::clone`, which the extraction leaves abstract. Anything the generated code touches through an axiom is a hole in an equivalence proof.
 
-**Fix:** Semantics-preserving Rust rewrites, verified by the equivalence theorems themselves: `ram_soft_limit` now uses an explicit overflow guard (`if pct != 0 && bytes > u64::MAX / pct { u64::MAX } else { bytes * pct } / 100`) instead of `saturating_mul`, and `NodeInfo` got a manual field-wise `impl Clone` (copying `Option<u64>` by value) instead of `#[derive(Clone)]`. Standing rule: before writing equivalence proofs, grep the generated file for `axiom` — each hit needs a Rust-side refactor or an honest documented assumption. **Now automated**: `utils/check-verif-axioms.sh` diffs generated axioms against `verif/axiom-allowlist.txt` inside `make verif-gen` / `make remote-verif`.
+**Fix:** Semantics-preserving Rust rewrites, verified by the equivalence theorems themselves: `ram_soft_limit` now uses an explicit overflow guard (`if pct != 0 && bytes > u64::MAX / pct { u64::MAX } else { bytes * pct } / 100`) instead of `saturating_mul`, and `NodeInfo` got a manual field-wise `impl Clone` (copying `Option<u64>` by value) instead of `#[derive(Clone)]`. Standing rule: before writing equivalence proofs, grep the generated file for `axiom` — each hit needs a Rust-side refactor or an honest documented assumption. **Now automated** (spec 9f-inc4): `utils/check-verif-axioms.sh` diffs generated axioms against `verif/axiom-allowlist.txt` inside `make verif-gen` / `make remote-verif`.
 
 **Reference:** Aeneas `backends/lean/Aeneas/Std/Scalar` (which ops have models).
 
@@ -332,7 +332,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 25. `@[simp]` bridges from Aeneas scalar bounds to mirror constants poison `scalar_tac`
+## 25. `@[simp]` bridges from Aeneas scalar bounds to mirror constants poison `scalar_tac` (spec 9f-inc2)
 
 **Symptom:** Mid-way through the rebuild-loop proofs, `scalar_tac` started failing on plain goals like `(↑t.nodes).length ≤ Usize.max` that it normally discharges instantly.
 
@@ -346,7 +346,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 26. `split`/`simp` choke on Aeneas match-in-do goals once the postcondition is rewritten — `show` with the reduced block is the reliable escape
+## 26. `split`/`simp` choke on Aeneas match-in-do goals once the postcondition is rewritten — `show` with the reduced block is the reliable escape (spec 9f-inc2)
 
 **Symptom:** In the LRU loop proofs (`lru_live_victim_loop`, `lru_evictable_leaf_subtree_loop`, `auto_evict_ram_loop`), `split` failed on the generated `match best with | none => … | some (la, id) => …` accumulator step with "target expression is not type-correct under the `instances` transparency level", and `simp` refused to make progress on the surrounding `do` block.
 
@@ -360,9 +360,9 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 27. TapNetBackend restart at virtqueue idx 0 hangs eth0 after prepare/warm-fork
+## 27. TapNetBackend restart at virtqueue idx 0 hangs eth0 after prepare/warm-fork (spec 13a Inc 0)
 
-**Symptom:** After `prepare_fork_source` on a VM that had already driven eth0 traffic, vsock agent reconnect succeeded but the next guest command that used eth0 (ping/nc) hung forever. internal notes
+**Symptom:** After `prepare_fork_source` on a VM that had already driven eth0 traffic, vsock agent reconnect succeeded but the next guest command that used eth0 (ping/nc) hung forever. Spec 9d therefore deferred its TCP-survival tests.
 
 **Root cause:** The userspace `TapNetBackend` worker keeps `last_avail` / `last_used` in host memory, starting at 0 on cold activate. Restore/warm-fork reattach a new backend while guest rings already have non-zero `used.idx`. Restarting at 0 re-processes already-serviced descriptors and writes stale used-ring entries; the guest networking softirq backs off and stops making progress. Vsock avoids the same bug via `VHOST_SET_VRING_BASE` kernel-side.
 
@@ -374,7 +374,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 28. Busybox `nc -l </dev/null` tears down held TCP immediately
+## 28. Busybox `nc -l </dev/null` tears down held TCP immediately (spec 13a Inc 0 test harness)
 
 **Symptom:** Held eth0 TCP looked dead before `fork_cluster_warm` — `/proc/net/tcp` empty, client `nc` gone — even though `before-fork` bytes had already landed in the server's file.
 
@@ -388,7 +388,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 29. TapNetBackend workers keep running during Vm::pause and kill source TCP across warm fork
+## 29. TapNetBackend workers keep running during Vm::pause and kill source TCP across warm fork (spec 13a Inc 0)
 
 **Symptom:** After `fork_cluster_warm`, a held eth0 TCP session on the *source* cluster was gone (`/proc/net/tcp` empty, busybox `nc` exited) even though ping/new TCP worked after `prepare_fork_source` (seed fix alone).
 
@@ -402,7 +402,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 30. Lean elaboration recurses once per numeral unit on `Array U8 4096#usize` — `maxRecDepth` blowup far from the actual proof
+## 30. Lean elaboration recurses once per numeral unit on `Array U8 4096#usize` — `maxRecDepth` blowup far from the actual proof (spec 9f-inc3)
 
 **Symptom:** Group E equivalence work stalled with `maximum recursion depth has been reached` — not in a tactic, but while *elaborating* statements mentioning `Array Std.U8 4096#usize`/`4100#usize` (a bare `example … := by sorry` already failed), and again later when `spec_imp_exists` was applied to those theorems in `Transfer.lean`. The generated `K7d.lean`'s own `set_option maxRecDepth 2048` was not inherited (set_option is file-scoped) and raising to 4096 merely moved the failure.
 
@@ -416,7 +416,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 31. `simp` loops on `BitVec.toLEBytes`' own recursion; unfold byte lists element-wise instead
+## 31. `simp` loops on `BitVec.toLEBytes`' own recursion; unfold byte lists element-wise instead (spec 9f-inc3)
 
 **Symptom:** Bridging Aeneas's `to_le_bytes` model (`BitVec.toLEBytes`) to the mirror's `extractLsb'` byte lists via `simp [BitVec.toLEBytes]` hit `maximum recursion depth` — the definition unfolds by peeling one byte and recursing on the shifted value, and `simp` re-fires on the recursive call forever.
 
@@ -430,7 +430,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 32. `rw` cannot rewrite across `BitVec ty.numBits` vs `BitVec 32` type indices — chain `Eq.trans`/`congrArg` term proofs instead
+## 32. `rw` cannot rewrite across `BitVec ty.numBits` vs `BitVec 32` type indices — chain `Eq.trans`/`congrArg` term proofs instead (spec 9f-inc3)
 
 **Symptom:** In `k7dl_parse_header_equiv`'s version check, every attempt to `rw` the hypothesis `version.bv = u32FromLe …` into the `if` condition failed with motive-is-not-type-correct, even though both sides printed identically. The scalar lives at `BitVec ty.numBits` (from the generic `UScalar` structure), the mirror at `BitVec 32` — definitionally equal, syntactically different indices.
 
@@ -444,7 +444,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 33. Inc 1's `ctr version` check was a false positive — no `set -e` and a "Client:"-satisfied assertion
+## 33. Inc 1's `ctr version` check was a false positive — no `set -e` and a "Client:"-satisfied assertion (spec 13a Inc 2)
 
 **Symptom:** `test_sidecar_containerd_socket_via_emptydir` was green while manual reproductions of the exact same pod showed the sidecar containerd crash-looping at startup. The "pass" looked nondeterministic until the assertion was read closely.
 
@@ -458,7 +458,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 34. bolt/sqlite-WAL cannot live on virtiofs with `--cache never` — mmap(MAP_SHARED) fails with ENODEV
+## 34. bolt/sqlite-WAL cannot live on virtiofs with `--cache never` — mmap(MAP_SHARED) fails with ENODEV (spec 13a Inc 2)
 
 **Symptom:** The sidecar containerd died at plugin init with `failed to create new snapshotter: failed to restore remote snapshot: failed to open database file: no such device` when its `--root` was on the container rootfs (virtiofs).
 
@@ -472,11 +472,11 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 35. virtiofsd `--announce-submounts` (default since 1.13) gives each container its own superblock for the same emptyDir — cross-container unix sockets ECONNREFUSED
+## 35. virtiofsd `--announce-submounts` (default since 1.13) gives each container its own superblock for the same emptyDir — cross-container unix sockets ECONNREFUSED (spec 13a Inc 2)
 
 **Symptom:** With containerd serving on `/cri/containerd.sock`, `ctr`/k3s in the *other* container of the same pod got `connect: connection refused` forever, while the same command inside the sidecar container worked. Files written to the emptyDir were visible both ways; `ls -i` showed identical inode numbers.
 
-**Root cause:** internal notes's volume plumbing bind-mounts every kubelet volume into the per-pod `volumes-rw` scratch tree, so each volume is a host *mount point* inside the virtiofsd share. virtiofsd ≥ 1.13 defaults to `--announce-submounts`, making the guest kernel expose each of those as a FUSE submount that is automounted lazily — and each container's runc traversal instantiated its *own* submount superblock (`/proc/self/mountinfo` showed `virtiofs none` device 0:29 in one container, 0:38 in the other). Unix-socket `connect()` resolves to the in-kernel inode object, which differs across superblocks, so the listener is never found. Regular file I/O goes through virtiofsd and works, which is why internal notes's file-sharing tests never caught it.
+**Root cause:** Spec 10b's volume plumbing bind-mounts every kubelet volume into the per-pod `volumes-rw` scratch tree, so each volume is a host *mount point* inside the virtiofsd share. virtiofsd ≥ 1.13 defaults to `--announce-submounts`, making the guest kernel expose each of those as a FUSE submount that is automounted lazily — and each container's runc traversal instantiated its *own* submount superblock (`/proc/self/mountinfo` showed `virtiofs none` device 0:29 in one container, 0:38 in the other). Unix-socket `connect()` resolves to the in-kernel inode object, which differs across superblocks, so the listener is never found. Regular file I/O goes through virtiofsd and works, which is why spec 10b's file-sharing tests never caught it.
 
 **Fix:** Pass `--no-announce-submounts` in `VirtiofsdProcess::spawn_with_options`. The whole share is then one superblock and every container binds subdirs of it (`mountinfo` now shows `virtiofs k7fs2 /emptydir-cri`), restoring kubelet-like emptyDir semantics for sockets.
 
@@ -486,11 +486,11 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 36. Stripping `linux.resources` from the guest OCI spec re-enables runc's default device filter — kubelet dies on `/dev/kmsg`
+## 36. Stripping `linux.resources` from the guest OCI spec re-enables runc's default device filter — kubelet dies on `/dev/kmsg` (spec 13a Inc 2)
 
 **Symptom:** kubelet inside the k3s container failed with `open /dev/kmsg: operation not permitted` even though the entrypoint had successfully `mknod`ed the node and the container is privileged in the pod spec.
 
-**Root cause:** The shim's `fix_and_write_oci_config` removes `linux.resources` wholesale. With no `devices` rules at all, runc installs its restrictive default eBPF device-cgroup program, which allows only the standard tty/null/zero/random set — privileged-ness from the outer pod spec never reaches the guest runc.
+**Root cause:** The shim's `fix_and_write_oci_config` removes `linux.resources` wholesale (spec 10c sizes the VM instead). With no `devices` rules at all, runc installs its restrictive default eBPF device-cgroup program, which allows only the standard tty/null/zero/random set — privileged-ness from the outer pod spec never reaches the guest runc.
 
 **Fix:** After stripping `resources`, the shim now writes back `{"devices":[{"allow":true,"access":"rwm"}]}`. The VM is the security boundary and host devices never enter the guest, so unrestricted in-guest device access matches the runtime's threat model.
 
@@ -500,7 +500,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 37. kubelet-in-guest kernel/runtime gaps: `lo` down, missing cpuset + keys, 1999 clock
+## 37. kubelet-in-guest kernel/runtime gaps: `lo` down, missing cpuset + keys, 1999 clock (spec 13a Inc 2)
 
 **Symptom:** Serial fatals while bringing up `k3s server` in a k7 pod: containerd's CRI stream server `listen tcp 127.0.0.1:0: cannot assign requested address`; then k3s `failed to find cpuset cgroup (v2)`; then kubelet `open /proc/sys/kernel/keys/root_maxkeys: no such file or directory`. Also every guest log timestamp is 1999-11-30.
 
@@ -514,7 +514,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 38. Empty shim `grouping` collapsed every concurrent k7 pod onto one shim process — `SandboxState` silently overwritten
+## 38. Empty shim `grouping` collapsed every concurrent k7 pod onto one shim process — `SandboxState` silently overwritten (spec 13a Inc 3)
 
 **Symptom:** First multi-pod test (3 outer k7 pods for the inner 3-node cluster): the 2nd and 3rd pods flapped between `Running` and `Completed`, `kubectl exec` into any of them hung until the kubelet timeout, and deleting one pod sometimes tore down a sibling's VM. `crictl` exec directly against containerd worked, single-pod tests (Incs 1–2) never showed any of this.
 
@@ -528,7 +528,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 39. After `prepare_fork_source`, every in-guest exec hangs — restore drops virtiofs, and `runc` lives on it
+## 39. After `prepare_fork_source`, every in-guest exec hangs — restore drops virtiofs, and `runc` lives on it (spec 13a Inc 4)
 
 **Symptom:** Post-`TreeAdoptCluster`, any `container_exec` against the adopted VMs' agents never completed — the test's `ContainerWaitExec` poll spun forever. Even a trivial `runc exec test -f …` never spawned a runc process in the guest; a host-level agent `ls /mnt/state/bin` timed out too.
 
@@ -540,11 +540,11 @@ Three small ones, recorded because each burned real time:
 
 **Time lost:** ~2 hours (agent-side vsock probing to localize the hang to virtiofs).
 
-**Resolved for share-less sources:** the residual trap here — the prepare swap restoring a *block-only* source on a NEW vsock CID while the pod's shim keeps dialing the cached one — is fixed by preserving the CID across the in-place restore: `prepare_fork_source_in` shuts the source down and drops its device registry **first** (closing the vhost-vsock fd releases the CID to the kernel; claiming it while the old fd is open would `EADDRINUSE`), then restores via `restore_vm_preserving_cid`. Agent connections still die (fresh vsock backend) but the shim dials the CID fresh per exec, so kubectl exec/logs against adopted cluster members keep working.
+**Resolved for share-less sources (spec 14a Inc 5):** the residual trap here — the prepare swap restoring a *block-only* source on a NEW vsock CID while the pod's shim keeps dialing the cached one — is fixed by preserving the CID across the in-place restore: `prepare_fork_source_in` shuts the source down and drops its device registry **first** (closing the vhost-vsock fd releases the CID to the kernel; claiming it while the old fd is open would `EADDRINUSE`), then restores via `restore_vm_preserving_cid`. Agent connections still die (fresh vsock backend) but the shim dials the CID fresh per exec, so kubectl exec/logs against adopted cluster members keep working.
 
 ---
 
-## 40. Restored VMs get a fresh unprogrammed PIT — no IRQ0 ever again, k3s parks and CLOCK_REALTIME freezes
+## 40. Restored VMs get a fresh unprogrammed PIT — no IRQ0 ever again, k3s parks and CLOCK_REALTIME freezes (spec 13a Inc 4)
 
 **Symptom:** After adopt (= prepare/restore), the source inner-k3s guests looked half-alive: ping and agent exec fine, TCP connect to `:6443` accepted, but the API server never answered a TLS ClientHello. k3s and containerd consumed **zero CPU**; `date +%s` was frozen while `/proc/uptime` advanced; `/proc/interrupts` showed IRQ0 (PIT timer) stuck at its pre-restore count while vsock interrupts flowed.
 
@@ -558,7 +558,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 41. Warm-forked guests SIGBUS on binaries mmap'd from virtiofs — fresh FUSE session EBADFs stale file handles
+## 41. Warm-forked guests SIGBUS on binaries mmap'd from virtiofs — fresh FUSE session EBADFs stale file handles (spec 13a Inc 4)
 
 **Symptom:** After the first successful warm fork of the inner-k3s cluster (6.4 s, virtiofs rebuilt, network answering), the fork's API server sent RSTs: the fork's `k3s` process had died with a Go runtime fatal dump; `ls /mnt/state/bin` in the fork returned `Bad file descriptor` (an error, not a hang — the fresh virtiofsd was answering).
 
@@ -572,7 +572,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 42. Continuous `/readyz` sampling flakes during the warm-fork source pause
+## 42. Continuous `/readyz` sampling flakes during the warm-fork source pause (spec 13a Inc 4)
 
 **Symptom:** `test_inner_k3s_cluster_warm_fork_no_restart` occasionally failed with `source inner API /readyz failed during fork (1 failures / N samples)` (later: `never succeeded after resume` with `samples=[true, true, true, false]`) even when the held `?watch=true` TLS session survived and both clusters came up Ready.
 
@@ -586,7 +586,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 43. In-process virtio-blk DMA is invisible to KVM dirty logging — warm forks would ship stale device-written pages
+## 43. In-process virtio-blk DMA is invisible to KVM dirty logging — warm forks would ship stale device-written pages (spec 14a Inc 1)
 
 **Symptom:** (Caught at design time, not debugged live — recorded because the final diff makes it look optional.) A warm fork copies `base.mem` + the KVM dirty bitmap. The new userspace virtio-blk worker writes guest RAM directly through k7d's own mapping (`pread` completions, used-ring entries, status bytes). KVM's dirty log only records **vCPU** writes, so none of those device writes are in the bitmap — a fork taken after block I/O would resurrect pre-I/O bytes on exactly those pages: silent data corruption, the in-process cousin of #39's virtiofsd problem (which forced virtiofs VMs onto the full-memfd path).
 
@@ -600,7 +600,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 44. Kani proof of the parallel-copy chunking OOM'd CBMC — symbolic-capacity `Vec`
+## 44. Kani proof of the parallel-copy chunking OOM'd CBMC — symbolic-capacity `Vec` (spec 14a Inc 0)
 
 **Symptom:** `verify_copy_chunk_ranges_cover_disjoint` (chunk work list for the multi-threaded memfd copy) failed `make remote-kani` with `CBMC appears to have run out of memory` during propositional reduction — no counterexample, 2306 VCCs after simplification.
 
@@ -614,7 +614,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 45. Shared-node measurement invalidated mid-run — another agent's rsync reverted `/root/k7d`
+## 45. Shared-node measurement invalidated mid-run — another agent's rsync reverted `/root/k7d` (spec 14a Inc 0)
 
 **Symptom:** Right after `make remote-check` showed the parallel cluster fork at ~1.3 s (daemon journal: three interleaved ~1.07 s copies), a standalone rerun of `test_inner_k3s_cluster_warm_fork_no_restart` measured `TreeFork elapsed=7.98s` with strictly sequential ~2.5 s copies and none of the new log lines — as if the change had never landed.
 
@@ -628,7 +628,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 46. FICLONE probe reported `EBADF` on a genuinely reflink-capable XFS — source fd opened write-only
+## 46. FICLONE probe reported `EBADF` on a genuinely reflink-capable XFS — source fd opened write-only (spec 14a Inc 3)
 
 **Symptom:** `test_writable_image_on_loopback_xfs_reflink_fork` failed with `NoReflink { dir: "/var/lib/k7d/disks", probe: "Bad file descriptor (os error 9)" }` — on the freshly provisioned loopback XFS with `reflink=1`, where `cp --reflink=always` works fine. The fail-loud probe was itself the bug.
 
@@ -642,7 +642,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 47. Deferred-VM sandboxes died in a kubelet recreate loop — Connect's reattach gate keyed on `vm_id == None`
+## 47. Deferred-VM sandboxes died in a kubelet recreate loop — Connect's reattach gate keyed on `vm_id == None` (spec 14a Inc 4)
 
 **Symptom:** With the block-path shim (VM creation deferred from sandbox `Create` to the first workload `Create` because virtio-blk cannot hotplug), every kubectl pod looped `FailedCreatePodSandBox: failed to get task pid: sandbox <id>: reattach failed: no such sandbox` — hundreds of sandboxes created and killed per minute, pod never got an IP. `test_cni_pod_traffic_flows` timed out. The shim log showed each sandbox `Create` succeeding ("VM deferred to first workload Create") immediately followed by a failing `Connect`.
 
@@ -650,13 +650,13 @@ Three small ones, recorded because each burned real time:
 
 **Fix:** Gate the reattach on "this shim has truly never seen this id": also require `pending_vm.is_none()`, `sandbox_id != req.id`, and `!containers.contains_key(&req.id)` before attempting daemon reattach. Lesson: any state-recovery heuristic keyed on "field not yet set" must be revisited whenever the lifecycle that sets the field moves later.
 
-**Reference:** none (own shim, internal notes).
+**Reference:** none (own shim, spec 11a Inc 4 recovery path vs spec 14a Inc 4 deferred boot).
 
 **Time lost:** ~30 minutes (one full remote-check round trip + node log archaeology).
 
 ---
 
-## 48. Block-path pods boot fast enough to land inside k3s' post-restart convergence window — host→pod TCP times out while the pod is fine
+## 48. Block-path pods boot fast enough to land inside k3s' post-restart convergence window — host→pod TCP times out while the pod is fine (spec 14a Inc 4)
 
 **Symptom:** `test_cni_pod_traffic_flows` failed Flow 2 (`curl http://<pod_ip>/` → timeout) on every full `make remote-check`, yet passed 5/5 standalone. During the broken window: pod Running with IP, guest agent answering on vsock, nginx listening, `ping` netns→guest fine, `curl http://10.200.0.2/` (guest IP, direct) → 200 — only host→pod-IP TCP dead. The same sandbox served 200 minutes later with zero intervention. Two red herrings burned time: guest `lo` being DOWN (it always is; in-guest loopback tests never worked on this design) and a mystery mid-test k7d restart (that was `LeakGuard::drop` → `systemctl try-restart k7d` running during the panic *unwind*, i.e. post-failure noise that then churned the sandbox and changed the pod IP under the debugger).
 
@@ -670,7 +670,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 49. 50×3-VM shared-pause batch died with EMFILE — soft `RLIMIT_NOFILE` stayed at 1024
+## 49. 50×3-VM shared-pause batch died with EMFILE — soft `RLIMIT_NOFILE` stayed at 1024 (spec 15a follow-up)
 
 **Symptom:** `test_cluster_tree_fork_batch_50` panicked mid-materialise with `Fork(Restore(Io(... Too many open files)))` after the shared-pause batch path was wired up. The 8× bare batch test passed.
 
@@ -684,9 +684,9 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 50. Nested hostNetwork www/nginx fails — etc-hosts bind
+## 50. Nested hostNetwork www/nginx fails — etc-hosts bind (spec 15b)
 
-**Symptom:** internal notes`hostNetwork` nginx DaemonSet inside the 3-VM inner-k3s cluster. Nginx CrashLooped on kubelet `etc-hosts` bind (`…/etc/hosts: not a directory`). CrashLoops stressed the sidecar containerd tmpfs; outer pods went `Error`.
+**Symptom:** Spec 15b tried a `hostNetwork` nginx DaemonSet inside the 3-VM inner-k3s cluster. Nginx CrashLooped on kubelet `etc-hosts` bind (`…/etc/hosts: not a directory`). CrashLoops stressed the sidecar containerd tmpfs; outer pods went `Error`.
 
 **Root cause:** Nested kubelet/hostNetwork path mounts `etc-hosts` into a layout the guest runc/k3s container does not provide as a real directory.
 
@@ -698,7 +698,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 51. Guest kernel missing CFS_BANDWIDTH — nested runc can't open `cpu.max`
+## 51. Guest kernel missing CFS_BANDWIDTH — nested runc can't open `cpu.max` (spec 15b)
 
 **Symptom:** Inner pause pods (Inc 3 and `Deployment/inner-load`) failed with `openat2 …/cpu.max: no such file or directory` even though `cpu` was listed in `cgroup.controllers`. Cgroup dirs showed `cpu.weight` / `cpu.stat` but never `cpu.max`. Sandbox pause tasks sometimes stayed Running (no CFS write), while the app container Create always failed.
 
@@ -712,7 +712,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 52. `copy_file_range` EXDEV — cross-filesystem copies got un-supported again in Linux 5.19
+## 52. `copy_file_range` EXDEV — cross-filesystem copies got un-supported again in Linux 5.19 (spec 16a Inc 1)
 
 **Symptom:** First run of `test_kubectl_pod_two_images` / `test_image_slot_exhaustion_fails_loud`: every image-slot fill failed with `copy_file_range /var/lib/k7d/images/….erofs -> /tmp/k7d-shim-…/image-slots/slot-0.img: Invalid cross-device link (os error 18)` — even though the FICLONE→`copy_file_range` fallback chain looked textbook.
 
@@ -726,7 +726,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 53. Guest `lo` was never brought up — pod-local 127.0.0.1 hung with a timeout, not ECONNREFUSED
+## 53. Guest `lo` was never brought up — pod-local 127.0.0.1 hung with a timeout, not ECONNREFUSED (spec 16a Inc 1)
 
 **Symptom:** In the two-image pod test, nginx reached Running and exec/logs worked, but `wget http://127.0.0.1/` from inside the *same* container timed out (`Operation timed out`, not `Connection refused` — which is what made it look like an nginx or netns problem rather than an interface problem).
 
@@ -740,13 +740,13 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 54. Preserving `linux.resources` resurfaced CRI `memory.swap.max` on a no-swap guest
+## 54. Preserving `linux.resources` resurfaced CRI `memory.swap.max` on a no-swap guest (spec 16a Inc 4)
 
 **Symptom:** After `fix_oci_config` stopped stripping `linux.resources`, every kubectl pod (including BestEffort nginx with no memory limit) CrashLoopBackOff'd at Start with `unable to set unified resource "memory.swap.max": … no such file or directory`. CNI / shim tests that previously passed started failing immediately.
 
-**Root cause:** containerd CRI stamps `linux.resources.unified["memory.swap.max"]="0"` on essentially every container. The guest kernel is built with `CONFIG_SWAP` unset, so cgroup v2 never creates `memory.swap.max`. internal notes`resources` object (then writing back devices allow-all only). Restoring structured memory/cpu for Inc 4 re-exposed the unified swap key.
+**Root cause:** containerd CRI stamps `linux.resources.unified["memory.swap.max"]="0"` on essentially every container. The guest kernel is built with `CONFIG_SWAP` unset, so cgroup v2 never creates `memory.swap.max`. Spec 10c had been hiding this by deleting the entire `resources` object (then writing back devices allow-all only). Restoring structured memory/cpu for Inc 4 re-exposed the unified swap key.
 
-**Fix:** In `fix_oci_config`, keep memory/cpu (and other) resource fields, force devices allow-all, drop structured `memory.swap` and swap/zswap unified keys the guest cannot honour. Also drop `memory.oom.group` until Inc 2 exit observation lands — with `oom.group=1` an over-limit `kubectl exec` kills the whole container cgroup and, without an exit event, kubelet never restarts it (breaks internal notes's "pod survives guest OOM" check). Process-level OOM still enforces `memory.max`; Inc 4's main-process hog covers whole-container OOMKilled. Delegate `+cpu +memory +pids` from guest `init.sh` after moving the agent into a `/sys/fs/cgroup/init` leaf. Rebuild guest kernel on the Inc 4 node for `CONFIG_CFS_BANDWIDTH` (CHALLENGES #51).
+**Fix:** In `fix_oci_config`, keep memory/cpu (and other) resource fields, force devices allow-all, drop structured `memory.swap` and swap/zswap unified keys the guest cannot honour. Also drop `memory.oom.group` until Inc 2 exit observation lands — with `oom.group=1` an over-limit `kubectl exec` kills the whole container cgroup and, without an exit event, kubelet never restarts it (breaks spec 10c's "pod survives guest OOM" check). Process-level OOM still enforces `memory.max`; Inc 4's main-process hog covers whole-container OOMKilled. Delegate `+cpu +memory +pids` from guest `init.sh` after moving the agent into a `/sys/fs/cgroup/init` leaf. Rebuild guest kernel on the Inc 4 node for `CONFIG_CFS_BANDWIDTH` (CHALLENGES #51).
 
 **Reference:** runc `libcontainer/cgroups/fs2` unified key writer; Linux `CONFIG_SWAP` / memcg swap files.
 
@@ -754,7 +754,7 @@ Three small ones, recorded because each burned real time:
 
 ---
 
-## 55. Parallel agents clobber `/root/k7d` on a shared bare-metal node
+## 55. Parallel agents clobber `/root/k7d` on a shared bare-metal node (spec 16a Inc 5)
 
 **Symptom:** `make remote-check` on the Inc 5 node flipped between green clippy on
 mainline sources and hard failures compiling Inc 2 symbols
@@ -780,7 +780,7 @@ them). Keep claiming the assigned `K7_NODE_IP`; do not fight over
 
 ---
 
-## 56. Console with a no-op IRQ trigger wedges the agent's vsock accept loop after ~4 KiB of logging
+## 56. Console with a no-op IRQ trigger wedges the agent's vsock accept loop after ~4 KiB of logging (spec 16a Inc 2 / the PR71 mystery)
 
 **Symptom:** The spec-15b "dirtier" inner-k3s warm-fork tests failed on `main`
 and every 16a-inc2 attempt (this is what sank PR71): after the churn workload,
@@ -804,7 +804,7 @@ backlog then explains both probe signatures: pending connects still complete
 their handshake into the accept queue (request then times out — no handler),
 and once the backlog fills the guest RSTs new connects
 (`virtio_transport_recv_listen` → `sk_acceptq_is_full` → reset). The 30–70 s
-window under 1/s probing is just 4096 bytes ÷ ~65 bytes per probe. internal notes's
+window under 1/s probing is just 4096 bytes ÷ ~65 bytes per probe. Spec 15b's
 churn (~30 extra execs against the server pod) pushed it over the edge, which
 is why lighter suites (and the Inc 5 adopt test) never caught it.
 
@@ -842,7 +842,7 @@ rate arithmetic).
 
 ---
 
-## 57. Virtio worker threads inherit the vCPU thread's cgroup *and* comm — the "exactly 2 TIDs" cgroup test was doubly wrong
+## 57. Virtio worker threads inherit the vCPU thread's cgroup *and* comm — the "exactly 2 TIDs" cgroup test was doubly wrong (spec 17a)
 
 **Symptom:** `test_multi_vcpu_all_tids_in_cgroup` found **10** TIDs in the
 2-vCPU pod's `cgroup.threads` instead of 2. The panic leaked the pod, whose
@@ -865,7 +865,7 @@ unnamed workers all reported `vcpu0`.
 **Fix:** Name the vCPU run-loop threads (`vcpu0`, `vcpu1`, …) *and* the
 virtio worker threads (`virtio-net`, `virtio-blk`) at spawn; the test asserts
 the set of `vcpu*`-named TIDs in `cgroup.threads` is exactly
-`{vcpu0, vcpu1}`. Added a `PodGuard` (drop-deletes the pod) to the internal notes
+`{vcpu0, vcpu1}`. Added a `PodGuard` (drop-deletes the pod) to the spec 17a
 kubectl tests so one panic can no longer cascade into later tests.
 
 **Reference:** Linux `Documentation/admin-guide/cgroup-v2.rst` (threaded
@@ -877,7 +877,7 @@ plus untangling the leaked-pod cascade from a suspected boot regression).
 
 ---
 
-## 58. Restored SMP guests hang intermittently — `KVM_GET_LAPIC` does not carry the TSC-deadline timer arm
+## 58. Restored SMP guests hang intermittently — `KVM_GET_LAPIC` does not carry the TSC-deadline timer arm (spec 17b Inc 6)
 
 **Symptom:** `test_multi_vcpu_snapshot_restore_roundtrip` failed
 intermittently after restore, and the failing step *moved between runs*:
@@ -912,7 +912,7 @@ were real but unrelated test bugs found on the way).
 
 ---
 
-## 59. Tree fork children are not prepared as fork sources
+## 59. Tree fork children are not prepared as fork sources (spec 17c test trap)
 
 **Symptom:** `test_cluster_annotation_mixed_vcpus` got the annotation
 adopt+fork to Running, then
@@ -936,6 +936,861 @@ trigger pod reaching Running.
 requiring `prepare_fork_source` first).
 
 **Time lost:** ~20 minutes.
+
+---
+
+## 60. Fork-source pods can never terminate — Kill blocks on the dead pre-swap agent connection while holding the state lock (spec 17d)
+
+**Symptom:** After `k7 fork` (spec-17d `fork-source-*` annotations →
+`ForkVm`), the *source* pod wedges in `Terminating` forever; kubelet
+spams `ExecSync ... context canceled` (readiness probes), and dozens of
+test namespaces pile up behind the stuck pod. All lifecycle tests pass —
+the wedge only shows at pod deletion.
+
+**Root cause:** the first `ForkVm` against a share-less source runs
+`prepare_fork_source`, which swaps the source VM for a restored copy on
+the SAME vsock CID. The source shim's **cached** `state.agent` connection
+still points at the torn-down backend: reads/writes just stall until the
+30s request deadline. `Kill` called `agent.container_signal` through that
+cached connection **while holding the shim state lock** — containerd's
+own Kill deadline is shorter than 30s, so every StopContainer attempt
+timed out, kubelet retried, and each retry blocked the lock again (which
+is also why the probes' Exec RPCs all hung). Exec never showed the bug
+because the exec bridges dial a *fresh* vsock connection per exec.
+
+**Fix:** `Kill` and workload `Delete` now dial a fresh
+`AgentClient::connect_vsock(cid, 2s)` for the best-effort
+`container_signal` / `container_stop` instead of trusting the cached
+connection — same pattern the exec/output bridges already use. A live
+guest answers in ms; a half-dead one costs at most 2s. Source pods now
+terminate in ~4s.
+
+**Reference:** spec 14a Inc 5 (CID-stable prepare swap), CHALLENGES #39.
+
+**Time lost:** ~1 hour (the smoking gun was `/proc/<shim>/task/*/wchan`
+showing the shim idle — not deadlocked — combined with `Kill: signal=9`
+arriving in the shim log while `crictl stop` still hit DeadlineExceeded).
+
+---
+
+## 61. Empty shim `Stats` response poisons node-wide kubelet stats (and blocks namespace deletion)
+
+**Symptom:** With any `runtimeClassName: k7` pod running, k3s logs
+`ListContainerStats failed ... failed to decode container metrics ...
+type with url : not found` for the k7d container; kubelet's summary API
+loses ALL container stats, metrics-server goes permanently NotReady
+("no metrics to serve"), and — the truly evil part — every namespace
+deletion on the node wedges with `stale GroupVersion discovery:
+metrics.k8s.io/v1beta1` because the namespace controller cannot finish
+discovery against the dead aggregated API.
+
+**Root cause:** the shim's `stats()` returned a bare
+`api::StatsResponse::new()` — no `stats` `Any` payload at all.
+containerd's CRI plugin fails the *aggregate* ListContainerStats call
+when any single container's metrics blob has an empty type URL, so one
+k7d pod takes down stats for every container on the node.
+
+**Fix:** return a valid empty
+`containerd_shim_protos::cgroups::metrics::Metrics` converted with
+`convert_to_any` (type URL `io.containerd.cgroups.v1.Metrics`). Real
+per-container accounting inside the guest is future work; the VM-level
+numbers live in the k7d daemon's per-VM CPU cgroup.
+
+**Reference:** containerd `cri/server/container_stats_list.go`
+(decode-all-or-fail), kata shim returns proper cgroup metrics.
+
+**Time lost:** ~45 min (surfaced as "why do test namespaces never
+finish deleting" three layers above the actual bug).
+
+---
+
+## 62. Guests ≥ ~4 GiB never booted: 32-bit `ramdisk_image`, and a "working" band that silently aliased RAM over the IOAPIC
+
+**Symptom:** any pod with `memory: 4Gi` or more stuck in ContainerCreating,
+the shim giving up with `agent connect failed: Connection timed out`
+(sometimes `No such device` from the vsock connect). `3.5Gi` worked. The
+obvious suspect — and the one the spec had already written down as the
+"smoking gun" — was that `vm.rs` placed the virtio-mmio windows at
+`mem_size + MMIO_GAP + idx*0x1000`, so at 4 GiB the vsock window jumped
+from `0xc4001000` to `0x104001000`, past the 32-bit boundary.
+
+**Root cause:** the MMIO jump was a red herring. `virtio_mmio.device=`
+addresses are parsed as 64-bit, the kernel maps them fine, and a guest
+booted with a window above 4 GiB talks to the device happily. The real
+defects were two, both invisible from the shim side:
+
+1. **`boot_params.hdr.ramdisk_image` is 32 bits wide.** We loaded the
+   initrd at the top of guest RAM and wrote that address into the header
+   without using the 64-bit `ext_ramdisk_image` extension, so past 4 GiB
+   the address silently truncated. The guest kernel then found no
+   initramfs, panicked in `prepare_namespace` with `VFS: Unable to mount
+   root fs`, and never started `k7-agent` — hence a connect timeout
+   rather than any memory-shaped error.
+2. **RAM aliased fixed platform MMIO.** Sizes in the narrow ~4076–4097
+   MiB band *did* connect, which is what made the ceiling look fuzzy.
+   Those guests had RAM mapped over the in-kernel IOAPIC (`0xfec00000`),
+   the LAPIC (`0xfee00000`) and KVM's TSS + identity-map pages: writes
+   landed on device registers, corruption was quiet, and the "max working
+   `memory_mb`" answer was meaningless because the boundary was two
+   unrelated bugs interleaved.
+
+**Fix:** give the guest the layout a real PC has. `crates/k7d/src/mem_layout.rs`
+splits RAM into a low region ending at `MMIO_HOLE_START` (`0xfe000000`)
+and, for bigger guests, a high region starting at 4 GiB, registered as
+two KVM slots. The hole stays unmapped so accesses reach devices, and
+virtio-mmio windows now sit at a *fixed* base inside it instead of
+floating above RAM. The initrd goes at the top of low RAM, which is
+always addressable in 32 bits — with a loud error if it ever fails to
+fit rather than a truncating cast. The host mapping stays linear
+(`hva == base + gpa`, the hole left as untouched sparse memfd pages) so
+every virtio backend keeps translating with a single addition; snapshots,
+deltas and dirty bitmaps switched from RAM size to the guest physical
+*span* (`Vm::mem_span()`), since the hole is inside the range they index.
+
+**Debugging note:** the guest panic was only visible on the serial
+console of a directly-built `Vm`. Going through kubectl, every failure
+mode — panic, corruption, agent crash — presents identically as a
+connect timeout, so binary-searching `memory_mb` through pods produced
+nothing but a confusing "sometimes 4076 works" signal. A throwaway
+integration test that built VMs at chosen sizes and dumped serial output
+found it in one run.
+
+**Reference:** Firecracker `arch::x86_64::layout` (`MMIO_MEM_START`,
+`FIRST_ADDR_PAST_32BITS`) and Cloud Hypervisor's `MemoryManager` both use
+the same low/high split; Linux `Documentation/arch/x86/boot.rst` for the
+`ramdisk_image` / `ext_ramdisk_image` field widths.
+
+**Time lost:** ~3 hours, most of it trusting the MMIO hypothesis the spec
+handed us before checking the serial log.
+
+---
+
+## 63. `prepare_fork_source`'s husk unlinks the live guest's scratch image — and `Path::exists()` cannot tell a mount from a mountpoint (spec 19b)
+
+**Symptom:** two traps found while giving each sandbox a host-backed
+virtio-blk scratch disk (`disks::ScratchDisk`, an RAII handle whose
+`Drop` unlinks the image).
+
+1. With the handle owned by the `Vm`, `prepare_fork_source` silently
+   deleted the image of a *running* guest. Nothing broke at that moment:
+   the block backend still holds the fd, so the parent kept reading and
+   writing happily. The damage only surfaced later and elsewhere — the
+   next `fork_warm` failed its `FICLONE` with `ENOENT` on a file the
+   guest was actively using, which reads like a reflink/XFS problem
+   rather than a lifetime problem.
+2. The obvious way to write the agent's fail-loud check for "scratch was
+   promised but did not mount" — `Path::new(SCRATCH_MOUNT).exists()` —
+   cannot fail. `mount_one_blk` does `fs::create_dir_all(&spec.mount)`
+   before mounting and only *logs* a mount failure, so an unformatted or
+   absent device leaves an empty *directory* at the mount point and the
+   check passes. The container would then run with its overlay upper on
+   the initramfs tmpfs — exactly the RAM-backed writable layer spec 19b
+   exists to abolish, now with a log line claiming it was on a disk.
+
+**Root cause:** (1) `Vm::prepare_fork_source_in` snapshots the source,
+builds a restored VM, and `std::mem::swap`s it into `self`; the
+swapped-out husk is dropped at end of scope. Every resource the live
+guest still needs has to be moved across *before* the swap — the TAP
+device already was, and the scratch handle is the same class of thing.
+(2) A mountpoint's existence says nothing about what, if anything, is
+mounted on it.
+
+**Fix:** (1) `restored.scratch_disk = self.scratch_disk.take();` before
+the swap, with the reason in a comment next to the TAP handover so the
+next resource added to `Vm` finds the precedent. (2) Check the
+*filesystem type* of the mount the path lives on
+(`mount_fstype_of` over `/proc/self/mountinfo`, already present for the
+erofs rootfs detection) and require `ext4`; an unmounted mountpoint
+reports `rootfs`/`tmpfs` and fails the container start with an error
+naming the mount point.
+
+Both are covered by assertions rather than left to inspection:
+`test_warm_fork_scratch_is_cow_and_isolated` asserts the source image
+still exists after `prepare_fork_source` (reverting the handover makes it
+fail immediately), and `test_promised_but_missing_scratch_fails_loud`
+boots a guest with a deliberately unformatted image at the scratch mount
+point.
+
+**Reference:** none — both are local invariants. The reflink-CoW
+inheritance decision follows `reference/cubesandbox/` (cubecow).
+
+**Time lost:** ~1 hour, most of it on trap 1: the parent guest showing no
+symptom at all made "the image is gone" the last hypothesis rather than
+the first.
+
+---
+
+## 64. A node-side edit makes every later `make remote-check` test stale code — rsync rolls the source's mtime *backwards* and cargo calls it fresh
+
+**Symptom:** `test_warm_fork_scratch_is_cow_and_isolated` failed in
+`make remote-check` with the exact assertion that a five-minute-earlier
+standalone `cargo test --test test_scratch` had passed, and that the code
+on the node plainly satisfied — `grep` found the required line in
+`crates/k7d/src/vm.rs` on the node, and the test still failed. Two
+consecutive full-suite runs tested a binary built from source that
+existed nowhere: not in the repo, not on the node.
+
+**Root cause:** an experiment had temporarily edited `vm.rs` *on the
+node* (to confirm that removing the scratch-disk handover really does
+break the fork test) and rebuilt. That build's fingerprint recorded the
+edited file's mtime — call it 07:10. Restoring the file and re-running
+`make rsync` then wrote the **workspace** copy back with the
+**workspace's** mtime, 07:05, because `rsync -a` preserves times. Cargo's
+freshness check is "is any source newer than the output": a source dated
+*before* the artifact is fresh by definition, so cargo skipped the
+rebuild and every later test linked the experimental library. `rsync`
+without `-c`/`--checksum` also has nothing to say here — it compares size
+and mtime, and both matched what it had already sent.
+
+The dangerous direction is the other one. This can just as easily hide a
+node-side hack that makes a test *pass*, and `make remote-check` would
+report green for code that was never in the repo.
+
+**Fix:** never leave a node-side source edit behind — restore from git
+(`git -C /root/k7d checkout -- <file>` is not available since the node
+copy is not a checkout, so `cp` from a backup *and then* force a
+rebuild). After any rsync that follows a node-side edit, bump the source
+mtimes so cargo cannot mistake old-but-different for unchanged:
+
+```bash
+ssh $NODE 'cd /root/k7d && find crates -name "*.rs" -newermt "1970-01-01" -exec touch {} +'
+```
+
+Better: do experiments the same way as any other change — edit locally,
+rsync, run — so the node's tree is only ever written by rsync and its
+mtimes only ever move forward.
+
+**Reference:** none. Related to #17 (`rsync --delete` removing node-side
+generated files) and #45 / #55 (a second writer to `/root/k7d`): the
+common theme is that the node's tree is shared mutable state and rsync is
+not a synchronisation primitive.
+
+**Time lost:** ~40 minutes, and one wasted 25-minute full-suite run. The
+tell was "the assertion contradicts the source on the node" — at that
+point stop debugging the code and start doubting the artifact.
+
+---
+
+## 65. The per-container memory-limit test was really a tmpfs-accounting test, and spec 19b broke it by working
+
+**Symptom:** `test_kubectl_pod_per_container_memory_limits` (spec 16a
+Inc 4, untouched for months) failed on the 19b branch with
+`40Mi write in 32Mi cgroup must fail, got: Ok("")`. Nothing in the diff
+went near cgroups, runc, or `linux.resources`.
+
+**Root cause:** the test proved "each container's memory limit is
+enforced independently" by writing a 40 MiB file to `/tmp` inside a
+32Mi-limited container and asserting the exec got OOM-killed. `/tmp` is
+part of the container rootfs, i.e. the overlay *upper* — which before
+19b was a guest tmpfs. Tmpfs pages are charged to the writing cgroup and
+are not reclaimable without swap, so the write did OOM, and the test
+passed for a reason it never stated. Spec 19b moves the upper onto a
+host-backed ext4 image on virtio-blk, where the same write is ordinary
+reclaimable page cache: the kernel writes back and reclaims instead of
+OOM-killing, the write succeeds, and the assertion fails. The test was
+right to fail — the behaviour it encoded is exactly the coupling 19b
+exists to remove.
+
+**Fix:** probe the limit with memory instead of with a file:
+`dd if=/dev/zero of=/dev/null bs=40M count=1`, whose 40 MiB I/O buffer is
+anonymous and fully faulted in by the read. OOM-kills at 32Mi, succeeds
+at 256Mi, and no longer depends on where the writable layer lives. The
+test comment now says which property it is measuring and why it is not a
+file write.
+
+**Reference:** none. `Documentation/admin-guide/cgroup-v2.rst` on why
+tmpfs pages count as unreclaimable file memory is the underlying reason.
+
+**Time lost:** ~20 minutes. Worth generalising: any test that reaches a
+resource limit *indirectly* silently depends on which subsystem backs the
+resource. Grep for the rest of them before changing a backing store.
+
+---
+
+## 66. Making the remote loop survive a dropped SSH: three ways the detached run was still fragile
+
+**Symptom:** hardening `make remote-check` against the two failure modes
+in #64 (a wedged connection with no keepalive, and rsync rolling a
+source's mtime backwards) produced three follow-on bugs that each look
+like the mechanism works when it does not.
+
+1. **The detached run never came up.** `nohup setsid bash run.sh >log &`
+   from an `ssh` command line raced its own session teardown: the whole
+   `&&` chain was backgrounded, so the setup and the `setsid` ran after
+   the remote shell had already been told to exit. The run *did* start
+   often enough to look correct, and the log even had output in it, but
+   the pid file was written by a process that was gone by the time the
+   local side polled for it.
+2. **Reattaching duplicated every line.** The local viewer is
+   `ssh … tail -f | tee -a <local log>`, and the local log's *size* is
+   the byte offset a reattach resumes from. `SIGKILL`ing the wrapper
+   (a dying agent, a closed laptop — the exact case reattach exists for)
+   leaves the ssh orphaned and still appending, so the new viewer and
+   the old one both write and the log gets each subsequent line twice.
+   Reattach then resumes from a doubled offset.
+3. **Touching rsynced files made every sync a full sync.** The #64 fix
+   is "bump the mtime of what rsync wrote". With rsync's default
+   size+mtime quick check, those touched files look changed on the next
+   run, so rsync re-transfers and re-touches the whole tree every time —
+   and a whole tree of fresh mtimes means cargo rebuilds everything on
+   every `make remote-check`.
+
+**Root cause:** (1) `setsid` only forks when it is already a process
+group leader, and a non-interactive shell does not put background jobs
+in their own group — so plain `setsid` blocked instead of detaching, and
+the surrounding subshell was racing SIGHUP. (2) A process's death does
+not reap its children, and the resume offset was derived from state a
+dead process could still be mutating. (3) mtime is both the thing being
+repaired and the thing rsync uses to decide what to send.
+
+**Fix:** (1) `nohup setsid --fork`, run synchronously (no `&`), with the
+wrapper recording its own `$$` and writing its exit code from an `EXIT`
+trap so a run can never finish without a status. (2) Reap any ssh
+carrying this run's viewer marker before attaching — matching on the
+marker *and* on `comm == ssh`, so a process that merely mentions the
+path is never signalled. (3) `rsync --checksum`: "transferred" then
+means "content really differs", which is exactly the set whose mtime
+must move forward, and the sync is idempotent again (~1.8 s for this
+tree, versus a full rebuild).
+
+**Testing note worth reusing:** three separate test scripts killed
+*themselves*, because `pkill -f <pattern>` matches the command line of
+the shell running the pkill. Put this kind of test in a file rather than
+an inline `bash -c`, or the harness fails in a way that looks like the
+thing under test. A wedged connection also cannot be faithfully
+simulated by `SIGSTOP`ing the node's sshd — the client did not time out
+in 150 s. A local TCP proxy that keeps both sockets open and delivers
+nothing does reproduce it exactly: 71 s to fail with the keepalives,
+still hanging at 120 s without them.
+
+**Reference:** none. `setsid(1)`'s `--fork` note and `tail --pid` are the
+only upstream behaviours involved.
+
+**Time lost:** ~1.5 hours, most of it on (1) — "the run produced output
+but reports as never started" reads like a state-machine bug, not a
+shell-detachment one.
+
+---
+
+## 67. Per-container writable images: the mount that must not nest, and a `statfs` that answers for the wrong filesystem (spec 19c)
+
+**Symptom:** giving a container its own ext4 image (spec 19c) looked like
+a one-line variation on 19b's shared scratch — same `create_ext4_volume`,
+same `k7d.blk=` plumbing, same agent mount. The first shape of it broke
+two things that have nothing to do with each other: container teardown
+started failing on `Device or resource busy`, and the usage number
+reported for a container sharing the pod scratch was the *pod's* usage,
+identical for every container in it.
+
+**Root cause:** both come from a per-container mount being a mount and
+not a directory.
+
+1. The obvious place to put it is
+   `/run/k7d/scratch/<name>` — right where 19b already puts a
+   container's `upper`/`work`. But that path is a plain directory the
+   agent creates on the shared image and reclaims with
+   `remove_dir_all` when the container goes away, so mounting a device
+   there means teardown tries to delete a live mount point. The mount
+   also shadows what is underneath it, so a `statfs` meant for the
+   shared disk answers for whichever nested image happened to be
+   mounted at the path it was given.
+2. `statfs` reports the *filesystem*, and for a shared-scratch container
+   the filesystem is the whole pod's disk. Used-blocks minus free-blocks
+   is a correct number for a dedicated image, where nobody else writes,
+   and a meaningless one per container on the shared image. The two
+   shapes need genuinely different measurements, not one with a
+   correction factor.
+
+**Fix:** per-container images mount at their own root,
+`/run/k7d/cscratch/<name>` (`disks::CONTAINER_SCRATCH_GUEST_ROOT`),
+deliberately not under the shared mount, with the reason written at the
+constant. `OverlayMounts` carries a `dedicated` flag that then decides
+both behaviours: teardown empties a dedicated mount instead of removing
+it, and `usage` returns `statfs` for a dedicated image but walks the
+container's `upper` tree for a shared one — which is also what makes a
+delete lower the reported number, since neither `statfs` on the shared
+disk nor the host's allocated block count ever goes down.
+
+**Testing notes worth reusing:**
+
+- Asserting "this container's writes land on its own device" by checking
+  the filesystem type at the container's own `/` finds `overlay`, always.
+  The ext4 is the overlay's `upperdir`; assert on that (and on the
+  `upperdir=` option naming the expected mount) instead.
+- `kubectl exec … dd` hitting `ENOSPC` looked like an empty failure:
+  the interesting text is on the command's stderr and the non-zero exit
+  makes the client discard it. Appending `; echo rc=$?` and matching on
+  the combined output turns "the exec failed" into "the write failed
+  with No space left on device", which is the difference between a
+  passing test and a debugging session.
+
+**Reference:** none.
+
+**Time lost:** ~1 hour, mostly on the busy-teardown, which surfaced as a
+container `Delete` failing long after the mount decision that caused it.
+
+---
+
+## 68. Teaching k7d to find installed guest artifacts made the test suite boot yesterday's guest
+
+**Symptom:** rebasing the release-packaging branch onto main turned the
+three per-container ephemeral-storage tests red, and only those. They
+failed as `agent not ready within timeout` and
+`container_usage(...): Timeout` — the signature of a hang, on a node
+where every other VM-booting test in the suite passed.
+
+**Root cause:** the branch taught `default_guest_paths()` to resolve
+`/usr/local/share/k7d/{vmlinux,initramfs.cpio.gz}` before the workspace,
+so an installed k7d could find its own guest. This node both builds and
+runs k7d, so it has both copies — and the installed one was from the
+previous day. `make test` rebuilds the agent and initramfs before every
+run precisely so the suite cannot test a stale guest (entry 64 is the
+same hazard by a different route), and this quietly undid that: the
+tests booted an initramfs whose agent predated the feature they were
+testing, so the call they waited on was never going to be answered.
+Nothing was flaky and nothing timed out for the reason it claimed.
+
+**Fix:** the workspace outranks the install. An installed binary has no
+workspace — the path is baked from `CARGO_MANIFEST_DIR` at compile time
+and belongs to whatever host compiled it — so it still resolves to the
+share dir, and installs from the tarball never depend on either, because
+`install.sh`'s systemd unit sets `K7D_KERNEL`/`K7D_INITRD` outright.
+
+The tell, for next time: a timeout that only hits the newest tests in a
+suite is more likely to be a stale guest than a slow one. `md5sum` the
+initramfs the VM actually booted against the one the build just wrote.
+
+**Reference:** none.
+
+**Time lost:** ~45 minutes.
+
+---
+
+## 69. The publish scrubber cut an em dash in half and shipped Rust that would not compile
+
+**Symptom:** the sanitized public tree looked right in `git diff` and
+passed every grep-gate, but 17 of its files — 15 of them `.rs` — were no
+longer valid UTF-8.
+
+**Root cause:** the scrubber rewrites internal spec references with a
+character class that itself contains multi-byte characters
+(`[0-9A-Za-z_.§ –-]`). Perl defaults to byte semantics, so `§` and `–`
+enter the class as their individual bytes, and a match can end partway
+through a *different* multi-byte character that happens to share a
+prefix — here the `—` in `Spec 19b — pod annotation ...`, whose first
+two bytes were consumed and whose third was left stranded. Rust source
+must be valid UTF-8, so the public tree would not have built. Every gate
+was a `rg` for forbidden *strings*; none of them asked whether the file
+was still a well-formed file.
+
+**Fix:** run the rewrites with `perl -CSD -Mutf8` so the patterns and
+the input are both characters, and validate the encoding of every file
+the sweep touched before the grep-gates run. A rewriting step needs a
+gate on the shape of its output, not only on the content it was aiming
+to remove.
+
+Two smaller traps in the same script, both found by finally running it
+end to end: `CHALLENGES.md`'s exemption from the spec-label scrub was an
+early `return`, which also skipped the redaction below it and leaked the
+node IP; and the curated copy list named a top-level `tests/` that has
+never existed, so a real run aborted before reaching any gate.
+
+**Reference:** perlrun `-C`, perlunicode.
+
+**Time lost:** ~40 minutes.
+
+---
+
+## 70. `Load key: invalid format` meant a missing newline, not a bad key
+
+**Symptom:** every `make remote-*` target failed to authenticate against
+a node that was up and healthy, with
+`Load key "/tmp/.../id_key": invalid format`.
+
+**Root cause:** `utils/ssh-setup.sh` reconstructs the PEM when the
+secret arrives with spaces instead of newlines, and that path appends a
+trailing newline. A key stored with real newlines skips the
+reconstruction and is written out verbatim — so a secret saved without a
+trailing newline produced a file OpenSSH refuses to parse. It reports
+that as `invalid format`, which reads like a corrupt or wrong-type key
+rather than a missing byte.
+
+**Fix:** terminate the file on both paths. Worth remembering that
+OpenSSH will not accept an unterminated key file at all, and says so in
+terms that point away from the cause.
+
+**Reference:** none.
+
+**Time lost:** ~15 minutes.
+
+---
+
+## 71. Deleting spec references by regex broke five things a diff review would not catch
+
+**Symptom:** a mechanical pass that stripped internal spec references
+from ~100 files left the tree looking plausible in review but wrong in
+five distinct ways, only two of which any compiler or linter noticed.
+
+**Root cause:** every reference sat inside prose, and deleting a span of
+prose is not a local edit. The failure classes were: (1) a reference that
+opened a parenthesis closed on a later line, leaving `... at boot (` with
+the close paren orphaned two lines down; (2) a reference that began a
+sentence, leaving a comment whose first character is `.` or `,`;
+(3) `// Spec 19b/19c:` where only the first id matched, turning `//` into
+`///` — a doc comment in the middle of an expression, which does not
+compile; (4) a tidy-up step that rewrote leading whitespace, silently
+de-indenting doc-list continuation lines until clippy's
+`doc_lazy_continuation` rejected them; (5) an identifier, `debug_log_10a`,
+that encoded a spec id and had callers in two other modules, so a
+file-scoped rename left dangling references.
+
+The deeper trap: searching for the leftovers by grepping for spec
+keywords finds nothing, because the keyword is exactly what was removed.
+The damage has to be searched for by *shape* — comments starting with
+punctuation, comment lines ending in an unclosed paren, indentation that
+changed on a `///` line — and each shape needs its own pattern.
+
+**Fix:** repair each site by hand against the pre-edit text from git,
+then verify by shape rather than by keyword, and finish with a real
+compile. `cargo fmt` will not flag any of this; clippy catches only the
+doc-comment classes. The rewrites now live in the source, so the publish
+scrubber's spec-rewriting block is gone and its grep-gate is what keeps
+the tree clean — a new reference gets reworded at the source instead of
+machine-mangled at publish time (which is what produced text like
+"for internal notes's k3s-agent sidecar").
+
+**Reference:** none.
+
+**Time lost:** ~3 hours, most of it discovering damage classes one at a
+time.
+
+---
+
+## 72. Nested dockerd died on a NAT write because the shim booted a guest nobody deployed
+
+**Symptom:** stock docker-in-docker sidecars CrashLooped on one node of
+a three-node k7 lab, on `--backend k7d`:
+
+```text
+failed to create NAT chain DOCKER: iptables --wait -t nat -N DOCKER:
+iptables v1.8.11 (nf_tables): TABLE_ADD failed (Not supported): table nat
+```
+
+Everything a triage would check said the opposite of broken. Host NAT
+was healthy, `iptables-save -t nat` non-empty, `/proc/net/ip_tables_names`
+listed `nat`. The other two nodes ran the same image fine, and k7d's own
+stock-dind e2e test was green on the node it runs on.
+
+**Root cause:** two silences that only meet on a node that both builds
+and runs k7d.
+
+*Which guest booted.* The shim resolved the guest kernel and initramfs
+itself and sent them to the daemon, which honours an explicit path over
+its own `K7D_KERNEL`/`K7D_INITRD`. containerd spawns a shim with no
+environment, so that resolution always fell through to the workspace
+path baked in at compile time. `/root/k7d/guest/kernel/vmlinux` exists
+on a build node and holds whatever was last built there — rsync
+excludes both artifacts on purpose — so pods booted that, and the
+deployed `/usr/local/share/k7d/vmlinux` was never opened. Nothing
+logged which of the two won. Entry #68 had made the workspace outrank
+the install a day earlier, reasoning that "an installed binary has no
+workspace": true of a binary built elsewhere, false of the shim here.
+
+*What was in it.* That stale kernel predated the config fix in 18a. Its
+config asked for `CONFIG_NF_TABLES_INET` and nothing else in the
+family; `NF_TABLES_INET` depends on `IPV6`, which was off then, so
+`make olddefconfig` dropped it — in silence, because a request kconfig
+cannot honour is simply absent from the answer. The result is a kernel
+where `CONFIG_NF_TABLES=y` and `nft_supported_family()` is false for
+every family. Measured on a kernel rebuilt that way on purpose:
+
+| In the guest | Result |
+|---|---|
+| `iptables -t nat -L -n` | rc=0, prints PREROUTING/INPUT/OUTPUT/POSTROUTING |
+| `iptables -t nat -N PROBE` | rc=4, `TABLE_ADD failed (Not supported): table nat` |
+
+The read succeeds because iptables-nft synthesizes a missing table's
+built-in chains, so the table looks present right up until something
+writes. `nf_tables_newtable()` returns `-EOPNOTSUPP` before it looks at
+anything else, and dockerd's first act is that write.
+
+**Fix:** one per silence.
+
+- The shim sends no guest paths at all; the daemon resolves them, logs
+  what it resolved and where the answer came from, and `vm_status`
+  reports the kernel each VM booted.
+- `guest/kernel/build.sh` diffs the config kconfig answered against
+  `config-minimal` and refuses to build a kernel that is not the one
+  described. Twelve symbols kconfig will never answer as asked are
+  listed in `config-drift-allowed` with the Kconfig rule behind each.
+- `CONFIG_IKCONFIG_PROC` puts the answered config in the guest at
+  `/proc/config.gz`, so a running VM can be asked what it is instead of
+  inferred from the tree that maybe built it.
+- The suite installs the guest it built into `/usr/local/share/k7d` and
+  points `k7d.service` there, which is both how a k7 node runs and the
+  only arrangement where the daemon's path differs from the shim's
+  compile-time one — so the assertion that a pod booted the daemon's
+  kernel has teeth. It reads the effective environment from `systemctl
+  show`, not the unit file it just wrote, because a drop-in overriding
+  `K7D_KERNEL` looks identical to everything working.
+
+**What would have found it faster:** asking the VM, not the host. Every
+host-side check passes in this failure, and the guest's own
+`/proc/config.gz` and the daemon's resolved kernel path each answer it
+outright. A green e2e suite is not evidence when the suite and the
+failing pod boot different artifacts — the first question about any
+"works here, not there" bug should be whether both sides are running
+the same bytes.
+
+**Reference:** linux 6.12 `net/netfilter/nf_tables_api.c`
+(`nft_supported_family`, `nf_tables_newtable`).
+
+**Time lost:** ~3 hours, most of it establishing that the host was
+innocent and that two nodes differed only in a file nobody deploys.
+
+---
+
+## 73. Four things stood between `CONFIG_KVM_GUEST=y` and a guest that knows what time it is (spec 19f)
+
+**Symptom:** `config-minimal` had asked for `CONFIG_KVM_GUEST=y` and
+`CONFIG_PARAVIRT=y` since the first guest kernel, and no guest had ever
+had either — both live under `if HYPERVISOR_GUEST`, which was never set,
+so `olddefconfig` dropped them in silence (#72's new check is what
+finally said so). Setting `CONFIG_HYPERVISOR_GUEST=y` and rebuilding
+changed nothing observable: the guest still logged
+
+```text
+Booting paravirtualized kernel on bare hardware
+clocksource: Switched to clocksource tsc-early
+```
+
+and `/sys/.../current_clocksource` still read `tsc`.
+
+**Root cause:** three more layers, each of which looks like the whole
+problem while you are on it.
+
+*The hypervisor bit.* `KVM_GET_SUPPORTED_CPUID` returns KVM's signature
+leaves — `0x4000_0000` spells `KVMKVMKVM`, `0x4000_0001` lists the
+paravirt features — but leaves `CPUID.1:ECX[31]` clear, because whether
+to tell the guest it is virtualized is the VMM's call. The guest gates
+its entire paravirt path on that one bit: `init_hypervisor_platform`
+never runs, so nothing ever looks at the signature leaves and
+`kvmclock_init` returns before it registers anything. A VMM that copies
+supported CPUID through verbatim gets a guest that cannot see the
+hypervisor it is asking about.
+
+*The TSC wins on merit.* With the bit set the guest registers kvmclock
+and then declines to use it. On a host with an invariant TSC the guest
+rates kvm-clock 299 and tsc 300, reasoning that a counter which never
+stops needs no paravirt help. Sound for a VM that runs to completion,
+wrong for one that is snapshotted: a restored guest's TSC resumes at the
+value it was captured with, and there is no ioctl that re-bases it.
+`clocksource=kvm-clock` on the cmdline settles it.
+
+*Nothing was moving the clock.* `KVM_KVMCLOCK_CTRL` was already called
+after restore, which reads like the clock being handled. It is not — it
+sets the "guest stopped" flag in the pvclock page so the guest touches
+its watchdogs instead of reporting a soft lockup across the jump. No
+part of it changes a clock's value. kvmclock counts nanoseconds from the
+creation of the VM fd; a restore makes a new fd, so the restored guest's
+clock starts near zero while its timekeeping core still holds the value
+from before the capture. The restore has to hand the value back with
+`KVM_SET_CLOCK`, and hand back the captured reading **plus the wall time
+the snapshot spent at rest** — otherwise the clock is monotonic and
+wrong, which is the harder bug to see.
+
+**Measured before any of it:** a VM restored across a 5-second gap read
+7 seconds behind the host. The error is however long the snapshot sat
+there, so a warm-pool template forked hours after it was minted hands
+its sandbox a clock hours behind — with no RTC to correct it, and TLS
+certificate validation downstream. Nothing in the suite had ever asked a
+restored guest what time it was. After: 0s across cold boot, restore,
+cold fork, prepared source and warm fork.
+
+**Fix:** `CONFIG_HYPERVISOR_GUEST=y`; `CPUID.1:ECX[31]` set in
+`vm::patch_cpuid_for_kvm_guest` on both the boot and restore paths;
+`clocksource=kvm-clock`; `KVM_GET_CLOCK` into the snapshot next to a
+host `CLOCK_REALTIME` reading, and `KVM_SET_CLOCK` on restore
+(`fork::restore_kvmclock`). `k7d.now=` and the `init.sh` block that
+parsed it are gone — kvmclock delivers the wall clock through
+`MSR_KVM_WALL_CLOCK_NEW` before userspace exists, and survives the
+transitions a cmdline is never re-read across.
+
+**Two traps worth naming.** Advertising a paravirt feature in CPUID is a
+promise to snapshot it: async page faults, steal time and PV EOI each
+publish a guest physical address through a per-vCPU MSR, and a restore
+that drops the MSR leaves the guest reading a page the host has stopped
+writing. Leaf `0x4000_0001` is narrowed to the two kvmclock bits for
+that reason. And the MSR save list's "kvmclock" entries were half wrong:
+`0x4b564d03`/`04` are steal time and PV EOI, not the wall-clock pair —
+harmless while the guest had no kvmclock at all, which is exactly how a
+mislabel like that survives.
+
+**Unrelated finding, kept because it was measured:** `idle=poll` came in
+as the other half of `mitigations=off` for a VERW fault that
+`CONFIG_CPU_MITIGATIONS=n` has since fixed, so removing it looked free —
+boot-to-agent did not move. It is not free: the virtiofs write path went
+from a 1.20 ms mean to 1.7 ms and broke its 2 ms budget in 2 of 10 runs,
+because a halted guest has to be woken by an interrupt for every host
+round trip. It stays, with the price written down (100% of a host core
+per idle vCPU against 1%) and the way out specced in 19g.
+
+**Reference:** linux 6.12 `arch/x86/kernel/kvmclock.c`
+(`kvmclock_init`, the 299/300 ratings), `arch/x86/kernel/cpu/hypervisor.c`
+(`init_hypervisor_platform`), `Documentation/virt/kvm/api.rst`
+(`KVM_KVMCLOCK_CTRL`, `KVM_GET_CLOCK`/`KVM_SET_CLOCK`),
+`arch/x86/include/uapi/asm/kvm_para.h` (the MSR numbering).
+
+**Time lost:** ~4 hours, most of it on the two layers that fail quietly:
+a guest that logs "bare hardware" while running under KVM, and a
+restored clock that is monotonic, plausible and hours wrong.
+
+---
+
+## 74. Guest haltpoll starts at zero, shrinks to zero, and re-arms the PIT (spec 19g)
+
+**Symptom:** dropping `idle=poll` (100% of a host core per idle vCPU)
+pushed `test_latency_virtiofs_write` from a 1.20 ms mean to 1.7 ms and
+broke its 2 ms budget in 2 of 10 runs. Host `kvm.halt_poll_ns` — already
+on at 200 µs, and still 2 of 10 over budget when bumped to 2 ms — does
+not close the gap: it keeps the host thread from scheduling out after a
+vmexit, it does not remove the vmexit.
+
+**Root cause:** four layers, each of which looks like a working haltpoll
+governor until the next one is measured.
+
+1. **The driver does not install.** `cpuidle-haltpoll.c` only loads if
+   `KVM_HINTS_REALTIME` is advertised or `cpuidle_haltpoll.force=1` is
+   on the cmdline, and it refuses to load if any `idle=` override is
+   present. `patch_cpuid_for_kvm_guest` zeroes the EDX that hint lives
+   in on purpose (advertising a dedicated-host-CPU claim that is not
+   true). `force=1` is the gate; the hint stays off.
+2. **Vanilla `poll_limit_ns` starts at 0 and shrinks after a long idle.**
+   A warm-pool VM never sees a short idle, so the next request is a
+   plain HLT. Widening `guest_halt_poll_ns` does nothing until the
+   governor has grown to it.
+3. **`haltpoll_select` sets `stop_tick=false` on POLL**, re-arming the
+   PIT for the next scheduler tick. Each tick ends the poll, so a 2 ms
+   window is charged once per tick instead of once per real wakeup.
+4. **Even after leaving `stop_tick` true, leftover PIT IRQs at ~43 Hz
+   remain** (`noapic` → 8254, oneshot stop is weak). Idle cost ≈
+   43 Hz × 2 ms ≈ 8.6% of a host core — under the 10% budget, not the
+   ~1% of plain HLT.
+5. **The virtiofs write test's 1 s settle is many governor cycles past
+   the poll window.** Haltpoll only helps a request that arrives
+   *during* the poll after the previous wakeup. After 1 s the guest has
+   HLTed; a warmup then a timed write is the HLT+vmexit path (~1.9 ms,
+   flaky against 2 ms). 50 ms settle + two warmups puts the timed write
+   in the window and recovers the 1.16 ms idle=poll number.
+
+**Fix:** `CONFIG_CPU_IDLE` + haltpoll governor; `idle=poll` off;
+`cpuidle_haltpoll.force=1`; pin 2 ms and `allow_shrink=0`; seed
+`poll_limit_ns` at `guest_halt_poll_ns` and leave `stop_tick` true
+(`guest/kernel/build.sh` patches `haltpoll.c`); 50 ms settle + two
+warmups in `test_latency_virtiofs_write`. `test_idle_vcpu_is_cheap`
+asserts the vCPU thread stays under 10% of a host core over 5 s.
+
+**Reference:** linux 6.12 `drivers/cpuidle/cpuidle-haltpoll.c`
+(`haltpoll_want`), `drivers/cpuidle/governors/haltpoll.c`
+(`haltpoll_select`, `haltpoll_enable_device`).
+
+**Time lost:** ~4 hours, most of it on (2) and (5) looking like a
+window-size problem when the guest had already HLTed. A sixth layer
+showed up only in `make check`: `test_cluster_fork_warm_fork_tcp_works`
+timed out on `nc -w 5` when run after `test_cluster_fork_warm_batch_8`,
+and passed in isolation. The fork test never warmed ARP on the *fork*
+bridge (the source ping is a different L2 domain), so the first SYN
+paid neighbour discovery; haltpoll HLTs between execs and busybox nc
+burns its whole timeout on that SYN. Same trap `start_held_tcp_session`
+already documented. Fix: ping both ways on the forks, and keep stdin
+open on `nc -l` (CHALLENGES #28).
+
+---
+
+## 75. The workspace lock a dropped connection must not release, and the holder that read its own script from `/dev/null`
+
+**Symptom:** two remote runs against one node interleave — one rsyncs into
+`/root/k7d` while the other is compiling it — and the result is a suite that
+fails in a different place each time. It reads as flakiness, so it gets
+retried rather than fixed. `remote-run.sh` already serialised runs of the
+*same* name (reattach instead of restart); nothing serialised two runs of
+different names, and the scheduler's node lease is advisory — the launched
+job still takes its node IP from its own environment, so the interlock has
+to be on the node.
+
+**Root cause:** two, one after the other.
+
+1. **The lock cannot be held by the ssh session.** That is the whole design
+   of this script: a dropped connection is a viewer problem, not a run
+   problem. A lock held by the connection would release mid-build on exactly
+   the network blip the detach exists to survive. It also cannot be held by
+   the run process alone, because the rsync that must be excluded happens
+   *before* the run exists.
+2. **A detached process cannot be fed on stdin.** The holder was launched as
+   `nohup setsid --fork bash -s ... </dev/null` with the script on a
+   heredoc. `</dev/null` is what detaches it from the connection, and it is
+   the same stdin the script arrives on — so `bash -s` read the script from
+   `/dev/null`, did nothing and exited 0. Nothing failed. The lock was never
+   taken, and the waiter sat in its poll loop for the full 45-minute timeout
+   because "holder never launched" and "lock is busy" look identical from
+   the client.
+
+**Fix:** a detached node-side holder process owns the lock for the whole
+rsync+build window — written to a file first, then launched, the same
+two-step the run wrapper already used. The kernel releases the flock if that
+process dies, so a killed client cannot wedge the node. The holder exits when
+the run records an exit code, after a start grace if the run never appears,
+and after a hard maximum so a hung build cannot own the node forever. Giving
+up before the run starts (a failed rsync) releases immediately instead of
+waiting out the grace. And the holder touches a marker *before* blocking on
+the lock, so a launch failure is reported in seconds rather than looking like
+a busy node — the second bug was only cheap to find because the first
+symptom was a wait, not an error.
+
+**Reference:** none upstream; `flock(2)` releases on process death, which is
+the property the whole design rests on.
+
+**Time lost:** ~25 minutes, almost all of it on the `</dev/null`
+interaction, which produced no error on either side.
+
+---
+
+## 76. `--test-threads=1` does not serialize the test suite, only each binary
+
+**Symptom:** cutting 0.2.0, two of three full `make remote-check` runs failed
+exactly one test each with the same shape — a fork whose VM never answers:
+`Agent(Io(Os { code: 110, TimedOut }))` on the vsock connect. It was a
+*different* test each time (`test_fork_warm_under_50ms`, then
+`test_emptydir_tmpfs_shared_and_survives_fork`), the middle run was green at
+268/268, and each failing test binary passed on its own immediately after.
+The first failure looked like a fork regression: it reported the fork itself
+at 1.88 ms and then failed on reachability.
+
+**Root cause:** `--test-threads=1` bounds parallelism *within* one test
+binary. Cargo still runs different test *binaries* concurrently, and this
+suite has many, each booting VMs and claiming vsock CIDs. So the invariant
+we thought we had — one VM at a time on the node — never held across
+binaries, and a fork that lands while another binary is saturating the host
+can miss its agent-connect deadline. It reads as a fork regression because
+the failing assertion is in the fork test.
+
+**Fix:** none in this release — 0.2.0 ships on a green run, and every test in
+the suite passed. But at two failures in three runs this is not a rare flake
+to re-run past; it makes `remote-check` unreliable as a gate, which is worse
+than a slower gate. The fix is to stop relying on a flag that cannot express
+what we want: drive one test binary at a time (a `--test` target per `cargo
+test` invocation, serially, each still `--test-threads=1`), or take a
+node-side lock around VM-booting tests the way the workspace lock in #75
+serializes whole runs. Until that lands, a lone fork/vsock timeout in an
+otherwise green run should be re-run before it is believed — and if it moves
+to a different test on the re-run, it is this.
+
+**Reference:** none upstream — this is cargo's documented behaviour
+(`--test-threads` is passed to the libtest harness, which only ever sees one
+binary), just not the behaviour the flag's use here assumed.
+
+**Time lost:** ~10 minutes, and it would have been much more if the
+re-run had also failed and sent us into fork's agent-connect path.
 
 ---
 

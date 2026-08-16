@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.1.0
+# Version: 0.2.0
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"
@@ -39,7 +39,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz; do
+for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz runc.amd64; do
   if [[ ! -f "$HERE/$f" ]]; then
     echo "missing $HERE/$f — run from the extracted release tarball" >&2
     exit 1
@@ -55,6 +55,14 @@ echo "==> installing guest assets to $SHARE_DIR"
 install -d "$SHARE_DIR"
 install -m 644 "$HERE/vmlinux" "$SHARE_DIR/vmlinux"
 install -m 644 "$HERE/initramfs.cpio.gz" "$SHARE_DIR/initramfs.cpio.gz"
+
+# Shim tools-image lookup includes /opt/k7d/runc.amd64. Always
+# install there so a stock release works on nodes without a host runc;
+# also mirror under $SHARE_DIR for the tarball layout's completeness.
+echo "==> installing runc.amd64 to /opt/k7d and $SHARE_DIR"
+install -d /opt/k7d
+install -m 755 "$HERE/runc.amd64" /opt/k7d/runc.amd64
+install -m 755 "$HERE/runc.amd64" "$SHARE_DIR/runc.amd64"
 
 KERNEL="$SHARE_DIR/vmlinux"
 INITRD="$SHARE_DIR/initramfs.cpio.gz"

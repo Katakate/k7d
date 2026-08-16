@@ -53,7 +53,7 @@ pub const FORK_COLD: Duration = Duration::from_millis(600);
 pub const FORK_WARM: Duration = Duration::from_millis(50);
 
 // The warm-fork budget model lives in `crate::tree_model` as raw `u64`
-// nanoseconds (internal notes; internal notes`Duration`
+// nanoseconds (Group F target; `Duration` is avoided
 // there because Aeneas models it opaquely â€” the `fork_warm_budget_*_rust`
 // corollaries in `verif/Verif/Equiv/Transfer.lean` are proved against the
 // Aeneas translation of `fork_warm_budget_ns`). This is the one place the
@@ -79,33 +79,33 @@ pub fn fork_warm_budget(dirty_pages: u64) -> Duration {
 /// Fork agent reconnect (vsock connect to forked VM's new CID).
 pub const FORK_AGENT_RECONNECT: Duration = Duration::from_millis(5000);
 
-/// internal notes” warm fork of a 2-vCPU source ([`FORK_WARM`] + 25 ms).
+/// Warm fork of a 2-vCPU source ([`FORK_WARM`] + 25 ms).
 ///
 /// The extra headroom covers the second vCPU's capture (LAPIC + MSRs +
 /// XSAVE reads) and restore (create + full state ioctl sequence);
 /// deliberately generous at first â€” tighten after measuring.
 pub const FORK_WARM_2VCPU: Duration = Duration::from_millis(75);
 
-/// internal notes” `CoW` restore of a 2-vCPU snapshot ([`RESTORE_COW`] + 25 ms).
+/// `CoW` restore of a 2-vCPU snapshot ([`RESTORE_COW`] + 25 ms).
 pub const RESTORE_2VCPU: Duration = Duration::from_millis(35);
 
-/// Warm cluster fork of 3 VMs.
+/// Warm cluster fork of 3 VMs (headline number).
 ///
 /// Budget covers the on-host portion only â€” bridge clone + per-VM
 /// `add_tap_at` + per-VM warm fork. Excludes any k8s-API plumbing that
 /// would happen above this layer.
 ///
-/// internal notes's quiet-host target is ~25â€“40 ms; the ceiling is 150 ms to
+/// The quiet-host target is ~25â€“40 ms; the ceiling is 150 ms to
 /// absorb bare-metal scheduler/KVM-cache jitter (same class of variance that
 /// pushed the cluster-tree budgets to 750 ms). Still fails loud on real
 /// regressions (hundreds of ms).
 pub const FORK_CLUSTER_WARM_3VM: Duration = Duration::from_millis(150);
 
-/// internal notes” 3-VM cluster fork via the cluster snapshot tree.
+/// 3-VM cluster fork via the cluster snapshot tree.
 ///
-/// [`FORK_CLUSTER_WARM_3VM`] (50 ms â€” internal notes's bare primitive) plus
+/// [`FORK_CLUSTER_WARM_3VM`] (50 ms â€” the bare primitive) plus
 /// the tree's bookkeeping: `auto_evict_if_over` + `save_metadata` +
-/// `cluster.json` write + per-fork bitmap re-seed. internal notes"Latency
+/// `cluster.json` write + per-fork bitmap re-seed. Â§"Latency
 /// expectations" projects ~75 ms; we set the ceiling at 750 ms to
 /// match the run-after-other-tests variance we see for
 /// [`FORK_CLUSTER_WARM_3VM`] on the loaded bare-metal node (the
@@ -116,7 +116,7 @@ pub const FORK_CLUSTER_WARM_3VM: Duration = Duration::from_millis(150);
 /// between tests.
 pub const FORK_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 
-/// internal notes” shared-pause batch of 50Ã— 3-VM cluster-tree forks.
+/// Shared-pause batch of 50Ã— 3-VM cluster-tree forks.
 ///
 /// [`crate::fork::fork_cluster_warm_batch`] pauses the source once,
 /// builds 50 bridges sequentially (host `ip`/`iptables`), then
@@ -125,17 +125,17 @@ pub const FORK_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 /// Enforced by `test_cluster_tree_fork_batch_50`.
 pub const FORK_CLUSTER_TREE_BATCH_50: Duration = Duration::from_secs(20);
 
-/// internal notes” 8Ã— 3-VM bare `fork_cluster_warm_batch` (no tree).
+/// 8Ã— 3-VM bare `fork_cluster_warm_batch` (no tree).
 ///
 /// Must beat 8 Ã— [`FORK_CLUSTER_WARM_3VM`] so the shared-pause path is
 /// measurably better than N independent pauses under the same ceiling.
 pub const FORK_CLUSTER_WARM_BATCH_8: Duration = Duration::from_secs(2);
 
-/// internal notes/ 14a Inc 5 â€” warm-fork a live 3-VM inner-k3s
+/// Warm-fork a live 3-VM inner-k3s
 /// cluster via `TreeAdoptCluster` + `TreeFork`.
 ///
 /// Covers only the on-host `TreeFork` call (not adopt/prepare, not
-/// kubectl plumbing). internal notes
+/// kubectl plumbing). put the cluster pods on the
 /// block path (airgap RO hostPath â†’ cached erofs on virtio-blk, zero
 /// virtiofs shares), so every member forks `CoW` (`MAP_PRIVATE` of
 /// `base.mem` + dirty-page memcpy) instead of full-copying 3 Ã—
@@ -146,29 +146,29 @@ pub const FORK_CLUSTER_WARM_BATCH_8: Duration = Duration::from_secs(2);
 /// Enforced by `test_inner_k3s_cluster_warm_fork_no_restart`.
 pub const FORK_INNER_K3S_CLUSTER_3VM: Duration = Duration::from_millis(1_000);
 
-/// internal notes” 3-VM cluster suspend via the cluster snapshot tree.
+/// 3-VM cluster suspend via the cluster snapshot tree.
 ///
 /// Per-member pause + dirty bitmap capture + `delta.pack` write +
 /// state-json write, plus bridge teardown and `cluster.json` write.
-/// internal notes~25 ms; ceiling at 250 ms for the same
+/// Projects ~25 ms; ceiling at 250 ms for the same
 /// run-after-other-tests headroom as the fork budget.
 pub const SUSPEND_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 
-/// internal notes” 3-VM cluster resume via the cluster snapshot tree.
+/// 3-VM cluster resume via the cluster snapshot tree.
 ///
 /// Bridge re-create + per-member `add_tap_at` + `mmap(MAP_PRIVATE)` of
 /// each member's `base.mem` + per-member `apply_delta` + KVM rebuild
-/// from `vm_state.json`. internal notes~40 ms; ceiling at 750 ms.
+/// from `vm_state.json`. projects ~40 ms; ceiling at 750 ms.
 pub const RESUME_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 
-/// internal notes” pool-compatible `create_vm` served from the
-/// warm pool (mirrors Milestone 10's 100 ms ceiling): pop an idle
+/// Pool-compatible `create_vm` served from the
+/// warm pool (mirrors the 100 ms cold-boot ceiling): pop an idle
 /// agent-ready VM, registry insert, sandbox-record write, and one
 /// JSON-lines Unix-socket round trip. No boot, no fork â€” those happen
 /// off the request path in the pool's filler thread.
 pub const POOL_ACQUIRE: Duration = Duration::from_millis(100);
 
-/// internal notes” single-VM tree fork through the daemon
+/// Single-VM tree fork through the daemon
 /// control plane: [`FORK_WARM`] plus tree bookkeeping (metadata save,
 /// post-fork eviction check) plus one JSON-lines Unix-socket round
 /// trip. Ceiling carries the same busy-node headroom as the cluster
@@ -178,7 +178,7 @@ pub const DAEMON_TREE_FORK: Duration = Duration::from_millis(500);
 /// VM shutdown (signal vCPU thread + join).
 pub const VM_SHUTDOWN: Duration = Duration::from_millis(5);
 
-/// internal notes” per-pod kubelet-volume setup time.
+/// Chunk 2b.2 â€” per-pod kubelet-volume setup time.
 ///
 /// Bounds the host-side work [`crate::volumes::PodVolumes::prepare`]
 /// does at sandbox `Create`: enumerate the kubelet pod dir, classify
@@ -187,7 +187,7 @@ pub const VM_SHUTDOWN: Duration = Duration::from_millis(5);
 /// and happens inline in the shim's Create path so it adds directly
 /// to "time-to-pod-Ready" for any `runtimeClassName: k7` workload.
 ///
-/// internal notes's design budget is **80 ms**; on the bare-metal node a
+/// The design budget is **80 ms**; on the bare-metal node a
 /// typical pod with 3-4 kubelet volumes (configmap + projected
 /// kube-api-access + maybe a secret or emptyDir) finishes in
 /// **~25-40 ms** dominated by the per-volume `mount --bind` fork+
@@ -202,10 +202,10 @@ pub const VM_SHUTDOWN: Duration = Duration::from_millis(5);
 /// Create â€” different code path, smaller scope).
 pub const POD_VOLUMES_SETUP: Duration = Duration::from_millis(250);
 
-/// internal notes” time from shim `Create` returning to "pod is reachable
+/// Time from shim `Create` returning to "pod is reachable
 /// on its CNI-assigned pod IP from another pod on the cluster."
 ///
-/// Adds the spec-10a in-pod-netns work over the existing
+/// Adds the in-pod-netns work over the existing
 /// [`VM_BOOT_TO_AGENT`] cost: `move_link_to_netns`,
 /// `create_bridge_in_netns` (with two `ip link set master` enslaves
 /// and two `sysctl -w bridge-nf-call-*=0`), and `install_pod_nat`
@@ -213,7 +213,7 @@ pub const POD_VOLUMES_SETUP: Duration = Duration::from_millis(250);
 /// `nsenter`/`ip`, ~1 ms per `nsenter` fork; ceiling is 50 ms.
 pub const POD_NETWORK_READY: Duration = Duration::from_millis(50);
 
-/// internal notes, Milestone 4 â€” how long the host waits for a freshly
+/// How long the host waits for a freshly
 /// spawned `virtiofsd` to create its vhost-user socket before failing
 /// the VM build.
 ///

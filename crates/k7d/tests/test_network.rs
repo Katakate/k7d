@@ -1,4 +1,4 @@
-//! Integration test for Milestone 4: per-cluster bridge + virtio-net.
+//! Integration test: per-cluster bridge + virtio-net.
 //! Requires KVM, /dev/vhost-net, /dev/net/tun, built guest kernel with
 //! CONFIG_VIRTIO_NET=y, and built initramfs with `ifconfig`/`ip`.
 

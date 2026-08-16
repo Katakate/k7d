@@ -1,4 +1,4 @@
-//! Integration test for Milestone 9: Fork — CoW memory + reflink disk.
+//! Integration test: fork — CoW memory + reflink disk.
 //! Requires KVM, /dev/vhost-vsock, virtiofsd, built guest kernel, and built initramfs.
 
 use std::time::Duration;
@@ -331,7 +331,7 @@ fn test_fork_warm_batch_10() {
     source.shutdown();
 }
 
-/// internal notes: warm-fork a 2-vCPU source. The child sees 2 CPUs, memory
+/// Warm-fork a 2-vCPU source. The child sees 2 CPUs, memory
 /// independence holds, the source stays undisturbed, and both child
 /// vCPU kernel TIDs land in a per-VM CPU cgroup (all-N-TIDs coverage,
 /// the 17a `apply_cpu_cap` contract).

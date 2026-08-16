@@ -1,15 +1,15 @@
-//! internal notes: the warm VM pool.
+//! Integration test: the warm VM pool.
 //!
 //! Spawns the real `k7d` binary with `K7D_POOL_SIZE` set, waits for the
 //! background filler to pre-warm the pool, and proves:
 //! * a pool-compatible `create_vm` is served from the pool
 //!   (`pooled: true`) within [`k7d::latency::POOL_ACQUIRE`], with a
-//!   live agent and full increment-4 sandbox persistence;
+//!   live agent and full sandbox persistence;
 //! * the pool refills in the background after an acquire;
 //! * an incompatible request cold-boots (`pooled: false`) and still
 //!   works;
 //! * a daemon without `K7D_POOL_SIZE` has no pool and cold-boots
-//!   everything, exactly as before this increment.
+//!   everything, exactly as it did before the pool existed.
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -163,9 +163,9 @@ fn ping_agent(guest_cid: u64) {
     agent.ping().expect("agent ping");
 }
 
-/// internal notes: the pool pre-warms to target in the
+/// The pool pre-warms to target in the
 /// background, and a pool-compatible `create_vm` (carrying a
-/// sandbox_id — increment-4 persistence must work identically for
+/// sandbox_id — reattach persistence must work identically for
 /// pooled VMs) returns `pooled: true` within `POOL_ACQUIRE` with a
 /// live, agent-ready guest.
 #[test]
@@ -195,7 +195,7 @@ fn test_pool_fills_and_acquire_is_fast() {
     // The pooled VM is agent-ready right now — no boot wait.
     ping_agent(guest_cid);
 
-    // Increment-4 bookkeeping is identical to cold boot: on-disk
+    // Reattach bookkeeping is identical to cold boot: on-disk
     // record + lookup, both erased by stop_vm.
     let record_path = guard.sandbox_root.join(format!("{sandbox_id}.json"));
     assert!(
@@ -227,7 +227,7 @@ fn test_pool_fills_and_acquire_is_fast() {
     drop(guard);
 }
 
-/// internal notes: after an acquire the pool refills to target
+/// After an acquire the pool refills to target
 /// in the background, and the hit/miss counters are loud about what
 /// happened.
 #[test]
@@ -259,7 +259,7 @@ fn test_pool_refills_in_background() {
     drop(guard);
 }
 
-/// internal notes: a pool-incompatible request (different
+/// A pool-incompatible request (different
 /// memory size) bypasses the pool, cold-boots, still works — and the
 /// pool is untouched (idle count unchanged, miss counted).
 #[test]
@@ -286,7 +286,7 @@ fn test_pool_miss_falls_back_to_cold_boot() {
     drop(guard);
 }
 
-/// internal notes: a pool prefilled with `K7D_POOL_VCPUS=2` serves a
+/// A pool prefilled with `K7D_POOL_VCPUS=2` serves a
 /// `vcpus: 2` request from the pool and misses a `vcpus: 1` request;
 /// the default (1-vCPU) pool does the mirror image. The pooled 2-vCPU
 /// VM's guest must actually see 2 CPUs.
@@ -340,9 +340,9 @@ fn test_pool_multi_vcpu_config() {
     }
 }
 
-/// internal notes: without `K7D_POOL_SIZE` there is no pool —
+/// Without `K7D_POOL_SIZE` there is no pool —
 /// `pool_status` reports size 0 and `create_vm` cold-boots exactly as
-/// before this increment (no counters move, `pooled: false`).
+/// it did before the pool existed (no counters move, `pooled: false`).
 #[test]
 fn test_pool_disabled_by_default() {
     let _ = env_logger::builder().is_test(true).try_init();

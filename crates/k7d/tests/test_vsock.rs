@@ -1,4 +1,4 @@
-//! Integration test for Milestone 2: Guest agent + vsock communication.
+//! Integration test: guest agent + vsock communication.
 //! Requires KVM, /dev/vhost-vsock, built guest kernel, and built initramfs.
 
 use std::path::PathBuf;

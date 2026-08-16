@@ -310,7 +310,9 @@ fn test_latency_virtiofs_read() {
     let mut agent = vm
         .connect_agent(Duration::from_secs(90))
         .expect("should connect");
-    std::thread::sleep(Duration::from_secs(1));
+    // Same settle as the write test: long enough for the mount, short
+    // enough that haltpoll has not HLTed past its poll window.
+    std::thread::sleep(Duration::from_millis(50));
 
     agent.exec(&["cat", "/mnt/state/test.txt"]).unwrap();
 
@@ -338,10 +340,20 @@ fn test_latency_virtiofs_write() {
     let mut agent = vm
         .connect_agent(Duration::from_secs(90))
         .expect("should connect");
-    std::thread::sleep(Duration::from_secs(1));
+    // Guest haltpoll polls for `guest_halt_poll_ns` (200 µs)
+    // then HLT. A 1 s gap is many governor cycles past that window, so
+    // the timed write takes the HLT+vmexit path (~1.9 ms, flaky against
+    // the 2 ms budget). 50 ms is enough for the mount to finish coming
+    // up after `connect_agent`, and two warmups leave the next request
+    // inside the poll window of the previous wakeup (measured 1.14 ms
+    // mean / 1.26 ms max at 200 µs, 10/10).
+    std::thread::sleep(Duration::from_millis(50));
 
     agent
         .exec(&["sh", "-c", "echo warmup > /mnt/state/warmup.txt"])
+        .unwrap();
+    agent
+        .exec(&["sh", "-c", "echo warmup2 > /mnt/state/warmup2.txt"])
         .unwrap();
 
     let start = Instant::now();
@@ -363,7 +375,7 @@ fn test_latency_virtiofs_write() {
     vm.shutdown();
 }
 
-/// internal notes: `PodVolumes::prepare` must come in under
+/// Chunk 2b.2: `PodVolumes::prepare` must come in under
 /// [`latency::POD_VOLUMES_SETUP`] for a typical pod (handful of
 /// kubelet volumes).
 ///

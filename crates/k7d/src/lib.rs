@@ -1,4 +1,5 @@
 //! k7d — purpose-built VM runtime daemon.
+//! See for the full specification.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -10,7 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::cast_lossless)]
 
-// `tree_model` is the Aeneas / Charon translation surface for internal notes
+// `tree_model` is the Aeneas / Charon translation surface for. Under
 // `--features verif` everything else is gated out so Charon only sees the pure
 // subset.
 pub mod tree_model;
@@ -37,6 +38,8 @@ pub mod erofs;
 pub mod fork;
 #[cfg(not(feature = "verif"))]
 pub mod latency;
+#[cfg(not(feature = "verif"))]
+pub mod mem_layout;
 #[cfg(not(feature = "verif"))]
 pub mod mptable;
 #[cfg(not(feature = "verif"))]

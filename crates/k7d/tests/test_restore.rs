@@ -1,4 +1,4 @@
-//! Integration test for Milestone 8: CoW mmap restore.
+//! Integration test: CoW mmap restore.
 //! Requires KVM, /dev/vhost-vsock, built guest kernel, and built initramfs.
 
 use std::path::PathBuf;
@@ -197,7 +197,7 @@ fn test_restore_can_be_resnapshotted() {
     vm2.shutdown();
 }
 
-/// internal notes: a pre-17b on-disk snapshot — `cpu.json`
+/// Forward-compat: a legacy on-disk snapshot — `cpu.json`
 /// holding a single bare `CpuState` object (no `lapic`/`mp_state`
 /// fields) and the LAPIC stored VM-scoped in `irqchip.json` — still
 /// restores correctly. Synthesized by down-converting a fresh
@@ -210,7 +210,7 @@ fn test_legacy_snapshot_readable() {
 
     // Down-convert cpu.json: [state] → bare object without the 17b
     // per-vCPU fields, moving the LAPIC into irqchip.json's legacy
-    // VM-scoped slot (exactly what a pre-17b snapshot looks like).
+    // VM-scoped slot (exactly what a legacy snapshot looks like).
     let cpu_path = snapshot_dir.path().join("cpu.json");
     let cpu_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cpu_path).unwrap()).unwrap();

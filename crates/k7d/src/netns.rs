@@ -1,8 +1,8 @@
-//! Network-namespace primitives used by internal notes(CNI integration).
+//! Network-namespace primitives used by (CNI integration).
 //!
 //! Today the shim strips the network namespace from the OCI bundle and
 //! gives every VM an IP off our own per-cluster bridge — pods get no
-//! Kubernetes-routable IP. internal notes: the shim moves
+//! Kubernetes-routable IP. turns that around: the shim moves
 //! the VM's TAP into the CNI-assigned pod netns, sets up an in-netns
 //! bridge linking the CNI veth (`eth0`) to the TAP, and installs
 //! `pod_ip` ↔ `guest_ip` NAT inside the pod netns.
@@ -43,8 +43,8 @@
 //!   `setns` mutates the calling-thread state and would race every
 //!   other thread holding raw fds; `nsenter` forks a child for each
 //!   command, which is slower but isolates the namespace switch in a
-//!   short-lived process. internal notes"What to build" sketched a richer
-//!   `with_netns` combinator; we intentionally don't ship one because
+//!   short-lived process. A richer `with_netns` combinator would be
+//!   possible; we intentionally don't ship one because
 //!   we don't need it — every consumer of this module talks to the
 //!   pod netns from outside via `nsenter`.
 

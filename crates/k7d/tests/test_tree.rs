@@ -1,4 +1,4 @@
-//! Integration test for internal notes: snapshot tree.
+//! Integration test for part 2: snapshot tree.
 //! Requires KVM, /dev/vhost-vsock, built guest kernel + initramfs.
 
 use std::time::Duration;
@@ -245,7 +245,7 @@ fn test_tree_protection() {
     }
 }
 
-/// internal notes: checkpoint → fork → rollback a 2-vCPU VM through the
+/// Checkpoint → fork → rollback a 2-vCPU VM through the
 /// snapshot tree, plus suspend + resume. Every materialised VM must
 /// still see 2 CPUs (per-vCPU state travels through capture,
 /// delta.pack replay, and `build_vm_from_state_and_mem`).

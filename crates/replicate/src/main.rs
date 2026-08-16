@@ -13,5 +13,5 @@ mod sync;
 fn main() {
     env_logger::init();
     log::info!("k7-replicate starting");
-    todo!("Milestone 12: implement cross-node replication daemon");
+    todo!("implement cross-node replication daemon");
 }

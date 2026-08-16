@@ -14,7 +14,7 @@ WORKSPACE := ..
 # `tree_model`.
 # `-loops-to-rec` extracts every Rust `while` as a recursive `…_loop`
 # function (instead of the `Aeneas.Std.loop` combinator), which is the
-# shape the internal notes`Verif/Equiv/` recurse on
+# shape the equivalence proofs in `Verif/Equiv/` recurse on
 # (same style as the Aeneas tutorial / hashmap worked examples).
 gen:
 	cd $(WORKSPACE) && $(CHARON) cargo --preset=aeneas -- -p k7d --features verif --lib

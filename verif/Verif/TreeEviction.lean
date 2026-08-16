@@ -56,8 +56,7 @@ def ancestorWalk (t : TreeModel) : Nat → Option Nat → List Nat
 
 /-- Mirror of `tree_model::ancestor_ids`: the inclusive ancestor chain
 `[id, parent, …, root]`, fuel-bounded by `max_id().saturating_add(2)` —
-saturation-exact, like every mirror (internal notes"Representation
-gaps" item 2). -/
+saturation-exact, like every mirror. -/
 def ancestorIds (t : TreeModel) (id : Nat) : List Nat :=
   ancestorWalk t (satAdd U64_MAX (maxId t) 2) (some id)
 

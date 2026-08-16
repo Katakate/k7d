@@ -1,4 +1,4 @@
-//! Integration test for internal notes: warm cluster fork via per-cluster bridge.
+//! Integration test for: warm cluster fork via per-cluster bridge.
 //!
 //! Validates the topology-preservation contract: forking an N-VM cluster
 //! reproduces every member VM's `(guest_ip, guest_mac)` on a fresh bridge,
@@ -105,7 +105,7 @@ fn test_cluster_fork_warm_preserves_identity() {
     assert_ne!(fork_net.bridge_name(), src_net.bridge_name());
 
     // Source-side vsock untouched — TRANSPORT_RESET went into the forks
-    // only.
+    // only (correctness invariant carried over to cluster fork).
     let alive0 = s0_agent
         .exec(&["echo", "src0-still-here"])
         .expect("source vm0 alive");
@@ -139,7 +139,7 @@ fn test_cluster_fork_warm_preserves_identity() {
     drop(src_net);
 }
 
-/// internal notes: a mixed cluster — 3 VMs where one member has 2 vCPUs —
+/// A mixed cluster — 3 VMs where one member has 2 vCPUs —
 /// warm-forks with identity AND per-member CPU counts preserved.
 /// `fork_cluster_warm`'s shared pause + per-member capture loop must
 /// handle members with different vCPU counts.
@@ -388,7 +388,7 @@ fn tcp_oneshot(
     }
 }
 
-/// internal notes/ 9d TCP claim — source side:
+/// / 9d TCP claim — source side:
 /// 1. eth0 stays usable after `prepare_fork_source` (TapNetBackend seed);
 /// 2. a held TCP session opened *after* prepare survives `fork_cluster_warm`
 ///    without reconnect (prepare itself is a cold snapshot+restore blip;
@@ -485,7 +485,7 @@ fn test_cluster_fork_warm_source_tcp_undisturbed() {
     drop(src_net);
 }
 
-/// internal notes: forked VMs can open *new* TCP to each other on the
+/// Forked VMs can open *new* TCP to each other on the
 /// fork bridge using the preserved guest IPs (identity + data plane).
 #[test]
 fn test_cluster_fork_warm_fork_tcp_works() {
@@ -549,12 +549,41 @@ fn test_cluster_fork_warm_fork_tcp_works() {
         .connect_agent(Duration::from_secs(30))
         .expect("fork1 agent");
 
+    // Warm ARP on the fork bridge. The source ping above populated the
+    // *source* neighbour tables; the forks are a new L2 domain. Cold
+    // ARP plus haltpoll (the vCPU HLTs between execs) lets busybox
+    // `nc -w 5` burn its whole timeout on the first SYN — especially
+    // after `test_cluster_fork_warm_batch_8`. Same reason
+    // `start_held_tcp_session` pings first.
+    let ping_s = f0
+        .exec(&["ping", "-c", "1", "-W", "3", &vm1_ip.to_string()])
+        .expect("fork0 ping");
+    assert_eq!(
+        ping_s.exit_code, 0,
+        "fork0→fork1 ping failed: {}",
+        ping_s.stderr
+    );
+    let ping_c = f1
+        .exec(&["ping", "-c", "1", "-W", "3", &vm0_ip.to_string()])
+        .expect("fork1 ping");
+    assert_eq!(
+        ping_c.exit_code, 0,
+        "fork1→fork0 ping failed: {}",
+        ping_c.stderr
+    );
+
     // Fresh TCP on the fork bridge using the preserved IPs.
+    // Keep stdin open: `nc -l </dev/null` gets immediate EOF (CHALLENGES #28).
+    f0.write_file(
+        "/tmp/fork-listen.sh",
+        b"#!/bin/sh\ntrap '' HUP\nrm -f /tmp/fork-in\n: > /tmp/fork-in\nsleep 3600 | nc -l -p 9998 >> /tmp/fork-in\n",
+    )
+    .expect("write fork listen script");
     let listen = f0
         .exec(&[
             "sh",
             "-c",
-            "nc -l -p 9998 </dev/null > /tmp/fork-in 2>/dev/null & echo LISTENING",
+            "chmod +x /tmp/fork-listen.sh; /tmp/fork-listen.sh </dev/null >/dev/null 2>&1 & echo LISTENING",
         ])
         .expect("fork listener");
     assert!(
@@ -594,10 +623,10 @@ fn test_cluster_fork_warm_fork_tcp_works() {
     drop(src_net);
 }
 
-/// 3-VM warm cluster fork latency target.
+/// 3-VM warm cluster fork latency target (headline).
 ///
 /// Takes the minimum of `REPEATS` independently-prepared clusters
-/// rather than a single sample. internal notes's quiet-host target is
+/// rather than a single sample. The quiet-host target is
 /// ~25–40 ms; [`FORK_CLUSTER_WARM_3VM`] (150 ms) absorbs bare-metal
 /// scheduler/KVM-cache jitter. The best-of-N pattern still catches
 /// genuine regressions (a real regression breaks every sample, not
@@ -661,7 +690,7 @@ fn test_cluster_fork_warm_3vm_under_50ms() {
     );
 }
 
-/// internal notes� shared-pause `fork_cluster_warm_batch` for 8× 3-VM clusters.
+/// Shared-pause `fork_cluster_warm_batch` for 8× 3-VM clusters.
 ///
 /// One pause / capture, eight bridges, 24 members materialised in
 /// parallel. Must stay under [`FORK_CLUSTER_WARM_BATCH_8`] and beat

@@ -1,4 +1,4 @@
--- internal notes"What to build / 3.1" — equivalence for the leaf scans:
+-- Equivalence for the leaf scans:
 -- `find_index`, `contains_id`, `max_id`. Each is a single `while i < len`
 -- loop; the proofs are loop-invariant inductions on the generated
 -- `…_loop` functions (structural recursion on `len - i`, closed by

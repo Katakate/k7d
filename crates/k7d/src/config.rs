@@ -1,6 +1,6 @@
 //! Daemon configuration: warm-pool sizing read
 //! from the environment at daemon start. No config file yet — a TOML
-//! file can come with the 9a M11 deployment work.
+//! file can come with the deployment work.
 
 /// Resolve kernel/initrd paths from explicit values or the environment
 /// (`K7D_KERNEL` / `K7D_INITRD`) — loudly. Missing both is an error;

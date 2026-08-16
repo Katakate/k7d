@@ -1,4 +1,4 @@
--- internal notes"What to build / 3.3" — equivalence for the accounting
+-- Equivalence for the accounting
 -- group: `usage`, `ram_soft_limit`, `over_ram`, `over_count`,
 -- `over_disk`. The `usage` loop threads four accumulators; the invariant
 -- says the mirror `usageAux` on the *remaining* suffix, seeded with the

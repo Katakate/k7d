@@ -1,4 +1,4 @@
-//! Integration tests for internal notes: kubelet volumes off virtiofs.
+//! Integration tests for: kubelet volumes off virtiofs.
 //!
 //! - RO volumes (configmap/secret/downwardAPI/projected) packed into a
 //!   cached erofs image on virtio-blk, readable in the container at
@@ -39,7 +39,7 @@ fn workspace_path(relative: &str) -> PathBuf {
 const MARKER: &str = "volblk-rootfs-marker";
 
 /// Build a minimal busybox container rootfs at `dir` (same shape as
-/// the Inc 2 tests: /bin/busybox + applet symlinks + runtime dirs).
+/// the erofs tests: /bin/busybox + applet symlinks + runtime dirs).
 fn make_busybox_rootfs(dir: &Path) {
     for d in &[
         "bin", "proc", "dev", "tmp", "etc", "etc/app", "scratch", "data",
@@ -160,7 +160,7 @@ fn make_kubelet_volumes(root: &Path) -> PathBuf {
     volumes
 }
 
-/// Spec checklist item 1: the RO volume tree is packed to erofs,
+/// Checklist item 1: the RO volume tree is packed to erofs,
 /// mounted in the guest, its contents readable in the container at
 /// the kubelet-declared destination, and writes are rejected.
 #[test]
@@ -174,7 +174,7 @@ fn test_ro_volumes_erofs_in_container() {
         .expect("BlockVolumes::prepare");
     let ro_img = bv.ro_image.clone().expect("RO volumes must pack");
 
-    // Container rootfs as erofs on vda (Inc 2), volumes image on vdb.
+    // Container rootfs as erofs on vda, volumes image on vdb.
     let src = tempfile::tempdir().unwrap();
     make_busybox_rootfs(src.path());
     let dir = tempfile::tempdir().unwrap();
@@ -278,7 +278,7 @@ fn test_ro_volumes_erofs_in_container() {
     assert!(ro_img.exists());
 }
 
-/// Spec checklist item 2: emptyDir on guest tmpfs — two containers in
+/// Checklist item 2: emptyDir on guest tmpfs — two containers in
 /// one VM share it, contents survive a warm fork, and the fork stays
 /// on the CoW path (zero virtiofs shares anywhere).
 #[test]
@@ -410,7 +410,7 @@ fn test_emptydir_tmpfs_shared_and_survives_fork() {
     source.shutdown();
 }
 
-/// Spec checklist item 3: a writable raw ext4 image on the loopback
+/// Checklist item 3: a writable raw ext4 image on the loopback
 /// XFS — guest writes persist, `fork_warm` reflinks it (never a byte
 /// copy: `reflink_file` has no fallback), both VMs see independent
 /// copies, and the fork stays on the CoW memory path.
@@ -501,7 +501,7 @@ fn test_writable_image_on_loopback_xfs_reflink_fork() {
     assert_ne!(s.exit_code, 0, "source must not see the fork's write");
 
     // The reflinked clone lives next to the source image on the same
-    // XFS (FICLONE requires same-filesystem, internal notes).
+    // XFS (FICLONE requires same-filesystem).
     let clones: Vec<_> = std::fs::read_dir(disks::DISKS_DIR)
         .unwrap()
         .filter_map(Result::ok)
@@ -523,7 +523,7 @@ fn test_writable_image_on_loopback_xfs_reflink_fork() {
     let _ = std::fs::remove_file(&vol);
 }
 
-/// Spec checklist item 4: `prepare_fork_source` on a VM with a
+/// Checklist item 4: `prepare_fork_source` on a VM with a
 /// virtiofs share follows the explicit policy — loud error by
 /// default, full-memfd forks only after the caller's explicit
 /// slow-fork opt-in. No silent degradation.

@@ -15,7 +15,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::{create_serial_device_with_trigger, PipeSerialDevice, SerialTrigger};
 use crate::network::{ClusterNetwork, TapDevice, TapNetBackend};
-use crate::snapshot::{CpuState, SnapshotError, VmState};
+use crate::snapshot::{CpuState, KvmClockState, SnapshotError, VmState};
 use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, VirtioBackend};
 use crate::vm::{Vm, VmError};
 use crate::vsock::VhostVsockBackend;
@@ -66,7 +66,7 @@ pub enum ForkError {
     /// Reflink copy failed.
     #[error("reflink copy failed: {0}")]
     Reflink(String),
-    /// internal notes: the VM has virtiofs shares, which force every
+    /// The VM has virtiofs shares, which force every
     /// fork onto the slow full-memfd copy path, and the caller did not
     /// explicitly opt in via [`Vm::allow_slow_fork`].
     #[error(
@@ -86,7 +86,7 @@ pub enum ForkError {
 
 /// Fork a running VM into an independent copy.
 ///
-/// This is the core milestone 9 operation:
+/// This is the core fork operation:
 /// 1. Pause the source VM
 /// 2. Snapshot memory + CPU + device state
 /// 3. Reflink-copy the source's virtiofs state directory (if any) for the fork
@@ -240,7 +240,7 @@ fn restore_vm_inner(
     let start = std::time::Instant::now();
 
     let cpu_json = fs::read_to_string(snapshot_dir.join("cpu.json"))?;
-    // internal notes: cpu.json is an array (one entry per vCPU); pre-17b
+    // Cpu.json is an array (one entry per vCPU); older
     // snapshots hold a single bare object — accept both.
     let cpu_states: Vec<CpuState> =
         serde_json::from_str::<crate::snapshot::CpuStatesCompat>(&cpu_json)?.into();
@@ -248,7 +248,12 @@ fn restore_vm_inner(
     let metadata_json = fs::read_to_string(snapshot_dir.join("metadata.json"))?;
     let bundle: crate::snapshot::SnapshotMetadata = serde_json::from_str(&metadata_json)?;
 
+    // The snapshot records guest RAM; `memory.bin` and the host
+    // mapping cover the whole guest physical span (RAM + the 32-bit MMIO
+    // hole for guests with RAM past 4 GiB).
     let mem_size = bundle.memory_size_bytes;
+    let layout = crate::mem_layout::MemLayout::from_ram(mem_size);
+    let mem_span = layout.span();
     let kernel_path = PathBuf::from(&bundle.kernel_path);
     let initrd_path = bundle.initrd_path.as_ref().map(PathBuf::from);
 
@@ -259,20 +264,20 @@ fn restore_vm_inner(
         .write(true)
         .open(&mem_file_path)?;
     let actual_size = mem_file.metadata()?.len();
-    if actual_size != mem_size {
+    if actual_size != mem_span {
         return Err(RestoreError::InvalidSnapshot(format!(
-            "memory.bin is {actual_size} bytes, expected {mem_size}"
+            "memory.bin is {actual_size} bytes, expected {mem_span}"
         )));
     }
 
     // mmap with MAP_PRIVATE for CoW semantics. GuestMemoryMmap::from_ranges_with_files
     // uses MAP_SHARED which doesn't give us CoW and may behave differently for
     // page table pages. We manually mmap and register with KVM.
-    // SAFETY: mem_file is valid and mem_size matches the file size.
+    // SAFETY: mem_file is valid and mem_span matches the file size.
     let mem_ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            mem_size as usize,
+            mem_span as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_NORESERVE,
             mem_file.as_raw_fd(),
@@ -303,20 +308,23 @@ fn restore_vm_inner(
         .create_pit2(pit_config)
         .map_err(|e| RestoreError::Kvm(format!("create PIT2: {e}")))?;
 
-    // Register the GuestMemoryMmap's CoW-mapped memory with KVM.
-    let mem_region = kvm_userspace_memory_region {
-        slot: 0,
-        guest_phys_addr: 0,
-        memory_size: mem_size,
-        userspace_addr: mem_host_addr,
-        flags: 0,
-    };
-    // SAFETY: guest_memory owns the mmap and will outlive the VM; the region
-    // describes a contiguous MAP_PRIVATE mmap backed by memory.bin.
-    unsafe {
-        vm_fd
-            .set_user_memory_region(mem_region)
-            .map_err(|e| RestoreError::Kvm(format!("set user memory region: {e}")))?;
+    // Register the CoW-mapped RAM regions with KVM, leaving the 32-bit MMIO
+    // hole unmapped.
+    for (slot, gpa, size) in layout.slots() {
+        let mem_region = kvm_userspace_memory_region {
+            slot,
+            guest_phys_addr: gpa,
+            memory_size: size,
+            userspace_addr: mem_host_addr + gpa,
+            flags: 0,
+        };
+        // SAFETY: the mmap outlives the VM (freed via Vm::drop's cow_mmap_addr);
+        // the region describes a sub-range of that MAP_PRIVATE mapping.
+        unsafe {
+            vm_fd
+                .set_user_memory_region(mem_region)
+                .map_err(|e| RestoreError::Kvm(format!("set user memory region: {e}")))?;
+        }
     }
 
     // Create GuestMemoryMmap wrapping the existing mmap.
@@ -352,7 +360,13 @@ fn restore_vm_inner(
 
     // Create one vCPU per captured CpuState and restore each (CPUID →
     // SREGS → XCRS → XSAVE → REGS → LAPIC → MSRs → MP_STATE last).
-    let vcpu_fds = create_and_restore_vcpus(&kvm, &vm_fd, &cpu_states, irqchip_state.as_ref())?;
+    let vcpu_fds = create_and_restore_vcpus(
+        &kvm,
+        &vm_fd,
+        &cpu_states,
+        irqchip_state.as_ref(),
+        bundle.kvmclock.as_ref(),
+    )?;
 
     // Fresh CID by default (concurrent restores from one snapshot must
     // not collide). `forced_cid` reuses the source's
@@ -390,7 +404,7 @@ fn restore_vm_inner(
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
             let irq_evt = Arc::new(irq_evt);
 
-            let mut vsock_backend = VhostVsockBackend::new(new_cid, mem_host_addr, mem_size)
+            let mut vsock_backend = VhostVsockBackend::new(new_cid, mem_host_addr, mem_span)
                 .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
 
             // Pre-activate with saved queue state and correct vring base indices.
@@ -509,7 +523,7 @@ fn restore_vm_inner(
                 &cfg.host_path,
                 cfg.readonly,
                 mem_host_addr,
-                mem_size,
+                mem_span,
             )
             .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
             blk_backend.ack_features(dev_state.acked_features);
@@ -558,7 +572,7 @@ fn restore_vm_inner(
     // our MAP_PRIVATE mmap. The GuestMemoryMmap is only for snapshot dump_memory.
     let guest_memory = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[(
         vm_memory::GuestAddress(0),
-        mem_size as usize,
+        mem_span as usize,
     )])
     .map_err(|e| RestoreError::Kvm(format!("create guest memory: {e}")))?;
 
@@ -577,9 +591,9 @@ fn restore_vm_inner(
         if has_vsock { new_cid } else { 0 },
         // Restore intentionally does NOT re-spawn virtiofsd or
         // re-register virtio-fs MMIO devices for the snapshotted VM
-        // — pre-10b behaviour was `_virtiofsd: None` (and the
+        // — the original behaviour was `_virtiofsd: None` (and the
         // shim's caller spawns virtiofsd separately when needed via
-        // `set_fork_state_dir`). 10b's multi-share rework keeps that
+        // `set_fork_state_dir`). The multi-share rework keeps that
         // contract: an empty `Vec` is the multi-share equivalent of
         // the old `None`.
         Vec::new(),
@@ -596,12 +610,13 @@ fn restore_vm_inner(
 /// Per vCPU the fixed order is CPUID → SREGS → XCRS → XSAVE → REGS →
 /// LAPIC → MSRs → `MP_STATE` last, followed by `KVM_KVMCLOCK_CTRL`.
 /// VM-scoped IRQ chip state (IOAPIC / PIC / PIT) is applied during vCPU
-/// 0's restore, preserving the pre-17b single-vCPU ioctl sequence.
+/// 0's restore, preserving the legacy single-vCPU ioctl sequence.
 fn create_and_restore_vcpus(
     kvm: &Kvm,
     vm_fd: &kvm_ioctls::VmFd,
     cpu_states: &[CpuState],
     irqchip: Option<&crate::snapshot::IrqChipState>,
+    kvmclock: Option<&KvmClockState>,
 ) -> Result<Vec<VcpuFd>, RestoreError> {
     if cpu_states.is_empty() {
         return Err(RestoreError::InvalidSnapshot(
@@ -620,15 +635,84 @@ fn create_and_restore_vcpus(
             cpu_state,
             if i == 0 { irqchip } else { None },
         )?;
-        // KVM_KVMCLOCK_CTRL: tell KVM to reset the pvclock TSC stable bit.
+        // KVM_KVMCLOCK_CTRL marks the guest's pvclock page "guest
+        // stopped", which is how the guest learns to touch its
+        // watchdogs instead of reporting a soft lockup for the wall
+        // time it spent suspended. It only works once the guest has
+        // registered a pvclock page — the MSR restore just above — and
+        // returns EINVAL when it has not, which is the honest answer
+        // for a snapshot of a guest that never had kvmclock.
         let kvmclock_ctrl: libc::c_ulong = 0x0000_AE7D;
         // SAFETY: vcpu_fd is valid; KVM_KVMCLOCK_CTRL takes no args.
-        unsafe {
-            libc::ioctl(vcpu_fd.as_raw_fd(), kvmclock_ctrl);
+        if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), kvmclock_ctrl) } < 0 {
+            log::warn!(
+                "restore: KVM_KVMCLOCK_CTRL on vCPU {i}: {} — this guest has no \
+                 kvmclock page registered",
+                std::io::Error::last_os_error()
+            );
         }
         vcpu_fds.push(vcpu_fd);
     }
+    restore_kvmclock(vm_fd, kvmclock)?;
     Ok(vcpu_fds)
+}
+
+/// Put the restored VM's kvmclock back where the guest left it, plus
+/// the wall time the snapshot spent at rest.
+///
+/// kvmclock counts from the creation of the `kvm` VM fd, and a restore
+/// creates a new one — so the guest, which reads its clock through the
+/// pvclock page the host maintains, would resume at a few milliseconds
+/// past zero while its timekeeping core still holds the value from
+/// before the snapshot. That is a clock running backwards by the whole
+/// life of the source VM.
+///
+/// Handing back `clock_ns + at_rest` instead of just `clock_ns` is what
+/// makes the guest's wall clock *correct* rather than merely monotonic:
+/// the guest derived `CLOCK_REALTIME` once at boot from the kvmclock
+/// wall-clock page and has advanced it by this clock ever since, so a
+/// template restored an hour after it was minted otherwise wakes up an
+/// hour behind — and it has no RTC to notice with.
+///
+/// The forward jump is the same event as a host suspend, which is what
+/// the `KVM_KVMCLOCK_CTRL` above tells the guest to expect.
+fn restore_kvmclock(
+    vm_fd: &kvm_ioctls::VmFd,
+    kvmclock: Option<&KvmClockState>,
+) -> Result<(), RestoreError> {
+    let Some(state) = kvmclock else {
+        log::warn!(
+            "restore: snapshot carries no kvmclock reading (taken before the guest ran kvmclock); \
+             leaving the restored guest's clock where the capture left it"
+        );
+        return Ok(());
+    };
+    let now_ns = crate::snapshot::host_unix_nanos()
+        .map_err(|e| RestoreError::Kvm(format!("read host wall clock: {e}")))?;
+    if now_ns < state.host_unix_ns {
+        log::warn!(
+            "restore: host wall clock went backwards by {}ns since capture; \
+             resuming the guest clock without advancing it",
+            state.host_unix_ns - now_ns
+        );
+    }
+    let at_rest_ns = now_ns.saturating_sub(state.host_unix_ns);
+    let data = kvm_bindings::kvm_clock_data {
+        clock: state.clock_ns.saturating_add(at_rest_ns),
+        // Flags are an input only for KVM_CLOCK_REALTIME, which asks
+        // KVM to pair the value with a host TSC reading we do not have.
+        flags: 0,
+        ..Default::default()
+    };
+    vm_fd
+        .set_clock(&data)
+        .map_err(|e| RestoreError::Kvm(format!("KVM_SET_CLOCK: {e}")))?;
+    log::info!(
+        "restore: kvmclock resumed at {}ns ({}ms of wall time at rest)",
+        data.clock,
+        at_rest_ns / 1_000_000
+    );
+    Ok(())
 }
 
 /// Restore one vCPU's CPUID: from the snapshot when captured (exact CPU
@@ -665,6 +749,7 @@ fn restore_vcpu_cpuid(
         let mut kvm_cpuid = kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .map_err(|e| RestoreError::Kvm(format!("get CPUID: {e}")))?;
+        crate::vm::patch_cpuid_for_kvm_guest(&mut kvm_cpuid);
         if let crate::vm::CpuTopology::Smp(n) = crate::vm::CpuTopology::of(cpu_count) {
             crate::vm::patch_cpuid_for_vcpu(&mut kvm_cpuid, cpu_index, n);
         }
@@ -680,7 +765,7 @@ fn restore_vcpu_cpuid(
 /// Order: SREGS → XCRS → XSAVE → REGS → LAPIC → IOAPIC → MSRs → `MP_STATE` (last).
 ///
 /// The LAPIC comes from the per-vCPU [`CpuState::lapic`],
-/// falling back to the legacy VM-scoped `irqchip.lapic` for pre-17b
+/// falling back to the legacy VM-scoped `irqchip.lapic` for older
 /// snapshots. `irqchip` (IOAPIC / PIC / PIT — VM-scoped) must be passed
 /// for exactly one vCPU per VM.
 #[allow(clippy::too_many_lines)]
@@ -776,7 +861,7 @@ fn restore_cpu_state(
         .map_err(|e| RestoreError::Kvm(format!("KVM_SET_REGS: {e}")))?;
 
     // 4b. LAPIC — per-vCPU state, legacy VM-scoped fallback
-    // for pre-17b snapshots (which are single-vCPU by construction).
+    // for legacy snapshots (which are single-vCPU by construction).
     let lapic_bytes: &[u8] = if state.lapic.is_empty() {
         irqchip.map_or(&[], |irq| irq.lapic.as_slice())
     } else {
@@ -905,9 +990,9 @@ fn restore_cpu_state(
     // vcpu_events may contain stale exception state that causes #BR.
     // TODO: investigate which fields of vcpu_events are safe to restore on AMD.
 
-    // 6. MP_STATE must be LAST (zeroboot: "MUST be last"). internal notes:
+    // 6. MP_STATE must be LAST (zeroboot: "MUST be last"):
     // restore the captured per-vCPU value — an AP may legitimately be
-    // HALTED; making it RUNNABLE would have it execute garbage. Pre-17b
+    // HALTED; making it RUNNABLE would have it execute garbage. Legacy
     // snapshots (no mp_state) default to RUNNABLE, correct for the
     // single vCPU (the BSP) they contain.
     let mp_state = kvm_bindings::kvm_mp_state {
@@ -1065,7 +1150,9 @@ fn fork_memory_for_state(
     state: &VmState,
     fork_id: &str,
 ) -> Result<(u64, Option<fs::File>), ForkError> {
-    let mem_size = state.memory_size;
+    // The mapping, `base.mem` and the dirty bitmap all cover the guest
+    // physical span, not just RAM.
+    let mem_size = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
     // Virtio-blk queues must be quiescent before ANY memory capture: the
     // in-process worker drains + parks on pause (`Vm::pause` waits for it),
     // so this converges immediately in practice — it is the used==avail
@@ -1552,7 +1639,11 @@ fn build_vm_from_state_and_mem_inner(
     fork_mem_file: Option<fs::File>,
 ) -> Result<Vm, ForkError> {
     let start = std::time::Instant::now();
+    // `mem_size` is guest RAM; the mapping and every guest-physical bound
+    // covers the span (RAM + 32-bit MMIO hole) —.
     let mem_size = state.memory_size;
+    let layout = crate::mem_layout::MemLayout::from_ram(mem_size);
+    let mem_span = layout.span();
     let kernel_path = state.kernel_path.clone();
     let initrd_path = state.initrd_path.clone();
 
@@ -1594,35 +1685,44 @@ fn build_vm_from_state_and_mem_inner(
             .create_pit2(pit_config)
             .map_err(|e| RestoreError::Kvm(format!("create PIT2: {e}")))?;
 
-        let mem_region = kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: mem_size,
-            userspace_addr: fork_mem_addr,
-            flags: 0,
-        };
-        // SAFETY: fork_mem_addr is a MAP_PRIVATE region of mem_size bytes that
-        // outlives the VM (cleaned up on Vm::drop via cow_mmap_addr).
-        unsafe {
-            vm_fd
-                .set_user_memory_region(mem_region)
-                .map_err(|e| RestoreError::Kvm(format!("set user memory region: {e}")))?;
+        for (slot, gpa, size) in layout.slots() {
+            let mem_region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: gpa,
+                memory_size: size,
+                userspace_addr: fork_mem_addr + gpa,
+                flags: 0,
+            };
+            // SAFETY: fork_mem_addr is a mapping of `mem_span` bytes that
+            // outlives the VM (cleaned up on Vm::drop via cow_mmap_addr);
+            // each region is a sub-range of it.
+            unsafe {
+                vm_fd
+                    .set_user_memory_region(mem_region)
+                    .map_err(|e| RestoreError::Kvm(format!("set user memory region: {e}")))?;
+            }
         }
 
         // Create one vCPU per captured CpuState and restore each (CPUID
         // → SREGS → XCRS → XSAVE → REGS → LAPIC → MSRs → MP_STATE last,
-        // then KVM_KVMCLOCK_CTRL).
-        let vcpu_fds = create_and_restore_vcpus(&kvm, &vm_fd, &state.cpus, Some(&state.irqchip))?;
+        // then KVM_KVMCLOCK_CTRL and the VM-scoped kvmclock).
+        let vcpu_fds = create_and_restore_vcpus(
+            &kvm,
+            &vm_fd,
+            &state.cpus,
+            Some(&state.irqchip),
+            state.kvmclock.as_ref(),
+        )?;
 
         // Inject TRANSPORT_RESET into the FORK's memory only. The source is
         // undisturbed (unlike the cold fork path, which injects into the source
-        // before dumping memory). This is the key correctness fix of internal notes
+        // before dumping memory). This is the key correctness fix of.
         //
         // This MUST happen before vsock backend activation: the injection advances
         // the used ring's idx field, and activate_with_bases reads that idx to
         // program the vhost module's vring base. Doing it after activation would
         // leave the kernel with a stale base and the event would go unprocessed.
-        crate::snapshot::inject_vsock_transport_reset_into(mem_size, &state.devices, fork_mem_addr);
+        crate::snapshot::inject_vsock_transport_reset_into(mem_span, &state.devices, fork_mem_addr);
 
         // Allocate a new CID for the fork/resumed VM.
         let new_cid = crate::vsock::allocate_cid();
@@ -1654,7 +1754,7 @@ fn build_vm_from_state_and_mem_inner(
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
                 let irq_evt = Arc::new(irq_evt);
 
-                let mut vsock_backend = VhostVsockBackend::new(new_cid, fork_mem_addr, mem_size)
+                let mut vsock_backend = VhostVsockBackend::new(new_cid, fork_mem_addr, mem_span)
                     .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
 
                 let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
@@ -1811,7 +1911,7 @@ fn build_vm_from_state_and_mem_inner(
                     &socket_path,
                     &fs_tag,
                     fork_mem_addr,
-                    mem_size,
+                    mem_span,
                     mem_fd,
                 )
                 .map_err(|e| RestoreError::Kvm(format!("fs backend (tag={fs_tag}): {e}")))?;
@@ -1912,7 +2012,7 @@ fn build_vm_from_state_and_mem_inner(
                     &host_path,
                     cfg.readonly,
                     fork_mem_addr,
-                    mem_size,
+                    mem_span,
                 )
                 .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
                 blk_backend.ack_features(dev_state.acked_features);
@@ -1966,7 +2066,7 @@ fn build_vm_from_state_and_mem_inner(
 
         let guest_memory = vm_memory::GuestMemoryMmap::<()>::from_ranges(&[(
             vm_memory::GuestAddress(0),
-            mem_size as usize,
+            mem_span as usize,
         )])
         .map_err(|e| RestoreError::Kvm(format!("create guest memory: {e}")))?;
 
@@ -1983,7 +2083,7 @@ fn build_vm_from_state_and_mem_inner(
             agent_serial,
             mmio_registry,
             if has_vsock { new_cid } else { 0 },
-            // internal notes: virtiofs-backed forks carry their fresh
+            // Virtiofs-backed forks carry their fresh
             // virtiofsd children + share configs so the guest's FUSE
             // mounts stay live and the fork itself is re-forkable.
             // Empty for share-less VMs (the historical behaviour).
@@ -2004,9 +2104,9 @@ fn build_vm_from_state_and_mem_inner(
     })();
 
     if result.is_err() {
-        // SAFETY: fork_mem_addr came from mmap_base_mem_private with mem_size.
+        // SAFETY: fork_mem_addr came from mmap_base_mem_private with mem_span.
         unsafe {
-            libc::munmap(fork_mem_addr as *mut libc::c_void, mem_size as usize);
+            libc::munmap(fork_mem_addr as *mut libc::c_void, mem_span as usize);
         }
         if let Some(ref dir) = blk_fork_dir {
             let _ = fs::remove_dir_all(dir);

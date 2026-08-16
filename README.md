@@ -339,7 +339,7 @@ make verif-gen verif-build     # regenerate Lean model + prove it
 - [beci.me/blog](https://beci.me/blog) — a six-part write-up on how and why k7d was built, from the RL motivation to the formal verification
 - [`docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md`](docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md) — hardware, exact commands, methodology
 - [`CHALLENGES.md`](CHALLENGES.md) — 56 non-trivial bugs with root causes and time lost (the three above are the headline; start anywhere)
-- [`docs/architecture.md`](docs/architecture.md) / [`docs/concepts.md`](docs/concepts.md) — design notes for systems readers
+- [docs.katakate.org/k7d](https://docs.katakate.org/k7d) — architecture, concepts, daemon API, guides ([source](https://github.com/Katakate/docs/tree/main/k7d))
 - [`HACKING.md`](HACKING.md) — build, test, and the RuntimeClass install steps
 - [Katakate/k7](https://github.com/Katakate/k7) — sibling project: use k7d-class VM sandboxes at scale with Kubernetes orchestration, a CLI/API, and a Python SDK for your agents
 

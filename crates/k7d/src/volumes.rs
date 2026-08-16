@@ -1,4 +1,4 @@
-//! internal notes: kubelet-managed volume support.
+//! Kubelet-managed volume support.
 //!
 //! Translates kubelet's per-pod volume layout into a pair of
 //! virtiofs shares the VM can mount, plus a rewrite map the shim
@@ -68,7 +68,7 @@ const HOSTPATH_SOURCE_WAIT_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Root directory for our per-pod scratch trees on the host.
 ///
-/// Each pod gets `BASE/<pod-uid>/volumes-{ro,rw}/`. internal notes
+/// Each pod gets `BASE/<pod-uid>/volumes-{ro,rw}/`. picks
 /// `/var/lib/k7d/pods/` to match kubelet's `/var/lib/kubelet/pods/`
 /// convention.
 const HOST_PODS_BASE: &str = "/var/lib/k7d/pods";
@@ -81,7 +81,7 @@ const VM_MOUNT_RW: &str = "/mnt/pod-volumes-rw";
 
 /// Container-side destinations the shim's per-workload `Create`
 /// pass auto-bind-mounts from the host into the per-pod scratch
-/// tree. internal notes� these are the kubelet/CRI-generated
+/// tree..1 — these are the kubelet/CRI-generated
 /// system files every container expects to see (the chunk-2a
 /// kubelet-volume scan doesn't cover them because their sources
 /// aren't under `<pod-dir>/volumes/`):
@@ -92,7 +92,7 @@ const VM_MOUNT_RW: &str = "/mnt/pod-volumes-rw";
 ///   Critically, **without** `resolv.conf` in the guest, the
 ///   inner workload can't resolve any DNS name — including
 ///   `kubernetes.default.svc.cluster.local` (which is what the
-///   k3s-agent sidecar pattern from internal notes's design relies on
+///   k3s-agent sidecar pattern relies on
 ///   for joining the inner control plane).
 /// - `/etc/hosts` lives in the kubelet pod dir
 ///   (`/var/lib/kubelet/pods/<uid>/etc-hosts`) and carries the
@@ -122,8 +122,8 @@ pub const ETC_FILE_WHITELIST: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/et
 ///   as `local-volume` PVCs (k3s' default `local-path` storage
 ///   class, what every stateful workload uses) get silently
 ///   stripped — the user's container starts without `/data` and
-///   crashes, which is exactly the fail-silent anti-pattern spec
-///   10g forbids. Plugins that [`PodVolumes::prepare`] does
+///   crashes, which is exactly the fail-silent anti-pattern this
+///   crate forbids. Plugins that [`PodVolumes::prepare`] does
 ///   recognize (`configmap`, `secret`, `projected`, `downward-api`,
 ///   `empty-dir`) are already in the rewrite map, so
 ///   [`PodVolumes::add_hostpath_mounts_for_workload`] short-circuits
@@ -154,7 +154,7 @@ const CRI_INTERNAL_SOURCE_PREFIXES: &[&str] = &[
 /// of the `/var/lib/kubelet/pods/` CRI-internal prefix so the
 /// hostPath enumerator can bind them when [`PodVolumes::prepare`]
 /// did not handle the plugin. See the `CRI_INTERNAL_SOURCE_PREFIXES`
-/// docs for the spec-10h rationale.
+/// docs for the rationale.
 const KUBELET_PLUGIN_VOLUME_MARKER: &str = "/volumes/kubernetes.io~";
 
 #[derive(Debug, thiserror::Error)]
@@ -239,8 +239,8 @@ impl MountRewriteMap {
         None
     }
 
-    /// Merge every entry of `other` into this map (internal notes:
-    /// the shim unions the block-volume, etc-file, disk, and
+    /// Merge every entry of `other` into this map (the shim unions
+    /// the block-volume, etc-file, disk, and
     /// virtiofs-fallback maps into one before rewriting a workload's
     /// OCI spec). `other` wins on key collisions.
     pub fn merge(&mut self, other: &Self) {
@@ -317,7 +317,7 @@ pub struct PodVolumes {
     /// Host source → in-VM source map for OCI spec rewriting.
     pub rewrites: MountRewriteMap,
     /// In-VM mount roots the RO / RW shares land on. Default to the
-    /// legacy [`VM_MOUNT_RO`]/[`VM_MOUNT_RW`]; the spec-14a-Inc-4
+    /// legacy [`VM_MOUNT_RO`]/[`VM_MOUNT_RW`]; the newer
     /// shim overrides them ([`Self::with_vm_mounts`]) because
     /// `/mnt/pod-volumes-ro` is taken by the packed block-volumes
     /// erofs image on the block path.
@@ -413,7 +413,7 @@ impl PodVolumes {
     }
 
     /// Override the in-VM mount roots for the RO / RW shares
-    /// (internal notes: the shim's virtiofs-fallback shares must not
+    /// (the shim's virtiofs-fallback shares must not
     /// collide with the block-path mounts at the legacy roots). Call
     /// before any `add_*_for_workload` so rewrites use the new roots.
     #[must_use]
@@ -495,8 +495,8 @@ impl PodVolumes {
         Ok(())
     }
 
-    /// internal notes: extend the rewrite map with per-workload
-    /// whitelist binds for `/etc/{resolv.conf,hosts,hostname}`.
+    /// Extend the rewrite map with per-workload whitelist binds for
+    /// `/etc/{resolv.conf,hosts,hostname}`.
     ///
     /// Called once per workload `Create` (after the per-pod
     /// kubelet-volume scan that [`Self::prepare`] runs in
@@ -606,8 +606,8 @@ impl PodVolumes {
         Ok(())
     }
 
-    /// internal notes: bind-mount user-supplied `hostPath` volumes
-    /// into the per-pod scratch tree.
+    /// Bind-mount user-supplied `hostPath` volumes into the per-pod
+    /// scratch tree.
     ///
     /// Unlike `ConfigMap` / `Secret` / etc., `hostPath` volumes
     /// have no kubelet pre-materialization step — the user gives
@@ -813,7 +813,7 @@ pub struct HostPathMount {
 /// workload's OCI `mounts[]` — the entries
 /// [`PodVolumes::add_hostpath_mounts_for_workload`] would wire.
 ///
-/// Shared filter pipeline (internal notes: the shim's block path
+/// Shared filter pipeline (the shim's block path
 /// routes `readonly` results to cached erofs images and only the
 /// leftovers to the virtiofs fallback, so both consumers must agree
 /// on what counts as a hostPath mount): skips non-bind mounts,
@@ -872,7 +872,7 @@ pub fn hostpath_mounts_for_workload(
         // lands on disk. Poll for a short bounded window, then fail
         // loud — a silent skip here would let the pod reach Running
         // without a volume the user asked for (the exact fail-silent
-        // anti-pattern internal notes).
+        // anti-pattern removes).
         if !wait_for_source(&src) {
             return Err(VolumeError::MissingSource {
                 src,
@@ -957,7 +957,7 @@ fn bind_mount(src: &Path, dst: &Path) -> Result<(), VolumeError> {
 ///    under `/var/lib/rancher/k3s/storage/<pvc>/` — historical
 ///    placement used by older `local-path` versions and still by
 ///    some `hostPath` PVs.
-/// 2. **internal notes:** kubelet plugin volume materializations under
+/// 2. **:** kubelet plugin volume materializations under
 ///    `/var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~<plugin>/<name>`.
 ///    Plugins [`PodVolumes::prepare`] knows about (`configmap`,
 ///    `secret`, `projected`, `downward-api`, `empty-dir`) are
@@ -970,7 +970,7 @@ fn bind_mount(src: &Path, dst: &Path) -> Result<(), VolumeError> {
 ///    them. Without this carve-out the workload's `/data` (or
 ///    whatever destination) is silently dropped and the container
 ///    immediately crash-loops trying to write into a non-existent
-///    directory — exactly the fail-silent anti-pattern internal notes
+///    directory — exactly the fail-silent anti-pattern this crate
 ///    forbids.
 fn is_cri_internal_source(src: &Path) -> bool {
     let s = src.to_string_lossy();
@@ -1251,7 +1251,7 @@ mod tests {
 
     #[test]
     fn cri_internal_source_lets_kubelet_plugin_volumes_through() {
-        // internal notes: kubelet plugin volume materializations
+        // Root cause: kubelet plugin volume materializations
         // under `/var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~<plugin>/<name>`
         // are user-facing volumes, NOT CRI runtime state. Plugins
         // `PodVolumes::prepare` handles (configmap, secret, projected,
@@ -1500,7 +1500,7 @@ mod tests {
 
     #[test]
     fn add_hostpath_kubelet_plugin_volume_falls_through_to_bind() {
-        // internal notes: a kubelet plugin volume that
+        // Regression guard: a kubelet plugin volume that
         // `prepare()` did NOT enumerate (the most common real-world
         // example is `local-volume`, k3s' default `local-path`
         // storage class) must be picked up by the hostPath
@@ -1565,7 +1565,7 @@ mod tests {
         // plugin volume, a second pass must be an idempotent skip
         // — not a bind retry, not a fail-loud Err. Locks in the
         // ordering invariant that `rewrites.translate` short-
-        // circuits known plugins before the new spec-10h carve-out
+        // circuits known plugins before the new carve-out
         // in `is_cri_internal_source` is even consulted.
         let tmp = unique_test_dir();
         let mut pv = pod_volumes_at(&tmp);

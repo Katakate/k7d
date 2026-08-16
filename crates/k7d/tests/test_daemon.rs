@@ -1,4 +1,4 @@
-//! internal notes: the k7d daemon control plane.
+//! The k7d daemon control plane.
 //!
 //! Spawns the real `k7d` binary as a separate process, boots VMs
 //! through its Unix-socket control plane, then — crucially — connects
@@ -6,7 +6,7 @@
 //! proving the daemon-owns-VM / client-talks-to-agent-directly seam
 //! that the shim relies on (vsock CIDs are kernel-global).
 //!
-//! Increment 2 adds daemon-owned networking: `create_vm` with a
+//! Daemon-owned networking: `create_vm` with a
 //! `NetConfig` joins a refcounted shared cluster bridge, and the
 //! bridge only disappears when the *last* VM on it stops (the shim-era
 //! shared-bridge teardown race).
@@ -191,7 +191,7 @@ fn test_daemon_vm_lifecycle_and_cross_process_agent() {
     drop(guard);
 }
 
-/// internal notes: two VMs sharing one cluster bridge. The
+/// Two VMs sharing one cluster bridge. The
 /// bridge must survive the first VM's stop (refcount) and disappear
 /// with the second — the exact shared-bridge teardown race the daemon
 /// exists to fix (with per-shim ownership, the first pod deleted
@@ -287,9 +287,9 @@ fn guest_exec(cid: u64, argv: &[&str]) -> String {
     out.stdout.trim().to_string()
 }
 
-/// internal notes: `fork_vm` — warm-fork a plain daemon VM. The
+/// `fork_vm` — warm-fork a plain daemon VM. The
 /// first fork prepares the source (swaps it for a restored fork-ready
-/// copy on the SAME vsock CID — internal notes); both source and fork
+/// copy on the SAME vsock CID —); both source and fork
 /// must be independently reachable afterwards.
 #[test]
 fn test_daemon_fork_vm() {
@@ -304,6 +304,7 @@ fn test_daemon_fork_vm() {
         &guard,
         &Request::ForkVm {
             vm_id: src_id.clone(),
+            sandbox_id: None,
         },
     ) {
         Response::VmForked {
@@ -317,7 +318,7 @@ fn test_daemon_fork_vm() {
     assert_eq!(
         src_cid, orig_cid,
         "prepare must preserve the source's CID across the restore swap \
-        "
+         (the pod's shim caches it)"
     );
 
     // Both VMs answer on their (new) CIDs.
@@ -343,7 +344,7 @@ fn test_daemon_fork_vm() {
     drop(guard);
 }
 
-/// internal notes: the single-VM snapshot tree lifecycle over
+/// The single-VM snapshot tree lifecycle over
 /// the control plane — create, fork (CoW independence proven through
 /// guest state), suspend, resume (state survives, CID changes), prune,
 /// drop. Runs against the real `k7d` binary in another process.
@@ -513,7 +514,7 @@ fn test_daemon_tree_lifecycle() {
     drop(guard);
 }
 
-/// internal notes: control-plane RL verbs — `tree_fork_batch`, `tree_rollback`,
+/// Control-plane RL verbs — `tree_fork_batch`, `tree_rollback`,
 /// `tree_protect` / `tree_unprotect`. Smoke against the real daemon binary.
 #[test]
 fn test_daemon_tree_rl_verbs() {
@@ -660,7 +661,7 @@ fn test_daemon_tree_rl_verbs() {
     drop(guard);
 }
 
-/// internal notes: cluster snapshot tree over the control plane
+/// Cluster snapshot tree over the control plane
 /// — a 2-member cluster forks as one unit and every member of source
 /// and fork stays independently reachable over vsock.
 #[test]
@@ -755,7 +756,7 @@ fn test_daemon_cluster_tree_fork() {
     drop(guard);
 }
 
-/// internal notes: `tree_adopt_cluster` — live sandbox VMs on one
+/// `tree_adopt_cluster` — live sandbox VMs on one
 /// shared bridge become a cluster-tree root that can fork; validation
 /// failures leave the registry untouched.
 #[test]
@@ -861,7 +862,7 @@ fn test_daemon_tree_adopt_cluster() {
     drop(guard);
 }
 
-/// internal notes: a sandbox-carrying `create_vm` persists an
+/// A sandbox-carrying `create_vm` persists an
 /// atomic reattach record, `lookup_sandbox` / `reattach_sandbox`
 /// resolve it while the VM lives, and `stop_vm` erases both the index
 /// entry and the file so a reattach after intentional delete fails
@@ -977,7 +978,7 @@ fn test_daemon_sandbox_persist_and_lookup() {
     drop(guard);
 }
 
-/// internal notes: a multi-vCPU sandbox create persists `vcpus` (and the CFS
+/// A multi-vCPU sandbox create persists `vcpus` (and the CFS
 /// cap) on the reattach record and surfaces the count via
 /// `lookup_sandbox` — crash-recovery metadata must not silently assume
 /// 1 vCPU on the annotation/kubectl route.
@@ -1003,7 +1004,7 @@ fn test_daemon_sandbox_record_carries_vcpus() {
     assert_eq!(record.cpu_quota, Some(200_000));
     assert_eq!(record.cpu_period, Some(100_000));
 
-    // Pre-17c records without the field still deserialize as 1 vCPU.
+    // Legacy records without the field still deserialize as 1 vCPU.
     let legacy = r#"{"sandbox_id":"x","vm_id":"y","guest_cid":1,"created_at_unix":1}"#;
     let legacy_rec: k7d::control::SandboxRecord =
         serde_json::from_str(legacy).expect("legacy record");
@@ -1031,7 +1032,7 @@ fn test_daemon_sandbox_record_carries_vcpus() {
     drop(guard);
 }
 
-/// internal notes: `reattach_sandbox` must not resurrect a dead
+/// `reattach_sandbox` must not resurrect a dead
 /// VM from JSON alone. A stale record (its VM died with a previous
 /// daemon) is garbage-collected by the reattach that trips over it —
 /// and a daemon restart's startup scan sweeps whatever records remain.

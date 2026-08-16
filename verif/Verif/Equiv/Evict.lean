@@ -1,4 +1,4 @@
--- internal notes"What to build / 3.6" — equivalence for the Tier-1 RAM
+-- Equivalence for the Tier-1 RAM
 -- eviction loop `auto_evict_ram`. Composes the accounting (3.3) and LRU
 -- (3.5) equivalences; the loop recurses on the fuel scalar.
 --

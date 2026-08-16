@@ -1,4 +1,4 @@
--- internal notes” equivalence for Group F: the Aeneas translation
+-- Equivalence for Group F: the Aeneas translation
 -- of `tree_model::fork_warm_budget_ns` computes the saturation-exact
 -- mirror `Verif.Latency.forkWarmBudgetNs`. Straight-line arithmetic
 -- (division by the nonzero per-page constant, one overflow guard, one

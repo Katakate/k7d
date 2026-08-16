@@ -1,0 +1,36 @@
+--- a/drivers/cpuidle/governors/haltpoll.c
++++ b/drivers/cpuidle/governors/haltpoll.c
+@@ -72,16 +72,19 @@ static int haltpoll_select(struct cpuidle_driver *drv,
+ 	if (dev->poll_limit_ns == 0)
+ 		return 1;
+ 
+ 	/* Last state was poll? */
+ 	if (dev->last_state_idx == 0) {
+ 		/* Halt if no event occurred on poll window */
+ 		if (dev->poll_time_limit == true)
+ 			return 1;
+ 
+-		*stop_tick = false;
+ 		/* Otherwise, poll again */
++		/* k7d: leave stop_tick true. Poll uses
++		 * local_clock, not the scheduler tick; re-arming the
++		 * PIT here is what charged 8% of a host core. */
+ 		return 0;
+ 	}
+ 
+-	*stop_tick = false;
+ 	/* Last state was halt: poll */
+ 	return 0;
+ }
+@@ -133,7 +136,10 @@ static void haltpoll_reflect(struct cpuidle_device *dev, int index)
+ static int haltpoll_enable_device(struct cpuidle_driver *drv,
+ 				  struct cpuidle_device *dev)
+ {
+-	dev->poll_limit_ns = 0;
++	/* k7d: vanilla starts at 0 and only grows after a
++	 * short idle. A warm-pool VM never sees one, so the next
++	 * request is a plain HLT. Seed the configured window. */
++	dev->poll_limit_ns = guest_halt_poll_ns;
+ 
+ 	return 0;
+ }

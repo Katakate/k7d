@@ -46,7 +46,7 @@ enum Request {
         id: String,
         args: Vec<String>,
     },
-    /// internal notes: interactive PTY exec. Handled by the connection loop
+    /// Interactive PTY exec. Handled by the connection loop
     /// (not `handle_request`) — after the handshake the connection is
     /// consumed by [`exec::run_pty_session`] for streaming.
     #[serde(rename = "container_exec_pty")]
@@ -74,7 +74,7 @@ enum Request {
     },
     #[serde(rename = "container_wait")]
     ContainerWait { name: String },
-    /// internal notes: non-blocking exit probe. The shim's per-container
+    /// Non-blocking exit probe. The shim's per-container
     /// exit watcher polls this over its own vsock connection (the
     /// blocking `container_wait` would outlive the client's 30s read
     /// deadline for any long-running container).
@@ -82,7 +82,13 @@ enum Request {
     ContainerWaitPoll { name: String },
     #[serde(rename = "container_signal")]
     ContainerSignal { name: String, signal: i32 },
-    /// internal notes: mount a virtio-blk device whose backing file
+    /// How much writable space this container is using, and
+    /// out of what capacity. Measured in the guest because the host
+    /// sees only the sparse image's allocated blocks, which never
+    /// shrink on delete and say nothing per container.
+    #[serde(rename = "container_usage")]
+    ContainerUsage { name: String },
+    /// Mount a virtio-blk device whose backing file
     /// the host filled AFTER boot (spare image slot). `BLKFLSBUF`
     /// first — the kernel partition-scanned a few sectors of the
     /// then-empty device at probe time and those stale cached pages
@@ -154,6 +160,15 @@ enum Response {
     },
     #[serde(rename = "container_signal_result")]
     ContainerSignalResult { ok: bool, error: String },
+    #[serde(rename = "container_usage_result")]
+    ContainerUsageResult {
+        ok: bool,
+        used_bytes: u64,
+        capacity_bytes: u64,
+        /// The capacity is this container's alone, i.e. a real limit.
+        dedicated: bool,
+        error: String,
+    },
     #[serde(rename = "mount_blk_result")]
     MountBlkResult { ok: bool, error: String },
 }
@@ -401,6 +416,22 @@ fn handle_request(req: Request, containers: &ContainerManager) -> Response {
                 error: e,
             },
         },
+        Request::ContainerUsage { name } => match containers.usage(&name) {
+            Ok(u) => Response::ContainerUsageResult {
+                ok: true,
+                used_bytes: u.used_bytes,
+                capacity_bytes: u.capacity_bytes,
+                dedicated: u.dedicated,
+                error: String::new(),
+            },
+            Err(e) => Response::ContainerUsageResult {
+                ok: false,
+                used_bytes: 0,
+                capacity_bytes: 0,
+                dedicated: false,
+                error: e,
+            },
+        },
         Request::MountBlk {
             device,
             fstype,
@@ -503,7 +534,7 @@ where
                 continue;
             }
         };
-        // internal notes: a PTY exec handshake switches this connection into
+        // A PTY exec handshake switches this connection into
         // streaming mode — the session consumes reader and writer.
         if let Request::ContainerExecPty {
             name,
@@ -612,7 +643,7 @@ fn run_serial_listener(containers: &ContainerManager) -> std::io::Result<()> {
 
 /// Parsed virtiofs share spec from the `k7d.virtiofs=` kernel cmdline param.
 ///
-/// internal notes(see `crates/k7d/src/vm.rs` build loop):
+/// Host-side encoding (see `crates/k7d/src/vm.rs` build loop):
 /// `k7d.virtiofs=<tag>:<mount>:<ro|rw>,<tag>:<mount>:<ro|rw>,…`
 struct VirtiofsShareSpec {
     tag: String,
@@ -622,7 +653,7 @@ struct VirtiofsShareSpec {
 
 /// Pull the `k7d.virtiofs=` param out of `cmdline` and return the
 /// parsed shares. Returns `None` if the param is absent (legacy
-/// pre-10b host).
+/// host).
 fn parse_virtiofs_shares(cmdline: &str) -> Option<Vec<VirtiofsShareSpec>> {
     let raw = cmdline
         .split_ascii_whitespace()
@@ -682,7 +713,7 @@ fn mount_one_virtiofs_share(share: &VirtiofsShareSpec) {
 }
 
 fn try_mount_virtiofs() {
-    // internal notes: prefer the explicit `k7d.virtiofs=` cmdline param,
+    // Prefer the explicit `k7d.virtiofs=` cmdline param,
     // which carries per-share (tag, mount, ro/rw) triples. Fall back
     // to the historical hardcoded single-share `mount -t virtiofs
     // k7fs /mnt/state` when the param is absent (= legacy host or
@@ -700,7 +731,7 @@ fn try_mount_virtiofs() {
     }
 
     // Legacy fallback: single share tagged `k7fs` mounted r/w at
-    // `/mnt/state`. Matches what the pre-10b host's single-share
+    // `/mnt/state`. Matches what the legacy host's single-share
     // build path expected.
     let _ = fs::create_dir_all("/mnt/state");
     let result = Command::new("mount")
@@ -727,9 +758,9 @@ fn try_mount_virtiofs() {
 /// param, mirroring `k7d.virtiofs=`:
 /// `k7d.blk=<dev>:<mount>:<fstype>:<ro|rw>,…` where `<dev>` is the
 /// guest device name (`vda`, `vdb`, …) in declaration order.
-struct BlkMountSpec {
+pub(crate) struct BlkMountSpec {
     dev: String,
-    mount: String,
+    pub(crate) mount: String,
     fstype: String,
     readonly: bool,
 }
@@ -737,7 +768,12 @@ struct BlkMountSpec {
 /// Pull the `k7d.blk=` param out of `cmdline` and return the parsed
 /// mounts. Returns `None` if the param is absent (no agent-mounted
 /// block devices configured).
-fn parse_blk_mounts(cmdline: &str) -> Option<Vec<BlkMountSpec>> {
+///
+/// Also reads this from [`crate::container`]: the presence of
+/// a mount at the scratch mount point is the host's *promise* of a
+/// host-backed writable layer, which turns a missing mount into a hard
+/// error instead of a silent RAM-backed fallback.
+pub(crate) fn parse_blk_mounts(cmdline: &str) -> Option<Vec<BlkMountSpec>> {
     let raw = cmdline
         .split_ascii_whitespace()
         .find_map(|tok| tok.strip_prefix("k7d.blk="))?;
@@ -814,8 +850,8 @@ fn mount_one_blk(spec: &BlkMountSpec) {
 }
 
 /// Pull the `k7d.mkdir=` param out of `cmdline` and return the
-/// comma-separated absolute directories to create (internal notes�
-/// guest tmpfs directories for emptyDir volumes). Returns `None` if
+/// comma-separated absolute directories to create (guest tmpfs
+/// directories for emptyDir volumes). Returns `None` if
 /// the param is absent. Relative entries are skipped loudly at
 /// creation time, matching the host-side builder validation.
 fn parse_mkdir_dirs(cmdline: &str) -> Option<Vec<String>> {
@@ -833,7 +869,7 @@ fn parse_mkdir_dirs(cmdline: &str) -> Option<Vec<String>> {
 /// Create every directory listed in `k7d.mkdir=` before containers
 /// start. The guest rootfs is the initramfs tmpfs, so these are
 /// RAM-backed directories that fork with the memory `CoW` for free —
-/// internal notes
+/// Uses them as emptyDir volume backing.
 fn try_mkdir_dirs() {
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let Some(dirs) = parse_mkdir_dirs(&cmdline) else {

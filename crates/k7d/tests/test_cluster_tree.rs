@@ -59,7 +59,7 @@ fn cluster_tree_budget() -> TreeBudget {
     }
 }
 
-/// internal notes"Integration tests" — cluster fork preserves topology and
+/// Cluster fork preserves topology and
 /// is independent from the source.
 #[test]
 fn test_cluster_tree_fork_preserves_topology() {
@@ -87,8 +87,8 @@ fn test_cluster_tree_fork_preserves_topology() {
     assert_eq!(a_info.state, NodeState::Live);
 
     // Forked cluster lives on a different bridge with the SAME per-VM
-    // (vm_index, guest_ip, guest_mac) tuples — that's the contract spec
-    // 9d's fork_cluster_warm provides and that this tree node inherits.
+    // (vm_index, guest_ip, guest_mac) tuples — that's the contract
+    // `fork_cluster_warm` provides and that this tree node inherits.
     let fork_payload = tree.get_payload(&a).expect("branch-a payload");
     assert_ne!(
         fork_payload.network.bridge_name(),
@@ -116,7 +116,7 @@ fn test_cluster_tree_fork_preserves_topology() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// internal notes"Integration tests" — suspend / resume round-trip rebuilds
+/// Suspend / resume round-trip rebuilds
 /// the bridge with the same per-VM identity tuples. Doubles as the
 /// budget assertion for `SUSPEND_CLUSTER_TREE_3VM` /
 /// `RESUME_CLUSTER_TREE_3VM` (uses 2 VMs to keep total wall-clock
@@ -179,7 +179,7 @@ fn test_cluster_tree_suspend_resume_preserves_topology() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// internal notes� shared-pause batch scales to 50× 3-VM cluster forks.
+/// Shared-pause batch scales to 50× 3-VM cluster forks.
 ///
 /// Asserts CoW on every member, distinct bridges, and wall-clock under
 /// [`k7d::latency::FORK_CLUSTER_TREE_BATCH_50`]. Also requires the batch
@@ -246,8 +246,8 @@ fn test_cluster_tree_fork_batch_50() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// internal notes"Latency expectations" — 3-VM cluster fork ≤ 75 ms (50 ms
-/// for internal notes's fork_cluster_warm + ~25 ms tree bookkeeping).
+/// 3-VM cluster fork ≤ 75 ms (50 ms
+/// for fork_cluster_warm + ~25 ms tree bookkeeping).
 #[test]
 fn test_cluster_tree_fork_under_75ms() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -272,7 +272,7 @@ fn test_cluster_tree_fork_under_75ms() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// internal notes"Eviction policy edge cases" — auto-evict accounts for
+/// Auto-evict accounts for
 /// `vm_count` against `max_live_vms`. Budget fits 2 of 3 cluster nodes
 /// at 3 VMs each (=6 underlying VMs); forking a third triggers
 /// auto-evict on the LRU cluster node.
@@ -309,7 +309,7 @@ fn test_cluster_tree_auto_evict_lru() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// internal notes"Integration tests" — persistence round-trip:
+/// Persistence round-trip:
 /// open a tree from disk and observe the right node states + vm_count.
 #[test]
 fn test_cluster_tree_persistence_roundtrip() {

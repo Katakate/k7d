@@ -1,6 +1,6 @@
-//! internal notes: end-to-end regression coverage.
+//! CNI integration: end-to-end regression coverage.
 //!
-//! This file codifies the four traffic flows from internal notes's
+//! This file codifies the four traffic flows from the original
 //! "Success criteria" section that the PR #27 bring-up validated by
 //! hand on a live k3s cluster:
 //!
@@ -15,7 +15,7 @@
 //! 5. VM → internet (TCP open to `1.1.1.1:443`) succeeds — egress
 //!    SNAT through cni0+flannel reaches the open internet.
 //!
-//! Each of these was a concrete failure during the spec-10a bring-up
+//! Each of these was a concrete failure during the CNI bring-up
 //! (SIGCHLD race with Tokio, missing in-guest IP/route/ARP, eth0
 //! enslaved to the in-netns bridge hairpinning replies). Without
 //! these tests, any future refactor of `attach_to_pod_netns` or the
@@ -59,7 +59,7 @@ mod common;
 fn ensure_shim_installed() -> common::LeakGuard {
     use std::process::Command;
 
-    // internal notes, Milestone 2: best-effort teardown of orphan
+    // Best-effort teardown of orphan
     // virtiofsd/shim processes and stale /tmp/k7d-shim mounts left by
     // earlier tests/binaries before we (re)install the shim.
     common::cleanup_k7_runtime_leaks();
@@ -128,7 +128,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
             .expect("create RuntimeClass");
     }
 
-    // internal notes: the shim's sandbox Create now requires a running k7d
+    // The shim's sandbox Create now requires a running k7d
     // daemon (it owns the VMs); install and start it.
     common::ensure_k7d_daemon_running();
 
@@ -160,7 +160,7 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
     }
 }
 
-/// Graceful pod delete used by every CNI test. See the spec-10h
+/// Graceful pod delete used by every CNI test. See the
 /// equivalent in `test_volumes.rs::kubectl_delete_pod` for the
 /// full rationale: `--force --grace-period=0` removes the API
 /// object but leaves containerd's node-side sandbox + our shim +
@@ -267,7 +267,7 @@ fn wait_for_pod_ip(name: &str, timeout: Duration) -> Result<String, String> {
 // ---- the actual CNI smoke test ----
 
 /// End-to-end CNI regression test. Deploys one `runtimeClassName: k7`
-/// nginx pod and walks through every flow internal notes
+/// nginx pod and walks through every flow promises. If any
 /// of them breaks, this test fails — which is exactly what we want
 /// after the half-day of live-cluster debugging that PR #27 took.
 ///
@@ -385,7 +385,7 @@ fn test_cni_pod_traffic_flows() {
     );
     eprintln!("Flow 5: VM -> 1.1.1.1:443 (internet egress) OK");
 
-    eprintln!("\nAll five spec-10a CNI flows green for {POD_NAME} (pod_ip={pod_ip})\n");
+    eprintln!("\nAll five CNI flows green for {POD_NAME} (pod_ip={pod_ip})\n");
 
     // Cleanup. Don't fail the test if delete hits a transient
     // kubectl issue — the next run's pre-test cleanup will catch

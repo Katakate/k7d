@@ -1,4 +1,4 @@
--- internal notes” equivalence for Group E: the Aeneas translations
+-- Equivalence for Group E: the Aeneas translations
 -- of the four pure K7DL codec halves (`k7dl_header_bytes`,
 -- `k7dl_parse_header`, `k7dl_encode_entry`, `k7dl_parse_entry`) compute
 -- the `Verif.K7dlCodec` mirrors, up to `absBytes` (`Array U8 n` â†’

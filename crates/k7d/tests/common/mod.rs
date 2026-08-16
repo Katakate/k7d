@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 /// there is no concurrent shim/sandbox to disturb. Every failure is
 /// ignored on purpose (see module docs).
 pub fn cleanup_k7_runtime_leaks() {
-    // internal notes: the k7d daemon owns the VMs now. Restart it (if the
+    // The k7d daemon owns the VMs now. Restart it (if the
     // unit exists) so leaked VMs from a crashed/panicked test are
     // dropped cleanly — the daemon's shutdown path tears down vCPUs,
     // virtiofsd children, TAPs, and cluster bridges in order.
@@ -53,7 +53,7 @@ pub fn cleanup_k7_runtime_leaks() {
     // SIGKILLed daemon) is safe to sweep here: the daemon was just
     // restarted above, so no live VM maps them — leaving them behind
     // fills the 32 GB tmpfs after a few dozen aborted runs and every
-    // later snapshot fails with ENOSPC.
+    // later snapshot fails with ENOSPC (collateral).
     let _ = Command::new("sh")
         .arg("-c")
         .arg(
@@ -73,7 +73,7 @@ pub fn cleanup_k7_runtime_leaks() {
 /// on a test panic, since the std test harness unwinds and drops
 /// locals — so a failing test reclaims its orphan virtiofsd/shim
 /// processes and stale mounts before the next test runs instead of
-/// poisoning it (the cascade seen in internal notes
+/// poisoning it (the cascade seen in where the 7th volume
 /// pod's crash took the 8th and 9th down with it).
 #[must_use = "bind it (e.g. `let _g = ensure_shim_installed();`) so cleanup runs at test end"]
 pub struct LeakGuard;
@@ -84,7 +84,7 @@ impl Drop for LeakGuard {
     }
 }
 
-/// internal notes: install `/usr/local/bin/k7d`, register it as the
+/// Install `/usr/local/bin/k7d`, register it as the
 /// `k7d.service` systemd unit, and make sure it is running with its
 /// control socket up. Idempotent — kubectl-driven integration tests
 /// call this from `ensure_shim_installed()` because the shim's
@@ -130,29 +130,42 @@ pub fn ensure_k7d_daemon_running() {
         std::fs::rename(&tmp, installed).expect("install k7d binary");
     }
 
+    let guest_refreshed = install_workspace_guest();
+
     let unit = Path::new("/etc/systemd/system/k7d.service");
-    const UNIT_BODY: &str = "[Unit]\n\
+    let unit_body = format!(
+        "[Unit]\n\
 Description=k7d microVM runtime daemon\n\
 After=network.target\n\n\
 [Service]\n\
 ExecStart=/usr/local/bin/k7d\n\
 Restart=on-failure\n\
 Environment=RUST_LOG=info\n\
+# The daemon is the only process that decides which guest a VM boots\n\
+# (CHALLENGES #72), so these two are what the suite is testing.\n\
+Environment=K7D_KERNEL={}\n\
+Environment=K7D_INITRD={}\n\
 # Soft default without this is 1024 — far too low for multi-cluster\n\
 # fork batches (EMFILE on /dev/vhost-vsock; CHALLENGES #49).\n\
 LimitNOFILE=524288\n\n\
 [Install]\n\
-WantedBy=multi-user.target\n";
+WantedBy=multi-user.target\n",
+        share_guest_paths().0.display(),
+        share_guest_paths().1.display(),
+    );
     let need_unit = match std::fs::read_to_string(unit) {
-        Ok(existing) => !existing.contains("LimitNOFILE="),
+        Ok(existing) => existing != unit_body,
         Err(_) => true,
     };
     if need_unit {
-        eprintln!("  writing k7d.service systemd unit (LimitNOFILE=524288)");
-        std::fs::write(unit, UNIT_BODY).expect("write k7d.service");
+        eprintln!("  writing k7d.service systemd unit");
+        std::fs::write(unit, &unit_body).expect("write k7d.service");
         let _ = Command::new("systemctl").args(["daemon-reload"]).status();
-        // Unit change must take effect even when the binary was already
-        // current — otherwise a long-lived daemon keeps soft=1024.
+    }
+    if need_unit || guest_refreshed {
+        // Must take effect even when the binary was already current —
+        // otherwise a long-lived daemon keeps booting the guest it
+        // resolved at startup, which is the whole failure mode here.
         let _ = Command::new("systemctl").args(["restart", "k7d"]).status();
     }
 
@@ -166,6 +179,31 @@ WantedBy=multi-user.target\n";
         let _ = Command::new("systemctl")
             .args(["enable", "--now", "k7d"])
             .status();
+    }
+
+    // systemd merges drop-ins over the unit, so the file just written
+    // is not necessarily what the daemon was started with. Ask systemd
+    // what it actually passed: a stray
+    // /etc/systemd/system/k7d.service.d/*.conf pinning K7D_KERNEL
+    // elsewhere would otherwise show up much later as a pod booting a
+    // guest nobody in this repo built.
+    let shown = Command::new("systemctl")
+        .args(["show", "k7d", "-p", "Environment", "--value"])
+        .output()
+        .expect("systemctl show k7d");
+    let effective = String::from_utf8_lossy(&shown.stdout);
+    for (var, want) in [
+        ("K7D_KERNEL", share_guest_paths().0),
+        ("K7D_INITRD", share_guest_paths().1),
+    ] {
+        let expected = format!("{var}={}", want.display());
+        assert!(
+            effective.split_whitespace().any(|kv| kv == expected),
+            "k7d.service runs with a different guest than the suite installed: \
+             wanted {expected}, systemd reports {}. Check for drop-ins under \
+             /etc/systemd/system/k7d.service.d/",
+            effective.trim()
+        );
     }
 
     // Fail loudly if the control socket never accepts — every
@@ -185,8 +223,84 @@ WantedBy=multi-user.target\n";
     }
 }
 
-/// Wait for k3s to actually converge after a `systemctl restart k3s`
-///. A fixed sleep is not enough: flannel/kube-proxy
+/// Installed guest artifact paths — the layout `packaging/install.sh`
+/// writes and `k7d.service` points at.
+fn share_guest_paths() -> (PathBuf, PathBuf) {
+    let share = PathBuf::from("/usr/local/share/k7d");
+    (share.join("vmlinux"), share.join("initramfs.cpio.gz"))
+}
+
+/// The guest kernel `k7d.service` tells the daemon to boot — the only
+/// path a pod's VM is allowed to come up on.
+pub fn daemon_kernel_path() -> String {
+    share_guest_paths().0.to_string_lossy().into_owned()
+}
+
+/// Copy the guest kernel and initramfs this workspace built into the
+/// installed location the daemon boots from, and report whether either
+/// changed (the caller restarts the daemon if so).
+///
+/// The suite deliberately runs the *installed* layout rather than
+/// booting straight out of the checkout: that is how a k7 node runs,
+/// and it is the only arrangement in which the daemon's guest path and
+/// the workspace path differ — which is what lets the kernel-path
+/// assertion in `test_kubectl_create_pod_with_k7_runtime` notice if
+/// anything ever starts guessing at guest artifacts again
+/// (CHALLENGES #72).
+///
+/// Copying on every run keeps entry #68's rule intact: `make test`
+/// rebuilds the agent and initramfs first precisely so no test can
+/// boot yesterday's guest.
+fn install_workspace_guest() -> bool {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let built = [
+        (
+            workspace.join("guest/kernel/vmlinux"),
+            share_guest_paths().0,
+            "make build-guest-kernel",
+        ),
+        (
+            workspace.join("guest/rootfs/initramfs.cpio.gz"),
+            share_guest_paths().1,
+            "make build-guest-rootfs",
+        ),
+    ];
+
+    let mut refreshed = false;
+    for (src, dst, how) in built {
+        assert!(
+            src.is_file(),
+            "{} is missing — run `{how}` before the suite; the daemon boots \
+             what this workspace built, never a leftover install",
+            src.display()
+        );
+        let stale = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            (Ok(s), Ok(d)) => s.len() != d.len() || s.modified().unwrap() > d.modified().unwrap(),
+            _ => true,
+        };
+        if !stale {
+            continue;
+        }
+        eprintln!("  installing {} → {}", src.display(), dst.display());
+        std::fs::create_dir_all(dst.parent().unwrap()).expect("create guest share dir");
+        // Via a temp file + rename: a running daemon has the current
+        // kernel open, and overwriting it in place would rewrite the
+        // bytes under it.
+        let tmp = dst.with_extension("new");
+        std::fs::copy(&src, &tmp).expect("copy guest artifact");
+        std::fs::rename(&tmp, &dst).expect("install guest artifact");
+        refreshed = true;
+    }
+    refreshed
+}
+
+/// Wait for k3s to actually converge after a `systemctl restart k3s`.
+/// A fixed sleep is not enough: flannel/kube-proxy
 /// take tens of seconds to reprogram the host dataplane, and the
 /// block path reaches Running fast enough that the first kubectl pod
 /// of a suite lands inside that window — host→pod TCP times out while
@@ -231,7 +345,7 @@ pub fn wait_for_k3s_ready() {
     }
 }
 
-/// internal notes: make containerd forward `k7d.katakate.org/*` pod
+/// Make containerd forward `k7d.katakate.org/*` pod
 /// annotations into the sandbox OCI spec (`pod_annotations` in the k7
 /// runtime config). Without it the shim never sees `cluster-id` /
 /// `image-slots` / `fork-vm-index` on kubectl-deployed pods.
@@ -282,7 +396,7 @@ pub fn ensure_pod_annotations_forwarded() {
     }
 }
 
-/// internal notes: block-path VM facts reported by the daemon's
+/// Block-path VM facts reported by the daemon's
 /// `vm_status` for assertions (zero-virtiofs invariant, explicit
 /// virtiofs fallback, CoW-vs-full-copy fork memory).
 pub struct PodVmState {
@@ -290,6 +404,9 @@ pub struct PodVmState {
     pub virtiofs_shares: usize,
     pub block_devices: usize,
     pub fork_memory_full_copy: bool,
+    /// The guest kernel the VM booted — the daemon's answer, which is
+    /// the only one there should be (CHALLENGES #72).
+    pub kernel: String,
 }
 
 /// Resolve a kubectl pod name to its CRI sandbox id via k3s'
@@ -329,7 +446,7 @@ pub fn pod_vm_id(pod: &str) -> String {
 }
 
 /// Query the daemon's `vm_status` for the VM backing kubectl pod
-/// `pod`.
+/// `pod` (block-path assertions).
 pub fn pod_vm_state(pod: &str) -> PodVmState {
     let vm_id = pod_vm_id(pod);
     vm_state(&vm_id)
@@ -349,12 +466,14 @@ pub fn vm_state(vm_id: &str) -> PodVmState {
             virtiofs_shares,
             block_devices,
             fork_memory_full_copy,
+            kernel,
             ..
         } => PodVmState {
             vm_id,
             virtiofs_shares,
             block_devices,
             fork_memory_full_copy,
+            kernel,
         },
         other => panic!("unexpected vm_status response for {vm_id}: {other:?}"),
     }

@@ -5,14 +5,13 @@
 //! Where the single-VM tree's nodes are `Vm`s, this tree's nodes are
 //! [`ClusterPayload`]s — an N-VM cluster + its [`ClusterNetwork`]. Every
 //! fork / suspend / resume / evict / prune operation runs atomically on
-//! the whole cluster: internal notes's `fork_cluster_warm` is the per-fork hot
+//! the whole cluster: `fork_cluster_warm` is the per-fork hot
 //! path, and the bookkeeping layer (LRU eviction, RAM/disk budgets, DAG
 //! invariants) reuses the exact same pure helpers in
 //! [`crate::tree_model`] as the single-VM tree.
 //!
-//! This file is the parallel-hierarchy implementation called out in spec
-//! 9g §"Implementation order" — we ship the runtime-side cluster tree
-//! today; the cleanup that fuses both trees behind a single
+//! This file is a parallel hierarchy: we ship the runtime-side cluster
+//! tree today; the cleanup that fuses both trees behind a single
 //! `SnapshotTree<P: Payload = VmPayload>` generic is left as a follow-up
 //! refactor that does not gate cluster-tree functionality.
 //!
@@ -154,7 +153,7 @@ mod mac_serde {
 ///
 /// This is the same shape as the single-VM tree's `TreeDoc`; the
 /// per-node `kind: "cluster"` and `vm_count: N` fields (already on
-/// `NodeInfo` from internal notes) tell a reader which on-disk layout
+/// `NodeInfo` from phase 1) tell a reader which on-disk layout
 /// each node uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterTreeDoc {
@@ -179,7 +178,7 @@ pub struct ClusterSnapshotTree {
     live: HashMap<NodeId, ClusterPayload>,
     created_at_unix: u64,
     next_id: u64,
-    /// internal notes: orchestrator `String → u64` id map into the pure model.
+    /// Orchestrator `String → u64` id map into the pure model.
     /// Minted monotonically at node creation (children after parents);
     /// rebuilt parents-first by [`Self::open`].
     pure_ids: HashMap<NodeId, u64>,
@@ -223,7 +222,7 @@ impl ClusterSnapshotTree {
             fs::create_dir_all(&member_dir)?;
             // Cluster adoption knowingly accepts full-memfd
             // forks for virtiofs-backed members — the explicit slow-fork
-            // opt-in internal notes(loud warn per member).
+            // opt-in requires (loud warn per member).
             if !vm.virtiofs_shares().is_empty() {
                 vm.allow_slow_fork();
             }
@@ -288,9 +287,9 @@ impl ClusterSnapshotTree {
 
     /// Fork a new cluster branch from any live or suspended node.
     ///
-    /// Implements internal notes"Cluster fork (warm path, on-host)":
+    /// Implements:
     ///   1. pre-fork eviction (RAM tier; cluster nodes count as `vm_count` each)
-    ///   2. internal notes's `fork_cluster_warm` — atomic per-cluster pause +
+    ///   2. `fork_cluster_warm` — atomic per-cluster pause +
     ///      bitmap+state capture, then per-VM warm fork onto a fresh bridge
     ///      cloned via `ClusterNetwork::fork_from + add_tap_at(i)`
     ///   3. post-fork eviction (the new cluster is exempted)
@@ -300,7 +299,7 @@ impl ClusterSnapshotTree {
     }
 
     /// Non-destructive rollback: create a new branch from `node_id`'s
-    /// state. Equivalent to [`Self::fork`].
+    /// state (RL verb). Equivalent to [`Self::fork`].
     pub fn rollback(&mut self, node_id: &NodeId, label: &str) -> Result<NodeId, TreeError> {
         self.fork(node_id, label)
     }
@@ -449,7 +448,7 @@ impl ClusterSnapshotTree {
     /// Fails loud for virtiofs-backed members: virtiofsd writes FUSE
     /// completions through its own mapping, invisible to KVM dirty
     /// tracking, so `delta.pack` would silently miss device DMA and the
-    /// resumed guest would corrupt.
+    /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
         if let Some(p) = self.live.get(node_id) {
             if p.members.iter().any(|vm| !vm.virtiofs_shares().is_empty()) {
@@ -480,7 +479,8 @@ impl ClusterSnapshotTree {
             let bitmap = vm.get_and_accumulate_dirty()?.to_vec();
             let state = snapshot::capture_vm_state(vm)?;
             let src_mem = vm.mem_host_addr();
-            let mem_size = vm.memory_size();
+            // Deltas index pages of the guest physical span, not of RAM (19a).
+            let mem_size = vm.mem_span();
 
             let dirty_pages = write_delta(
                 &member_dir.join("delta.pack"),
@@ -568,15 +568,11 @@ impl ClusterSnapshotTree {
             let state_json = fs::read_to_string(member_dir.join("vm_state.json"))?;
             let state: VmState = serde_json::from_str(&state_json)?;
 
-            let fork_mem_addr =
-                crate::fork::mmap_base_mem_private(&base_mem_path, state.memory_size)?;
+            let mem_span = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
+            let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_mem_path, mem_span)?;
 
             if base_node != *node_id {
-                apply_delta(
-                    &member_dir.join("delta.pack"),
-                    fork_mem_addr,
-                    state.memory_size,
-                )?;
+                apply_delta(&member_dir.join("delta.pack"), fork_mem_addr, mem_span)?;
             }
 
             let mut vm = crate::fork::build_vm_from_state_and_mem(
@@ -1041,7 +1037,7 @@ impl ClusterSnapshotTree {
         self.root_dir.join("nodes").join(id)
     }
 
-    /// Mint (or return) the pure-model id for a node — the internal notes
+    /// Mint (or return) the pure-model id for a node — the
     /// orchestrator `String → u64` map. Minting is monotonic, so children
     /// (created after their parents) always get larger pure ids.
     fn mint_pure_id(&mut self, id: &NodeId) -> u64 {
@@ -1073,8 +1069,8 @@ impl ClusterSnapshotTree {
         Err(TreeError::NodeNotFound(format!("pure id {pure}")))
     }
 
-    /// Derive the pure [`tree_model::TreeModel`] view of this tree (spec
-    /// 9g) for the verified eviction helpers. Mirrors
+    /// Derive the pure [`tree_model::TreeModel`] view of this tree for
+    /// the verified eviction helpers. Mirrors
     /// `SnapshotTree::build_model`; `est_ram_bytes` is the Σ over live
     /// cluster members, `disk_bytes` stays 0 (the victim pickers never
     /// read it — the disk-budget check is `fs`-based in the orchestrator).

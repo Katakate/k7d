@@ -1,4 +1,4 @@
--- internal notes"What to build / 3.4" — equivalence for the fuel-bounded
+-- Equivalence for the fuel-bounded
 -- ancestor walk `ancestor_ids`. The loop recurses on the fuel scalar
 -- (not the node index), and each iteration pushes one id, so the honest
 -- side condition is `|out| + |remaining walk| ≤ usize::MAX` — the

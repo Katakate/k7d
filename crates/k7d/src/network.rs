@@ -586,7 +586,7 @@ impl ClusterNetwork {
     ///    `eth0` keeps its IP; the TAP has none. `bridge-nf-call-iptables`
     ///    is set to `0` inside the netns so kube-proxy's host-side
     ///    iptables rules don't re-process bridged frames.
-    /// 3. Install the spec-9d pod-netns DNAT/SNAT rules so the rest of
+    /// 3. Install the pod-netns DNAT/SNAT rules so the rest of
     ///    Kubernetes still sees the pod's CNI IP, but the guest VM
     ///    continues to see its stable `10.200.0.{2 + vm_index}`
     ///    address.
@@ -633,7 +633,7 @@ impl ClusterNetwork {
             (entry.tap_name.clone(), entry.guest_ip, entry.guest_mac)
         };
 
-        debug_log_10a(&format!(
+        debug_log_cni(&format!(
             "attach_to_pod_netns: start vm_index={vm_index} tap={tap_name} \
              pod_netns={} pod_ip={pod_ip}",
             pod_netns.display()
@@ -646,10 +646,10 @@ impl ClusterNetwork {
         //    cleanly.
         if let Err(e) = crate::netns::move_link_to_netns(&tap_name, pod_netns) {
             let msg = format!("move {tap_name} into pod netns: {e}");
-            debug_log_10a(&format!("attach_to_pod_netns: STEP1 FAIL {msg}"));
+            debug_log_cni(&format!("attach_to_pod_netns: STEP1 FAIL {msg}"));
             return Err(msg);
         }
-        debug_log_10a("attach_to_pod_netns: STEP1 OK (move_link_to_netns)");
+        debug_log_cni("attach_to_pod_netns: STEP1 OK (move_link_to_netns)");
 
         // 2. Create k7-podbr0 inside the pod netns and enslave ONLY
         //    the TAP. Earlier iterations of this code also enslaved
@@ -666,19 +666,19 @@ impl ClusterNetwork {
         //    handles the eth0<->bridge plumbing.
         if let Err(e) = crate::netns::create_bridge_in_netns(pod_netns, "k7-podbr0", &[&tap_name]) {
             let msg = format!("create k7-podbr0 in pod netns: {e}");
-            debug_log_10a(&format!("attach_to_pod_netns: STEP2 FAIL {msg}"));
+            debug_log_cni(&format!("attach_to_pod_netns: STEP2 FAIL {msg}"));
             return Err(msg);
         }
-        debug_log_10a("attach_to_pod_netns: STEP2 OK (create_bridge_in_netns)");
+        debug_log_cni("attach_to_pod_netns: STEP2 OK (create_bridge_in_netns)");
 
         // 3. Install the pod-netns DNAT/SNAT translating
         //    pod_ip ↔ guest_ip. This populates
         //    entry.pod_ip and entry.pod_netns as a side effect.
         if let Err(e) = self.install_pod_nat(vm_index, pod_ip, pod_netns) {
-            debug_log_10a(&format!("attach_to_pod_netns: STEP3 FAIL {e}"));
+            debug_log_cni(&format!("attach_to_pod_netns: STEP3 FAIL {e}"));
             return Err(e);
         }
-        debug_log_10a("attach_to_pod_netns: STEP3 OK (install_pod_nat)");
+        debug_log_cni("attach_to_pod_netns: STEP3 OK (install_pod_nat)");
 
         // 4. Make the in-netns bridge a proper L3 gateway for the
         //    guest:
@@ -712,12 +712,12 @@ impl ClusterNetwork {
         );
         if let Ok((status, _, stderr)) = addr_res {
             if !status.success() && !stderr.contains("File exists") {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "attach_to_pod_netns: STEP4 addr add warn: {stderr}"
                 ));
             }
         }
-        debug_log_10a("attach_to_pod_netns: STEP4 OK (forward + gateway IP)");
+        debug_log_cni("attach_to_pod_netns: STEP4 OK (forward + gateway IP)");
 
         // 5. Install a permanent ARP entry mapping the guest IP to
         //    the guest's MAC. Without this the kernel ARPs for
@@ -753,12 +753,12 @@ impl ClusterNetwork {
         );
         if let Ok((status, _, stderr)) = neigh_res {
             if !status.success() {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "attach_to_pod_netns: STEP5 ip neigh warn: {stderr}"
                 ));
             }
         }
-        debug_log_10a(&format!(
+        debug_log_cni(&format!(
             "attach_to_pod_netns: STEP5 OK (static ARP {guest_ip_str} -> {guest_mac_str})"
         ));
 
@@ -767,7 +767,7 @@ impl ClusterNetwork {
              with pod_ip={pod_ip}",
             pod_netns.display(),
         );
-        debug_log_10a("attach_to_pod_netns: DONE");
+        debug_log_cni("attach_to_pod_netns: DONE");
         Ok(())
     }
 
@@ -837,11 +837,11 @@ impl ClusterNetwork {
     }
 }
 
-/// internal notes: append a timestamped line to /tmp/k7-shim.log.
+/// Debugging: append a timestamped line to /tmp/k7-shim.log.
 /// containerd hands the shim /dev/null for stderr, so this is the only
 /// way to see what `attach_to_pod_netns` is doing on a live cluster.
 /// Best-effort; we ignore IO errors.
-fn debug_log_10a(msg: &str) {
+fn debug_log_cni(msg: &str) {
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -987,7 +987,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
     // shim's async create path. The previous std::process::Command::output()
     // path failed with "No child processes (os error 10)" because
     // Tokio reaped our child before our `waitpid` could collect it,
-    // silently breaking every spec-10a `attach_to_pod_netns` call on
+    // silently breaking every `attach_to_pod_netns` call on
     // a live cluster. See crate::netns::run_capture for the full
     // background.
     let (status, _stdout, stderr) =
@@ -1193,7 +1193,7 @@ impl VirtioBackend for TapNetBackend {
         let worker_tx_kick_fd = unsafe { libc::dup(tx_kick_fd) };
 
         // Named so it doesn't inherit the activating vCPU thread's comm
-        // (device activation runs on a vCPU thread — see internal notes).
+        // (device activation runs on a vCPU thread — see).
         let builder = std::thread::Builder::new().name("virtio-net".to_string());
         let handle = builder.spawn(move || {
             net_worker(

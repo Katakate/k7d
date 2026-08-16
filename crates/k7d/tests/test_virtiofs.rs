@@ -1,4 +1,4 @@
-//! Integration test for Milestone 3: host-guest directory sharing via virtiofs.
+//! Integration test: host-guest directory sharing via virtiofs.
 //! Requires KVM (/dev/kvm), virtiofsd, built guest kernel, and built initramfs.
 
 use std::path::PathBuf;

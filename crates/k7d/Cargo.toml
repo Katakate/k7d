@@ -33,8 +33,8 @@ thiserror.workspace = true
 default = []
 # When enabled, hides every non-`tree_model` module from the build (lib.rs
 # gates them with `#[cfg(not(feature = "verif"))]`) so Charon and Aeneas only
-# see the pure subset translated to Lean for internal notes
-# and thiserror proc-macro derives in `tree_model`. See internal notes.
+# see the pure subset translated to Lean. Also drops the serde
+# and thiserror proc-macro derives in `tree_model`.
 verif = []
 
 [lints.rust]

@@ -1,4 +1,4 @@
-//! Integration test for Milestone 1: Boot a VM and see serial output.
+//! Integration test: boot a VM and see serial output.
 //! Requires KVM (/dev/kvm) and a built guest kernel at guest/kernel/vmlinux.
 
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ fn test_vm_boots_and_prints_to_serial() {
     vm.shutdown();
 }
 
-/// internal notes: a 2-vCPU VM boots with both CPUs online — the guest
+/// A 2-vCPU VM boots with both CPUs online — the guest
 /// discovers the second CPU from the MP table (ACPI is compiled out)
 /// and brings it up via INIT/SIPI. The CPU count through the agent
 /// must report 2, both vCPU threads must publish kernel TIDs, and
@@ -109,11 +109,11 @@ fn test_boot_multi_vcpu() {
     vm.shutdown();
 }
 
-/// internal notes: a 2-vCPU VM snapshots and restores like a 1-vCPU VM.
+/// A 2-vCPU VM snapshots and restores like a 1-vCPU VM.
 /// Both CPUs run a counter before the snapshot; after the `CoW`
 /// restore the guest still sees 2 CPUs, both counters advance (both
 /// vCPUs execute), and dmesg is free of TSC-unstable / soft-lockup
-/// splats (Inc 6 clock sanity).
+/// splats (clock sanity).
 #[test]
 fn test_multi_vcpu_snapshot_restore_roundtrip() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -199,7 +199,7 @@ fn test_multi_vcpu_snapshot_restore_roundtrip() {
         .exec(&["sh", "-c", "kill $(cat /tmp/ctrpid0) $(cat /tmp/ctrpid1)"])
         .expect("counters should stop");
 
-    // Inc 6 clock sanity: no TSC-unstable / soft-lockup splats.
+    // Clock sanity: no TSC-unstable / soft-lockup splats.
     let dmesg = agent2
         .exec(&[
             "sh",
@@ -237,4 +237,183 @@ fn test_multi_vcpu_snapshot_restore_roundtrip() {
     );
 
     restored.shutdown();
+}
+
+/// Host USER_HZ. Asserted rather than assumed so a different value
+/// cannot silently rescale the 10% idle-vCPU bound.
+fn host_clk_tck() -> u64 {
+    let out = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .expect("getconf CLK_TCK should run");
+    assert!(
+        out.status.success(),
+        "getconf CLK_TCK failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        reported, "100",
+        "host USER_HZ is {reported}, not 100; the idle-vCPU bound would be wrong"
+    );
+    100
+}
+
+/// Host CPU time of a kernel thread, in clock ticks, from
+/// `/proc/<tid>/stat` (utime + stime).
+fn thread_cpu_ticks(tid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"))
+        .unwrap_or_else(|e| panic!("read /proc/{tid}/stat: {e}"));
+    let rest = stat
+        .rsplit_once(')')
+        .unwrap_or_else(|| panic!("malformed /proc/{tid}/stat: {stat}"))
+        .1;
+    let mut fields = rest.split_whitespace();
+    // After `)`: state ppid … utime(index 11) stime(index 12).
+    let utime: u64 = fields
+        .nth(11)
+        .unwrap_or_else(|| panic!("utime missing in /proc/{tid}/stat: {stat}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("utime parse: {e}"));
+    let stime: u64 = fields
+        .next()
+        .unwrap_or_else(|| panic!("stime missing in /proc/{tid}/stat: {stat}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("stime parse: {e}"));
+    utime + stime
+}
+
+/// An idle vCPU must not burn a host core. `idle=poll` did (100%);
+/// haltpoll + HLT at a 200 µs window should sit under 2% over a 5 s
+/// sample (a 2 ms window measured 8.2–8.6%). Without this test the
+/// work can "succeed" by silently leaving poll-forever behaviour in
+/// place.
+#[test]
+fn test_idle_vcpu_is_cheap() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut vm = Vm::builder()
+        .kernel_and_initrd()
+        .memory_mb(256)
+        .vsock(true)
+        .build()
+        .expect("VM should build");
+    vm.start().expect("VM should start");
+    let mut agent = vm
+        .connect_agent(Duration::from_secs(90))
+        .expect("agent should connect");
+
+    let cmdline = agent
+        .exec(&["cat", "/proc/cmdline"])
+        .expect("guest /proc/cmdline");
+    assert_eq!(cmdline.exit_code, 0, "cat /proc/cmdline: {cmdline:?}");
+    assert!(
+        !cmdline.stdout.contains("idle=poll"),
+        "idle=poll is still on the cmdline; haltpoll will refuse to load: {}",
+        cmdline.stdout.trim()
+    );
+    assert!(
+        cmdline.stdout.contains("cpuidle_haltpoll.force=1"),
+        "cpuidle_haltpoll.force=1 missing; the driver will not install without \
+         KVM_HINTS_REALTIME, which k7d does not advertise: {}",
+        cmdline.stdout.trim()
+    );
+    assert!(
+        cmdline
+            .stdout
+            .contains("haltpoll.guest_halt_poll_allow_shrink=0"),
+        "haltpoll shrink still on; a warm-pool idle collapses poll_limit_ns \
+         back to plain HLT: {}",
+        cmdline.stdout.trim()
+    );
+
+    let cfg = agent
+        .exec(&[
+            "sh",
+            "-c",
+            "zcat /proc/config.gz | grep -E '^CONFIG_(CPU_IDLE|CPU_IDLE_GOV_HALTPOLL|HALTPOLL_CPUIDLE|NO_HZ_IDLE)='",
+        ])
+        .expect("guest /proc/config.gz");
+    assert_eq!(cfg.exit_code, 0, "config.gz grep: {cfg:?}");
+    for want in [
+        "CONFIG_CPU_IDLE=y",
+        "CONFIG_CPU_IDLE_GOV_HALTPOLL=y",
+        "CONFIG_HALTPOLL_CPUIDLE=y",
+        "CONFIG_NO_HZ_IDLE=y",
+    ] {
+        assert!(
+            cfg.stdout.lines().any(|l| l.trim() == want),
+            "booted guest kernel is missing {want}: {}",
+            cfg.stdout.trim()
+        );
+    }
+
+    let gov = agent
+        .exec(&["cat", "/sys/devices/system/cpu/cpuidle/current_governor"])
+        .expect("cpuidle governor");
+    assert_eq!(
+        gov.exit_code, 0,
+        "cpuidle governor sysfs missing (haltpoll did not install): {gov:?}"
+    );
+    assert_eq!(
+        gov.stdout.trim(),
+        "haltpoll",
+        "guest idle governor is {}, not haltpoll — the force=1 gate failed or \
+         the driver lost to ladder",
+        gov.stdout.trim()
+    );
+
+    // The governor starts poll_limit_ns at 0 and shrinks it after a
+    // long idle. If these params did not take, a warm-pool VM is back
+    // to plain HLT on the next request (the virtiofs-write pattern).
+    let params = agent
+        .exec(&[
+            "sh",
+            "-c",
+            "for f in /sys/module/haltpoll/parameters/*; do echo \"$(basename $f)=$(cat $f)\"; done",
+        ])
+        .expect("haltpoll module params");
+    assert_eq!(params.exit_code, 0, "haltpoll params: {params:?}");
+    eprintln!("haltpoll params:\n{}", params.stdout.trim());
+    assert!(
+        params
+            .stdout
+            .lines()
+            .any(|l| l.trim() == "guest_halt_poll_ns=200000"),
+        "guest_halt_poll_ns not 200 µs: {}",
+        params.stdout.trim()
+    );
+    assert!(
+        params.stdout.contains("guest_halt_poll_allow_shrink=N")
+            || params.stdout.contains("guest_halt_poll_allow_shrink=0"),
+        "shrink still enabled: {}",
+        params.stdout.trim()
+    );
+
+    let tid = vm
+        .vcpu_kernel_tid(Duration::from_secs(5))
+        .expect("vCPU thread should publish its kernel TID");
+
+    let clk_tck = host_clk_tck();
+    let sample = Duration::from_secs(5);
+    let t0 = thread_cpu_ticks(tid);
+    let wall0 = std::time::Instant::now();
+    std::thread::sleep(sample);
+    let t1 = thread_cpu_ticks(tid);
+    let wall = wall0.elapsed();
+
+    let delta_ticks = t1.saturating_sub(t0);
+    let cpu_frac = delta_ticks as f64 / clk_tck as f64 / wall.as_secs_f64();
+    eprintln!(
+        "idle vCPU tid={tid}: {delta_ticks} ticks over {wall:?} = {:.1}% of a host core",
+        cpu_frac * 100.0
+    );
+    assert!(
+        cpu_frac < 0.02,
+        "idle vCPU used {:.1}% of a host core over {wall:?} (budget 2%); \
+         leftover PIT ticks are still charging a too-wide poll window",
+        cpu_frac * 100.0
+    );
+
+    vm.shutdown();
 }

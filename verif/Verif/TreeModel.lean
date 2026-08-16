@@ -2,7 +2,7 @@
 --
 -- Aeneas names the generated top-level module after the Cargo crate
 -- (`k7d`), so on a fresh `make verif-gen` it writes `Verif/K7d.lean`.
--- internal notes"Step 3" talks about `TreeModel.lean` — this thin wrapper
+-- The proofs import `Verif.TreeModel`, so this thin wrapper
 -- bridges the two so the proof files only ever import `Verif.TreeModel`.
 --
 -- Hand-edits to `Verif/K7d.lean` are forbidden (it is overwritten on

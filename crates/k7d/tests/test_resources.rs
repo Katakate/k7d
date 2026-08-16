@@ -1,4 +1,4 @@
-//! internal notes: pod CPU/memory requests and limits → VM sizing + host
+//! Pod CPU/memory requests and limits → VM sizing + host
 //! cgroup caps — kubectl-level end-to-end coverage.
 //!
 //! Like `test_shim.rs` / `test_exec_pty.rs`, this file self-installs
@@ -108,7 +108,7 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
     }
 }
 
-/// Graceful pod delete (see test_cni.rs / internal notes).
+/// Graceful pod delete (see test_cni.rs / for the rationale).
 fn kubectl_delete_pod(name: &str) {
     let graceful = Command::new("kubectl")
         .args([
@@ -181,7 +181,7 @@ fn wait_for_pod_ready(name: &str, timeout: Duration) -> Result<(), String> {
     Err(format!("pod {name} not ready within {timeout:?}"))
 }
 
-// ---- internal notes
+// ---- helpers ----
 
 /// The guest's `/proc/meminfo` MemTotal in kB — the VM sizing as the
 /// container actually sees it.
@@ -238,6 +238,18 @@ fn vm_cpu_cgroups() -> Vec<PathBuf> {
     dirs
 }
 
+/// The per-VM CPU cgroups that appeared since `baseline` was sampled,
+/// i.e. the ones the test's own pod is responsible for. Every k7d VM on
+/// the node shares `k7d.service`, so absolute counts would also see
+/// unrelated k7 workloads (a bench deployment, another suite's pod) and
+/// fail for reasons that have nothing to do with the code under test.
+fn vm_cpu_cgroups_since(baseline: &[PathBuf]) -> Vec<PathBuf> {
+    vm_cpu_cgroups()
+        .into_iter()
+        .filter(|p| !baseline.contains(p))
+        .collect()
+}
+
 /// `usage_usec` from a cgroup's `cpu.stat`.
 fn cgroup_usage_usec(dir: &std::path::Path) -> u64 {
     std::fs::read_to_string(dir.join("cpu.stat"))
@@ -252,7 +264,7 @@ fn cgroup_usage_usec(dir: &std::path::Path) -> u64 {
 
 /// Count of host-side OOM kill events in the kernel log. The guest's
 /// OOM killer logs to the *guest* kernel log, so any increase here
-/// means the host (not the VM) OOMed — exactly what internal notes
+/// means the host (not the VM) OOMed — exactly what forbids.
 fn host_oom_kill_count() -> u64 {
     let out = Command::new("sh")
         .arg("-c")
@@ -265,7 +277,7 @@ fn host_oom_kill_count() -> u64 {
         .unwrap_or(0)
 }
 
-// ---- the internal notes
+// ---- the tests ----
 
 /// A pod with `memory: 256Mi` boots a VM sized limit + 64 MB overhead:
 /// the guest sees 256–320 MB, and an in-guest allocation blowing past
@@ -307,7 +319,7 @@ spec:
         "guest MemTotal {mem_total_kb} kB outside expected 256–320 MB for a 256Mi pod"
     );
 
-    // Allocate past the per-container cgroup limit (internal notes
+    // Allocate past the per-container cgroup limit (the shim
     // preserves linux.resources.memory.limit). Process-level OOM
     // kills the hog exec; the main sleep (and agent) survive.
     let start = Instant::now();
@@ -336,6 +348,85 @@ spec:
     kubectl_delete_pod(pod);
 }
 
+/// A pod asking for 8Gi boots a VM whose RAM straddles the
+/// 32-bit MMIO hole — low RAM below `0xfe00_0000`, the rest at 4 GiB —
+/// reaches Ready, reports the matching `MemTotal`, and can actually use
+/// the memory past 4 GiB.
+///
+/// Before 19a the initrd was placed at the top of guest RAM and its
+/// address truncated to the 32-bit `boot_params.hdr.ramdisk_image`, so
+/// any pod over ~4 GiB booted a kernel with no initramfs
+/// ("VFS: Unable to mount root fs"), the agent never started, and the
+/// shim failed with `agent connect failed: Connection timed out`.
+#[test]
+fn test_pod_large_memory_boots() {
+    let _leak_guard = ensure_shim_installed();
+    let pod = "test-k7d-res-mem-8gi";
+    kubectl_delete_pod(pod);
+    let _pod_guard = PodGuard(pod);
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: main
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    resources:
+      limits:
+        memory: 8Gi
+      requests:
+        memory: 8Gi
+"#
+    )))
+    .expect("kubectl apply");
+    wait_for_pod_ready(pod, Duration::from_secs(180)).expect("8Gi pod ready");
+
+    // 8 Gi limit + 64 MB overhead = 8256 MB of guest RAM; the guest
+    // kernel reserves ~230 MB of it (mostly `struct page`), so MemTotal
+    // must land comfortably above 4 GiB and never above the VM size.
+    let mem_total_kb = guest_mem_total_kb(pod);
+    assert!(
+        (7 * 1024 * 1024..=8256 * 1024).contains(&mem_total_kb),
+        "guest MemTotal {mem_total_kb} kB outside expected 7 GiB–8256 MB for an 8Gi pod \
+         (RAM past the 32-bit MMIO hole missing?)"
+    );
+
+    // ZONE_NORMAL only exists when the guest has RAM past 4 GiB — proof
+    // the high region reached the E820 map and the guest accepted it.
+    let zones = kubectl_exec(pod, &["cat", "/proc/zoneinfo"]).expect("read guest zoneinfo");
+    assert!(
+        zones.contains("zone   Normal"),
+        "guest has no ZONE_NORMAL — RAM past 4 GiB never made it into the E820 map"
+    );
+
+    // Use a GiB of it and read every byte back: Linux allocates from the
+    // highest zone first, so this exercises the region past 4 GiB. A byte
+    // outside the `yes` pattern would mean that GPA range is not backed by
+    // real RAM (e.g. aliased onto the LAPIC / IOAPIC / KVM TSS windows).
+    let stray = kubectl_exec(
+        pod,
+        &[
+            "sh",
+            "-c",
+            "yes | head -c 1073741824 >/tmp/blob && tr -d 'y\\n' </tmp/blob | wc -c",
+        ],
+    )
+    .expect("write + verify 1 GiB inside the guest");
+    assert_eq!(
+        stray.trim(),
+        "0",
+        "guest memory past 4 GiB returned bytes outside the written pattern"
+    );
+
+    kubectl_delete_pod(pod);
+}
+
 /// A pod with `cpu: "0.5"` gets its vCPU thread capped host-side: four
 /// busy-loop workers inside the guest burn ≤ ~55% of one host core
 /// (sampled from the per-VM CPU cgroup, i.e. the vCPU thread itself —
@@ -345,6 +436,7 @@ fn test_pod_cpu_limit_caps_host_usage() {
     let _leak_guard = ensure_shim_installed();
     let pod = "test-k7d-res-cpu";
     kubectl_delete_pod(pod);
+    let baseline = vm_cpu_cgroups();
 
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -367,11 +459,11 @@ spec:
     wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
 
     // Exactly one capped VM (this pod's) with the pod's CFS quota.
-    let cgroups = vm_cpu_cgroups();
+    let cgroups = vm_cpu_cgroups_since(&baseline);
     assert_eq!(
         cgroups.len(),
         1,
-        "expected exactly one per-VM CPU cgroup, found: {cgroups:?}"
+        "expected exactly one new per-VM CPU cgroup, found: {cgroups:?}"
     );
     let cg = &cgroups[0];
     let cpu_max = std::fs::read_to_string(cg.join("cpu.max")).expect("read cpu.max");
@@ -411,17 +503,17 @@ spec:
     // Teardown removes the per-VM cgroup (Vm drop joins the vCPU
     // thread first, then the cgroup drops).
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !vm_cpu_cgroups().is_empty() {
+    while !vm_cpu_cgroups_since(&baseline).is_empty() {
         assert!(
             Instant::now() < deadline,
             "per-VM CPU cgroup not removed after pod delete: {:?}",
-            vm_cpu_cgroups()
+            vm_cpu_cgroups_since(&baseline)
         );
         std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-// ---- the internal notes
+// ---- the multi-vCPU tests ----
 
 /// Deletes the named pod on drop — panic-safe cleanup so a failing
 /// test doesn't leak its pod (whose per-VM CPU cgroup would break the
@@ -434,7 +526,7 @@ impl Drop for PodGuard {
 }
 
 /// Apply a `cpu: "2"` pod (4 in-guest busy-loop workers) and wait for
-/// it to be Running. Shared by the internal notes
+/// it to be Running. Shared by the tests.
 fn apply_multi_vcpu_pod(pod: &str) {
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -457,7 +549,7 @@ spec:
     wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
 }
 
-/// internal notes: a pod with `cpu: "2"` boots a 2-vCPU guest (`nproc` = 2)
+/// A pod with `cpu: "2"` boots a 2-vCPU guest (`nproc` = 2)
 /// and the pod's CFS quota caps the whole VM: four busy-loop workers
 /// burn ≤ ~2.2 host cores (sampled from the per-VM CPU cgroup, which
 /// contains both vCPU threads) — and > 1.2 cores, proving the second
@@ -467,17 +559,18 @@ fn test_pod_cpu_limit_multi_vcpu() {
     let _leak_guard = ensure_shim_installed();
     let pod = "test-k7d-res-mvcpu";
     kubectl_delete_pod(pod);
+    let baseline = vm_cpu_cgroups();
     let _pod_guard = PodGuard(pod);
     apply_multi_vcpu_pod(pod);
 
     let nproc = kubectl_exec(pod, &["nproc"]).expect("nproc in guest");
     assert_eq!(nproc.trim(), "2", "cpu: \"2\" pod must see 2 vCPUs");
 
-    let cgroups = vm_cpu_cgroups();
+    let cgroups = vm_cpu_cgroups_since(&baseline);
     assert_eq!(
         cgroups.len(),
         1,
-        "expected exactly one per-VM CPU cgroup, found: {cgroups:?}"
+        "expected exactly one new per-VM CPU cgroup, found: {cgroups:?}"
     );
     let cg = &cgroups[0];
     let cpu_max = std::fs::read_to_string(cg.join("cpu.max")).expect("read cpu.max");
@@ -510,7 +603,7 @@ fn test_pod_cpu_limit_multi_vcpu() {
     kubectl_delete_pod(pod);
 }
 
-/// internal notes: every vCPU kernel TID lands in the per-VM cgroup's
+/// Every vCPU kernel TID lands in the per-VM cgroup's
 /// `cgroup.threads` — a quota that only caps the BSP is a silent
 /// escape hatch for the second vCPU. The cgroup legitimately holds
 /// more than the vCPU threads: virtio device workers spawned *by* a
@@ -523,14 +616,15 @@ fn test_multi_vcpu_all_tids_in_cgroup() {
     let _leak_guard = ensure_shim_installed();
     let pod = "test-k7d-res-mvcpu-tids";
     kubectl_delete_pod(pod);
+    let baseline = vm_cpu_cgroups();
     let _pod_guard = PodGuard(pod);
     apply_multi_vcpu_pod(pod);
 
-    let cgroups = vm_cpu_cgroups();
+    let cgroups = vm_cpu_cgroups_since(&baseline);
     assert_eq!(
         cgroups.len(),
         1,
-        "expected exactly one per-VM CPU cgroup, found: {cgroups:?}"
+        "expected exactly one new per-VM CPU cgroup, found: {cgroups:?}"
     );
     let threads_raw =
         std::fs::read_to_string(cgroups[0].join("cgroup.threads")).expect("read cgroup.threads");
@@ -548,7 +642,7 @@ fn test_multi_vcpu_all_tids_in_cgroup() {
     );
 }
 
-/// internal notes: a 2-vCPU pod
+/// Regression guard for CHALLENGES.md §23: a 2-vCPU pod
 /// deletes within 15 s and the per-VM CPU cgroup disappears (both
 /// vCPU threads joined, cgroup rmdir'd).
 #[test]
@@ -556,10 +650,11 @@ fn test_multi_vcpu_teardown() {
     let _leak_guard = ensure_shim_installed();
     let pod = "test-k7d-res-mvcpu-teardown";
     kubectl_delete_pod(pod);
+    let baseline = vm_cpu_cgroups();
     let _pod_guard = PodGuard(pod);
     apply_multi_vcpu_pod(pod);
     assert_eq!(
-        vm_cpu_cgroups().len(),
+        vm_cpu_cgroups_since(&baseline).len(),
         1,
         "the capped VM's cgroup should exist while the pod runs"
     );
@@ -573,11 +668,11 @@ fn test_multi_vcpu_teardown() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !vm_cpu_cgroups().is_empty() {
+    while !vm_cpu_cgroups_since(&baseline).is_empty() {
         assert!(
             Instant::now() < deadline,
             "per-VM CPU cgroup not removed after 2-vCPU pod delete: {:?}",
-            vm_cpu_cgroups()
+            vm_cpu_cgroups_since(&baseline)
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -590,6 +685,8 @@ fn test_besteffort_pod_gets_defaults() {
     let _leak_guard = ensure_shim_installed();
     let pod = "test-k7d-res-be";
     kubectl_delete_pod(pod);
+    let baseline = vm_cpu_cgroups();
+    let _pod_guard = PodGuard(pod);
 
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -620,11 +717,9 @@ spec:
     assert_eq!(nproc.trim(), "1", "BestEffort pod should get 1 vCPU");
 
     // No CPU limit -> no per-VM cgroup, vCPU thread uncapped.
-    let cgroups = vm_cpu_cgroups();
+    let cgroups = vm_cpu_cgroups_since(&baseline);
     assert!(
         cgroups.is_empty(),
         "BestEffort pod must not get a CPU cap, found: {cgroups:?}"
     );
-
-    kubectl_delete_pod(pod);
 }

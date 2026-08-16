@@ -1,4 +1,4 @@
-//! internal notes: shim-side PTY exec bridge — `kubectl exec -it` support.
+//! Shim-side PTY exec bridge — `kubectl exec -it` support.
 //!
 //! Bridges containerd's exec attach (stdin/stdout FIFOs +
 //! `ResizePty`/`CloseIO` ttrpc calls) to the guest agent's

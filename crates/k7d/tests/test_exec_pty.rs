@@ -1,4 +1,4 @@
-//! internal notes: interactive `kubectl exec -it` with a real PTY —
+//! Interactive `kubectl exec -it` with a real PTY —
 //! end-to-end kubectl coverage.
 //!
 //! Each test allocates a **local** PTY pair and runs `kubectl exec
@@ -119,7 +119,7 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
     }
 }
 
-/// Graceful pod delete (see test_cni.rs / internal notes).
+/// Graceful pod delete (see test_cni.rs / for the rationale).
 fn kubectl_delete_pod(name: &str) {
     let graceful = std::process::Command::new("kubectl")
         .args([
@@ -432,7 +432,7 @@ fn expect_stty_size(t: &mut TtyKubectl, rows: u16, cols: u16, timeout: Duration)
     }
 }
 
-// ---- the internal notes
+// ---- the sketch tests ----
 
 /// `kubectl exec -it` gets the client's window size, and resizing the
 /// client terminal mid-session propagates (SIGWINCH → resize stream →

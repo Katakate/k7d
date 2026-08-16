@@ -14,14 +14,51 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const CONTAINER_RUN_DIR: &str = "/run/k7/containers";
+
+/// In-VM mount point of the sandbox's host-backed scratch
+/// disk, where every container's overlay `upper`/`work` lives so a
+/// container's writes land on a host image instead of guest RAM.
+///
+/// Must equal `k7d::disks::SCRATCH_GUEST_MOUNT`. The agent is a
+/// standalone musl binary with no dependency on the host crate, so the
+/// string is duplicated; the host puts the device here via `k7d.blk=`
+/// and [`scratch_promised`] looks for exactly this mount point in the
+/// kernel cmdline.
+const SCRATCH_MOUNT: &str = "/run/k7d/scratch";
+
+/// Root under which a container's **own** scratch disk is
+/// mounted, one ext4 image per container that asked for a
+/// writable-space limit. Must equal
+/// `k7d::disks::CONTAINER_SCRATCH_GUEST_ROOT`; duplicated for the same
+/// reason as [`SCRATCH_MOUNT`].
+const CONTAINER_SCRATCH_ROOT: &str = "/run/k7d/cscratch";
+
+/// CRI annotation carrying the Kubernetes container name. The runc
+/// container name the agent is given is the containerd container id,
+/// which does not exist when the host declares a container's scratch
+/// device at sandbox create — so the *bundle* is what tells us which
+/// mount under [`CONTAINER_SCRATCH_ROOT`] belongs to this container.
+const CRI_CONTAINER_NAME: &str = "io.kubernetes.cri.container-name";
+
+/// Size of the bounded tmpfs the writable layer falls back to when the
+/// host attached **no** scratch disk (bare `Vm`-API callers; the shim
+/// always attaches one).
+///
+/// The point of the `size=` option is that writable space
+/// stops being "50% of guest RAM". This fallback is small, fixed, and
+/// announced with a warning on every container start — a pod that
+/// needs real writable space gets a scratch disk, and one that silently
+/// got RAM instead is the failure mode this replaces.
+const FALLBACK_TMPFS_SIZE: &str = "128m";
 const RUNC_VIRTIOFS: &str = "/mnt/state/bin/runc";
-/// internal notes: the shim attaches a cached "tools" erofs image
+/// The shim attaches a cached "tools" erofs image
 /// (containing the static runc) as a read-only virtio-blk device
 /// mounted here, so block-path pods carry no virtiofs share at all.
 const RUNC_BLOCK_TOOLS: &str = "/run/k7d/tools/runc";
@@ -49,7 +86,7 @@ struct ContainerState {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     /// Overlay rootfs mounts to tear down when the container goes away
-    ///.
+    /// (erofs lower + tmpfs upper).
     overlay: Option<OverlayMounts>,
     /// The container init pid (from runc's `--pid-file`). The agent is
     /// guest PID 1, so `runc run --detach` reparents init to us and its
@@ -60,16 +97,33 @@ struct ContainerState {
     exit_code: Option<i32>,
 }
 
-/// Mounts backing an overlay container rootfs, unmounted in order on
-/// cleanup: first the overlay (`merged`), then the tmpfs holding
-/// upper/work (`tmpfs`).
+/// Mounts backing an overlay container rootfs, torn down in order on
+/// cleanup: first the overlay (`merged`), then the fallback tmpfs
+/// holding upper/work when there is one, then the upper/work directory
+/// tree.
 struct OverlayMounts {
     merged: PathBuf,
-    tmpfs: PathBuf,
+    /// `upper_root` is the mount point of this container's
+    /// own scratch disk rather than a directory inside the shared one.
+    /// Teardown must then empty it instead of removing it (the device
+    /// stays mounted for the life of the VM), and usage is a `statfs`
+    /// of an image nobody else writes to.
+    dedicated: bool,
+    /// Per-container tmpfs carrying `upper`/`work`, for the
+    /// fallback path only. `None` when the writable layer is the
+    /// host-backed scratch disk: that device is mounted once at boot
+    /// and shared by every container in the pod, so it must survive
+    /// this container's teardown.
+    tmpfs: Option<PathBuf>,
+    /// Directory holding `upper` and `work`, removed after the
+    /// unmounts.
+    upper_root: PathBuf,
 }
 
 fn cleanup_overlay(overlay: &OverlayMounts) {
-    for mnt in [&overlay.merged, &overlay.tmpfs] {
+    let mut mounts = vec![&overlay.merged];
+    mounts.extend(overlay.tmpfs.as_ref());
+    for mnt in mounts {
         let out = Command::new("umount").arg(mnt).output();
         if let Ok(out) = out {
             if !out.status.success() {
@@ -81,6 +135,114 @@ fn cleanup_overlay(overlay: &OverlayMounts) {
             }
         }
     }
+    if overlay.tmpfs.is_none() {
+        // Scratch-disk path: reclaim this container's writable bytes.
+        // (In the tmpfs path the directories died with the unmount, and
+        // the mountpoint lives under the run dir the caller removes.)
+        let reclaimed = if overlay.dedicated {
+            // Its own device: empty the mount point, never remove it.
+            clear_dir_contents(&overlay.upper_root)
+        } else {
+            fs::remove_dir_all(&overlay.upper_root)
+        };
+        if let Err(e) = reclaimed {
+            eprintln!(
+                "k7-agent: remove writable layer {} failed: {e}",
+                overlay.upper_root.display()
+            );
+        }
+    }
+}
+
+/// A container's writable-layer usage, measured inside the
+/// guest. The host cannot compute this: it sees only the sparse image's
+/// allocated blocks, which never shrink when the guest deletes a file
+/// and say nothing about which container wrote them.
+pub struct WritableUsage {
+    /// Bytes the container's writable layer currently occupies.
+    pub used_bytes: u64,
+    /// Capacity of the filesystem that layer lives on.
+    pub capacity_bytes: u64,
+    /// Whether that filesystem is this container's alone. When false
+    /// the capacity is shared with every other container in the pod,
+    /// so it is a pod-level number, not a limit on this container.
+    pub dedicated: bool,
+}
+
+/// `(used, capacity)` in bytes for the filesystem holding `path`.
+fn statfs_bytes(path: &Path) -> Result<(u64, u64), String> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("statfs path {}: {e}", path.display()))?;
+    // SAFETY: an all-zero `statfs` is a valid initial value — every
+    // field is an integer the kernel overwrites on success.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives
+    // the call, and `st` is a live, correctly sized statfs.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &raw mut st) };
+    if rc != 0 {
+        return Err(format!(
+            "statfs {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let frsize = u64::try_from(st.f_frsize).unwrap_or(0);
+    let capacity = st.f_blocks.saturating_mul(frsize);
+    let used = st
+        .f_blocks
+        .saturating_sub(st.f_bfree)
+        .saturating_mul(frsize);
+    Ok((used, capacity))
+}
+
+/// Bytes actually allocated under `dir`, summing `st_blocks` so sparse
+/// files and holes count the way the filesystem counts them.
+///
+/// Only used for the shared-scratch case, where there is no cheaper
+/// answer: a directory has no `statfs` of its own. Callers must not
+/// poll this in a hot loop (the shim samples it on an interval).
+fn tree_bytes(dir: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let entries = match fs::read_dir(&path) {
+            Ok(e) => e,
+            // Raced with container teardown: the tree is going away,
+            // so what is left of it is what it now uses.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("read entry under {}: {e}", path.display())),
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("stat {}: {e}", entry.path().display())),
+            };
+            total = total.saturating_add(meta.blocks().saturating_mul(512));
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Remove everything inside `dir`, leaving `dir` itself in place.
+fn clear_dir_contents(dir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Filesystem type of the mount that `path` lives on, per
@@ -104,16 +266,186 @@ fn mount_fstype_of(path: &Path) -> Option<String> {
     best.map(|(_, fstype)| fstype)
 }
 
-/// internal notes: when the bundle's rootfs lives on a read-only erofs
+/// Whether the host promised a scratch disk at [`SCRATCH_MOUNT`], per
+/// the `k7d.blk=` kernel cmdline param. The promise is what
+/// makes a missing mount an error rather than a configuration choice.
+fn scratch_promised(cmdline: &str) -> bool {
+    crate::parse_blk_mounts(cmdline)
+        .is_some_and(|mounts| mounts.iter().any(|m| m.mount == SCRATCH_MOUNT))
+}
+
+/// Whether `path` is the mount point of an ext4 device, as opposed to
+/// a plain directory. Both scratch paths live on the initramfs root
+/// otherwise, which reports `rootfs`/`tmpfs` — so an ext4 answer means
+/// the host really did attach the image (CHALLENGES #63:
+/// `Path::exists()` cannot tell a mount from a mount point).
+fn is_ext4_mount(path: &Path) -> bool {
+    matches!(mount_fstype_of(path).as_deref(), Some("ext4"))
+}
+
+/// Where `name`'s **own** scratch disk would be mounted, from
+/// the bundle's CRI annotations. `None` when the bundle carries no
+/// usable Kubernetes container name (a bare `Vm`-API caller), which is
+/// simply a container that cannot have asked for its own image.
+///
+/// The path existing says nothing about a device being there — see
+/// [`is_ext4_mount`].
+fn container_scratch_mount(config: &serde_json::Value) -> Option<PathBuf> {
+    let k8s_name = config
+        .get("annotations")
+        .and_then(|a| a.get(CRI_CONTAINER_NAME))
+        .and_then(serde_json::Value::as_str)
+        .filter(|n| !n.is_empty() && !n.contains('/') && !n.contains(".."))?;
+    Some(Path::new(CONTAINER_SCRATCH_ROOT).join(k8s_name))
+}
+
+/// Whether the host declared a per-container scratch device at `mount`,
+/// per `k7d.blk=`. Same role as [`scratch_promised`] one level down: a
+/// declared device that did not mount is an error, not a licence to
+/// fall back onto the shared sandbox scratch the container was
+/// explicitly moved off.
+fn container_scratch_promised(cmdline: &str, mount: &Path) -> bool {
+    crate::parse_blk_mounts(cmdline)
+        .is_some_and(|mounts| mounts.iter().any(|m| Path::new(&m.mount) == mount))
+}
+
+/// Where a container's overlay `upper`/`work` will live.
+enum WritableLayer {
+    /// A per-container directory on the host-backed scratch disk. The
+    /// device was mounted once at boot, so there is nothing to unmount
+    /// when the container goes away.
+    Scratch(PathBuf),
+    /// The container's **own** host-backed image, mounted at
+    /// [`CONTAINER_SCRATCH_ROOT`]`/<k8s name>`. Filling it gives this
+    /// container `ENOSPC` and leaves its siblings untouched.
+    ContainerScratch(PathBuf),
+    /// A bounded per-container tmpfs, mounted here. Used only when the
+    /// host attached no scratch disk.
+    Tmpfs(PathBuf),
+}
+
+/// Decide (and set up) where `name`'s writable layer lives.
+///
+/// - Host promised a scratch disk and it is mounted ⇒ a directory on
+///   it. Container writes go to the host image; capacity comes from the
+///   `k7d.katakate.org/scratch-size` annotation, not from guest RAM.
+/// - Host promised one and it is **not** mounted ⇒ hard error. The pod
+///   was admitted on the promise of host-backed writable space;
+///   quietly handing it RAM instead is precisely the regression this
+///   contract exists to prevent.
+/// - Host promised none ⇒ a bounded [`FALLBACK_TMPFS_SIZE`] tmpfs, with
+///   a warning naming the annotation. Never an unsized tmpfs, whose
+///   capacity would again be half of guest RAM.
+fn prepare_writable_layer(
+    run_dir: &Path,
+    name: &str,
+    config: &serde_json::Value,
+) -> Result<WritableLayer, String> {
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+
+    // A container that was given its own image wins over the
+    // shared sandbox scratch — that is the whole point of asking.
+    if let Some(mount) = container_scratch_mount(config) {
+        let promised = container_scratch_promised(&cmdline, &mount);
+        if promised && !is_ext4_mount(&mount) {
+            return Err(format!(
+                "the host declared a per-container scratch disk at {} (k7d.blk=) but it is \
+                 not mounted (filesystem there is {:?}, want ext4) — refusing to run {name} \
+                 on the pod's shared writable layer, whose capacity is not the limit it was \
+                 given",
+                mount.display(),
+                mount_fstype_of(&mount)
+            ));
+        }
+        if promised {
+            // A leftover under this mount (a container restart, or a
+            // warm fork's inherited copy) must not become the new
+            // overlay's upper: stale whiteouts would mask files the
+            // image legitimately has. Emptying it — rather than
+            // removing it — keeps the device's mount point in place.
+            clear_dir_contents(&mount)
+                .map_err(|e| format!("clear stale writable layer {}: {e}", mount.display()))?;
+            eprintln!(
+                "k7-agent: {name} writable layer on its own scratch disk at {}",
+                mount.display()
+            );
+            return Ok(WritableLayer::ContainerScratch(mount));
+        }
+    }
+
+    if scratch_promised(&cmdline) {
+        let fstype = mount_fstype_of(Path::new(SCRATCH_MOUNT));
+        // A bare directory on the initramfs root reports `rootfs`/
+        // `tmpfs` here: the device never mounted, so the promise was
+        // not kept.
+        if !matches!(fstype.as_deref(), Some("ext4")) {
+            return Err(format!(
+                "the host declared a scratch disk at {SCRATCH_MOUNT} (k7d.blk=) but it is \
+                 not mounted (filesystem there is {fstype:?}, want ext4) — refusing to run \
+                 {name} on a RAM-backed writable layer it was not sized for"
+            ));
+        }
+        let root = Path::new(SCRATCH_MOUNT).join(name);
+        // A leftover from an earlier container of the same name (a
+        // restart inside a warm-forked guest) must not be inherited as
+        // an overlay upper: stale whiteouts would mask files the new
+        // image legitimately has.
+        if root.exists() {
+            fs::remove_dir_all(&root)
+                .map_err(|e| format!("clear stale writable layer {}: {e}", root.display()))?;
+        }
+        fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
+        eprintln!(
+            "k7-agent: {name} writable layer on host-backed scratch disk at {}",
+            root.display()
+        );
+        return Ok(WritableLayer::Scratch(root));
+    }
+
+    let tmpfs = run_dir.join("overlay");
+    fs::create_dir_all(&tmpfs).map_err(|e| format!("create {}: {e}", tmpfs.display()))?;
+    let out = Command::new("mount")
+        .args([
+            "-t",
+            "tmpfs",
+            "-o",
+            &format!("size={FALLBACK_TMPFS_SIZE}"),
+            "tmpfs",
+        ])
+        .arg(&tmpfs)
+        .output()
+        .map_err(|e| format!("mount tmpfs: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "mount tmpfs at {}: {}",
+            tmpfs.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    eprintln!(
+        "k7-agent: WARNING: no scratch disk attached; {name} writable layer is a \
+         {FALLBACK_TMPFS_SIZE} guest tmpfs at {} and its writes consume guest RAM. Set \
+         k7d.katakate.org/scratch-size on the pod for host-backed writable space",
+        tmpfs.display()
+    );
+    Ok(WritableLayer::Tmpfs(tmpfs))
+}
+
+/// When the bundle's rootfs lives on a read-only erofs
 /// block mount, runc cannot use it directly (no upper layer to write
-/// to). Assemble `overlay(lower=<erofs rootfs>, upper+work=tmpfs)`
-/// under `run_dir` and return a patched bundle whose `root.path` is
-/// the overlay's merged dir. Returns the bundle to hand runc plus the
+/// to). Assemble `overlay(lower=<erofs rootfs>, upper+work=<writable
+/// layer>)` and return a patched bundle whose `root.path` is the
+/// overlay's merged dir. Returns the bundle to hand runc plus the
 /// mounts to tear down; `(original bundle, None)` when the rootfs is
 /// not on erofs.
+///
+/// The writable layer is the sandbox's host-backed scratch
+/// disk ([`prepare_writable_layer`]), so a container's writes no longer
+/// come out of the pod's memory budget.
 fn prepare_rootfs_overlay(
     bundle: &Path,
     run_dir: &Path,
+    name: &str,
 ) -> Result<(PathBuf, Option<OverlayMounts>), String> {
     let config_raw = fs::read_to_string(bundle.join("config.json"))
         .map_err(|e| format!("read config.json: {e}"))?;
@@ -133,28 +465,34 @@ fn prepare_rootfs_overlay(
         return Ok((bundle.to_path_buf(), None));
     }
 
-    // upper + work must live on the same writable fs: a fresh tmpfs.
-    let tmpfs = run_dir.join("overlay");
-    fs::create_dir_all(&tmpfs).map_err(|e| format!("create {}: {e}", tmpfs.display()))?;
-    let out = Command::new("mount")
-        .args(["-t", "tmpfs", "tmpfs"])
-        .arg(&tmpfs)
-        .output()
-        .map_err(|e| format!("mount tmpfs: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "mount tmpfs at {}: {}",
-            tmpfs.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let overlay = OverlayMounts {
-        merged: tmpfs.join("merged"),
-        tmpfs,
+    // upper + work must live on the same writable filesystem: the
+    // host-backed scratch disk, or the bounded tmpfs fallback.
+    let overlay = match prepare_writable_layer(run_dir, name, &config)? {
+        WritableLayer::Scratch(root) => OverlayMounts {
+            // `merged` is only a mount point, so it stays on the guest
+            // tmpfs run dir — the bytes behind it are the lower erofs
+            // and the scratch upper.
+            merged: run_dir.join("merged"),
+            dedicated: false,
+            tmpfs: None,
+            upper_root: root,
+        },
+        WritableLayer::ContainerScratch(root) => OverlayMounts {
+            merged: run_dir.join("merged"),
+            dedicated: true,
+            tmpfs: None,
+            upper_root: root,
+        },
+        WritableLayer::Tmpfs(tmpfs) => OverlayMounts {
+            merged: tmpfs.join("merged"),
+            dedicated: false,
+            tmpfs: Some(tmpfs.clone()),
+            upper_root: tmpfs,
+        },
     };
     let result = (|| {
-        let upper = overlay.tmpfs.join("upper");
-        let work = overlay.tmpfs.join("work");
+        let upper = overlay.upper_root.join("upper");
+        let work = overlay.upper_root.join("work");
         for d in [&upper, &work, &overlay.merged] {
             fs::create_dir_all(d).map_err(|e| format!("create {}: {e}", d.display()))?;
         }
@@ -188,9 +526,10 @@ fn prepare_rootfs_overlay(
         )
         .map_err(|e| format!("write patched config.json: {e}"))?;
         eprintln!(
-            "k7-agent: erofs rootfs {} overlaid at {} (tmpfs upper)",
+            "k7-agent: erofs rootfs {} overlaid at {} (upper on {})",
             rootfs.display(),
-            overlay.merged.display()
+            overlay.merged.display(),
+            overlay.upper_root.display()
         );
         Ok(patched_bundle)
     })();
@@ -269,9 +608,11 @@ impl ContainerManager {
         fs::create_dir_all(&run_dir)
             .map_err(|e| format!("failed to create run dir {}: {e}", run_dir.display()))?;
 
-        // internal notes: rootfs on a read-only erofs block mount gets an
-        // overlay with a tmpfs upper; runc receives the patched bundle.
-        let (runc_bundle, overlay) = match prepare_rootfs_overlay(bundle, &run_dir) {
+        // Rootfs on a read-only erofs block mount gets
+        // an overlay; runc receives the patched bundle. The
+        // overlay's upper lives on the sandbox's host-backed scratch
+        // disk, so this container's writes never touch guest RAM.
+        let (runc_bundle, overlay) = match prepare_rootfs_overlay(bundle, &run_dir, name) {
             Ok(v) => v,
             Err(e) => {
                 let _ = fs::remove_dir_all(&run_dir);
@@ -282,7 +623,7 @@ impl ContainerManager {
 
         let stdout_path = run_dir.join("stdout");
         let stderr_path = run_dir.join("stderr");
-        // internal notes: runc writes the init pid here at create time,
+        // Runc writes the init pid here at create time,
         // BEFORE start — reliable even for containers that exit
         // instantly (`runc state` would already report pid 0).
         let pid_file = run_dir.join("pid");
@@ -486,7 +827,7 @@ impl ContainerManager {
             let _ = fs::remove_dir_all(state.stdout_path.parent().unwrap_or(Path::new("/")));
         }
 
-        // internal notes: container stop is the durability point for
+        // Container stop is the durability point for
         // writable virtio-blk volumes (k7d RWO disk images). The VM is
         // torn down without a guest-side unmount, so anything still in
         // the guest page cache when the vCPUs stop would be lost —
@@ -497,7 +838,7 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Whether a container with this name is tracked (internal notes: PTY
+    /// Whether a container with this name is tracked (PTY
     /// exec handshake validation).
     pub fn contains(&self, name: &str) -> bool {
         self.containers.lock().unwrap().contains_key(name)
@@ -507,6 +848,46 @@ impl ContainerManager {
     pub fn list(&self) -> Vec<String> {
         let containers = self.containers.lock().unwrap();
         containers.keys().cloned().collect()
+    }
+
+    /// How much writable space `name` is using, and out of
+    /// what capacity.
+    ///
+    /// A container with its **own** scratch disk gets an exact,
+    /// constant-cost `statfs` of an image nobody else writes to — and
+    /// the capacity is a real limit. A container sharing the sandbox
+    /// scratch needs its `upper` tree walked, and the capacity it is
+    /// reported against belongs to the whole pod.
+    pub fn usage(&self, name: &str) -> Result<WritableUsage, String> {
+        let (root, dedicated) = {
+            let containers = self.containers.lock().unwrap();
+            let state = containers
+                .get(name)
+                .ok_or_else(|| format!("container {name} not found"))?;
+            match state.overlay {
+                Some(ref ov) => (ov.upper_root.clone(), ov.dedicated),
+                // No overlay means the rootfs was not on erofs, so
+                // there is no writable layer of ours to measure. Say so
+                // rather than reporting a zero that looks like "empty".
+                None => {
+                    return Err(format!(
+                        "container {name} has no k7d-managed writable layer \
+                         (its rootfs is not an overlay)"
+                    ))
+                }
+            }
+        };
+        let (statfs_used, capacity_bytes) = statfs_bytes(&root)?;
+        let used_bytes = if dedicated {
+            statfs_used
+        } else {
+            tree_bytes(&root.join("upper"))?
+        };
+        Ok(WritableUsage {
+            used_bytes,
+            capacity_bytes,
+            dedicated,
+        })
     }
 
     /// Non-blocking exit probe. Returns `Ok(None)`
@@ -555,7 +936,7 @@ impl ContainerManager {
     }
 
     /// Block until a container's init process exits. Returns the real
-    /// exit code (internal notes� previously this polled `runc state`
+    /// exit code (previously this polled `runc state`
     /// and always returned 0).
     pub fn wait(&self, name: &str) -> Result<i32, String> {
         loop {

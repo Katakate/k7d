@@ -12,6 +12,7 @@ mod exec;
 mod io_bridge;
 mod sandbox;
 mod task;
+mod usage;
 
 use task::K7Service;
 

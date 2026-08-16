@@ -31,8 +31,15 @@ use crate::sandbox::{ContainerState, ImageSlot, ProcessState, RootfsDevice, Sand
 
 const CRI_CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
 const CRI_SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
+/// Kubernetes container name, stamped on a WORKLOAD container's OCI
+/// spec (never on the sandbox's). matches it against the names
+/// in [`ANN_CONTAINER_SCRATCH_SIZE`]; the guest agent reads the same
+/// key off the bundle, because the guest runc name is the containerd
+/// container id, which does not exist yet when the sandbox declares a
+/// container's writable image.
+const CRI_CONTAINER_NAME: &str = "io.kubernetes.cri.container-name";
 
-// internal notes: pod-level resources containerd's CRI stamps onto the
+// Pod-level resources containerd's CRI stamps onto the
 // SANDBOX OCI spec for VM runtimes (workload containers' configs only
 // arrive later, so sandbox-create is the one place VM sizing can
 // happen). Values are decimal strings: memory limit in bytes, CFS
@@ -47,23 +54,23 @@ const ANN_FORK_SOURCE_CLUSTER: &str = "k7d.katakate.org/fork-source-cluster";
 const ANN_FORK_SOURCE_VM: &str = "k7d.katakate.org/fork-source-vm";
 const ANN_FORK_VM_INDEX: &str = "k7d.katakate.org/fork-vm-index";
 
-// internal notes
+// Cluster-tree annotations.
 //
 // `tree-id` is opt-in: when set, the cluster lives under a named
 // `ClusterSnapshotTree` whose lifecycle (suspend / resume / evict) the
 // k7d daemon owns — the shim merely records the tree-id so the
 // daemon-side wiring (currently the responsibility of a future
-// shim ↔ k7d Unix-socket call, see internal notes"Shim integration") can
+// shim ↔ k7d Unix-socket call) can
 // route to the right tree. When `tree-id` is absent the shim's
-// behaviour is unchanged from internal notes
+// behaviour is unchanged.
 const ANN_TREE_ID: &str = "k7d.katakate.org/tree-id";
 /// When both `tree-id` and `tree-source-node-id` are set, the new
 /// cluster is a fork of the source node within the named tree.
 const ANN_TREE_SOURCE_NODE_ID: &str = "k7d.katakate.org/tree-source-node-id";
 
-// internal notes: operator-facing cluster-tree fork annotations.
+// Operator-facing cluster-tree fork annotations.
 //
-// These DRIVE the k7d daemon (unlike the record-only spec-9g pair
+// These DRIVE the k7d daemon (unlike the record-only pair
 // above). Trigger: the **sandbox `Create`** of a pod carrying them —
 // Create is the one CRI hop where containerd reliably forwards pod
 // annotations into the OCI spec (`pod_annotations` in the k7 runtime
@@ -90,7 +97,7 @@ const ANN_TREE_FORK_LABEL: &str = "k7d.katakate.org/tree-fork-label";
 /// JSON-serialized [`k7d::tree::TreeBudget`] for the adopt.
 const ANN_TREE_BUDGET: &str = "k7d.katakate.org/tree-budget";
 
-// internal notes� spare image-slot virtio-blk devices. virtio-mmio
+// Spare image-slot virtio-blk devices. virtio-mmio
 // has no hotplug, and the VM boots at the FIRST workload Create; a
 // later workload with a distinct image attaches through one of these
 // boot-time-declared spares: the host fills the slot's sparse backing
@@ -100,6 +107,45 @@ const ANN_TREE_BUDGET: &str = "k7d.katakate.org/tree-budget";
 const ANN_IMAGE_SLOTS: &str = "k7d.katakate.org/image-slots";
 /// Pod annotation: capacity in bytes of each slot's backing file.
 const ANN_IMAGE_SLOT_SIZE: &str = "k7d.katakate.org/image-slot-size";
+
+/// Pod annotation sizing the sandbox's writable scratch
+/// disk, the host-backed ext4 image every container's overlay
+/// `upper`/`work` lives on. Accepts a plain byte count or a k8s-style
+/// quantity suffix (`512Mi`, `16Gi`, `2G`). Unset ⇒
+/// [`k7d::disks::DEFAULT_SCRATCH_SIZE`] (8 GiB), which is deliberately
+/// a constant and NOT a function of the pod's memory limit — decoupling
+/// writable space from guest RAM is the point of the annotation.
+const ANN_SCRATCH_SIZE: &str = "k7d.katakate.org/scratch-size";
+
+/// Pod annotation giving named containers their **own**
+/// writable image instead of a directory on the shared sandbox
+/// scratch, so one container filling its writable layer cannot starve
+/// its siblings. Value is a comma-separated `name=size` list over
+/// Kubernetes container names, e.g. `builder=2Gi,logger=256Mi`; sizes
+/// take the same suffixes as [`ANN_SCRATCH_SIZE`]. Containers not
+/// listed keep sharing the sandbox scratch exactly as in.
+///
+/// Why an annotation and not the pod spec: containerd's CRI carries no
+/// ephemeral-storage number at all — not on the sandbox, not on the
+/// container, and not in `linux.resources` (verified against live k3s
+/// bundles). The
+/// kubelet's own `ephemeral-storage` limits only exist on the pod
+/// object in the API server, which the shim deliberately does not talk
+/// to. Do not go looking for the number again, and do not substitute
+/// anything memory-shaped for it.
+///
+/// Why a whole device per container rather than an ext4 project quota
+/// on the shared image: the guest kernel has no quota support at all
+/// (`guest/kernel/config-minimal` has `CONFIG_EXT4_FS=y` and no
+/// `CONFIG_QUOTA`/`CONFIG_QUOTA_TREE`/`CONFIG_QFMT_V2`), and no loop
+/// device either, so every in-guest quota mechanism costs a guest
+/// kernel rebuild that the nodes of an existing cluster would not
+/// have. A virtio-blk image costs one MMIO slot out of
+/// [`MMIO_DEVICE_BUDGET`] instead, which is why it is opt-in per
+/// container. The third option — measure but do not enforce — is what
+/// unlisted containers still get, and it is reported as such
+/// (`dedicated: false`) rather than dressed up as a limit.
+const ANN_CONTAINER_SCRATCH_SIZE: &str = "k7d.katakate.org/container-scratch-size";
 /// Default spare image-slot count (each costs one MMIO slot + IOAPIC pin).
 const DEFAULT_IMAGE_SLOTS: u32 = 4;
 /// Default slot capacity: 2 GiB, sparse (blocks allocate on fill).
@@ -112,7 +158,7 @@ const GUEST_IMAGE_SLOT_PREFIX: &str = "/run/k7d/slot";
 /// declaration) is what lets the error name the annotation.
 const MMIO_DEVICE_BUDGET: usize = 19;
 
-// internal notes� block-path guest layout. All under /run/k7d/
+// Block-path guest layout. All under /run/k7d/
 // (guest tmpfs; the initramfs root) or /mnt/ (kept for the explicit
 // virtiofs fallback), matching the strip-pass carve-out in
 // `fix_oci_config`.
@@ -128,7 +174,7 @@ const GUEST_BUNDLES_BASE: &str = "/run/k7d/bundles";
 /// (`/etc/{resolv.conf,hosts,hostname}` sources).
 const GUEST_ETC_BASE: &str = "/run/k7d/etc";
 /// Guest mount base for k7d-provisioned RWO disk volumes (raw ext4
-/// images on the reflink loopback XFS, internal notes/4).
+/// images on the reflink loopback XFS).
 const GUEST_DISKS_BASE: &str = "/run/k7d/disks";
 /// In-VM roots of the explicit virtiofs fallback shares (hostPath /
 /// unsupported PVC plugins). Distinct from the legacy
@@ -143,7 +189,7 @@ const GUEST_HOSTPATH_PREFIX: &str = "/run/k7d/hostpath";
 /// Default size of a k7d-provisioned RWO disk volume image: 1 GiB,
 /// sparse (real blocks allocate as the guest writes). The OCI spec
 /// carries no PVC capacity, so static provisioning uses this fixed
-/// size; a real CSI driver (out of scope, internal notes) would size
+/// size; a real CSI driver (out of scope) would size
 /// from the claim.
 const K7D_DISK_DEFAULT_SIZE: u64 = 1024 * 1024 * 1024;
 
@@ -165,7 +211,7 @@ pub struct ShimAnnotations {
     pub fork_vm_index: Option<u32>,
     /// `k7d.katakate.org/tree-id` — the named cluster
     /// snapshot tree this cluster belongs to. `None` means the cluster
-    /// is not tree-managed (legacy spec-9d behaviour).
+    /// is not tree-managed (legacy behaviour).
     pub tree_id: Option<String>,
     /// `k7d.katakate.org/tree-source-node-id` — the source
     /// node within the named tree to fork from. Only meaningful when
@@ -200,6 +246,15 @@ pub struct ShimAnnotations {
     /// backing-file capacity in bytes. Raw string; validated loudly
     /// at sandbox Create.
     pub image_slot_size: Option<String>,
+    /// `k7d.katakate.org/scratch-size` — capacity of the
+    /// sandbox's writable scratch disk. Raw string; parsed loudly at
+    /// sandbox Create ([`scratch_size_from_annotations`]).
+    pub scratch_size: Option<String>,
+    /// `k7d.katakate.org/container-scratch-size` — raw
+    /// `name=size,...` list of containers that get their own writable
+    /// image; parsed loudly at sandbox Create
+    /// ([`container_scratch_from_annotations`]).
+    pub container_scratch_size: Option<String>,
 }
 
 impl ShimAnnotations {
@@ -212,7 +267,7 @@ impl ShimAnnotations {
 pub struct K7Service {
     state: Arc<Mutex<SandboxState>>,
     bridges: Arc<Mutex<HashMap<String, OutputBridge>>>,
-    /// internal notes: live/pending PTY exec sessions keyed by exec id
+    /// Live/pending PTY exec sessions keyed by exec id
     /// (`ResizePty`/`CloseIO` route through here).
     pty_sessions: crate::exec::PtySessions,
     /// Arc so per-container exit watcher threads can
@@ -224,13 +279,16 @@ pub struct K7Service {
     /// cleanup-after-dead-shim path) uses it to find and stop the dead
     /// predecessor's VM in the k7d daemon.
     id: String,
+    /// Per-container writable-layer usage, sampled off the
+    /// guest on `Stats` and logged (see [`crate::usage`]).
+    usage: crate::usage::UsageTracker,
     exit: Arc<tokio::sync::Notify>,
 }
 
-/// internal notes: append a timestamped line to /tmp/k7-shim.log.
+/// Debugging: append a timestamped line to /tmp/k7-shim.log.
 /// containerd hands the shim /dev/null for stderr, so this is the only
 /// way to see Create/Delete decisions on a live cluster.
-fn debug_log_10a(msg: &str) {
+pub(crate) fn debug_log_cni(msg: &str) {
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -248,7 +306,7 @@ fn debug_log_10a(msg: &str) {
     }
 }
 
-/// internal notes: detect a `hostNetwork: true` pod by the absence of the
+/// Detect a `hostNetwork: true` pod by the absence of the
 /// `network` namespace AND a non-empty namespaces list (kubelet
 /// produces a fully-populated `linux.namespaces` array for normal
 /// pods and omits the `network` entry for `hostNetwork: true`).
@@ -272,7 +330,7 @@ fn spec_has_host_network(bundle: &str) -> bool {
     !has_network
 }
 
-/// internal notes: extract the CNI-assigned pod netns path from the OCI
+/// Extract the CNI-assigned pod netns path from the OCI
 /// spec, or `None` if no `network` namespace is present (which kubelet
 /// produces for `hostNetwork: true` pods — those are explicitly
 /// rejected in `Create`).
@@ -294,7 +352,7 @@ fn pod_netns_from_spec(bundle: &str) -> Option<PathBuf> {
     None
 }
 
-/// internal notes: pull the kubelet-set pod UID annotation out of the
+/// Pull the kubelet-set pod UID annotation out of the
 /// OCI spec. Used by sandbox `Create` to derive the kubelet
 /// volumes directory `/var/lib/kubelet/pods/<pod-uid>/` that
 /// [`k7d::volumes::PodVolumes::prepare`] enumerates.
@@ -382,10 +440,120 @@ fn annotations_from_spec(bundle: &str) -> ShimAnnotations {
         image_slots: ShimAnnotations::lookup(annotations, ANN_IMAGE_SLOTS).map(str::to_string),
         image_slot_size: ShimAnnotations::lookup(annotations, ANN_IMAGE_SLOT_SIZE)
             .map(str::to_string),
+        scratch_size: ShimAnnotations::lookup(annotations, ANN_SCRATCH_SIZE).map(str::to_string),
+        container_scratch_size: ShimAnnotations::lookup(annotations, ANN_CONTAINER_SCRATCH_SIZE)
+            .map(str::to_string),
     }
 }
 
-// internal notes: pod resources → VM sizing.
+/// Parse a k8s-style storage quantity into bytes: a decimal integer
+/// with an optional binary (`Ki`/`Mi`/`Gi`/`Ti`) or decimal
+/// (`k`/`M`/`G`/`T`) suffix. Bare digits are bytes.
+fn parse_size_quantity(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, suffix) = s.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("{raw:?} must start with a decimal digit"));
+    }
+    let value: u64 = digits
+        .parse()
+        .map_err(|e| format!("{raw:?}: {e} (value too large for a byte count)"))?;
+    let unit: u64 = match suffix {
+        "" | "B" => 1,
+        "Ki" => 1024,
+        "Mi" => 1024 * 1024,
+        "Gi" => 1024 * 1024 * 1024,
+        "Ti" => 1024 * 1024 * 1024 * 1024,
+        "k" | "K" => 1000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        other => {
+            return Err(format!(
+                "unknown size suffix {other:?} in {raw:?} — use bytes, Ki/Mi/Gi/Ti or k/M/G/T"
+            ))
+        }
+    };
+    value
+        .checked_mul(unit)
+        .ok_or_else(|| format!("{raw:?} overflows a 64-bit byte count"))
+}
+
+/// Capacity of the sandbox's writable scratch disk, from the
+/// `k7d.katakate.org/scratch-size` annotation, defaulting to
+/// [`k7d::disks::DEFAULT_SCRATCH_SIZE`].
+///
+/// Note what this function does NOT read: `ann.sandbox_memory_bytes`.
+/// Deriving scratch capacity from the pod's memory limit is the exact
+/// coupling removes.
+fn scratch_size_from_annotations(ann: &ShimAnnotations) -> Result<u64, String> {
+    let Some(raw) = ann.scratch_size.as_deref() else {
+        return Ok(k7d::disks::DEFAULT_SCRATCH_SIZE);
+    };
+    let bytes = parse_size_quantity(raw).map_err(|e| format!("invalid {ANN_SCRATCH_SIZE}: {e}"))?;
+    if bytes < k7d::disks::MIN_SCRATCH_SIZE {
+        return Err(format!(
+            "{ANN_SCRATCH_SIZE}={raw:?} is {bytes} bytes, below the \
+             {}-byte minimum for a usable ext4 scratch filesystem",
+            k7d::disks::MIN_SCRATCH_SIZE
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Containers that get their own writable image, from the
+/// `k7d.katakate.org/container-scratch-size` annotation.
+///
+/// Every failure is loud: a pod that asked for a per-container limit
+/// and silently did not get one would go on sharing the sandbox
+/// scratch, which is precisely the behaviour the annotation exists to
+/// change.
+fn container_scratch_from_annotations(
+    ann: &ShimAnnotations,
+) -> Result<Vec<k7d::control::ContainerScratchConfig>, String> {
+    let Some(raw) = ann.container_scratch_size.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<k7d::control::ContainerScratchConfig> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, size) = entry.split_once('=').ok_or_else(|| {
+            format!(
+                "invalid {ANN_CONTAINER_SCRATCH_SIZE} entry {entry:?} — expected \
+                 <container-name>=<size>, e.g. builder=2Gi"
+            )
+        })?;
+        let name = name.trim();
+        k7d::disks::ScratchDisk::validate_key(name)
+            .map_err(|e| format!("invalid {ANN_CONTAINER_SCRATCH_SIZE} container name: {e}"))?;
+        if out.iter().any(|c| c.name == name) {
+            return Err(format!(
+                "{ANN_CONTAINER_SCRATCH_SIZE} names container {name:?} twice"
+            ));
+        }
+        let size_bytes = parse_size_quantity(size.trim())
+            .map_err(|e| format!("invalid {ANN_CONTAINER_SCRATCH_SIZE} size for {name:?}: {e}"))?;
+        if size_bytes < k7d::disks::MIN_SCRATCH_SIZE {
+            return Err(format!(
+                "{ANN_CONTAINER_SCRATCH_SIZE} gives {name:?} {size_bytes} bytes, below the \
+                 {}-byte minimum for a usable ext4 filesystem",
+                k7d::disks::MIN_SCRATCH_SIZE
+            ));
+        }
+        out.push(k7d::control::ContainerScratchConfig {
+            name: name.to_string(),
+            size_bytes,
+        });
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{ANN_CONTAINER_SCRATCH_SIZE}={raw:?} names no containers"
+        ));
+    }
+    Ok(out)
+}
+
+// Pod resources → VM sizing.
 
 /// Fixed VM overhead added on top of the pod's memory limit: guest
 /// kernel text/data, page tables, and agent runtime that exist inside
@@ -457,14 +625,14 @@ fn stop_daemon_vm(vm_id: &str) {
         });
     match result {
         Ok(k7d::control::Response::Ok) => {
-            debug_log_10a(&format!("stop_daemon_vm: {vm_id} stopped"));
+            debug_log_cni(&format!("stop_daemon_vm: {vm_id} stopped"));
         }
         Ok(other) => {
-            debug_log_10a(&format!("stop_daemon_vm: {vm_id}: {other:?}"));
+            debug_log_cni(&format!("stop_daemon_vm: {vm_id}: {other:?}"));
             log::warn!("k7d stop_vm({vm_id}): {other:?}");
         }
         Err(e) => {
-            debug_log_10a(&format!("stop_daemon_vm: {vm_id}: {e}"));
+            debug_log_cni(&format!("stop_daemon_vm: {vm_id}: {e}"));
             log::warn!("k7d stop_vm({vm_id}): {e}");
         }
     }
@@ -485,13 +653,13 @@ fn lookup_daemon_sandbox(sandbox_id: &str) -> Option<String> {
         Ok(k7d::control::Response::SandboxFound { vm_id, .. }) => Some(vm_id),
         Ok(_) => None,
         Err(e) => {
-            debug_log_10a(&format!("lookup_daemon_sandbox({sandbox_id}): {e}"));
+            debug_log_cni(&format!("lookup_daemon_sandbox({sandbox_id}): {e}"));
             None
         }
     }
 }
 
-/// internal notes: resolve the live daemon VMs whose sandboxes sit on
+/// Resolve the live daemon VMs whose sandboxes sit on
 /// `cluster_id`, sorted by `vm_index`. Returns `(vm_id, guest_cid)`
 /// pairs — the CIDs feed the post-adopt invariant check in
 /// [`run_tree_annotation_ops`]. Fails loud when the cluster has no
@@ -529,8 +697,8 @@ fn discover_cluster_vms(
     Ok(found.into_iter().map(|(_, id, cid)| (id, cid)).collect())
 }
 
-/// internal notes: annotation-driven cluster-tree adopt + fork (the
-/// operator-facing drive path over the Inc 4 primitives). Runs during
+/// Annotation-driven cluster-tree adopt + fork (the
+/// operator-facing drive path over the tree primitives). Runs during
 /// sandbox `Create` of the trigger pod, before its own VM is created —
 /// a failed adopt/fork therefore fails Create with nothing to unwind.
 ///
@@ -543,7 +711,7 @@ fn discover_cluster_vms(
 /// exec against those pods. `prepare_fork_source_in` preserves the
 /// CID on both routes — virtiofs-backed sources stay running in
 /// place, share-less sources are restored **onto the same CID**
-/// — so a mismatch here is a
+/// (CHALLENGES.md #39) — so a mismatch here is a
 /// broken daemon invariant and fails the Create loudly instead of
 /// leaving half the cluster unreachable.
 fn run_tree_annotation_ops(ann: &ShimAnnotations) -> Result<(), String> {
@@ -618,7 +786,7 @@ fn annotation_adopt_cluster(
     let members = discover_cluster_vms(daemon, cluster_id)?;
     let vm_ids: Vec<String> = members.iter().map(|(id, _)| id.clone()).collect();
     let pre_adopt_cids: Vec<u64> = members.iter().map(|(_, cid)| *cid).collect();
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "tree annotations: adopting cluster {cluster_id} (vm_ids={vm_ids:?}) \
          into tree {tree_id}"
     ));
@@ -636,7 +804,7 @@ fn annotation_adopt_cluster(
                      would dial dead CIDs"
                 ));
             }
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "tree annotations: adopted tree {tree_id} (cids {guest_cids:?} unchanged)"
             ));
             Ok(())
@@ -653,7 +821,7 @@ fn annotation_fork_tree(
     source_id: String,
     label: String,
 ) -> Result<(), String> {
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "tree annotations: forking tree {tree_id} from {source_id} (label {label})"
     ));
     match daemon.call(&k7d::control::Request::TreeFork {
@@ -666,7 +834,7 @@ fn annotation_fork_tree(
             guest_cids,
             fork_memory_full_copy,
         } => {
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "tree annotations: forked node {node_id} (cids {guest_cids:?}, \
                  full_copy {fork_memory_full_copy:?})"
             ));
@@ -674,6 +842,138 @@ fn annotation_fork_tree(
         }
         k7d::control::Response::Error { message } => Err(format!("tree_fork: {message}")),
         other => Err(format!("unexpected tree_fork response: {other:?}")),
+    }
+}
+
+/// Whether the pod carries either single-VM fork-source
+/// annotation. Both-or-neither is validated by
+/// [`sandbox_create_fork_adopt`] — this only routes the Create.
+fn has_fork_source(ann: &ShimAnnotations) -> bool {
+    ann.fork_source_vm.is_some() || ann.fork_source_cluster.is_some()
+}
+
+/// Sandbox Create of a fork pod. Resolves the source
+/// sandbox through the daemon (`LookupSandbox`), validates the
+/// annotated cluster identity against the source VM's actual cluster,
+/// warm-forks it (`ForkVm`), and adopts the returned VM as this
+/// sandbox's — no cold boot, no `pending_vm`. Fail-loud on every
+/// half-specified or mismatched input, naming the annotation keys.
+fn sandbox_create_fork_adopt(
+    state: &mut SandboxState,
+    sandbox_id: &str,
+    ann: &ShimAnnotations,
+) -> Result<(), String> {
+    let (src_sandbox, src_cluster) = match (&ann.fork_source_vm, &ann.fork_source_cluster) {
+        (Some(v), Some(c)) => (v.clone(), c.clone()),
+        _ => {
+            return Err(format!(
+                "{ANN_FORK_SOURCE_VM} and {ANN_FORK_SOURCE_CLUSTER} must be set together"
+            ));
+        }
+    };
+
+    let mut daemon = k7d::control::Client::connect_env().map_err(|e| {
+        format!(
+            "connect to k7d daemon at {}: {e}",
+            k7d::control::socket_path_from_env()
+        )
+    })?;
+
+    let (src_vm_id, src_cluster_actual) =
+        match daemon.call(&k7d::control::Request::LookupSandbox {
+            sandbox_id: src_sandbox.clone(),
+        })? {
+            k7d::control::Response::SandboxFound {
+                vm_id, cluster_id, ..
+            } => (vm_id, cluster_id),
+            k7d::control::Response::Error { message } => {
+                return Err(format!("{ANN_FORK_SOURCE_VM}={src_sandbox:?}: {message}"));
+            }
+            other => return Err(format!("unexpected lookup_sandbox response: {other:?}")),
+        };
+    if let Some(ref actual) = src_cluster_actual {
+        if *actual != src_cluster {
+            return Err(format!(
+                "{ANN_FORK_SOURCE_CLUSTER}={src_cluster:?} does not match the source \
+                 VM's cluster {actual:?}"
+            ));
+        }
+    }
+
+    let (fork_vm_id, fork_cid) = match daemon.call(&k7d::control::Request::ForkVm {
+        vm_id: src_vm_id.clone(),
+        sandbox_id: Some(sandbox_id.to_string()),
+    })? {
+        k7d::control::Response::VmForked {
+            vm_id, guest_cid, ..
+        } => (vm_id, guest_cid),
+        k7d::control::Response::Error { message } => {
+            return Err(format!("fork_vm({src_vm_id}): {message}"));
+        }
+        other => return Err(format!("unexpected fork_vm response: {other:?}")),
+    };
+
+    let state_dir = std::env::temp_dir().join(format!("k7d-shim-{sandbox_id}"));
+    let _ = std::fs::create_dir_all(&state_dir);
+
+    log::info!(
+        "sandbox {sandbox_id}: adopted warm fork {fork_vm_id} (cid {fork_cid}) of \
+         source sandbox {src_sandbox} (vm {src_vm_id})"
+    );
+    debug_log_cni(&format!(
+        "Create: sandbox={sandbox_id} fork-adopted vm={fork_vm_id} cid={fork_cid} \
+         source_sandbox={src_sandbox} source_vm={src_vm_id}"
+    ));
+
+    state.vm_id = Some(fork_vm_id);
+    state.guest_cid = Some(fork_cid);
+    state.sandbox_id = Some(sandbox_id.to_string());
+    state.state_dir = Some(state_dir);
+    state.fork_of = Some(src_sandbox);
+    state.pending_vm = None;
+    // The fork VM rides the source's (daemon-owned) bridge and keeps
+    // the inherited guest network identity; this pod's own CNI netns
+    // is left untouched (kubectl exec/logs go over vsock, not the pod
+    // IP).
+    state.cluster_id = None;
+    state.cluster_mode = false;
+    state.vm_index = None;
+    Ok(())
+}
+
+/// Workload Create in a fork pod — adopt the container the
+/// forked guest inherited from the source instead of pushing a fresh
+/// bundle. Exactly one unclaimed guest container must exist: fork
+/// adoption is defined for single-workload pods only (multi-container
+/// pods have no reliable containerd-id → guest-name correspondence).
+fn adopt_forked_workload(state: &mut SandboxState, container_id: &str) -> Result<(), String> {
+    if state.agent.is_none() {
+        state.connect_agent()?;
+    }
+    let claimed: Vec<String> = state.guest_names.values().cloned().collect();
+    let agent = state.agent_mut()?;
+    let listed = agent
+        .container_list()
+        .map_err(|e| format!("container_list in forked guest: {e}"))?;
+    let available: Vec<String> = listed
+        .containers
+        .into_iter()
+        .filter(|n| !claimed.contains(n))
+        .collect();
+    match available.as_slice() {
+        [one] => {
+            log::info!("fork workload {container_id}: adopting guest container {one}");
+            state
+                .guest_names
+                .insert(container_id.to_string(), one.clone());
+            Ok(())
+        }
+        [] => Err("forked guest reports no unclaimed running container to adopt".to_string()),
+        many => Err(format!(
+            "forked guest has {} unclaimed containers ({many:?}); fork of \
+             multi-container pods is not supported",
+            many.len()
+        )),
     }
 }
 
@@ -700,7 +1000,7 @@ fn cleanup_state_dir(sandbox_id: &str) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// internal notes: rebuild a freshly spawned shim's
+/// Rebuild a freshly spawned shim's
 /// `SandboxState` from the k7d daemon (the source of truth for VM
 /// identity) and dial the guest agent. Fails loudly — the caller
 /// surfaces the error so kubelet recreates the pod instead of
@@ -731,7 +1031,7 @@ fn reattach_sandbox_state(
             pod_netns_attached,
             ..
         } => {
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "reattach: sandbox {sandbox_id} -> vm {vm_id} (cid {guest_cid})"
             ));
             {
@@ -747,7 +1047,7 @@ fn reattach_sandbox_state(
                 // is bookkeeping only for a reattached shim).
                 let _ = pod_netns_attached;
                 let state_dir = std::env::temp_dir().join(format!("k7d-shim-{sandbox_id}"));
-                // internal notes: reload the persisted block-path
+                // Reload the persisted block-path
                 // snapshot (mount rewrites, attached rootfs erofs
                 // devices, pushed etc-files) so workload Creates
                 // replayed at this fresh shim still resolve.
@@ -786,6 +1086,7 @@ impl shim::asynchronous::Shim for K7Service {
             publisher: None,
             namespace: args.namespace.clone(),
             id: args.id.clone(),
+            usage: crate::usage::UsageTracker::default(),
             exit: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -814,9 +1115,8 @@ impl shim::asynchronous::Shim for K7Service {
         // Create at the first pod's shim process, whose singleton
         // `SandboxState` (vm_id / guest_cid / sandbox_id) was silently
         // overwritten — execs then dialed the wrong VM's agent and hung,
-        // and sandbox teardowns stopped sibling VMs (internal notes
-        // found this; earlier increments only ever ran one kubectl pod
-        // at a time).
+        // and sandbox teardowns stopped sibling VMs (earlier tests
+        // only ever ran one kubectl pod at a time).
         let grouping = annotations_from_spec(".")
             .sandbox_id
             .unwrap_or_else(|| opts.id.clone());
@@ -825,16 +1125,16 @@ impl shim::asynchronous::Shim for K7Service {
     }
 
     async fn delete_shim(&mut self) -> shim::Result<api::DeleteResponse> {
-        // internal notes: containerd runs the binary `delete`
+        // Containerd runs the binary `delete`
         // subcommand to clean up after a shim it can no longer reach
         // (cleanup-after-dead-shim) — the path taken when a shim is
         // SIGKILLed. The dead shim's VM is still running inside the
         // k7d daemon; stop it here so kubelet's recreated sandbox
         // doesn't compete with (and leak) the orphan forever.
-        debug_log_10a(&format!("delete_shim: id={}", self.id));
+        debug_log_cni(&format!("delete_shim: id={}", self.id));
         if !self.id.is_empty() {
             if let Some(vm_id) = lookup_daemon_sandbox(&self.id) {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "delete_shim: stopping orphaned VM {vm_id} of dead sandbox {}",
                     self.id
                 ));
@@ -857,6 +1157,7 @@ impl shim::asynchronous::Shim for K7Service {
             publisher: Some(Arc::new(publisher)),
             namespace: self.namespace.clone(),
             id: self.id.clone(),
+            usage: self.usage.clone(),
             exit: Arc::clone(&self.exit),
         }
     }
@@ -871,7 +1172,7 @@ impl K7Service {
         }
     }
 
-    /// internal notes: watch a workload container for its NATURAL exit.
+    /// Watch a workload container for its NATURAL exit.
     ///
     /// A dedicated thread dials the guest agent over its own fresh
     /// vsock connection (never the shared `state.agent` — a blocked
@@ -886,6 +1187,7 @@ impl K7Service {
     fn spawn_exit_watcher(
         &self,
         container_id: String,
+        guest_name: String,
         guest_cid: u64,
         exit_code: Arc<Mutex<Option<i32>>>,
         pid: u32,
@@ -895,7 +1197,7 @@ impl K7Service {
         let namespace = self.namespace.clone();
         let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
-            let Some(code) = watch_container_exit(guest_cid, &container_id, &exit_code) else {
+            let Some(code) = watch_container_exit(guest_cid, &guest_name, &exit_code) else {
                 return;
             };
             {
@@ -905,7 +1207,7 @@ impl K7Service {
                 }
                 *ec = Some(code);
             }
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "exit watcher: container {container_id} exited naturally with code {code}"
             ));
             // One more output-bridge poll cycle so the tail of the logs
@@ -930,8 +1232,8 @@ impl K7Service {
     }
 }
 
-/// Poll the guest agent for a workload container's exit (internal notes
-/// Inc 2). Returns the exit code, or `None` when watching should stop
+/// Poll the guest agent for a workload container's exit.
+/// Returns the exit code, or `None` when watching should stop
 /// silently: Kill/Delete already stamped an exit code, the container
 /// is gone from the agent (stopped/torn down), or the VM's vsock died
 /// (sandbox teardown is normal shutdown, not an error). Never panics —
@@ -964,7 +1266,7 @@ fn watch_container_exit(guest_cid: u64, name: &str, exit_code: &Mutex<Option<i32
                 // The agent no longer tracks the container (stop /
                 // teardown) or cannot observe its init — logged for
                 // diagnosability, then quiet exit.
-                debug_log_10a(&format!("exit watcher: {name}: agent said: {e}"));
+                debug_log_cni(&format!("exit watcher: {name}: agent said: {e}"));
                 return None;
             }
             // Transport hiccup: retry on a fresh connection.
@@ -1041,21 +1343,34 @@ impl Task for K7Service {
         let pid = {
             let mut state = self.state.lock().unwrap();
 
-            if container_type == "sandbox" {
-                // internal notes: annotation-driven cluster-tree adopt +
+            if container_type == "sandbox" && has_fork_source(&ann) {
+                // A pod carrying `k7d.katakate.org/
+                // fork-source-{cluster,vm}` boots as a WARM FORK of the
+                // named live sandbox VM instead of cold-booting. The
+                // daemon does the fork; this sandbox adopts the
+                // returned VM (and later, at workload Create, the
+                // container already running inside it). Fail-loud:
+                // unknown source / half-specified annotations fail
+                // Create with an error naming the annotation keys.
+                sandbox_create_fork_adopt(&mut state, &req.id, &ann).map_err(|e| {
+                    debug_log_cni(&format!("Create: fork adopt for {} failed: {e}", req.id));
+                    containerd_shim::Error::Other(format!("k7d fork-source annotations: {e}"))
+                })?;
+            } else if container_type == "sandbox" {
+                // Annotation-driven cluster-tree adopt +
                 // fork runs FIRST, before this trigger pod's own VM is
                 // created — a failed adopt/fork fails Create with
                 // nothing to unwind, and the pod only reaches Running
                 // when the fork landed.
                 run_tree_annotation_ops(&ann).map_err(|e| {
-                    debug_log_10a(&format!("Create: tree annotation ops failed: {e}"));
+                    debug_log_cni(&format!("Create: tree annotation ops failed: {e}"));
                     containerd_shim::Error::Other(format!("k7d tree annotations: {e}"))
                 })?;
 
                 let state_dir = std::env::temp_dir().join(format!("k7d-shim-{}", req.id));
                 let _ = std::fs::create_dir_all(&state_dir);
 
-                // internal notes(block path): kubelet volumes ride
+                // (block path): kubelet volumes ride
                 // on virtio-blk / guest tmpfs instead of virtiofs.
                 // RO classes (configmap/secret/downwardAPI/projected)
                 // pack into one erofs image; emptyDir becomes a
@@ -1071,7 +1386,7 @@ impl Task for K7Service {
                 .map_err(|e| {
                     containerd_shim::Error::Other(format!("BlockVolumes::prepare: {e}"))
                 })?;
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Create: pod_uid={pod_uid:?} block_volumes rewrites={} ro_image={:?} \
                      emptydirs={}",
                     block_volumes.rewrites.len(),
@@ -1094,19 +1409,19 @@ impl Task for K7Service {
                 // where `cluster_id == sandbox_id`.
                 let cluster_id = ann.cluster_id.clone().unwrap_or_else(|| req.id.clone());
 
-                // internal notes: if kubelet handed us a CNI-assigned pod
+                // If kubelet handed us a CNI-assigned pod
                 // netns, the daemon will move the VM's TAP into it,
                 // bridge it to `eth0` (the CNI veth), and install
                 // pod_ip ↔ guest_ip NAT. Pods on hostNetwork: true
                 // come through with no `network` namespace entry —
                 // we refuse them upfront with a clear error.
                 let pod_netns = pod_netns_from_spec(&req.bundle);
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Create: sandbox={} bundle={} pod_netns={:?}",
                     req.id, req.bundle, pod_netns
                 ));
                 if pod_netns.is_none() && spec_has_host_network(&req.bundle) {
-                    debug_log_10a(&format!(
+                    debug_log_cni(&format!(
                         "Create: refusing hostNetwork=true sandbox {}",
                         req.id
                     ));
@@ -1117,7 +1432,7 @@ impl Task for K7Service {
                     )
                     .into());
                 }
-                // internal notes: if the pod carries a
+                // Preservation: if the pod carries a
                 // `k7d.katakate.org/cluster-id` annotation it is opting
                 // into the shared-bridge cluster-mode (zero-restart
                 // cluster fork), where every pod in the cluster shares
@@ -1152,10 +1467,10 @@ impl Task for K7Service {
                 // either way.
                 let cluster_mode_pod = ann.cluster_id.is_some();
                 if cluster_mode_pod {
-                    debug_log_10a(&format!(
+                    debug_log_cni(&format!(
                         "Create: cluster-mode pod (cluster-id={:?}); \
-                         skipping spec-10a CNI integration to preserve \
-                         spec-9d shared-bridge L2",
+                         skipping CNI integration to preserve \
+                         shared-bridge L2",
                         ann.cluster_id
                     ));
                 }
@@ -1165,11 +1480,11 @@ impl Task for K7Service {
                     pod_netns.clone()
                 };
 
-                // internal notes: the k7d daemon owns the VM —
+                // The k7d daemon owns the VM —
                 // KVM, guest memory, vsock, and the whole network
                 // attachment (cluster bridge + TAP + pod-netns NAT).
                 //
-                // internal notes: the VM is NOT created here. Its
+                // The VM is NOT created here. Its
                 // rootfs is an erofs image on virtio-blk, and
                 // virtio-blk devices are boot-time declarations (no
                 // hotplug) — but the container image is only known at
@@ -1180,7 +1495,7 @@ impl Task for K7Service {
                 // workload Create appends the rootfs device (plus any
                 // k7d disk images / explicit virtiofs fallback
                 // shares) and submits `create_vm`.
-                // internal notes: size the VM from the pod's CPU/memory
+                // Size the VM from the pod's CPU/memory
                 // limits (BestEffort pods keep today's 256 MB / 1
                 // vCPU defaults) and pass the CFS quota through so
                 // the daemon caps the vCPU threads host-side.
@@ -1197,13 +1512,24 @@ impl Task for K7Service {
                     ann.sandbox_cpu_quota,
                     ann.sandbox_cpu_period,
                 );
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Create: sandbox={} sizing memory_mb={} vcpus={} cpu_quota={:?} \
                      cpu_period={:?}",
                     req.id, sizing.memory_mb, sizing.vcpus, sizing.cpu_quota, sizing.cpu_period
                 ));
 
-                let (kernel, initrd) = k7d::vm::default_guest_paths();
+                // Which guest a VM boots is the daemon's answer alone —
+                // it is the process whose environment an operator sets
+                // (`K7D_KERNEL` / `K7D_INITRD` in k7d.service), and it
+                // fails loudly when they are unset. The shim used to
+                // resolve the pair itself and send it, which *overrode*
+                // that; and since containerd spawns a shim with no
+                // environment of its own, the shim's answer came from
+                // the workspace path baked into the binary at compile
+                // time. On a node that both builds and runs k7d that
+                // path exists and holds whatever guest was last built
+                // there — rsync deliberately never updates it — so pods
+                // booted a kernel nobody deployed. See CHALLENGES #72.
                 let mut block_devices = vec![k7d::control::BlockDeviceConfig {
                     host_path: tools_image.to_string_lossy().into_owned(),
                     readonly: true,
@@ -1218,9 +1544,28 @@ impl Task for K7Service {
                         fstype: Some("erofs".to_string()),
                     });
                 }
+                // Every container in this pod writes to a
+                // host-backed scratch disk, not to guest RAM. Sized
+                // from the annotation (default 8 GiB), never from
+                // `sizing.memory_mb`. A malformed annotation fails
+                // Create loudly — silently falling back to the
+                // RAM-sized tmpfs is the bug this replaces.
+                let scratch_size_bytes = scratch_size_from_annotations(&ann).map_err(|e| {
+                    debug_log_cni(&format!("Create: scratch size for {} failed: {e}", req.id));
+                    containerd_shim::Error::Other(e)
+                })?;
+                // Containers that asked for a writable-space
+                // limit of their own. Same fail-loud rule.
+                let container_scratch = container_scratch_from_annotations(&ann).map_err(|e| {
+                    debug_log_cni(&format!(
+                        "Create: container scratch for {} failed: {e}",
+                        req.id
+                    ));
+                    containerd_shim::Error::Other(e)
+                })?;
                 let mut config = k7d::control::VmConfig {
-                    kernel: Some(kernel.to_string_lossy().into_owned()),
-                    initrd: Some(initrd.to_string_lossy().into_owned()),
+                    kernel: None,
+                    initrd: None,
                     memory_mb: sizing.memory_mb,
                     vcpus: sizing.vcpus,
                     cpu_quota: sizing.cpu_quota,
@@ -1229,6 +1574,8 @@ impl Task for K7Service {
                     virtiofs: Vec::new(),
                     block_devices,
                     guest_dirs: block_volumes.emptydir_guest_dirs.clone(),
+                    scratch_size_bytes: Some(scratch_size_bytes),
+                    container_scratch,
                     sandbox_id: Some(req.id.clone()),
                     network: Some(k7d::control::NetConfig {
                         cluster_id: cluster_id.clone(),
@@ -1236,26 +1583,33 @@ impl Task for K7Service {
                         pod_netns: cni_netns.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     }),
                 };
-                // internal notes: declare the spare image-slot devices
+                // Declare the spare image-slot devices
                 // while the VmConfig is still parked — they must be in
                 // the boot-time declaration for a post-boot distinct
                 // image to have somewhere to attach.
                 let image_slots =
                     declare_image_slots(&mut config, &ann, &state_dir).map_err(|e| {
-                        debug_log_10a(&format!("Create: image slots for {} failed: {e}", req.id));
+                        debug_log_cni(&format!("Create: image slots for {} failed: {e}", req.id));
                         containerd_shim::Error::Other(format!("image slots for {}: {e}", req.id))
                     })?;
 
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Create: sandbox={} VM deferred to first workload Create \
-                     (block_devices={}, image_slots={}, guest_dirs={}, zero virtiofs)",
+                     (block_devices={}, image_slots={}, guest_dirs={}, scratch={} MiB, \
+                     zero virtiofs)",
                     req.id,
                     config.block_devices.len(),
                     image_slots.len(),
-                    config.guest_dirs.len()
+                    config.guest_dirs.len(),
+                    scratch_size_bytes / (1024 * 1024)
                 ));
 
                 state.image_slots = image_slots;
+                state.container_scratch = config
+                    .container_scratch
+                    .iter()
+                    .map(|cs| (cs.name.clone(), cs.size_bytes))
+                    .collect();
                 state.pending_vm = Some(config);
                 state.rewrites = block_volumes.rewrites;
                 // Only record the pod netns when the daemon actually
@@ -1270,12 +1624,12 @@ impl Task for K7Service {
                 state
                     .fork_source_cluster
                     .clone_from(&ann.fork_source_cluster);
-                // internal notes: opt-in cluster-tree association. The actual
+                // Opt-in cluster-tree association. The actual
                 // tree-side fork / suspend / resume is the k7d daemon's
                 // job — the shim merely records the annotations so the
                 // future shim ↔ k7d Unix-socket call can route to the
                 // right tree. When `tree_id` is None the cluster is not
-                // tree-managed (legacy spec-9d behaviour, unchanged).
+                // tree-managed (legacy behaviour, unchanged).
                 state.tree_id.clone_from(&ann.tree_id);
                 state
                     .tree_source_node_id
@@ -1287,8 +1641,23 @@ impl Task for K7Service {
                         ann.tree_source_node_id,
                     );
                 }
+            } else if state.fork_of.is_some() {
+                // Workload Create in a fork pod — the
+                // container is ALREADY RUNNING inside the forked
+                // guest (inherited from the source, warm memory and
+                // all). Adopt it: map this containerd id to the
+                // guest's runc container name so Start/Exec/Kill/
+                // Delete route to the inherited container instead of
+                // pushing a fresh bundle.
+                adopt_forked_workload(&mut state, &req.id).map_err(|e| {
+                    debug_log_cni(&format!(
+                        "Create: fork workload adopt {} failed: {e}",
+                        req.id
+                    ));
+                    containerd_shim::Error::Other(format!("fork workload adopt {}: {e}", req.id))
+                })?;
             } else if state.state_dir.is_some() {
-                // internal notes: the block-path workload Create —
+                // The block-path workload Create —
                 // resolve the container's rootfs into a cached erofs
                 // image, boot the VM on the first workload (the
                 // pending config from sandbox Create plus the rootfs
@@ -1298,7 +1667,7 @@ impl Task for K7Service {
                 // tmpfs. Fail-loud throughout: a pod must never
                 // reach Running without its rootfs or volumes.
                 workload_create_block(&mut state, &req).map_err(|e| {
-                    debug_log_10a(&format!("Create: workload {} failed: {e}", req.id));
+                    debug_log_cni(&format!("Create: workload {} failed: {e}", req.id));
                     containerd_shim::Error::Other(format!("workload create {}: {e}", req.id))
                 })?;
             }
@@ -1343,11 +1712,13 @@ impl Task for K7Service {
     ) -> TtrpcResult<api::StartResponse> {
         log::info!("Start: id={} exec_id={}", req.id, req.exec_id);
 
-        // internal notes: (guest_cid, exit_code) of a workload whose
-        // natural exit must be watched — set inside the lock, spawned
-        // after it is released. Sandboxes keep their synthetic exit
-        // behaviour (there is no runc container for the pause task).
-        let mut exit_watch: Option<(u64, Arc<Mutex<Option<i32>>>)> = None;
+        // (guest_cid, exit_code, guest container name)
+        // of a workload whose natural exit must be watched — set inside
+        // the lock, spawned after it is released. Sandboxes keep their
+        // synthetic exit behaviour (there is no runc container for the
+        // pause task). The guest name differs from the containerd id
+        // only for fork-adopted containers.
+        let mut exit_watch: Option<(u64, Arc<Mutex<Option<i32>>>, String)> = None;
 
         let pid = {
             let mut state = self.state.lock().unwrap();
@@ -1361,13 +1732,13 @@ impl Task for K7Service {
                     containerd_shim::Error::NotFoundError(format!("exec {} not found", req.exec_id))
                 })?;
                 let pid = exec.pid;
-                // internal notes: PTY execs bridge containerd's attach FIFOs
+                // PTY execs bridge containerd's attach FIFOs
                 // to the agent's PTY session, starting here (the
                 // non-PTY bridge was already spawned in `Exec`).
                 if exec.terminal {
                     let params = crate::exec::PtyBridgeParams {
                         guest_cid,
-                        container: req.id.clone(),
+                        container: state.guest_name(&req.id),
                         exec_id: req.exec_id.clone(),
                         args: exec.args.clone(),
                         term: exec.term.clone(),
@@ -1391,11 +1762,11 @@ impl Task for K7Service {
 
             if is_sandbox {
                 if state.pending_vm.is_some() {
-                    // internal notes: the VM boots at the FIRST
+                    // The VM boots at the FIRST
                     // workload Create (the earliest moment the
                     // container's rootfs erofs image is known), so
                     // sandbox Start has nothing to dial yet.
-                    debug_log_10a(&format!(
+                    debug_log_cni(&format!(
                         "Start: sandbox {} VM deferred to first workload Create (block path)",
                         req.id
                     ));
@@ -1403,18 +1774,31 @@ impl Task for K7Service {
                     // Reattached / legacy sandboxes whose VM already
                     // exists: dial the agent (retries absorb any
                     // remaining boot time) and configure the guest
-                    // network exactly as before.
+                    // network exactly as before. Fork-adopted VMs
+                    // inherit the source guest's fully
+                    // configured eth0 — reconfiguring it here would
+                    // clobber the inherited identity.
                     state
                         .connect_agent()
                         .map_err(|e| containerd_shim::Error::Other(e.to_string()))?;
-                    configure_guest_network(&mut state);
+                    if state.fork_of.is_none() {
+                        configure_guest_network(&mut state);
+                    }
                 }
             } else {
-                let guest_bundle = format!("{GUEST_BUNDLES_BASE}/{}", req.id);
-                let agent = state.agent_mut().map_err(containerd_shim::Error::Other)?;
-                agent.container_start(&req.id, &guest_bundle).map_err(|e| {
-                    containerd_shim::Error::Other(format!("container start failed: {e}"))
-                })?;
+                // Fork-adopted workloads are already running
+                // inside the forked guest — starting them again would
+                // fail in runc. Bridges and the exit watcher poll the
+                // MAPPED guest container name.
+                let guest_name = state.guest_name(&req.id);
+                let adopted = state.fork_of.is_some();
+                if !adopted {
+                    let guest_bundle = format!("{GUEST_BUNDLES_BASE}/{}", req.id);
+                    let agent = state.agent_mut().map_err(containerd_shim::Error::Other)?;
+                    agent.container_start(&req.id, &guest_bundle).map_err(|e| {
+                        containerd_shim::Error::Other(format!("container start failed: {e}"))
+                    })?;
+                }
 
                 if let Some(container) = state.containers.get(&req.id) {
                     // Read the VM's actual CID instead of
@@ -1426,7 +1810,7 @@ impl Task for K7Service {
                     let guest_cid = state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID);
                     if !container.init.stdout.is_empty() || !container.init.stderr.is_empty() {
                         let bridge = io_bridge::start_output_bridge(
-                            req.id.clone(),
+                            guest_name.clone(),
                             guest_cid,
                             container.init.stdout.clone(),
                             container.init.stderr.clone(),
@@ -1434,15 +1818,16 @@ impl Task for K7Service {
                         let mut bridges = self.bridges.lock().unwrap();
                         bridges.insert(req.id.clone(), bridge);
                     }
-                    exit_watch = Some((guest_cid, Arc::clone(&container.init.exit_code)));
+                    exit_watch =
+                        Some((guest_cid, Arc::clone(&container.init.exit_code), guest_name));
                 }
             }
 
             state.containers.get(&req.id).map_or(1, |c| c.init.pid)
         }; // state lock released here
 
-        if let Some((guest_cid, exit_code)) = exit_watch {
-            self.spawn_exit_watcher(req.id.clone(), guest_cid, exit_code, pid);
+        if let Some((guest_cid, exit_code, guest_name)) = exit_watch {
+            self.spawn_exit_watcher(req.id.clone(), guest_name, guest_cid, exit_code, pid);
         }
 
         let mut event = TaskStart::new();
@@ -1463,11 +1848,11 @@ impl Task for K7Service {
             req.signal
         );
 
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let is_sandbox = state.sandbox_id.as_ref().is_some_and(|sid| *sid == req.id);
 
         if !req.exec_id.is_empty() {
-            // internal notes: a live PTY session must also be hung up guest-
+            // A live PTY session must also be hung up guest-
             // side, or the exec process would outlive its bookkeeping.
             if let Some(crate::exec::PtySessionState::Active(w)) =
                 self.pty_sessions.lock().unwrap().get(&req.exec_id)
@@ -1499,10 +1884,23 @@ impl Task for K7Service {
             // deadlocks: containerd only sends Delete *after* io.Wait().
             self.bridges.lock().unwrap().clear();
         } else {
-            if let Some(ref mut agent) = state.agent {
+            let guest_name = state.guest_name(&req.id);
+            // Dial a FRESH agent connection instead of trusting the cached
+            // one: after this pod's VM was prepared as a fork source
+            // (share swap), the cached connection is silently dead and a
+            // signal through it blocks until the 30s request deadline WHILE
+            // HOLDING THE STATE LOCK — containerd's own Kill deadline is
+            // shorter, so kubelet retries forever and the pod can never
+            // terminate. A fresh dial reaches the swapped VM on the same
+            // CID in milliseconds (the same pattern the exec bridges use).
+            if let Some(cid) = state.guest_cid {
                 #[allow(clippy::cast_possible_wrap)]
                 let signal = req.signal as i32;
-                let _ = agent.container_signal(&req.id, signal);
+                if let Ok(mut agent) =
+                    k7d::api::AgentClient::connect_vsock(cid, Duration::from_secs(2))
+                {
+                    let _ = agent.container_signal(&guest_name, signal);
+                }
             }
             if let Some(container) = state.containers.get(&req.id) {
                 if req.signal == 9 || req.signal == 15 {
@@ -1532,7 +1930,7 @@ impl Task for K7Service {
             let mut state = self.state.lock().unwrap();
 
             if !req.exec_id.is_empty() {
-                // internal notes: drop any leftover PTY session entry.
+                // Drop any leftover PTY session entry.
                 self.pty_sessions.lock().unwrap().remove(&req.exec_id);
                 let (pid, exit_code) = if let Some(container) = state.containers.get_mut(&req.id) {
                     if let Some(exec) = container.execs.remove(&req.exec_id) {
@@ -1558,6 +1956,9 @@ impl Task for K7Service {
                 let mut bridges = self.bridges.lock().unwrap();
                 bridges.remove(&req.id);
             }
+            // This container's writable layer is going away
+            // with it; keep no sample for it.
+            self.usage.forget(&req.id);
 
             let known = state.containers.contains_key(&req.id) || is_sandbox;
 
@@ -1569,8 +1970,16 @@ impl Task for K7Service {
             };
 
             if !is_sandbox && known {
-                if let Some(ref mut agent) = state.agent {
-                    let _ = agent.container_stop(&req.id);
+                let guest_name = state.guest_name(&req.id);
+                // Fresh dial, not the cached agent — see Kill above (a
+                // fork-prepared source's cached connection is dead and
+                // would block teardown while holding the state lock).
+                if let Some(cid) = state.guest_cid {
+                    if let Ok(mut agent) =
+                        k7d::api::AgentClient::connect_vsock(cid, Duration::from_secs(2))
+                    {
+                        let _ = agent.container_stop(&guest_name);
+                    }
                 }
                 if let Some(ref state_dir) = state.state_dir {
                     let rootfs = state_dir.join("containers").join(&req.id).join("rootfs");
@@ -1585,7 +1994,7 @@ impl Task for K7Service {
             state.containers.remove(&req.id);
 
             if is_sandbox {
-                // internal notes: the daemon owns the VM, the
+                // The daemon owns the VM, the
                 // TAP, the in-pod-netns bridge, and the (refcounted)
                 // cluster bridge — one `stop_vm` tears all of it down
                 // in the right order. Best-effort: if the daemon is
@@ -1595,12 +2004,12 @@ impl Task for K7Service {
                 }
                 state.pod_netns = None;
                 state.agent = None;
-                // internal notes: a sandbox deleted before its first
+                // A sandbox deleted before its first
                 // workload Create never booted a VM — drop the parked
                 // config.
                 state.pending_vm = None;
 
-                // internal notes: tear down the per-pod kubelet volume
+                // Tear down the per-pod kubelet volume
                 // bind-mount tree AFTER the VM is gone (so the
                 // virtiofsd children have released their file
                 // handles into the binds) and BEFORE the state_dir
@@ -1624,13 +2033,13 @@ impl Task for K7Service {
             (pid, exit_code, known)
         }; // state lock released here
 
-        // internal notes: an id this shim has never seen can be
+        // An id this shim has never seen can be
         // a dead predecessor's sandbox routed here through the shared
         // shim socket. If the daemon still holds a VM for it, that VM
         // is an orphan — stop it and sweep the dead shim's state dir.
         if !known {
             if let Some(vm_id) = lookup_daemon_sandbox(&req.id) {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Delete: foreign sandbox {} still had VM {vm_id}; stopping orphan",
                     req.id
                 ));
@@ -1666,13 +2075,13 @@ impl Task for K7Service {
         );
 
         let (args, spec_terminal, term) = parse_exec_process_spec(req.spec.as_ref());
-        // internal notes: containerd sets `terminal` on the request AND in
+        // Containerd sets `terminal` on the request AND in
         // the OCI process spec — honor either.
         let terminal = req.terminal || spec_terminal;
 
         let exit_code = Arc::new(Mutex::new(None));
 
-        let guest_cid = {
+        let (guest_cid, guest_name) = {
             let mut state = self.state.lock().unwrap();
             let pid = state.alloc_pid();
 
@@ -1702,15 +2111,19 @@ impl Task for K7Service {
             // the spawned exec bridge thread doesn't need to re-lock.
             // Falls back to `DEFAULT_GUEST_CID` only for
             // SandboxStates somehow created before this field
-            // existed.
-            state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID)
+            // existed. The guest container name differs from `req.id`
+            // only for fork-adopted containers.
+            (
+                state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID),
+                state.guest_name(&req.id),
+            )
         }; // state lock released here
 
-        // internal notes: PTY execs start their bridge at `Start(exec_id)`
+        // PTY execs start their bridge at `Start(exec_id)`
         // (containerd's attach is set up by then). Non-PTY execs keep
         // the historical behavior: bridge spawned right here.
         if !args.is_empty() && !terminal {
-            let container_name = req.id.clone();
+            let container_name = guest_name;
             let exit_code_clone = Arc::clone(&exit_code);
             let stdout_path = req.stdout.clone();
             let stderr_path = req.stderr.clone();
@@ -1782,9 +2195,45 @@ impl Task for K7Service {
     async fn stats(
         &self,
         _ctx: &TtrpcContext,
-        _req: api::StatsRequest,
+        req: api::StatsRequest,
     ) -> TtrpcResult<api::StatsResponse> {
-        Ok(api::StatsResponse::new())
+        // Use the poll as a clock for per-container writable
+        // usage (logged; see `crate::usage` for why the number cannot
+        // ride in the payload below) — never as a reason to change the
+        // payload's shape. Returns without waiting on the guest.
+        {
+            let (guest_cid, guest_name, is_workload) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.guest_cid,
+                    state.guest_name(&req.id),
+                    state.containers.contains_key(&req.id)
+                        && state.sandbox_id.as_deref() != Some(req.id.as_str()),
+                )
+            };
+            if let (true, Some(cid)) = (is_workload, guest_cid) {
+                self.usage.sample(&req.id, &guest_name, cid);
+            }
+        }
+
+        // An empty response (no `stats` Any) poisons the CRI plugin's
+        // ListContainerStats for the WHOLE node: containerd fails the
+        // aggregate call with `failed to decode container metrics: type
+        // with url : not found`, kubelet's summary API loses container
+        // stats, and metrics-server serves nothing (which even blocks
+        // namespace deletion via the stale aggregated-API discovery).
+        // Return a valid empty cgroups Metrics payload instead — the VM's
+        // real resource accounting lives host-side in the k7d daemon's
+        // per-VM cgroup. The guest's per-container writable-layer usage
+        // deliberately does NOT go in here: `Metrics` has no filesystem
+        // field, so every candidate would mean writing storage bytes
+        // into a counter kubelet reads as cpu/memory/blkio.
+        let metrics = containerd_shim_protos::cgroups::metrics::Metrics::new();
+        let any = containerd_shim::util::convert_to_any(Box::new(metrics))
+            .map_err(|e| containerd_shim::Error::Other(format!("stats Any: {e}")))?;
+        let mut resp = api::StatsResponse::new();
+        resp.set_stats(any);
+        Ok(resp)
     }
 
     async fn connect(
@@ -1794,7 +2243,7 @@ impl Task for K7Service {
     ) -> TtrpcResult<api::ConnectResponse> {
         log::info!("Connect: id={}", req.id);
 
-        // internal notes: a shim that receives Connect without
+        // A shim that receives Connect without
         // ever having run Create is a fresh process containerd pointed
         // at an existing sandbox (e.g. reconnect after a containerd
         // restart raced a shim respawn). Rebuild the sandbox state
@@ -1802,7 +2251,7 @@ impl Task for K7Service {
         // "No such sandbox" is returned as NotFound — loudly — so
         // kubelet recreates the pod.
         //
-        // internal notes: a sandbox whose VM is DEFERRED to the first
+        // A sandbox whose VM is DEFERRED to the first
         // workload Create legitimately has `vm_id == None` right after
         // its own Create — the daemon knows nothing about it yet, so a
         // reattach would fail "no such sandbox" and containerd would
@@ -1818,13 +2267,13 @@ impl Task for K7Service {
         };
         if needs_reattach {
             reattach_sandbox_state(&self.state, &req.id).map_err(|e| {
-                debug_log_10a(&format!("Connect: reattach {} failed: {e}", req.id));
+                debug_log_cni(&format!("Connect: reattach {} failed: {e}", req.id));
                 containerd_shim::Error::NotFoundError(format!(
                     "sandbox {}: reattach failed: {e}",
                     req.id
                 ))
             })?;
-            debug_log_10a(&format!("Connect: reattached sandbox {}", req.id));
+            debug_log_cni(&format!("Connect: reattached sandbox {}", req.id));
         }
 
         let mut resp = api::ConnectResponse::new();
@@ -1840,7 +2289,7 @@ impl Task for K7Service {
     ) -> TtrpcResult<api::Empty> {
         log::info!("Shutdown requested: id={}", req.id);
 
-        // internal notes: shims now group per pod (sandbox-id
+        // Shims now group per pod (sandbox-id
         // grouping in start_shim), but a crashed predecessor of the
         // SAME pod leaves its socket path behind, so containerd can
         // still route the dead shim's Shutdown at a freshly spawned
@@ -1856,7 +2305,7 @@ impl Task for K7Service {
                     .is_some_and(|sid| *sid != req.id && !state.containers.contains_key(&req.id))
         };
         if foreign {
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "Shutdown: foreign id {} (ours: {:?}); stopping its daemon VM only",
                 req.id,
                 self.state.lock().unwrap().sandbox_id
@@ -1878,7 +2327,7 @@ impl Task for K7Service {
             state.agent = None;
             state.pending_vm = None;
 
-            // internal notes: parallel to the sandbox Delete cleanup, also
+            // Parallel to the sandbox Delete cleanup, also
             // tear down per-pod kubelet volume binds on Shutdown.
             if let Some(pv) = state.pod_volumes.take() {
                 pv.cleanup();
@@ -1910,7 +2359,7 @@ impl Task for K7Service {
             req.exec_id,
             req.stdin
         );
-        // internal notes: closing stdin of a TTY exec means the client
+        // Closing stdin of a TTY exec means the client
         // detached — hang the guest-side session up (SIGHUP).
         if !req.exec_id.is_empty() && req.stdin {
             if let Some(crate::exec::PtySessionState::Active(w)) =
@@ -1934,7 +2383,7 @@ impl Task for K7Service {
             req.width,
             req.height
         );
-        // internal notes: only PTY exec processes have a window to resize.
+        // Only PTY exec processes have a window to resize.
         if req.exec_id.is_empty() {
             return Ok(api::Empty::new());
         }
@@ -2123,10 +2572,17 @@ fn mount_rootfs(
 /// - Point `root.path` at the agent-mounted erofs rootfs device
 ///   (`guest_root`) — the agent assembles overlay(erofs, tmpfs) and
 ///   patches its own copy of the bundle
-/// - Strip namespace types the kernel doesn't support (keep only pid, mount)
-/// - Strip mount types the kernel doesn't support (mqueue, cgroup, etc.)
+/// - Strip namespace types the kernel doesn't support (keep pid,
+///   mount, cgroup — this restores the cgroup namespace for
+///   Kata-like per-container cgroup2 views)
+/// - Strip mount types the kernel doesn't support (mqueue, hugetlbfs)
+/// - Translate `cgroup`/`cgroup2` mounts to the OCI `cgroup` type so
+///   guest runc mounts the guest's cgroup2 hierarchy (the
+///   guest is cgroup2-only; stripping these left
+///   `/sys/fs/cgroup` empty and forced nested daemons like dockerd to
+///   `mount -t cgroup2` themselves)
 /// - Rewrite kubelet-volume mount sources to their in-VM
-///   paths via the spec-10b [`k7d::volumes::MountRewriteMap`]
+///   paths via the [`k7d::volumes::MountRewriteMap`]
 /// - Strip remaining bind mounts whose source is outside the
 ///   container rootfs and wasn't covered by the rewrite map
 /// - Strip seccomp, apparmor, `maskedPaths`, `readonlyPaths`,
@@ -2146,7 +2602,7 @@ fn fix_oci_config(
     rewrites: &k7d::volumes::MountRewriteMap,
     guest_root: Option<&str>,
 ) -> std::io::Result<String> {
-    // internal notes: the container rootfs lives on an erofs
+    // The container rootfs lives on an erofs
     // virtio-blk device mounted in the guest — rewrite `root.path`
     // to it. The agent detects the read-only erofs lower and builds
     // the tmpfs-upper overlay before handing the bundle to runc.
@@ -2163,7 +2619,7 @@ fn fix_oci_config(
             }
         }
     }
-    // internal notes: apply the per-pod rewrite map FIRST (before the
+    // Apply the per-pod rewrite map FIRST (before the
     // strip pass below), so a kubelet-set mount whose host source
     // we know how to translate ends up with an in-VM source string
     // and survives the bind-mount strip downstream. Untranslated
@@ -2192,6 +2648,14 @@ fn fix_oci_config(
         .pointer_mut("/linux/namespaces")
         .and_then(|v| v.as_array_mut())
     {
+        // The cgroup namespace is KEPT: with cgroupns, the
+        // translated cgroup2 mount below shows each container its own
+        // private subtree — exactly what Kata/stock k8s containers
+        // see. Nested daemons (dockerd, k3s) handle cgroup2's
+        // no-internal-process constraint themselves via the standard
+        // dind-style evacuation (moby hack/dind), so 18b's guest-root
+        // shortcut (dropping cgroupns) is unnecessary and
+        // over-permissive.
         namespaces.retain(|ns| {
             let ns_type = ns.get("type").and_then(|t| t.as_str()).unwrap_or_default();
             ns_type != "network"
@@ -2203,13 +2667,33 @@ fn fix_oci_config(
         }
     }
 
-    let unsupported_mount_types = ["mqueue", "cgroup", "cgroup2", "hugetlbfs"];
+    let unsupported_mount_types = ["mqueue", "hugetlbfs"];
     let virtual_fs_types = ["proc", "tmpfs", "sysfs", "devpts", "devtmpfs"];
     if let Some(mounts) = spec.get_mut("mounts").and_then(|v| v.as_array_mut()) {
+        // Translate cgroup/cgroup2 mounts to the OCI `cgroup`
+        // type instead of stripping them. The guest mounts cgroup2 at
+        // /sys/fs/cgroup (init.sh), so guest runc's
+        // cgroup-mount special case mounts the unified hierarchy at the
+        // requested destination, honoring the CRI-set options (ro for
+        // regular containers, rw for privileged ones). The cgroup
+        // namespace is kept, so the mount shows each
+        // container its own private namespaced subtree.
+        for m in mounts.iter_mut() {
+            let mount_type = m.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+            if mount_type == "cgroup" || mount_type == "cgroup2" {
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("type".into(), serde_json::Value::String("cgroup".into()));
+                    obj.insert("source".into(), serde_json::Value::String("cgroup".into()));
+                }
+            }
+        }
         mounts.retain(|m| {
             let mount_type = m.get("type").and_then(|t| t.as_str()).unwrap_or_default();
             if unsupported_mount_types.contains(&mount_type) {
                 return false;
+            }
+            if mount_type == "cgroup" {
+                return true;
             }
             // Keep virtual filesystem mounts (proc, tmpfs, sysfs, devpts)
             if virtual_fs_types.contains(&mount_type) {
@@ -2264,7 +2748,7 @@ fn fix_oci_config(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// internal notes: keep CRI memory/cpu (and other) resource fields so
+/// Keep CRI memory/cpu (and other) resource fields so
 /// guest runc enforces per-container cgroup limits; force devices
 /// allow-all (CHALLENGES #36); drop swap fields/unified keys the
 /// no-swap guest kernel cannot honour (CHALLENGES #54).
@@ -2295,10 +2779,10 @@ fn sanitize_guest_resources(
                 "memory.zswap.writeback",
                 // oom.group=1 kills every task in the container cgroup
                 // on soft OOM (including an over-limit kubectl exec).
-                // Without Inc 2 exit observation the shim never
+                // Without exit observation the shim never
                 // publishes that death, so kubelet cannot restart and
                 // the container stays Stopped. Default (process-level)
-                // OOM still enforces memory.max; Inc 4's main-process
+                // OOM still enforces memory.max; the main-process
                 // hog test covers whole-container OOMKilled.
                 "memory.oom.group",
             ] {
@@ -2319,7 +2803,7 @@ fn sanitize_guest_resources(
 }
 
 /// Locate the static runc binary on the host for the guest tools
-/// image (internal notes� replaces the virtiofs
+/// image (replaces the virtiofs
 /// `/mnt/state/bin/runc` placement).
 fn find_runc_binary() -> Option<PathBuf> {
     let candidates = [
@@ -2329,6 +2813,8 @@ fn find_runc_binary() -> Option<PathBuf> {
             .map(|p| p.join("guest/rootfs/runc.amd64"))
             .unwrap_or_default(),
         std::path::PathBuf::from("/root/k7d/guest/rootfs/runc.amd64"),
+        // Release install location (k7 Ansible playbook).
+        std::path::PathBuf::from("/opt/k7d/runc.amd64"),
         std::path::PathBuf::from("/usr/bin/runc"),
         std::path::PathBuf::from("/usr/sbin/runc"),
     ];
@@ -2370,11 +2856,11 @@ fn prepare_tools_image(cache_dir: &Path) -> Result<PathBuf, String> {
 
 /// Configure the guest's eth0 / default route once its VM is up.
 ///
-/// internal notes: if the daemon moved this VM's TAP into a pod netns and
+/// If the daemon moved this VM's TAP into a pod netns and
 /// put a 10.200.0.1 gateway on the in-netns bridge, configure the
 /// guest's eth0 with the matching `10.200.0.{2 + vm_index}` address
 /// and a default route via that gateway (plus a pinned gateway ARP
-/// entry — see the inline comment). internal notes: cluster-mode
+/// entry — see the inline comment). Cluster-mode
 /// pods (TAP on the shared host bridge) get the same eth0 identity
 /// without the ARP pin.
 ///
@@ -2385,7 +2871,7 @@ fn configure_guest_network(state: &mut SandboxState) {
     if state.pod_netns.is_some() {
         let guest_ip = format!("10.200.0.{}", 2 + state.vm_index.unwrap_or(0));
         if let Ok(agent) = state.agent_mut() {
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "Create: configuring guest eth0={guest_ip} gateway=10.200.0.1"
             ));
             if let Err(e) = agent.exec(&[
@@ -2396,11 +2882,11 @@ fn configure_guest_network(state: &mut SandboxState) {
                 "255.255.255.0",
                 "up",
             ]) {
-                debug_log_10a(&format!("Create: guest ifconfig eth0 failed: {e}"));
+                debug_log_cni(&format!("Create: guest ifconfig eth0 failed: {e}"));
             } else if let Err(e) =
                 agent.exec(&["ip", "route", "add", "default", "via", "10.200.0.1"])
             {
-                debug_log_10a(&format!("Create: guest add default route failed: {e}"));
+                debug_log_cni(&format!("Create: guest add default route failed: {e}"));
             } else if let Err(e) = agent.exec(&[
                 "ip",
                 "neigh",
@@ -2420,11 +2906,11 @@ fn configure_guest_network(state: &mut SandboxState) {
                 // reply traffic out `eth0` instead of letting it
                 // L3-route + SNAT. The bridge MAC is pinned in
                 // create_bridge_in_netns; keep these in sync.
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Create: guest add static ARP for gateway failed: {e}"
                 ));
             } else {
-                debug_log_10a("Create: guest eth0 + default route + gateway ARP configured");
+                debug_log_cni("Create: guest eth0 + default route + gateway ARP configured");
             }
         }
     } else if state.cluster_mode {
@@ -2436,7 +2922,7 @@ fn configure_guest_network(state: &mut SandboxState) {
         // itself, so ARP resolves unambiguously.
         let guest_ip = format!("10.200.0.{}", 2 + state.vm_index.unwrap_or(0));
         if let Ok(agent) = state.agent_mut() {
-            debug_log_10a(&format!(
+            debug_log_cni(&format!(
                 "Start: cluster-mode guest eth0={guest_ip} gateway=10.200.0.1"
             ));
             if let Err(e) = agent.exec(&[
@@ -2447,23 +2933,23 @@ fn configure_guest_network(state: &mut SandboxState) {
                 "255.255.255.0",
                 "up",
             ]) {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Start: cluster-mode guest ifconfig eth0 failed: {e}"
                 ));
             } else if let Err(e) =
                 agent.exec(&["ip", "route", "add", "default", "via", "10.200.0.1"])
             {
-                debug_log_10a(&format!(
+                debug_log_cni(&format!(
                     "Start: cluster-mode guest default route failed: {e}"
                 ));
             } else {
-                debug_log_10a("Start: cluster-mode guest eth0 + default route set");
+                debug_log_cni("Start: cluster-mode guest eth0 + default route set");
             }
         }
     }
 }
 
-/// internal notes: release a deleted container's claim on its rootfs
+/// Release a deleted container's claim on its rootfs
 /// erofs key. The guest erofs mounts (boot rootfs devices and image
 /// slots) are NEVER unmounted at container Delete — a live sibling
 /// may still run from the same mount (same-image init + main), and an
@@ -2481,11 +2967,11 @@ fn release_container_rootfs(state: &mut SandboxState, container_id: &str) -> Res
     if remaining > 0 && !mount_live {
         return Err(format!(
             "Delete {container_id}: rootfs erofs key {key} is still used by {remaining} \
-             live container(s) but its guest mount is gone (internal notes\
+             live container(s) but its guest mount is gone (refcount \
              invariant violated)"
         ));
     }
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "Delete {container_id}: released rootfs key {key} ({remaining} live user(s) \
          remain; guest erofs mount retained until VM teardown)"
     ));
@@ -2495,7 +2981,7 @@ fn release_container_rootfs(state: &mut SandboxState, container_id: &str) -> Res
     Ok(())
 }
 
-/// internal notes� the block-path workload `Create`.
+/// The block-path workload `Create`.
 ///
 /// 1. Resolve the container's rootfs into a cached erofs image and
 ///    attach it as a read-only virtio-blk device (dedup per image).
@@ -2520,14 +3006,16 @@ fn workload_create_block(
         .clone()
         .ok_or("workload Create before sandbox Create (no sandbox_id)")?;
 
-    // Read + parse the workload's OCI config ONCE (fail-loud, spec
-    // 10g Milestone 2b): an unreadable/unparseable config.json must
+    // Read + parse the workload's OCI config ONCE (fail-loud): an
+    // unreadable/unparseable config.json must
     // NOT let the pod reach Running without its mounts.
     let src_config = Path::new(&req.bundle).join("config.json");
     let spec_data = std::fs::read_to_string(&src_config)
         .map_err(|e| format!("read {}: {e}", src_config.display()))?;
     let spec_val: serde_json::Value = serde_json::from_str(&spec_data)
         .map_err(|e| format!("parse {}: {e}", src_config.display()))?;
+
+    log_container_scratch_placement(state, &req.id, &spec_val);
 
     let cache_dir = Path::new(k7d::erofs::DEFAULT_CACHE_DIR);
     let guest_root = prepare_rootfs_device(state, req, cache_dir)?;
@@ -2565,13 +3053,50 @@ fn workload_create_block(
         .agent_mut()?
         .write_file(&guest_config, fixed.as_bytes())
         .map_err(|e| format!("push bundle {guest_config}: {e}"))?;
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "Create: workload {} bundle pushed to {guest_config} (root.path={guest_root})",
         req.id
     ));
 
     state.persist_block_state()?;
     Ok(())
+}
+
+/// Say in the log which writable layer this container got.
+///
+/// The agent does the actual matching (it reads the container's
+/// `io.kubernetes.cri.container-name` off the bundle and looks for a
+/// mount of that name), so the shim cannot fail a mismatch: a name in
+/// [`ANN_CONTAINER_SCRATCH_SIZE`] that belongs to no container in the
+/// pod provisions an image nobody mounts, and the container the author
+/// meant goes on sharing the pod scratch. Printing both the container's
+/// name and the declared set makes that visible on the spot instead of
+/// as an unexplained `ENOSPC` later.
+fn log_container_scratch_placement(
+    state: &SandboxState,
+    container_id: &str,
+    spec: &serde_json::Value,
+) {
+    if state.container_scratch.is_empty() {
+        return;
+    }
+    let k8s_name = spec
+        .pointer("/annotations")
+        .and_then(|a| a.get(CRI_CONTAINER_NAME))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match state.container_scratch.get(k8s_name) {
+        Some(size) => debug_log_cni(&format!(
+            "Create: workload {container_id} ({k8s_name}) gets its own {} MiB writable image \
+             ({ANN_CONTAINER_SCRATCH_SIZE})",
+            size / (1024 * 1024)
+        )),
+        None => debug_log_cni(&format!(
+            "Create: workload {container_id} ({k8s_name}) shares the pod scratch disk — \
+             {ANN_CONTAINER_SCRATCH_SIZE} names {:?}, which does not include it",
+            state.container_scratch.keys().collect::<Vec<_>>()
+        )),
+    }
 }
 
 /// Resolve the workload's container rootfs into a cached erofs image
@@ -2636,7 +3161,7 @@ fn prepare_rootfs_device(
 
     if let Some(dev) = state.rootfs_devices.iter().find(|d| d.key == key) {
         let guest_mount = dev.guest_mount.clone();
-        // internal notes: a second container of the SAME image (e.g.
+        // A second container of the SAME image (e.g.
         // a main container after a same-image init) shares the mount —
         // record its claim so Delete of the other container knows the
         // mount is still live.
@@ -2679,7 +3204,7 @@ fn prepare_rootfs_device(
     Ok(guest_mount)
 }
 
-/// internal notes: declare `N` spare "image slot" virtio-blk devices
+/// Declare `N` spare "image slot" virtio-blk devices
 /// on the parked [`k7d::control::VmConfig`] — RO, backed by per-pod
 /// sparse files of fixed capacity, with **no** `guest_mount` (empty
 /// slots must not appear in `k7d.blk=`; the agent would automount
@@ -2717,7 +3242,12 @@ fn declare_image_slots(
     let declared = usize::from(config.vsock)
         + config.virtiofs.len()
         + config.block_devices.len()
-        + usize::from(config.network.is_some());
+        + usize::from(config.network.is_some())
+        // The daemon appends the sandbox scratch device
+        // and every per-container one after the devices declared here,
+        // so they spend pins too.
+        + usize::from(config.scratch_size_bytes.is_some())
+        + config.container_scratch.len();
     if declared + count as usize > MMIO_DEVICE_BUDGET {
         return Err(format!(
             "{ANN_IMAGE_SLOTS}={count} exceeds the MMIO/IOAPIC pin budget: {declared} \
@@ -2760,7 +3290,7 @@ fn declare_image_slots(
     Ok(slots)
 }
 
-/// internal notes: attach `image` to the RUNNING VM through a spare
+/// Attach `image` to the RUNNING VM through a spare
 /// image slot. The fill goes through the slot backing file's **same
 /// inode** (open + FICLONE / `copy_file_range`, never rename — the blk
 /// backend holds an fd from boot), then ftruncates back to slot
@@ -2797,8 +3327,7 @@ fn assign_image_slot(
             "no free image slot for erofs key {key} — all {} slots are assigned \
              ({assigned:?}). virtio-blk devices are boot-time declarations (no \
              hotplug); raise the {ANN_IMAGE_SLOTS} pod annotation (default \
-             {DEFAULT_IMAGE_SLOTS}) to attach more distinct post-boot images \
-            .",
+             {DEFAULT_IMAGE_SLOTS}) to attach more distinct post-boot images.",
             state.image_slots.len()
         ));
     };
@@ -3023,12 +3552,12 @@ fn push_etc_files(state: &mut SandboxState, to_push: &[(String, String)]) -> Res
             .write_file(guest, &data)
             .map_err(|e| format!("push etc-file {host} -> {guest}: {e}"))?;
         state.etc_pushed.insert(host.clone(), guest.clone());
-        debug_log_10a(&format!("Create: pushed etc-file {host} -> {guest}"));
+        debug_log_cni(&format!("Create: pushed etc-file {host} -> {guest}"));
     }
     Ok(())
 }
 
-/// k7d-provisioned RWO disk volumes (internal notes/4 static
+/// k7d-provisioned RWO disk volumes (static
 /// provisioning): a bind mount whose source is a direct child of
 /// `/var/lib/k7d/disks/` opts into a raw ext4 image on the reflink
 /// loopback XFS, attached read-write as a virtio-blk device. The
@@ -3085,7 +3614,7 @@ fn prepare_k7d_disks(state: &mut SandboxState, spec: &serde_json::Value) -> Resu
     Ok(())
 }
 
-/// internal notes: route `readOnly: true` hostPath mounts onto the
+/// Route `readOnly: true` hostPath mounts onto the
 /// block path — pack the host dir (or a staging dir holding the host
 /// file) into a cached erofs image (`cached_erofs_image`, content-walk
 /// key) and attach it as one more RO virtio-blk device, rewriting the
@@ -3164,7 +3693,7 @@ fn prepare_ro_hostpath_images(
         let guest_mount = if let Some(dev) = state.hostpath_devices.iter().find(|d| d.key == key) {
             dev.guest_mount.clone()
         } else if state.pending_vm.is_none() {
-            // internal notes: RO hostPath declared after the VM booted
+            // RO hostPath declared after the VM booted
             // rides a spare image slot — the same mechanism as a
             // post-boot distinct container image.
             let guest_mount = assign_image_slot(state, &key, &image, "erofs")?;
@@ -3204,7 +3733,7 @@ fn prepare_ro_hostpath_images(
             src.display(),
             image.display()
         );
-        debug_log_10a(&format!(
+        debug_log_cni(&format!(
             "Create: RO hostPath {} -> {in_vm} (erofs on virtio-blk)",
             src.display()
         ));
@@ -3218,7 +3747,7 @@ fn prepare_ro_hostpath_images(
 /// (virtiofs shares force a full-copy fork, `allow_slow_fork()`)
 /// and the shim logs which volume forced it. Everything the block
 /// path already handles (kubelet RO volumes, emptyDir, etc-files,
-/// k7d disks, RO hostPath erofs images — internal notes) is
+/// k7d disks, RO hostPath erofs images —) is
 /// pre-seeded into the probe's rewrite map so only genuinely
 /// unsupported binds (RW hostPath, special files) trigger the
 /// fallback.
@@ -3276,7 +3805,7 @@ fn prepare_hostpath_fallback(
          {FALLBACK_MOUNT_RW} virtiofs shares; this pod will SLOW-FORK (full memory \
          copy) because virtiofs sessions cannot be CoW-forked"
     );
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "Create: virtiofs fallback for {sandbox_id} ({added} hostPath bind(s)) — slow-fork"
     ));
     cfg.virtiofs.push(k7d::control::ShareConfig {
@@ -3293,8 +3822,8 @@ fn prepare_hostpath_fallback(
     Ok(())
 }
 
-/// Submit the sandbox's parked `VmConfig` to the k7d daemon (spec
-/// 11a: the daemon owns KVM, guest memory, vsock, and the network
+/// Submit the sandbox's parked `VmConfig` to the k7d daemon (which
+/// owns KVM, guest memory, vsock, and the network
 /// attachment), record the returned identity, dial the agent, and
 /// configure the guest network. `pending_vm` is consumed only on
 /// success so a kubelet retry of a failed Create replays cleanly.
@@ -3308,7 +3837,7 @@ fn boot_pending_vm(state: &mut SandboxState) -> Result<(), String> {
         .as_ref()
         .and_then(|n| n.pod_netns.clone())
         .map(PathBuf::from);
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "Create: booting deferred VM (virtiofs={}, block_devices={}, guest_dirs={})",
         config.virtiofs.len(),
         config.block_devices.len(),
@@ -3337,7 +3866,7 @@ fn boot_pending_vm(state: &mut SandboxState) -> Result<(), String> {
             return Err(format!("unexpected k7d create_vm response: {other:?}"));
         }
     };
-    debug_log_10a(&format!(
+    debug_log_cni(&format!(
         "Create: daemon vm_id={vm_id} guest_cid={guest_cid} vm_index={vm_index:?} \
          pod_netns_attached={pod_netns_attached}"
     ));
@@ -3412,6 +3941,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn cscratch_ann(raw: Option<&str>) -> ShimAnnotations {
+        ShimAnnotations {
+            container_scratch_size: raw.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The per-container annotation parses to exactly what it
+    /// says, and 19b behaviour is what its absence means.
+    #[test]
+    fn container_scratch_annotation_parses() {
+        assert!(
+            container_scratch_from_annotations(&cscratch_ann(None))
+                .unwrap()
+                .is_empty(),
+            "no annotation must reproduce: everyone shares the pod scratch"
+        );
+        let parsed =
+            container_scratch_from_annotations(&cscratch_ann(Some(" builder=2Gi , logger=32Mi ")))
+                .expect("valid list");
+        assert_eq!(
+            parsed,
+            vec![
+                k7d::control::ContainerScratchConfig {
+                    name: "builder".into(),
+                    size_bytes: 2 * 1024 * 1024 * 1024,
+                },
+                k7d::control::ContainerScratchConfig {
+                    name: "logger".into(),
+                    size_bytes: 32 * 1024 * 1024,
+                },
+            ]
+        );
+    }
+
+    /// Every rejection names the annotation: a pod that asked for a
+    /// limit must never reach Running sharing the pod scratch instead.
+    #[test]
+    fn container_scratch_annotation_rejections_are_loud() {
+        for bad in [
+            "builder",            // no size
+            "builder=",           // empty size
+            "=2Gi",               // no name
+            "bui/lder=2Gi",       // not a filename component
+            "..=2Gi",             // path escape
+            "builder=2Zi",        // unknown suffix
+            "builder=1Mi",        // below the ext4 floor
+            "a=32Mi,a=64Mi",      // same container twice
+            ",",                  // names nobody
+            "builder=2Gi,logger", // one good entry does not excuse a bad one
+        ] {
+            let err = container_scratch_from_annotations(&cscratch_ann(Some(bad)))
+                .expect_err("annotation value must be rejected");
+            assert!(
+                err.contains(ANN_CONTAINER_SCRATCH_SIZE),
+                "error for {bad:?} must name the annotation, got: {err}"
+            );
+        }
+    }
+
+    /// Each per-container image is one more virtio-blk device, so it
+    /// spends an MMIO pin the image-slot budget check has to see.
+    #[test]
+    fn container_scratch_counts_against_the_pin_budget() {
+        let dir = std::env::temp_dir().join(format!("k7d-cscratch-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = k7d::control::VmConfig {
+            vsock: true,
+            scratch_size_bytes: Some(k7d::disks::DEFAULT_SCRATCH_SIZE),
+            container_scratch: (0..MMIO_DEVICE_BUDGET - 4)
+                .map(|i| k7d::control::ContainerScratchConfig {
+                    name: format!("c{i}"),
+                    size_bytes: k7d::disks::MIN_SCRATCH_SIZE,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = declare_image_slots(&mut config, &slot_ann(Some("4"), None), &dir)
+            .expect_err("per-container images must count against the budget");
+        assert!(err.contains(ANN_IMAGE_SLOTS), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn image_slot_exhaustion_is_loud() {
         // No free slot: the error must name the annotation knob.
@@ -3458,7 +4071,7 @@ mod tests {
 
     #[test]
     fn fix_oci_config_preserves_memory_and_cpu_resources() {
-        // internal notes: CRI linux.resources must reach guest runc.
+        // CRI linux.resources must reach guest runc.
         let spec = serde_json::json!({
             "root": { "path": "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snap" },
             "linux": {
@@ -3516,6 +4129,68 @@ mod tests {
             serde_json::from_str(&fix_oci_config(spec, &empty, None).unwrap()).unwrap();
         assert_eq!(fixed["linux"]["resources"]["memory"]["limit"], 268_435_456);
         assert!(fixed["linux"]["resources"]["memory"].get("swap").is_none());
+    }
+
+    #[test]
+    fn fix_oci_config_translates_cgroup_mounts_and_strips_mqueue() {
+        // Cgroup/cgroup2 mounts are translated to the OCI
+        // `cgroup` type (guest runc mounts the cgroup2 hierarchy),
+        // preserving destination and CRI-set options; mqueue is still
+        // stripped.
+        let spec = serde_json::json!({
+            "root": { "path": "/x" },
+            "linux": {
+                "namespaces": [
+                    { "type": "pid" },
+                    { "type": "mount" },
+                    { "type": "cgroup" },
+                    { "type": "network" }
+                ]
+            },
+            "mounts": [
+                {
+                    "destination": "/sys/fs/cgroup",
+                    "type": "cgroup",
+                    "source": "cgroup",
+                    "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]
+                },
+                {
+                    "destination": "/custom/cgroup2",
+                    "type": "cgroup2",
+                    "source": "cgroup2",
+                    "options": ["rw"]
+                },
+                {
+                    "destination": "/dev/mqueue",
+                    "type": "mqueue",
+                    "source": "mqueue",
+                    "options": ["nosuid"]
+                }
+            ]
+        });
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None).unwrap()).unwrap();
+        let mounts = fixed["mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 2, "cgroup mounts kept, mqueue stripped");
+        assert_eq!(mounts[0]["destination"], "/sys/fs/cgroup");
+        assert_eq!(mounts[0]["type"], "cgroup");
+        assert_eq!(
+            mounts[0]["options"],
+            serde_json::json!(["nosuid", "noexec", "nodev", "relatime", "ro"])
+        );
+        assert_eq!(mounts[1]["destination"], "/custom/cgroup2");
+        assert_eq!(mounts[1]["type"], "cgroup", "cgroup2 normalized to cgroup");
+        assert_eq!(mounts[1]["source"], "cgroup");
+        // The cgroup namespace is kept so the mount shows a
+        // private namespaced subtree; network is stripped as before.
+        let ns_types: Vec<&str> = fixed["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ns| ns["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(ns_types, vec!["pid", "mount", "cgroup"]);
     }
 
     #[test]

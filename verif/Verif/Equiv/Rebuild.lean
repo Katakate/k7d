@@ -1,4 +1,4 @@
--- internal notes"What to build / 3.2" — equivalence for the rebuild
+-- Equivalence for the rebuild
 -- loops: `touch`, `set_state`, `set_protected`, `add_child`. Each scans
 -- `t.nodes` and pushes a (possibly updated) copy of every node into a
 -- fresh `Vec`, so on top of the scan recipe from `Scans.lean` these

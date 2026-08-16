@@ -1,0 +1,34 @@
+# Symbols `make olddefconfig` is allowed to answer differently from
+# guest/kernel/config-minimal. Any other divergence fails the build
+# (guest/kernel/build.sh).
+#
+# The list exists because kconfig's silence is indistinguishable from
+# agreement: an option it cannot honour is simply absent from the
+# answer, and the guest boots, runs, and misbehaves only where that
+# option mattered. Every symbol here has been checked against the 6.12
+# Kconfig sources — the reason says which rule makes the request
+# unanswerable. Adding a line is a decision; satisfying the missing
+# dependency is usually the better one.
+#
+# Format: one symbol per line, `CONFIG_X  # why kconfig wins here`.
+
+# Promptable only under CONFIG_EXPERT, which this config does not set,
+# and `default y`. Asking for them off is aspirational; none of them
+# changes behaviour the guest depends on.
+CONFIG_KALLSYMS         # init/Kconfig: prompt "…" if EXPERT, default y
+CONFIG_INPUT            # drivers/input/Kconfig: prompt if EXPERT, default y
+CONFIG_DEBUG_BUGVERBOSE # lib/Kconfig.debug: prompt if DEBUG_KERNEL && EXPERT
+CONFIG_VGA_CONSOLE      # drivers/video/console/Kconfig: prompt if EXPERT || !X86
+
+# Selected, not chosen: STACKDEPOT (a promptless bool) selects
+# STACKTRACE, and SCHED_MC_PRIO — default y on any x86 SMP kernel —
+# selects CPU_FREQ and X86_INTEL_PSTATE.
+CONFIG_STACKTRACE
+CONFIG_CPU_FREQ
+CONFIG_X86_INTEL_PSTATE
+
+# The "Debug information" choice depends on DEBUG_KERNEL, so with
+# DEBUG_KERNEL off the choice is invisible and NONE cannot be selected.
+# No CONFIG_DEBUG_INFO* is set either, which is the point of the line:
+# the answered config generates no debug info.
+CONFIG_DEBUG_INFO_NONE

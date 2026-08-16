@@ -1,4 +1,4 @@
-//! Snapshot tree for tree-shaped VM exploration.
+//! Snapshot tree for tree-shaped VM exploration (part 2).
 //!
 //! A `SnapshotTree` is a DAG of VM states (Live / Suspended / Evicted) with
 //! resource budgets and LRU-based auto-eviction. It is designed as
@@ -59,8 +59,8 @@ use crate::vm::{Vm, VmError};
 // Re-export the pure model types so external callers (tests, other crates)
 // keep using `k7d::tree::{NodeState, TreeBudget, TreeUsage, ...}` after the
 // refactor with no source-level changes. `NodeId` / `NodeInfo` are the
-// orchestrator-side (String-keyed, serde) types defined below — since spec
-// 9g's pure-model rewrite, `tree_model::NodeInfo` is the `u64`-keyed pure
+// orchestrator-side (String-keyed, serde) types defined below — since the
+// pure-model rewrite, `tree_model::NodeInfo` is the `u64`-keyed pure
 // twin used by the verified eviction helpers.
 pub use crate::tree_model::{NodeState, PayloadKind, TreeBudget, TreeUsage};
 
@@ -74,7 +74,7 @@ pub type NodeId = String;
 /// the orchestrator maintains a `String → u64` id map and derives the pure
 /// model from these records at every eviction decision point (see
 /// [`SnapshotTree::build_model`]). The `kind` and `vm_count` fields were
-/// added in internal notes� older `tree.json` files (no `kind`/`vm_count`) load
+/// added in — older `tree.json` files (no `kind`/`vm_count`) load
 /// as a single-VM payload via the `serde(default)` attributes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -96,13 +96,13 @@ pub struct NodeInfo {
     pub last_active_at_unix: u64,
     /// Whether this node is excluded from auto-eviction.
     pub protected: bool,
-    /// internal notes: payload kind (Vm or Cluster). Defaults to Vm so pre-9g
+    /// Payload kind (Vm or Cluster). Defaults to Vm so legacy
     /// `tree.json` files load unchanged.
     #[serde(default)]
     pub kind: PayloadKind,
-    /// internal notes: number of *underlying* VMs this payload represents.
+    /// Number of *underlying* VMs this payload represents.
     /// 1 for a single-VM payload; N for a cluster of N members.
-    /// Defaults to 1 so pre-9g `tree.json` files load unchanged.
+    /// Defaults to 1 so legacy `tree.json` files load unchanged.
     #[serde(default = "default_vm_count")]
     pub vm_count: u32,
 }
@@ -176,7 +176,7 @@ pub struct SnapshotTree {
     live_vms: HashMap<NodeId, Vm>,
     created_at_unix: u64,
     next_id: u64,
-    /// internal notes: orchestrator `String → u64` id map into the pure model.
+    /// Orchestrator `String → u64` id map into the pure model.
     /// Ids are minted monotonically at node creation, so a child's pure id
     /// is always greater than its parent's (the `parentLt` invariant the
     /// Lean proofs' `well_formed` relies on). Not persisted — rebuilt from
@@ -210,7 +210,7 @@ impl SnapshotTree {
         // into `root_node_dir` and restores the VM from them.
         //
         // Tree roots with virtiofs shares knowingly take the slow
-        // (full-memfd) fork path — the explicit opt-in internal notes
+        // (full-memfd) fork path — the explicit opt-in
         // requires (loud warn inside `allow_slow_fork`).
         if !root_vm.virtiofs_shares().is_empty() {
             root_vm.allow_slow_fork();
@@ -277,7 +277,7 @@ impl SnapshotTree {
         self.root_dir.join("nodes").join(id)
     }
 
-    /// Mint (or return) the pure-model id for a node — the internal notes
+    /// Mint (or return) the pure-model id for a node — the
     /// orchestrator `String → u64` map. Minting is monotonic, so children
     /// (created after their parents) always get larger pure ids.
     fn mint_pure_id(&mut self, id: &NodeId) -> u64 {
@@ -309,8 +309,8 @@ impl SnapshotTree {
         Err(TreeError::NodeNotFound(format!("pure id {pure}")))
     }
 
-    /// Derive the pure [`tree_model::TreeModel`] view of this tree (spec
-    /// 9g). The verified eviction helpers (`tree_model::lru_live_victim`,
+    /// Derive the pure [`tree_model::TreeModel`] view of this tree.
+    /// The verified eviction helpers (`tree_model::lru_live_victim`,
     /// `tree_model::lru_evictable_leaf_subtree`,
     /// `tree_model::implicitly_protected`) run on this view; the winning
     /// pure id is mapped back via [`Self::node_id_for_pure`].
@@ -382,7 +382,7 @@ impl SnapshotTree {
     ) -> Result<Vec<NodeId>, TreeError> {
         self.ensure_live(source_id)?;
         // Proactively reclaim RAM if we're ALREADY over budget. The fork will
-        // add `labels.len()` more live VMs, but per internal notes
+        // add `labels.len` more live VMs, but per we only evict
         // when a budget is _exceeded_ — we allow the fork to temporarily push
         // us over; the next auto_evict call (or the post-fork eviction below)
         // cleans up.
@@ -500,7 +500,7 @@ impl SnapshotTree {
     /// Fails loud for virtiofs-backed VMs: virtiofsd writes FUSE
     /// completions through its own mapping, invisible to KVM dirty
     /// tracking, so `delta.pack` would silently miss device DMA and the
-    /// resumed guest would corrupt.
+    /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
         if let Some(vm) = self.live_vms.get(node_id) {
             if !vm.virtiofs_shares().is_empty() {
@@ -524,7 +524,8 @@ impl SnapshotTree {
         let bitmap = vm.get_and_accumulate_dirty()?.to_vec();
         let state = snapshot::capture_vm_state(&vm)?;
         let src_mem = vm.mem_host_addr();
-        let mem_size = vm.memory_size();
+        // Deltas index pages of the guest physical span, not of RAM (19a).
+        let mem_size = vm.mem_span();
 
         // Write delta + vm_state.json. Then drop the VM (munmap memory, close fds).
         let dirty_pages = write_delta(
@@ -575,16 +576,13 @@ impl SnapshotTree {
         let state_json = fs::read_to_string(node_dir.join("vm_state.json"))?;
         let state: VmState = serde_json::from_str(&state_json)?;
 
-        let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_path, state.memory_size)?;
+        let mem_span = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
+        let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_path, mem_span)?;
 
         // Apply this node's delta on top of base.mem. (If the node is the same
         // as base_node — i.e. a checkpoint that also has a delta — we skip.)
         if base_node != *node_id {
-            apply_delta(
-                &node_dir.join("delta.pack"),
-                fork_mem_addr,
-                state.memory_size,
-            )?;
+            apply_delta(&node_dir.join("delta.pack"), fork_mem_addr, mem_span)?;
         }
 
         let mut vm = crate::fork::build_vm_from_state_and_mem(
@@ -652,7 +650,7 @@ impl SnapshotTree {
 
     /// Get current resource usage.
     ///
-    /// internal notes: `live_vm_count` is the Σ of `vm_count` across all Live
+    /// `live_vm_count` is the Σ of `vm_count` across all Live
     /// nodes, so an N-VM cluster node counts as N. For a single-VM tree
     /// it equals the number of live nodes; the new `live_node_count`
     /// field reports that explicitly.
@@ -674,7 +672,7 @@ impl SnapshotTree {
         let live_node_count = self.live_vms.len();
         // For VmPayload-backed trees this is identical to the previous
         // semantics (every live node has vm_count == 1); for cluster
-        // trees it sums the underlying VM counts so internal notes's
+        // trees it sums the underlying VM counts so the rule
         // "max_live_vms == 50 means 50 underlying VMs" holds.
         let live_vm_count: usize = self
             .live_vms

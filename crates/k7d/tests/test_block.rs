@@ -1,4 +1,4 @@
-//! Integration tests for internal notes: userspace virtio-blk device.
+//! Integration tests for: userspace virtio-blk device.
 //! Requires KVM, /dev/vhost-vsock, built guest kernel (CONFIG_VIRTIO_BLK,
 //! CONFIG_EXT4_FS), built initramfs, and mkfs.ext4 on the host.
 
@@ -233,7 +233,7 @@ fn test_block_device_warm_fork_ro() {
 
     let mut forked = source.fork_warm("blk-ro-fork").expect("warm fork");
 
-    // internal notes: a VM whose only extra device is virtio-blk must
+    // Invariant: a VM whose only extra device is virtio-blk must
     // stay on the CoW (MAP_PRIVATE base.mem) fork path, not full-memfd.
     assert!(
         !forked.fork_memory_is_full_copy(),

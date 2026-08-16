@@ -7,17 +7,15 @@
 
 REFERENCE_DIR := reference
 REMOTE_DIR := /root/k7d
-VERSION := 0.1.0
-RELEASE_NAME := k7d-v$(VERSION)-x86_64-linux
+K7D_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+RELEASE_NAME := k7d-v$(K7D_VERSION)-x86_64-linux
 RELEASE_TGZ := dist/$(RELEASE_NAME).tar.gz
 
 # --- SSH setup (used by all remote-* targets) ---
-# Set K7_NODE_IP to your Linux/KVM build host.
+# Source utils/ssh-setup.sh to get SSH_OPTS, NODE, SSH_PRIVKEY
 define ssh_setup
-: "$${K7_NODE_IP:?set K7_NODE_IP to your Linux/KVM build host}"; \
-SSH_PRIVKEY="$${K7_SSH_KEY_FILE:-$$HOME/.ssh/id_ed25519}"; \
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -i "$$SSH_PRIVKEY"); \
-NODE="$${K7_NODE_USER:-root}@$$K7_NODE_IP";
+source utils/ssh-setup.sh && \
+[[ -n "$${_SSH_TMPDIR:-}" ]] && trap "rm -rf '$$_SSH_TMPDIR'" EXIT;
 endef
 
 # --- Local targets (formatting only -- rust-vmm crates are Linux-only) ---
@@ -47,7 +45,7 @@ lint:
 	cargo deny check
 	cargo clippy -- -D warnings
 
-# internal notes: rebuild the guest agent + initramfs before testing so the
+# Rebuild the guest agent + initramfs before testing so the
 # suite never runs against a stale guest (rsync excludes the initramfs
 # artifact; both builds are no-op-fast when nothing changed).
 test: build-agent build-guest-rootfs
@@ -93,101 +91,83 @@ verif-gen:
 	@CHARON_BIN="$${CHARON:-$$HOME/aeneas/charon/bin/charon}"; \
 	AENEAS_BIN="$${AENEAS:-$$HOME/aeneas/bin/aeneas}"; \
 	$(MAKE) -C verif gen CHARON="$$CHARON_BIN" AENEAS="$$AENEAS_BIN"
-	@# internal notes: fail loudly on new Aeneas axioms before lake build
+	@# Fail loudly on new Aeneas axioms before lake build
 	@bash utils/check-verif-axioms.sh
 
 # Run the Lean theorems against the regenerated model.
 verif-build:
 	$(MAKE) -C verif build
 
-# Build release tarball (run ON a Linux/KVM host, or via `make remote-release`).
-# Produces dist/k7d-v0.1.0-x86_64-linux.tar.gz with binaries, guest assets,
-# and packaging/install.sh (optional --with-k3s RuntimeClass).
+# Release tarball in the official layout (matches the katakate/k7d
+# GitHub release artifact): a k7d-v<version>-x86_64-linux/ directory
+# with the binaries, guest kernel/initramfs, and install.sh. The
+# runtime boots guest/rootfs/initramfs.cpio.gz (there is no rootfs.img
+# — container rootfs erofs images are built at runtime); runc.amd64 is
+# included as an extra so nodes without a host runc still work (the
+# shim's tools-image lookup includes /opt/k7d/runc.amd64).
+#
+# Run ON a Linux/KVM host, or via `make remote-release`.
 release: build build-agent build-guest-kernel build-guest-rootfs
 	@test -f guest/kernel/vmlinux || { echo "missing guest/kernel/vmlinux" >&2; exit 1; }
 	@test -f guest/rootfs/initramfs.cpio.gz || { echo "missing guest/rootfs/initramfs.cpio.gz" >&2; exit 1; }
+	@test -f guest/rootfs/runc.amd64 || { echo "missing guest/rootfs/runc.amd64" >&2; exit 1; }
 	@test -x target/release/k7d || { echo "missing target/release/k7d" >&2; exit 1; }
 	@test -x target/release/containerd-shim-k7-v1 || { echo "missing shim binary" >&2; exit 1; }
+	@test -x target/x86_64-unknown-linux-musl/release/k7-agent || { echo "missing k7-agent binary" >&2; exit 1; }
 	rm -rf "dist/$(RELEASE_NAME)"
 	mkdir -p "dist/$(RELEASE_NAME)"
 	cp target/release/k7d "dist/$(RELEASE_NAME)/"
 	cp target/release/containerd-shim-k7-v1 "dist/$(RELEASE_NAME)/"
+	cp target/x86_64-unknown-linux-musl/release/k7-agent "dist/$(RELEASE_NAME)/"
 	cp guest/kernel/vmlinux "dist/$(RELEASE_NAME)/"
 	cp guest/rootfs/initramfs.cpio.gz "dist/$(RELEASE_NAME)/"
-	cp packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
-	chmod 755 "dist/$(RELEASE_NAME)/install.sh" \
-	  "dist/$(RELEASE_NAME)/k7d" \
-	  "dist/$(RELEASE_NAME)/containerd-shim-k7-v1"
+	cp guest/rootfs/runc.amd64 "dist/$(RELEASE_NAME)/"
+	install -m 755 packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
 	tar -C dist -czf "$(RELEASE_TGZ)" "$(RELEASE_NAME)"
 	@echo "==> $(RELEASE_TGZ)"
 	@tar -tzf "$(RELEASE_TGZ)"
 
 # --- Remote targets (rsync + run on bare-metal node via SSH) ---
 
+# Every long-running remote target goes through utils/remote-run.sh: it
+# rsyncs, starts the command detached from the SSH connection (nohup
+# setsid, output to a log on the node), streams that log back, and exits
+# with the remote command's own exit code. A dropped connection no longer
+# SIGHUPs the run mid-suite — re-running the same target reattaches to
+# the run in flight. See CHALLENGES.md #64.
+
 rsync:
-	@bash -c '$(ssh_setup) \
-	echo "==> Rsyncing to $$NODE:$(REMOTE_DIR)" && \
-	rsync -az --delete \
-	  --exclude target --exclude .git --exclude reference \
-	  --exclude tmp --exclude dist \
-	  --exclude "guest/kernel/linux-*" --exclude "guest/kernel/vmlinux" \
-	  --exclude "guest/rootfs/initramfs.cpio.gz" \
-	  --exclude "guest/rootfs/runc.amd64" \
-	  --exclude "verif/.lake" --exclude "verif/build" \
-	  -e "ssh $${SSH_OPTS[*]}" \
-	  ./ "$$NODE:$(REMOTE_DIR)/"'
+	@bash utils/rsync-to-node.sh
 
-remote-check: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running check on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make check"'
+remote-check:
+	@bash utils/remote-run.sh check "make check"
 
-remote-build: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Building on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make build"'
+remote-build:
+	@bash utils/remote-run.sh build "make build"
 
-remote-release: rsync
+remote-test-integration:
+	@bash utils/remote-run.sh test-integration "make test-integration"
+
+# Build the tarball on the node, then fetch it back to ./dist.
+remote-release:
+	@bash utils/remote-run.sh release "make release"
 	@bash -c '$(ssh_setup) \
-	echo "==> Building release tarball on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make release" && \
 	mkdir -p dist && \
 	rsync -az -e "ssh $${SSH_OPTS[*]}" \
 	  "$$NODE:$(REMOTE_DIR)/$(RELEASE_TGZ)" "$(RELEASE_TGZ)" && \
 	echo "==> fetched $(RELEASE_TGZ)"'
 
-remote-test-integration: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running integration tests on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make test-integration"'
+remote-bench:
+	@bash utils/remote-run.sh bench "make bench"
 
-remote-bench: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running benchmarks on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make bench"'
+remote-miri:
+	@bash utils/remote-run.sh miri "make miri"
 
-remote-miri: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running Miri on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make miri"'
+remote-fuzz:
+	@bash utils/remote-run.sh fuzz "make fuzz"
 
-remote-fuzz: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running fuzzer on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make fuzz"'
-
-remote-kani: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running Kani on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; make kani"'
+remote-kani:
+	@bash utils/remote-run.sh kani "make kani"
 
 remote-install-rust:
 	@bash -c '$(ssh_setup) \
@@ -197,7 +177,7 @@ remote-install-rust:
 	   source ~/.cargo/env && \
 	   rustup target add x86_64-unknown-linux-musl"'
 
-# --- Aeneas / Charon / Lean install on the node ---
+# --- Aeneas / Charon / Lean install on the node (Step 2) ---
 #
 # Idempotent: re-running on a partially-installed node just no-ops the
 # bits that are already there. After a node reset, run this once before
@@ -218,20 +198,13 @@ remote-install-rust:
 # `verif/lakefile.toml` must reference the SAME commit —
 #   044c73b72171670cbe3a245ee7bccc4d626f0113
 # `install-aeneas.sh` reads it from AENEAS_REV; bump both together.
-remote-install-verif: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Installing Aeneas + Charon + Lean on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "bash $(REMOTE_DIR)/utils/install-aeneas.sh"'
+remote-install-verif:
+	@bash utils/remote-run.sh install-verif "bash $(REMOTE_DIR)/utils/install-aeneas.sh"
 
-remote-verif: rsync
-	@bash -c '$(ssh_setup) \
-	echo "==> Running Aeneas + Lean verification on $$NODE" && \
-	ssh "$${SSH_OPTS[@]}" "$$NODE" \
-	  "cd $(REMOTE_DIR) && source ~/.cargo/env 2>/dev/null; \
-	    source ~/.elan/env 2>/dev/null; \
-	    export PATH=\$$HOME/aeneas/bin:\$$HOME/aeneas/charon/bin:\$$PATH; \
-	    make verif-gen && make verif-build"'
+# remote-run.sh sources ~/.elan/env and puts ~/aeneas/{bin,charon/bin}
+# on PATH for every run, so verif needs no extra environment here.
+remote-verif:
+	@bash utils/remote-run.sh verif "make verif-gen && make verif-build"
 
 # --- Reference repos (for agent exploration, not tracked in git) ---
 

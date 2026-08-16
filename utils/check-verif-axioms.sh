@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Guard: fail loudly if Aeneas emits an axiom not listed in
-# verif/axiom-allowlist.txt.
+# verif/axiom-allowlist.txt (see CHALLENGES.md #24).
 #
 # Usage (on the node, after Charon+Aeneas):
 #   utils/check-verif-axioms.sh [K7d.lean] [allowlist]

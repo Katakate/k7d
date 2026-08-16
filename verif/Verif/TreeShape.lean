@@ -103,7 +103,7 @@ def addChild (t : TreeModel) (parent newId now : Nat) : TreeModel :=
       nodes := t.nodes.map (bumpParent parent newId now)
         ++ [newChild parent newId now] }
 
-/-- Well-formedness of the pure model:
+/-- Well-formedness of the pure model (Group A):
 
 * `idsNodup` — node ids are unique.
 * `parentLt` — every parent id is strictly below its child's id (the

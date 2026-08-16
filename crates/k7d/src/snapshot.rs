@@ -166,14 +166,14 @@ pub struct CpuState {
     pub vcpu_events: Option<VcpuEventsState>,
     /// Per-vCPU Local APIC state (raw bytes from `KVM_GET_LAPIC`).
     ///
-    /// internal notes: the LAPIC is per-vCPU state — pre-17b snapshots
+    /// The LAPIC is per-vCPU state — legacy snapshots
     /// stored the (single) vCPU's LAPIC VM-scoped in
     /// [`IrqChipState::lapic`]; restore falls back to that field when
     /// this one is empty (legacy snapshots).
     #[serde(default)]
     pub lapic: Vec<u8>,
     /// Per-vCPU `KVM_GET_MP_STATE` value. Restored LAST in
-    /// the per-vCPU sequence. `None` (pre-17b snapshots) restores as
+    /// the per-vCPU sequence. `None` (legacy snapshots) restores as
     /// `KVM_MP_STATE_RUNNABLE` — correct for the BSP, which is the only
     /// vCPU such snapshots can contain. An AP may legitimately be
     /// HALTED at capture time; restoring it RUNNABLE would make it
@@ -182,16 +182,56 @@ pub struct CpuState {
     pub mp_state: Option<u32>,
 }
 
+/// The VM's kvmclock reading, paired with the host wall clock it was
+/// taken next to.
+///
+/// kvmclock is VM-scoped, not vCPU-scoped: it counts nanoseconds from
+/// the moment the `kvm` VM fd was created. A restore builds a brand new
+/// VM fd, so its clock starts back at zero while the guest's
+/// timekeeping is still holding the value it read before the snapshot —
+/// hence [`crate::fork::restore_kvmclock`], which needs both halves of
+/// this pair: the reading to resume from, and the host instant that
+/// says how long the snapshot has been sitting there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvmClockState {
+    /// `kvm_clock_data.clock` — nanoseconds on this VM's kvmclock.
+    pub clock_ns: u64,
+    /// Host `CLOCK_REALTIME`, in nanoseconds since the Unix epoch, read
+    /// next to the `KVM_GET_CLOCK` ioctl.
+    pub host_unix_ns: u64,
+}
+
+/// Host `CLOCK_REALTIME` in nanoseconds since the Unix epoch.
+pub(crate) fn host_unix_nanos() -> Result<u64, SnapshotError> {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| SnapshotError::Kvm(format!("host clock is before the Unix epoch: {e}")))?;
+    u64::try_from(since_epoch.as_nanos())
+        .map_err(|_| SnapshotError::Kvm("host clock is past the year 2554".into()))
+}
+
+/// Read the VM's kvmclock and the host wall clock together.
+fn capture_kvmclock(vm: &Vm) -> Result<KvmClockState, SnapshotError> {
+    let clock = vm
+        .vm_fd()
+        .get_clock()
+        .map_err(|e| SnapshotError::Kvm(format!("KVM_GET_CLOCK: {e}")))?;
+    Ok(KvmClockState {
+        clock_ns: clock.clock,
+        host_unix_ns: host_unix_nanos()?,
+    })
+}
+
 /// Compat wrapper for CPU state on disk: accepts either a bare
-/// `CpuState` object (pre-17b single-vCPU `cpu.json` / `VmState.cpu`)
+/// `CpuState` object (legacy single-vCPU `cpu.json` / `VmState.cpu`)
 /// or an array of them (17b+ `cpus`). New writes are always the
 /// plural array form.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum CpuStatesCompat {
-    /// 17b+ shape: one entry per vCPU, in vCPU-index order.
+    /// Current shape: one entry per vCPU, in vCPU-index order.
     Many(Vec<CpuState>),
-    /// Legacy pre-17b shape: a single vCPU's state as a bare object.
+    /// Legacy shape: a single vCPU's state as a bare object.
     One(Box<CpuState>),
 }
 
@@ -215,24 +255,32 @@ where
 /// Snapshot metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
+    /// Guest RAM in bytes. `memory.bin` is `MemLayout::from_ram(this).span()`
+    /// bytes long, which is larger for guests with RAM past 4 GiB — it also
+    /// covers the 32-bit MMIO hole.
     pub memory_size_bytes: u64,
     pub kernel_path: String,
     pub initrd_path: Option<String>,
     pub guest_cid: u64,
     pub timestamp_unix: u64,
     /// Virtio-blk device configs, in device order. Cold restore rebuilds
-    /// one `BlockBackend` per entry against the same backing file (spec
-    /// 14a Inc 1). Empty for pre-14a snapshots (serde default).
+    /// one `BlockBackend` per entry against the same backing file.
+    /// Empty for snapshots taken before virtio-blk (serde default).
     #[serde(default)]
     pub block_devices: Vec<crate::vm::BlockConfig>,
+    /// kvmclock reading at capture. `None` in snapshots taken before
+    /// the guest had kvmclock at all — restore says so and
+    /// leaves the clock alone rather than guessing an origin.
+    #[serde(default)]
+    pub kvmclock: Option<KvmClockState>,
 }
 
 /// Saved IRQ chip state (LAPIC + PIC + IOAPIC) for interrupt delivery after restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IrqChipState {
-    /// Legacy VM-scoped Local APIC state (pre-17b snapshots only).
+    /// Legacy VM-scoped Local APIC state (old snapshots only).
     ///
-    /// The LAPIC is per-vCPU state; internal notes
+    /// The LAPIC is per-vCPU state moved it to
     /// [`CpuState::lapic`]. New captures leave this empty; restore
     /// reads it only when a vCPU's own `lapic` field is empty.
     #[serde(default)]
@@ -271,7 +319,7 @@ pub struct IrqChipState {
 pub struct VmState {
     /// Complete per-vCPU state (registers, MSRs, XSAVE, CPUID, LAPIC,
     /// `mp_state`, …), in vCPU-index order. Deserialization accepts the
-    /// legacy singular `cpu` field (a bare object) from pre-17b
+    /// legacy singular `cpu` field (a bare object) from older
     /// snapshots.
     #[serde(alias = "cpu", deserialize_with = "de_cpus")]
     pub cpus: Vec<CpuState>,
@@ -279,7 +327,8 @@ pub struct VmState {
     pub irqchip: IrqChipState,
     /// MMIO device states (captured so vsock etc. can be rebuilt).
     pub devices: Vec<MmioDeviceState>,
-    /// Guest memory size in bytes.
+    /// Guest RAM in bytes (not the mapping length — see
+    /// [`SnapshotMetadata::memory_size_bytes`]).
     pub memory_size: u64,
     /// Kernel path (used for metadata only — fork inherits the source's kernel).
     pub kernel_path: std::path::PathBuf,
@@ -291,16 +340,20 @@ pub struct VmState {
     /// a virtiofs-backed VM respawns one virtiofsd per share (same host
     /// dirs) and re-handshakes vhost-user against a full-copy memfd —
     /// see `fork::restore_vm_from_state`. Empty for share-less VMs and
-    /// for pre-13a snapshots (serde default).
+    /// for older snapshots (serde default).
     #[serde(default)]
     pub virtiofs_shares: Vec<crate::vm::VirtiofsConfig>,
     /// Virtio-blk device configs of the source, in device order. A fork
     /// rebuilds each backend: read-only devices share the backing file;
     /// read-write devices are reflinked (`FICLONE`) into the fork's dir,
     /// failing loudly when the filesystem cannot reflink.
-    /// Empty for pre-14a snapshots (serde default).
+    /// Empty for older snapshots (serde default).
     #[serde(default)]
     pub block_devices: Vec<crate::vm::BlockConfig>,
+    /// kvmclock reading at capture — see [`KvmClockState`]. Every fork
+    /// off this state re-bases its own clock from it.
+    #[serde(default)]
+    pub kvmclock: Option<KvmClockState>,
 }
 
 /// Capture the full in-memory VM state for warm fork.
@@ -323,6 +376,7 @@ pub fn capture_vm_state(vm: &Vm) -> Result<VmState, SnapshotError> {
         guest_cid: vm.guest_cid(),
         virtiofs_shares: vm.virtiofs_shares().to_vec(),
         block_devices: vm.block_devices().to_vec(),
+        kvmclock: Some(capture_kvmclock(vm)?),
     })
 }
 
@@ -384,10 +438,20 @@ const MSR_INDICES: &[u32] = &[
     0x0000_06E0, // IA32_TSC_DEADLINE
     0x0000_003A, // IA32_FEATURE_CONTROL
     0x0000_048B, // IA32_VMX_PROCBASED_CTLS2 — may not exist; skip on error
-    0x4B56_4D00, // KVM_MSR_WALL_CLOCK (kvmclock)
-    0x4B56_4D01, // KVM_MSR_SYSTEM_TIME
-    0x4B56_4D03, // KVM_MSR_WALL_CLOCK_NEW
-    0x4B56_4D04, // KVM_MSR_SYSTEM_TIME_NEW
+    // The two halves of the kvmclock handshake, and the reason they are
+    // restored: each holds a guest physical address the guest published
+    // once at boot, so writing them back is what re-registers the
+    // pvclock page with the new VM fd. Restoring them is not optional
+    // now that the guest actually runs kvmclock — without
+    // MSR_KVM_SYSTEM_TIME_NEW the host never updates the page the
+    // restored guest is reading its clock out of.
+    //
+    // The list stops here on purpose. `0x4b56_4d02` and up (async page
+    // faults, steal time, PV EOI, poll control) are the same kind of
+    // address handshake for paravirt features `vm::patch_cpuid_for_kvm_guest`
+    // deliberately does not advertise; the two must be changed together.
+    0x4B56_4D00, // MSR_KVM_WALL_CLOCK_NEW
+    0x4B56_4D01, // MSR_KVM_SYSTEM_TIME_NEW
 ];
 
 /// Capture every vCPU's state, in vCPU-index order. The VM must be
@@ -660,7 +724,7 @@ fn capture_cpu_state(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<CpuState, SnapshotE
         }
     };
 
-    // Per-vCPU LAPIC.
+    // Per-vCPU LAPIC (moved off the VM-scoped IrqChipState).
     let lapic = vcpu_fd
         .get_lapic()
         .map_err(|e| SnapshotError::Kvm(format!("KVM_GET_LAPIC: {e}")))?;
@@ -699,9 +763,12 @@ fn capture_cpu_state(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<CpuState, SnapshotE
 /// the source VM's own memory. For warm forks, pass the fork's `MAP_PRIVATE`
 /// mapping address to inject without disturbing the source's live connections.
 ///
+/// `mem_span` is the guest physical address span (see [`Vm::mem_span`]), used
+/// to bounds-check the descriptor the guest published.
+///
 /// This mirrors Firecracker's `prepare_save` → `send_transport_reset_event`.
 pub(crate) fn inject_vsock_transport_reset_into(
-    memory_size: u64,
+    mem_span: u64,
     device_states: &[MmioDeviceState],
     target_mem_addr: u64,
 ) {
@@ -745,7 +812,7 @@ pub(crate) fn inject_vsock_transport_reset_into(
             let buf_gpa = unsafe { std::ptr::read_volatile(desc_addr_ptr) };
 
             // Write VIRTIO_VSOCK_EVENT_TRANSPORT_RESET (u32) to the buffer.
-            if buf_gpa == 0 || buf_gpa >= memory_size {
+            if buf_gpa == 0 || buf_gpa >= mem_span {
                 log::warn!(
                     "snapshot: vsock evq descriptor {desc_idx} has invalid buf_gpa={buf_gpa:#x}"
                 );
@@ -782,8 +849,13 @@ pub(crate) fn inject_vsock_transport_reset_into(
 }
 
 /// Dump guest memory to a file.
+///
+/// Writes the whole guest physical address span, so `memory.bin` offsets are
+/// guest physical addresses and a restore can `MAP_PRIVATE` the file straight
+/// back. For guests with RAM past 4 GiB that includes the (all-zero, never
+/// touched) 32-bit MMIO hole —.
 fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
-    let mem_size = vm.memory_size() as usize;
+    let mem_size = vm.mem_span() as usize;
 
     let host_addr: *const u8 = if vm.is_restored() {
         vm.mem_host_addr() as *const u8
@@ -811,7 +883,7 @@ fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
 /// Creates the directory and writes four files:
 /// - `memory.bin` — raw guest memory dump
 /// - `cpu.json` — per-vCPU registers (JSON array, one entry per vCPU;
-///   pre-17b snapshots hold a single bare object instead)
+///   legacy snapshots hold a single bare object instead)
 /// - `devices.json` — MMIO device state
 /// - `metadata.json` — VM configuration
 pub fn snapshot_vm(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
@@ -831,11 +903,7 @@ pub fn snapshot_vm(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
         let registry = vm.mmio_registry().lock().unwrap();
         registry.snapshot_device_states()
     };
-    inject_vsock_transport_reset_into(
-        vm.memory_size(),
-        &device_states_for_reset,
-        vm.mem_host_addr(),
-    );
+    inject_vsock_transport_reset_into(vm.mem_span(), &device_states_for_reset, vm.mem_host_addr());
 
     dump_memory(vm, snapshot_dir)?;
     log::info!(
@@ -870,6 +938,7 @@ pub fn snapshot_vm(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
             .unwrap_or_default()
             .as_secs(),
         block_devices: vm.block_devices().to_vec(),
+        kvmclock: Some(capture_kvmclock(vm)?),
     };
     let metadata_json = serde_json::to_string_pretty(&metadata)?;
     fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;

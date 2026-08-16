@@ -2,8 +2,7 @@
 //!
 //! The daemon owns VM lifecycle (KVM, guest memory, vhost-vsock,
 //! virtiofsd) and exposes create/stop/status operations to clients
-//! (the containerd shim, the `k7` Python backend, tests). See
-//! internal notes.
+//! (the containerd shim, the `k7` Python backend, tests).
 //!
 //! Protocol: one JSON request object per line, one JSON response
 //! object per line. A connection may carry multiple request/response
@@ -78,7 +77,7 @@ pub struct BlockDeviceConfig {
     #[serde(default)]
     pub readonly: bool,
     /// Mount the device inside the guest at this absolute path before
-    /// containers start. A caller declares
+    /// containers start (`k7d.blk=`). A caller declares
     /// "this device is the container rootfs" by mounting an erofs image
     /// here and pointing the container bundle's `root.path` at it — the
     /// agent assembles overlay(erofs RO, tmpfs upper) for runc. Requires
@@ -119,7 +118,7 @@ fn apply_block_devices(
 /// When present, the daemon creates (or joins) the shared cluster
 /// bridge `k7-br-{cluster_id}`, allocates a TAP on it, and — when
 /// `pod_netns` is given — moves the TAP into the CNI pod netns with
-/// the spec-10a bridge + NAT plumbing. Bridges are refcounted across
+/// the bridge + NAT plumbing. Bridges are refcounted across
 /// VMs so the first pod deleted in a cluster no longer tears the
 /// shared bridge down under its peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,11 +151,11 @@ pub struct VmConfig {
     /// Guest RAM in MiB.
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
-    /// Guest vCPU count (internal notes: derived from the pod's CPU limit;
-    /// internal notes: honored by the VMM — the guest boots with this many
+    /// Guest vCPU count (derived from the pod's CPU limit;
+    /// Honored by the VMM — the guest boots with this many
     /// CPUs, discovered via an MP table when > 1). The host-side CFS
     /// quota below still enforces the pod's CPU limit across all vCPU
-    /// threads. internal notes: multi-vCPU VMs snapshot/fork/checkpoint like
+    /// threads. Multi-vCPU VMs snapshot/fork/checkpoint like
     /// single-vCPU ones, and are pool-served when the pool's prefill
     /// config carries the same vCPU count.
     #[serde(default = "default_vcpus")]
@@ -179,9 +178,33 @@ pub struct VmConfig {
     #[serde(default)]
     pub block_devices: Vec<BlockDeviceConfig>,
     /// Absolute guest tmpfs directories the agent creates at boot
-    /// — emptyDir volume backing.
+    /// (`k7d.mkdir=`) — emptyDir volume backing.
     #[serde(default)]
     pub guest_dirs: Vec<String>,
+    /// Capacity in bytes of this sandbox's writable scratch
+    /// disk. The daemon provisions a sparse ext4 image on the reflink
+    /// loopback XFS, attaches it as the LAST read-write virtio-blk
+    /// device, and the guest agent puts every container's overlay
+    /// `upper`/`work` on it — so container writes land on the host
+    /// instead of guest RAM.
+    ///
+    /// `None` means "no scratch disk": the guest agent falls back to a
+    /// small, explicitly bounded tmpfs and says so loudly. Callers that
+    /// run containers (the shim always does) should set this; the
+    /// default lives in the shim (`k7d.katakate.org/scratch-size`) and
+    /// is deliberately independent of `memory_mb`.
+    #[serde(default)]
+    pub scratch_size_bytes: Option<u64>,
+    /// Containers that get their **own** writable image
+    /// instead of a directory on the shared sandbox scratch, so that a
+    /// container which fills its writable layer cannot starve its
+    /// siblings. Empty (the default) reproduces exactly.
+    ///
+    /// Each entry costs one more virtio-blk device out of the guest's
+    /// MMIO budget, which is why it is opt-in per container rather than
+    /// the default for all of them.
+    #[serde(default)]
+    pub container_scratch: Vec<ContainerScratchConfig>,
     /// Optional caller-supplied sandbox identity, echoed in
     /// `list_vms` so a shim can find its VM after a restart.
     #[serde(default)]
@@ -189,6 +212,18 @@ pub struct VmConfig {
     /// Optional network attachment (bridge + TAP + pod netns).
     #[serde(default)]
     pub network: Option<NetConfig>,
+}
+
+/// One container's own writable capacity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerScratchConfig {
+    /// Kubernetes container name. The agent matches it against the
+    /// bundle's `io.kubernetes.cri.container-name` annotation — the
+    /// guest runc name is the containerd container id, which does not
+    /// exist yet when this device is declared at sandbox create.
+    pub name: String,
+    /// Capacity in bytes of that container's ext4 image.
+    pub size_bytes: u64,
 }
 
 /// Manual `Default` matching the serde field defaults — a derived one
@@ -206,6 +241,8 @@ impl Default for VmConfig {
             virtiofs: Vec::new(),
             block_devices: Vec::new(),
             guest_dirs: Vec::new(),
+            scratch_size_bytes: None,
+            container_scratch: Vec::new(),
             sandbox_id: None,
             network: None,
         }
@@ -224,12 +261,12 @@ fn default_true() -> bool {
     true
 }
 
-/// On-disk reattach record for one sandbox-carrying VM (internal notes
-/// increment 4). Written atomically to
+/// On-disk reattach record for one sandbox-carrying VM.
+/// Written atomically to
 /// `{sandbox_root}/{sandbox_id}.json` on `create_vm`, removed on
 /// `stop_vm` / daemon shutdown. A freshly respawned shim resolves its
 /// sandbox back to the still-running VM through `reattach_sandbox`.
-/// internal notes: also persists the create-time vCPU count (and CFS cap)
+/// Also persists the create-time vCPU count (and CFS cap)
 /// so crash-recovery / reattach paths never silently assume 1 vCPU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxRecord {
@@ -313,15 +350,38 @@ pub enum Request {
         /// CRI sandbox identity given to `create_vm`.
         sandbox_id: String,
     },
-    /// Warm-fork a daemon-owned VM into a new daemon-owned VM (internal notes
-    /// increment 3). The first fork of a VM prepares it as a fork
+    /// Warm-fork a daemon-owned VM into a new daemon-owned VM.
+    /// The first fork of a VM prepares it as a fork
     /// source — a share-less source is swapped for a restored copy on
-    /// the **same vsock CID** (internal notes: the pod's shim caches
+    /// the **same vsock CID** (the pod's shim caches
     /// the CID), echoed back as `source_guest_cid`. Live agent
     /// connections to the source still die (fresh vsock backend);
     /// clients redial the same CID.
     ForkVm {
         /// Source VM identifier from `create_vm`.
+        vm_id: String,
+        /// CRI sandbox identity of the FORK pod, when the
+        /// fork backs a kubectl pod (`fork-source-*` annotations).
+        /// The fork is then registered + persisted like a
+        /// `create_vm`-born sandbox VM, so `lookup_sandbox` /
+        /// `reattach_sandbox` (and `k7 pause` on the fork) work.
+        #[serde(default)]
+        sandbox_id: Option<String>,
+    },
+    /// Pause a VM (`k7 pause` for the k7d backend):
+    /// vCPU threads are stopped and joined and device workers parked;
+    /// guest memory, devices, and the vsock CID are all retained.
+    /// Idempotent — pausing an already-paused VM is `Ok`.
+    PauseVm {
+        /// VM identifier from `create_vm`.
+        vm_id: String,
+    },
+    /// Resume a paused VM: the vCPU run loop restarts on the same
+    /// guest memory and vsock CID. A CFS-capped VM's fresh vCPU
+    /// threads are re-attached to its CPU cgroup (same invariant as
+    /// the fork-source prepare swap). Idempotent.
+    ResumeVm {
+        /// VM identifier from `create_vm`.
         vm_id: String,
     },
     /// Root a single-VM snapshot tree at a freshly booted VM.
@@ -352,8 +412,8 @@ pub enum Request {
         tree_id: Option<String>,
     },
     /// Adopt live daemon-owned sandbox VMs + their shared
-    /// [`ClusterNetwork`] as a [`ClusterSnapshotTree`] root (internal notes
-    /// Inc 4). The VMs must already share one cluster bridge (same
+    /// [`ClusterNetwork`] as a [`ClusterSnapshotTree`] root.
+    /// The VMs must already share one cluster bridge (same
     /// `cluster_id`, distinct `vm_index`s covering `0..N-1`). On
     /// success they leave the sandbox VM registry and become
     /// tree-owned; `ClusterSnapshotTree::new_cluster` then
@@ -459,13 +519,13 @@ pub enum Request {
     /// List all trees the daemon owns.
     TreeList,
     /// Forget a tree: live payloads are torn down, on-disk state under
-    /// the tree's directory is kept (re-openable by later increments).
+    /// the tree's directory is kept (re-openable later).
     TreeDrop {
         /// Tree identifier.
         tree_id: String,
     },
-    /// Report warm-pool sizing and hit/miss counters (internal notes
-    /// increment 5). Always answers, even with the pool disabled
+    /// Report warm-pool sizing and hit/miss counters. Always
+    /// answers, even with the pool disabled
     /// (`size: 0`).
     PoolStatus,
 }
@@ -521,8 +581,8 @@ pub enum Response {
         /// in-netns gateway route in the guest.
         #[serde(default)]
         pod_netns_attached: bool,
-        /// Whether this VM was served from the warm pool (internal notes
-        /// increment 5) instead of cold-booted. Loud so tests can
+        /// Whether this VM was served from the warm pool instead
+        /// of cold-booted. Loud so tests can
         /// assert the fast path was taken rather than inferring it
         /// from timing.
         #[serde(default)]
@@ -536,7 +596,7 @@ pub enum Response {
         state: String,
         /// Guest vsock CID.
         guest_cid: u64,
-        /// Number of virtiofs shares attached (internal notes: the
+        /// Number of virtiofs shares attached (the
         /// block-path suites assert this is 0 for normal pods and
         /// non-zero exactly when the shim fell back to virtiofs).
         #[serde(default)]
@@ -546,9 +606,15 @@ pub enum Response {
         block_devices: usize,
         /// Whether this VM's memory is a full memfd copy of its fork
         /// source rather than `CoW` `MAP_PRIVATE` (always `false` for
-        /// cold boots; internal notes's fork-path invariant probe).
+        /// cold boots; the fork-path invariant probe).
         #[serde(default)]
         fork_memory_full_copy: bool,
+        /// The guest kernel this VM actually booted. Reported so
+        /// "which guest is this VM running" is a question the socket
+        /// answers, and so the suite can assert that nobody but the
+        /// daemon chose it (CHALLENGES #72).
+        #[serde(default)]
+        kernel: String,
     },
     /// Reply to `list_vms`.
     VmList {
@@ -611,7 +677,7 @@ pub enum Response {
         guest_cids: Vec<u64>,
         /// Per-member (same order as `guest_cids`): whether the fork's
         /// memory is a full memfd copy rather than `CoW` `MAP_PRIVATE`
-        /// (internal notes: block-path cluster forks must be all-false;
+        /// (block-path cluster forks must be all-false;
         /// only virtiofs-backed sources full-copy).
         #[serde(default)]
         fork_memory_full_copy: Vec<bool>,
@@ -678,12 +744,12 @@ pub struct TreeSummary {
 /// though the control plane never reads it back yet: holding the `Vm`
 /// keeps the guest alive, and dropping the entry (on `stop_vm` /
 /// `shutdown_all`) runs `Vm::drop`, which tears down the vCPU thread,
-/// device workers, virtiofsd children, and TAP. Later increments
-/// (fork, snapshot, tree) will read it.
+/// device workers, virtiofsd children, and TAP. The fork, snapshot
+/// and tree paths read it.
 struct VmEntry {
     #[allow(dead_code)]
     vm: Vm,
-    /// internal notes: the threaded CPU cgroup capping this VM's vCPU
+    /// The threaded CPU cgroup capping this VM's vCPU
     /// threads at the pod's CFS quota. Held only for its `Drop`
     /// (like `vm`): declared AFTER `vm` — struct fields drop in
     /// declaration order, so the vCPU thread is joined (by
@@ -701,7 +767,7 @@ struct VmEntry {
     cluster_id: Option<String>,
     /// `vm_index` allocated on the cluster bridge.
     vm_index: Option<u32>,
-    /// Pod netns the TAP was attached into, when the spec-10a attach
+    /// Pod netns the TAP was attached into, when the CNI attach
     /// succeeded. Detached (best-effort) on stop.
     pod_netns: Option<PathBuf>,
 }
@@ -719,7 +785,7 @@ struct BridgeEntry {
 struct NetAttachment {
     tap: TapDevice,
     vm_index: u32,
-    /// Set only when the spec-10a pod-netns attach succeeded.
+    /// Set only when the pod-netns attach succeeded.
     pod_netns: Option<PathBuf>,
 }
 
@@ -885,7 +951,7 @@ impl TreePayload {
 pub struct Daemon {
     vms: Mutex<HashMap<String, VmEntry>>,
     /// Shared cluster bridges keyed by `cluster_id`, refcounted across
-    /// VMs (internal notes� fixes the shared-bridge teardown
+    /// VMs (this fixes the shared-bridge teardown
     /// race where the first pod deleted destroyed its peers' bridge).
     bridges: Mutex<HashMap<String, BridgeEntry>>,
     /// Snapshot trees keyed by `tree_id`. The
@@ -1002,7 +1068,9 @@ impl Daemon {
             Request::StopVm { vm_id } => self.stop_vm(&vm_id),
             Request::LookupSandbox { sandbox_id } => self.lookup_sandbox(&sandbox_id),
             Request::ReattachSandbox { sandbox_id } => self.reattach_sandbox(&sandbox_id),
-            Request::ForkVm { vm_id } => self.fork_vm(&vm_id),
+            Request::ForkVm { vm_id, sandbox_id } => self.fork_vm(&vm_id, sandbox_id),
+            Request::PauseVm { vm_id } => self.pause_vm(&vm_id),
+            Request::ResumeVm { vm_id } => self.resume_vm(&vm_id),
             Request::TreeCreate {
                 config,
                 budget,
@@ -1116,7 +1184,7 @@ impl Daemon {
     }
 
     fn create_vm(&self, config: VmConfig) -> Response {
-        // internal notes: pool fast path. A pool-compatible
+        // Pool fast path. A pool-compatible
         // request is served from the warm pool when it has an idle VM;
         // a miss (incompatible or empty) cold-boots — never an error.
         if let Some(ref pool) = self.pool {
@@ -1228,7 +1296,7 @@ impl Daemon {
             .expect("bridge entry just ensured");
         entry.refcount += 1;
 
-        // internal notes: move the TAP into the CNI pod netns and install
+        // Move the TAP into the CNI pod netns and install
         // pod_ip ↔ guest_ip NAT. Best-effort — on failure the VM
         // falls back to host-bridge networking (the TAP fd stays valid
         // across the netns move).
@@ -1296,10 +1364,23 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     fn build_and_start(&self, config: VmConfig) -> Result<CreatedVm, String> {
         let (kernel, initrd) = Self::resolve_guest_paths(&config)?;
+        // Name the guest in the log. "Which kernel did this pod boot?"
+        // is otherwise unanswerable after the fact, and the answer is
+        // what turns a guest that misbehaves in one corner (nf_tables
+        // with no address families, an agent older than the call it is
+        // waiting for) into a one-line diagnosis. See CHALLENGES #72.
+        log::info!(
+            "guest artifacts: kernel={kernel} initrd={initrd} (from {})",
+            if config.kernel.is_some() {
+                "the client's request"
+            } else {
+                "the daemon environment"
+            }
+        );
 
         // Build the (fallible) device config before acquiring the
         // network so a validation error cannot leak a bridge reference.
-        // internal notes: the builder honors `vcpus` (and rejects invalid
+        // The builder honors `vcpus` (and rejects invalid
         // counts loudly at build time).
         let mut builder = Vm::builder()
             .kernel(&kernel)
@@ -1313,6 +1394,45 @@ impl Daemon {
         builder = apply_block_devices(builder, &config.block_devices)?;
         for dir in &config.guest_dirs {
             builder = builder.guest_dir(dir);
+        }
+
+        // The VM id doubles as the scratch image's name, so mint it
+        // before the disk. Both happen before `acquire_network` so a
+        // provisioning failure cannot leak a bridge reference.
+        let vm_id = self.mint_vm_id();
+
+        // The sandbox's writable layer. Attached after every
+        // caller-declared device, so the guest device names the caller
+        // computed from `block_devices` positions still hold. The built
+        // `Vm` owns the handle: teardown unlinks the image.
+        if let Some(size) = config.scratch_size_bytes {
+            let disk = crate::disks::ScratchDisk::create(&vm_id, size)
+                .map_err(|e| format!("provision scratch disk for {vm_id}: {e}"))?;
+            builder = builder.scratch_disk(disk);
+        }
+
+        // And one image per container that asked for its own
+        // writable-space limit, so its ENOSPC stays its own. Last of
+        // all, for the same reason.
+        for (i, cs) in config.container_scratch.iter().enumerate() {
+            if config.container_scratch[..i]
+                .iter()
+                .any(|prev| prev.name == cs.name)
+            {
+                // Two devices at one mount point: the second would
+                // shadow the first, and one container's limit would
+                // silently be an image nobody writes to.
+                return Err(format!(
+                    "container_scratch names container {:?} twice",
+                    cs.name
+                ));
+            }
+            let disk =
+                crate::disks::ScratchDisk::create(&format!("{vm_id}-c-{}", cs.name), cs.size_bytes)
+                    .map_err(|e| {
+                        format!("provision scratch disk for container {}: {e}", cs.name)
+                    })?;
+            builder = builder.container_scratch_disk(&cs.name, disk);
         }
 
         let attachment = match config.network {
@@ -1329,8 +1449,6 @@ impl Daemon {
             None => (None, None),
         };
 
-        let vm_id = self.mint_vm_id();
-
         // From here on a failure must release the bridge reference we
         // just took, or a failed boot leaks the bridge forever.
         let vm_result = builder
@@ -1341,7 +1459,7 @@ impl Daemon {
                 Ok(vm)
             })
             .and_then(|vm| {
-                // internal notes: cap the vCPU thread at the pod's CFS quota.
+                // Cap the vCPU thread at the pod's CFS quota.
                 // Fails loudly — a pod promised a CPU limit must never
                 // silently run uncapped. Dropping the partially built
                 // VM on failure joins the vCPU thread first, so the
@@ -1382,7 +1500,7 @@ impl Daemon {
         })
     }
 
-    /// internal notes: apply the pod's CFS quota to `vm`'s vCPU thread via a
+    /// Apply the pod's CFS quota to `vm`'s vCPU thread via a
     /// dedicated threaded cgroup under the daemon's own cgroup (see
     /// [`crate::cgroup`] for why the pod slice itself can't be used).
     /// `Ok(None)` when the config carries no quota.
@@ -1402,7 +1520,7 @@ impl Daemon {
                 "invalid CPU cap: quota={quota} period={period} (both must be > 0)"
             ));
         }
-        // internal notes: every vCPU thread goes into the cgroup so the pod's
+        // Every vCPU thread goes into the cgroup so the pod's
         // CFS quota caps the whole VM, not just the BSP.
         let tids = vm
             .vcpu_kernel_tids(Duration::from_secs(5))
@@ -1500,8 +1618,7 @@ impl Daemon {
         Ok(vm_id)
     }
 
-    /// Warm-fork `vm_id` into a fresh daemon-owned VM (internal notes
-    /// increment 3, internal notes).
+    /// Warm-fork `vm_id` into a fresh daemon-owned VM (warm path).
     ///
     /// The registry lock is held for the whole operation: the source
     /// `Vm` must not be stopped or forked concurrently. The fork itself
@@ -1509,7 +1626,8 @@ impl Daemon {
     /// VM's first fork is the slow path (cold snapshot + restore). The
     /// source's vsock CID is preserved across prepare
     /// and echoed back as `source_guest_cid`.
-    fn fork_vm(&self, vm_id: &str) -> Response {
+    #[allow(clippy::too_many_lines)]
+    fn fork_vm(&self, vm_id: &str, fork_sandbox_id: Option<String>) -> Response {
         let fork_id = self.mint_vm_id();
 
         let mut vms = self.vms.lock().unwrap();
@@ -1579,7 +1697,7 @@ impl Daemon {
             (fork, entry.guest_cid, entry.cpu_quota, entry.cpu_period)
         };
         let (fork, source_guest_cid, cpu_quota, cpu_period) = forked;
-        // internal notes: a capped source's fork inherits the same CFS cap
+        // A capped source's fork inherits the same CFS cap
         // across all N child vCPU threads — leaving the child uncapped
         // would be a silent quota escape on the kubectl fork path.
         let cpu_cgroup = match (cpu_quota, cpu_period) {
@@ -1600,6 +1718,7 @@ impl Daemon {
             _ => None,
         };
         let guest_cid = fork.guest_cid();
+        let vcpus = fork.vcpu_count();
         vms.insert(
             fork_id.clone(),
             VmEntry {
@@ -1608,18 +1727,111 @@ impl Daemon {
                 cpu_quota,
                 cpu_period,
                 guest_cid,
-                sandbox_id: None,
+                sandbox_id: fork_sandbox_id.clone(),
                 cluster_id: None,
                 vm_index: None,
                 pod_netns: None,
             },
         );
+        // A fork that backs a kubectl pod is a first-class
+        // sandbox VM — persist its reattach record and index it so
+        // `lookup_sandbox` / `reattach_sandbox` (and `k7 pause` on the
+        // fork) resolve it exactly like a `create_vm`-born sandbox.
+        if let Some(sandbox_id) = fork_sandbox_id {
+            let record = SandboxRecord {
+                sandbox_id: sandbox_id.clone(),
+                vm_id: fork_id.clone(),
+                guest_cid,
+                vcpus,
+                cpu_quota,
+                cpu_period,
+                vm_index: None,
+                cluster_id: None,
+                pod_netns: None,
+                created_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = write_sandbox_record(&record) {
+                if let Some(entry) = vms.remove(&fork_id) {
+                    drop(vms);
+                    self.teardown_entry(&fork_id, entry);
+                }
+                return Response::Error {
+                    message: format!("persist sandbox record for fork {sandbox_id}: {e}"),
+                };
+            }
+            self.sandboxes
+                .lock()
+                .unwrap()
+                .insert(sandbox_id, fork_id.clone());
+        }
         log::info!("forked {vm_id} -> {fork_id} (guest_cid={guest_cid})");
         Response::VmForked {
             vm_id: fork_id,
             guest_cid,
             source_guest_cid,
         }
+    }
+
+    /// Pause `vm_id` in place: vCPUs stopped, memory and
+    /// vsock CID retained. The registry lock is held so the VM cannot
+    /// be stopped/forked mid-pause.
+    fn pause_vm(&self, vm_id: &str) -> Response {
+        let mut vms = self.vms.lock().unwrap();
+        let Some(entry) = vms.get_mut(vm_id) else {
+            return Response::Error {
+                message: format!("no such VM: {vm_id}"),
+            };
+        };
+        match entry.vm.pause() {
+            Ok(()) => {
+                log::info!("paused {vm_id} (guest_cid={} retained)", entry.guest_cid);
+                Response::Ok
+            }
+            Err(e) => Response::Error {
+                message: format!("pause({vm_id}): {e}"),
+            },
+        }
+    }
+
+    /// Resume a paused `vm_id`. Fresh vCPU threads of a CFS-capped VM
+    /// are re-attached to its CPU cgroup — same invariant as the
+    /// fork-source prepare swap (/17c).
+    fn resume_vm(&self, vm_id: &str) -> Response {
+        let mut vms = self.vms.lock().unwrap();
+        let Some(entry) = vms.get_mut(vm_id) else {
+            return Response::Error {
+                message: format!("no such VM: {vm_id}"),
+            };
+        };
+        if let Err(e) = entry.vm.resume() {
+            return Response::Error {
+                message: format!("resume({vm_id}): {e}"),
+            };
+        }
+        if let Some(cg) = &entry.cpu_cgroup {
+            let Some(tids) = entry.vm.vcpu_kernel_tids(Duration::from_secs(5)) else {
+                return Response::Error {
+                    message: format!(
+                        "resume({vm_id}): vCPU threads never published kernel TIDs — \
+                         cannot re-apply the CPU cap"
+                    ),
+                };
+            };
+            for tid in tids {
+                if let Err(e) = cg.add_thread(tid) {
+                    return Response::Error {
+                        message: format!(
+                            "resume({vm_id}): re-attach vCPU TID {tid} to CPU cgroup: {e}"
+                        ),
+                    };
+                }
+            }
+        }
+        log::info!("resumed {vm_id} (guest_cid={})", entry.guest_cid);
+        Response::Ok
     }
 
     /// Resolve kernel/initrd from `config` or the environment — loudly.
@@ -1636,13 +1848,26 @@ impl Daemon {
     /// snapshot (`prepare_fork_source_in`) so the guest's vsock state
     /// at snapshot time has an established connection for the injected
     /// `TRANSPORT_RESET` to reset — the pattern `test_tree.rs` has
-    /// exercised since internal notes
+    /// exercised since. Closing it just before the snapshot
     /// leaves the guest mid-close and the restored vsock device was
     /// (rarely, but observably) unresponsive.
     fn boot_tree_member(
         config: &VmConfig,
         tap: Option<TapDevice>,
     ) -> Result<(Vm, crate::api::AgentClient), String> {
+        if config.scratch_size_bytes.is_some() || !config.container_scratch.is_empty() {
+            // A tree payload VM is owned by the SnapshotTree, not by a
+            // sandbox, and its whole point is to be forked repeatedly.
+            // Rather than quietly drop the request (the failure
+            // mode is exactly a writable layer that isn't where the
+            // caller thinks), refuse it.
+            return Err(
+                "scratch_size_bytes / container_scratch are not supported for tree payload \
+                 VMs — a tree node's writable layer comes from the sandbox VMs it adopts \
+"
+                .to_string(),
+            );
+        }
         let (kernel, initrd) = Self::resolve_guest_paths(config)?;
         let mut builder = Vm::builder()
             .kernel(&kernel)
@@ -1790,8 +2015,7 @@ impl Daemon {
     }
 
     /// Adopt live sandbox VMs + their shared bridge as a cluster
-    /// snapshot-tree root. See
-    /// [`Request::TreeAdoptCluster`].
+    /// snapshot-tree root. See [`Request::TreeAdoptCluster`].
     #[allow(clippy::too_many_lines)]
     fn tree_adopt_cluster(
         &self,
@@ -1976,7 +2200,7 @@ impl Daemon {
         };
 
         // Drop sandbox index + on-disk records: these VMs are no longer
-        // reattachable as sandboxes (they're tree members). internal notes
+        // reattachable as sandboxes (they're tree members).
         // StopVm on pod teardown then sees "no such VM", which the shim
         // already treats as best-effort.
         {
@@ -1989,7 +2213,7 @@ impl Daemon {
             }
         }
 
-        // Build the payload. The spec-10c CPU cgroups are held until
+        // Build the payload. The CPU cgroups are held until
         // after `new_cluster`: prepare swaps each member for a restored
         // copy whose fresh vCPU thread is not in the old cgroup, so the
         // pod's CFS cap cannot follow the VM into the tree anyway
@@ -2265,6 +2489,7 @@ impl Daemon {
                 virtiofs_shares: entry.vm.virtiofs_shares().len(),
                 block_devices: entry.vm.block_devices().len(),
                 fork_memory_full_copy: entry.vm.fork_memory_is_full_copy(),
+                kernel: entry.vm.kernel_path().to_string_lossy().into_owned(),
             },
             None => Response::Error {
                 message: format!("no such VM: {vm_id}"),
@@ -2340,7 +2565,7 @@ impl Daemon {
     /// after), then the VM itself (vCPU, device workers, virtiofsd
     /// children, TAP link via `Vm::drop`), then the bridge reference.
     fn teardown_entry(&self, vm_id: &str, entry: VmEntry) {
-        // internal notes: a stopped sandbox must not be
+        // A stopped sandbox must not be
         // reattachable — drop the index entry and the on-disk record
         // before the VM teardown.
         if let Some(ref sandbox_id) = entry.sandbox_id {
@@ -2386,7 +2611,7 @@ impl Daemon {
         }
         // Trees own their live VMs (and, for clusters, their bridges);
         // dropping each payload tears them down. On-disk tree state is
-        // kept — a later increment re-opens it for crash recovery.
+        // kept — it is re-opened later for crash recovery.
         let trees: Vec<(String, TreePayload)> = self.trees.lock().unwrap().drain().collect();
         for (tree_id, payload) in trees {
             log::info!("shutdown: dropping tree {tree_id}");

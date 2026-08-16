@@ -1,4 +1,4 @@
-//! internal notes+ 2b.1: kubelet volume support end-to-end.
+//! Chunks 2a + 2b.1: kubelet volume support end-to-end.
 //!
 //! Boots `runtimeClassName: k7` pods with real Kubernetes
 //! volumes via `kubectl apply` and asserts the volume contents
@@ -57,7 +57,7 @@ const POD_K7D_DISK_2: &str = "test-vol-k7d-disk-2";
 fn ensure_shim_installed() -> common::LeakGuard {
     use std::process::Command;
 
-    // internal notes, Milestone 2: shared best-effort teardown of orphan
+    // Shared best-effort teardown of orphan
     // virtiofsd/shim processes and stale /tmp/k7d-shim mounts left by
     // earlier tests (replaces the old local cleanup_orphan_k7_processes).
     common::cleanup_k7_runtime_leaks();
@@ -126,7 +126,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
             .expect("create RuntimeClass");
     }
 
-    // internal notes: the shim's sandbox Create now requires a running k7d
+    // The shim's sandbox Create now requires a running k7d
     // daemon (it owns the VMs); install and start it.
     common::ensure_k7d_daemon_running();
 
@@ -159,8 +159,8 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
 }
 
 /// Graceful pod delete used at the end of every kubectl-driven
-/// test in this binary. internal notes, Phase B0 — defence-in-depth on
-/// top of the spec-10h product fix that unblocks the volume trio.
+/// test in this binary., Phase B0 — defence-in-depth on
+/// top of the product fix that unblocks the volume trio.
 ///
 /// The old `--force --grace-period=0` form **removes the API
 /// object immediately** but leaves containerd's node-side sandbox
@@ -196,7 +196,7 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
 ///      the original bug, but at least we don't deadlock.
 ///
 /// Test-only, best-effort: ignored errors are fine here, the
-/// product code's fail-loud rule from internal notes
+/// product code's fail-loud rule from still applies to
 /// every required volume bind / shim Create on the production
 /// path.
 fn kubectl_delete_pod(name: &str) {
@@ -232,7 +232,7 @@ fn kubectl_delete_pod(name: &str) {
         // Graceful delete failed or timed out (shim wedged?).
         // Last-resort force delete so the harness doesn't hang. We
         // intentionally don't `pkill -9` here — the panic-path
-        // `LeakGuard` from internal notes, and doing it
+        // `LeakGuard` from already does that, and doing it
         // on every test boundary is what historically triggered the
         // sandbox-state cascade we're trying to avoid.
         let _ = std::process::Command::new("kubectl")
@@ -377,7 +377,7 @@ spec:
     wait_for_pod_running(POD_CFGMAP, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
-    // internal notes: configMap rides the block path (packed erofs
+    // ConfigMap rides the block path (packed erofs
     // image on virtio-blk) — the pod must carry ZERO virtiofs shares.
     let vm = common::pod_vm_state(POD_CFGMAP);
     assert_eq!(
@@ -744,18 +744,18 @@ spec:
     kubectl_delete_secret(PROJECTED_SECRET);
 }
 
-/// DNS in the guest VM — the long-deferred spec-10a follow-up.
+/// DNS in the guest VM — the long-deferred CNI follow-up.
 ///
 /// Kubelet writes per-pod `/etc/hosts` to `/var/lib/kubelet/pods/
 /// <uid>/etc-hosts` and containerd CRI writes per-sandbox
 /// `/etc/resolv.conf` + `/etc/hostname` to its own sandbox dir,
 /// then bind-mounts both into the workload container at the
-/// canonical container paths. Pre-10b.1 the shim's strip pass
+/// canonical container paths. The shim's strip pass used to
 /// dropped these silently, so any DNS lookup inside the guest
 /// failed and the container saw `/etc/resolv.conf: No such file
 /// or directory`.
 ///
-/// internal notes's etc-files whitelist
+/// The etc-files whitelist
 /// ([`k7d::volumes::PodVolumes::add_etc_files_for_workload`])
 /// bind-mounts each of those host paths into the per-pod
 /// `volumes-ro` scratch tree and inserts a rewrite-map entry, so
@@ -769,13 +769,12 @@ spec:
 /// 3. Resolving `kubernetes.default.svc.cluster.local` from
 ///    inside the guest — proves the in-cluster DNS path
 ///    end-to-end (resolver knows the nameserver, nameserver
-///    reachable via the spec-10a CNI path, CoreDNS resolves the
+///    reachable via the CNI path, CoreDNS resolves the
 ///    name to a Service IP).
 ///
-/// Why this matters: the k3s-agent sidecar pattern from spec
-/// 10b's design needs in-guest DNS to find the inner control
-/// plane's API server by name. Without 10b.1, the inner cluster
-/// can't form. internal notes's milestone-11 end-to-end test
+/// Why this matters: the k3s-agent sidecar pattern needs in-guest
+/// DNS to find the inner control plane's API server by name. Without
+/// it the inner cluster can't form, and the end-to-end test
 /// (boot inner k3s + fork it) is gated on this test passing.
 #[test]
 fn test_dns_resolution_inside_guest() {
@@ -843,7 +842,7 @@ spec:
     assert_eq!(
         rc, 0,
         "nslookup kubernetes.default.svc.cluster.local must succeed inside the guest \
-         (this is the cluster-DNS unblock check for internal notes's k3s-agent sidecar \
+         (this is the cluster-DNS unblock check for the k3s-agent sidecar \
          pattern)"
     );
     // The output should contain the Service IP (10.43.0.1 by
@@ -873,7 +872,7 @@ spec:
 /// reads the host content; writes are refused.
 ///
 /// This is the smallest possible hostPath surface: a single regular
-/// file. internal notes� exercises the
+/// file. routes it onto the block path — exercises the
 /// file-staging branch of `prepare_ro_hostpath_images` (mkfs.erofs
 /// packs directories, so the file is staged into one first).
 #[test]
@@ -916,7 +915,7 @@ spec:
     wait_for_pod_running(POD_HOSTPATH_FILE, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
-    // internal notes: a `readOnly: true` hostPath rides the block
+    // A `readOnly: true` hostPath rides the block
     // path — the file is staged and packed into a cached erofs image
     // on virtio-blk, so the pod carries ZERO virtiofs shares and
     // stays CoW-forkable. Asserted loudly so a silent regression to
@@ -1000,7 +999,7 @@ spec:
     wait_for_pod_running(POD_HOSTPATH_DIR, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
-    // internal notes: hostPath RW = explicit virtiofs fallback,
+    // HostPath RW = explicit virtiofs fallback,
     // slow-fork (asserted loudly; see test_hostpath_file_ro).
     let vm = common::pod_vm_state(POD_HOSTPATH_DIR);
     assert_eq!(
@@ -1046,7 +1045,7 @@ spec:
 /// **This is the chunk-2b.2 closer test**: it proves the whole
 /// volume-support pipeline composes for the de facto "Kubernetes
 /// stateful workload" pattern (PVC + PV + StorageClass), and is
-/// the test the milestone-11 "boot inner k3s + fork it"
+/// the test the "boot inner k3s + fork it"
 /// integration depends on (k3s itself stores etcd / leader-
 /// election state on local-path PVCs in single-node setups).
 #[test]
@@ -1101,7 +1100,7 @@ spec:
     wait_for_pod_running(POD_PVC, Duration::from_secs(180))
         .expect("pod should reach Running+Ready");
 
-    // internal notes: local-path PVCs are hostPath-backed
+    // PVC matrix: local-path PVCs are hostPath-backed
     // (arbitrary host dirs under /var/lib/rancher/k3s/storage/) —
     // the explicit virtiofs fallback, slow-fork.
     let vm = common::pod_vm_state(POD_PVC);
@@ -1136,7 +1135,7 @@ spec:
     kubectl_delete_pvc(PVC_NAME);
 }
 
-/// internal notes: k7d-provisioned RWO disk volume. A hostPath under
+/// K7d-provisioned RWO disk volume. A hostPath under
 /// `/var/lib/k7d/disks/<name>` opts into a raw ext4 image on the
 /// reflink loopback XFS attached read-write as a virtio-blk device —
 /// NOT a virtiofs share, so the pod stays on the CoW fork path.

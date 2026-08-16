@@ -11,8 +11,8 @@ name = "aeneas"
 git  = "https://github.com/AeneasVerif/aeneas"
 subDir = "backends/lean"
 # Pin to the same commit the node's `~/aeneas` checkout is built from —
-# see `Makefile`'s `remote-install-verif` target (internal notes
-# task 0). If `lake build` complains about a version mismatch, update
+# see `Makefile`'s `remote-install-verif` target. If `lake build`
+# complains about a version mismatch, update
 # both this `rev` and the matching `aeneas` checkout on the node
 # together (`AENEAS_REV=<sha> utils/install-aeneas.sh`).
 rev = "044c73b72171670cbe3a245ee7bccc4d626f0113"

@@ -28,6 +28,7 @@ use crate::devices::{
     PipeSerialDevice, SerialTrigger, SharedPipeSerialDevice, SharedSerialDevice, SERIAL2_PORT_BASE,
     SERIAL_PORT_BASE, SERIAL_PORT_SIZE,
 };
+use crate::mem_layout::{MemLayout, MMIO_HOLE_START};
 use crate::network::{TapDevice, TapNetBackend};
 use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, SharedMmioRegistry};
 use crate::virtiofs::{VirtioFsBackend, VirtiofsdProcess};
@@ -123,19 +124,20 @@ const KERNEL_MIN_ALIGNMENT_BYTES: u32 = 0x0100_0000;
 const E820_RAM: u32 = 1;
 const E820_RESERVED: u32 = 2;
 
-// MMIO device addresses — placed ABOVE guest RAM so KVM generates MMIO exits
-const MMIO_GAP: u64 = 0x1000; // gap between RAM end and first MMIO device
+// MMIO device addresses — placed in the 32-bit MMIO hole, so
+// they never overlap guest RAM regardless of how much RAM the guest has
+// and always stay addressable in 32 bits.
 const MMIO_IRQ_BASE: u32 = 5; // IRQ 5+ for virtio devices (COM1=4, COM2=3)
 /// IOAPIC pin count — every virtio-mmio device burns one pin
 /// (IRQ `MMIO_IRQ_BASE + idx`), so at most `24 - 5 = 19` devices fit
-///.
+/// (pin-budget check).
 const IOAPIC_PINS: usize = 24;
 
 /// Configuration for one host-guest directory sharing.
 ///
-/// internal notes(one virtiofsd + one
+/// Introduces multi-share virtiofs (one virtiofsd + one
 /// virtio-fs MMIO device per share, all on the same VM). For
-/// backward compatibility with pre-10b callers, the existing
+/// backward compatibility with legacy callers, the existing
 /// [`VmBuilder::virtiofs`] single-share API still works — it
 /// becomes a thin wrapper around [`VmBuilder::virtiofs_share`] with
 /// `readonly: false`. New callers should prefer
@@ -155,8 +157,7 @@ pub struct VirtiofsConfig {
     pub readonly: bool,
 }
 
-/// Configuration for one virtio-blk device backed by a raw host file
-///.
+/// Configuration for one virtio-blk device backed by a raw host file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockConfig {
     /// Backing file on the host (raw image; size must be a non-zero
@@ -170,7 +171,7 @@ pub struct BlockConfig {
     /// builder emits a `k7d.blk=<dev>:<mount>:<fstype>:<ro|rw>` kernel
     /// cmdline entry and the guest agent mounts the device before
     /// containers start — the same discipline as `k7d.virtiofs=`.
-    /// `None` (the default, and the value deserialized from pre-Inc 2
+    /// `None` (the default, and the value deserialized from older
     /// snapshots) leaves mounting to the guest workload.
     #[serde(default)]
     pub mount: Option<BlockMountSpec>,
@@ -205,7 +206,7 @@ pub struct NetworkConfig {
 ///
 /// Current divergences:
 /// - MP-table emission at cold boot (`Smp` only; `Single` memory stays
-///   byte-identical to the pre-17a layout),
+///   byte-identical to the original layout),
 /// - per-vCPU CPUID identity patching at cold boot and on the restore
 ///   fallback path (`Smp` only; `Single` keeps the raw host CPUID).
 ///
@@ -242,7 +243,7 @@ pub struct VmBuilder {
     /// Guest vCPU count. Defaults to 1. When > 1, the
     /// builder emits an MP table so the guest kernel discovers the
     /// additional CPUs (ACPI is compiled out); `vcpus == 1` boots stay
-    /// byte-identical to the pre-17a layout (no MP table, no E820
+    /// byte-identical to the original layout (no MP table, no E820
     /// reservation) so single-vCPU snapshots and the fork/tree suites
     /// are untouched.
     vcpus: u32,
@@ -262,10 +263,15 @@ pub struct VmBuilder {
     block_devices: Vec<BlockConfig>,
     /// Absolute guest directories the agent creates at boot
     /// (`k7d.mkdir=` cmdline param). The guest rootfs is tmpfs, so
-    /// these are tmpfs directories — internal notes
+    /// these are tmpfs directories — uses them for
     /// emptyDir volumes (`/run/k7d/emptydir/<name>`).
     guest_dirs: Vec<String>,
     network: Option<NetworkConfig>,
+    /// The sandbox's writable scratch image, attached as one
+    /// more read-write virtio-blk device and owned by the built `Vm`.
+    scratch_disk: Option<crate::disks::ScratchDisk>,
+    /// Per-container writable images, same ownership rules.
+    container_scratch_disks: Vec<crate::disks::ScratchDisk>,
 }
 
 impl Default for VmBuilder {
@@ -278,11 +284,22 @@ impl Default for VmBuilder {
 ///
 /// Resolution order (first complete pair wins):
 /// 1. `K7D_KERNEL` + `K7D_INITRD` env (both required if either is set)
-/// 2. Installed share dir `/usr/local/share/k7d/{vmlinux,initramfs.cpio.gz}`
-/// 3. Workspace root baked at compile time (`CARGO_MANIFEST_DIR/../../guest/...`)
+/// 2. Workspace root baked at compile time (`CARGO_MANIFEST_DIR/../../guest/...`)
+/// 3. Installed share dir `/usr/local/share/k7d/{vmlinux,initramfs.cpio.gz}`
 ///
-/// Shared by [`VmBuilder::kernel_and_initrd`] and control-plane clients
-/// that need to pass explicit paths to the k7d daemon.
+/// The workspace outranks the install because a host that builds k7d and
+/// also has it installed holds both, and `make test` rebuilds the guest
+/// before every run precisely so the suite cannot boot a stale one — an
+/// installed copy winning there silently tests artifacts nobody built.
+/// An installed binary has no workspace (the baked path belongs to
+/// whichever host compiled it), so it still resolves to the share dir.
+///
+/// That last sentence holds only for a binary built on another host. A
+/// build node runs binaries whose baked path is real, so this must only
+/// be called by processes whose environment somebody sets deliberately:
+/// the daemon (`k7d.service`) and the tests. The shim is neither — it
+/// is spawned by containerd with no environment — so it sends no guest
+/// paths at all and lets the daemon answer. See CHALLENGES #72.
 #[must_use]
 pub fn default_guest_paths() -> (PathBuf, PathBuf) {
     let env_kernel = std::env::var_os("K7D_KERNEL");
@@ -298,6 +315,17 @@ pub fn default_guest_paths() -> (PathBuf, PathBuf) {
         }
     }
 
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let workspace_kernel = root.join("guest/kernel/vmlinux");
+    let workspace_initrd = root.join("guest/rootfs/initramfs.cpio.gz");
+    if workspace_kernel.is_file() && workspace_initrd.is_file() {
+        return (workspace_kernel, workspace_initrd);
+    }
+
     let share = PathBuf::from("/usr/local/share/k7d");
     let installed_kernel = share.join("vmlinux");
     let installed_initrd = share.join("initramfs.cpio.gz");
@@ -305,15 +333,9 @@ pub fn default_guest_paths() -> (PathBuf, PathBuf) {
         return (installed_kernel, installed_initrd);
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
-    (
-        root.join("guest/kernel/vmlinux"),
-        root.join("guest/rootfs/initramfs.cpio.gz"),
-    )
+    // Neither exists: hand back the workspace pair so the failure names
+    // the path a developer is expected to build, not one of two guesses.
+    (workspace_kernel, workspace_initrd)
 }
 
 impl VmBuilder {
@@ -325,8 +347,88 @@ impl VmBuilder {
             initrd_path: None,
             memory_mb: 256,
             vcpus: 1,
+            // `clocksource=kvm-clock`: the guest would otherwise settle
+            // on `tsc`. On a host with an invariant TSC the guest
+            // demotes kvm-clock to rating 299, just under tsc's 300, on
+            // the reasoning that a TSC that never stops needs no
+            // paravirt help. That reasoning does not survive fork and
+            // restore: the guest TSC of a restored VM resumes at the
+            // value it was captured with, so a guest timing itself off
+            // the TSC wakes up believing no time passed, while kvmclock
+            // is VM-scoped state the host re-bases in one ioctl
+            // (`KVM_SET_CLOCK`, see `fork::restore_kvmclock`). Pinning
+            // it makes the clock the guest reads the clock k7d owns.
+            //
+            // There is no `k7d.now=` here any more: kvmclock hands the
+            // guest the host's wall clock at boot through the
+            // `MSR_KVM_WALL_CLOCK_NEW` page, which is what that
+            // parameter was standing in for while the guest had no
+            // kvmclock and no RTC.
+            //
+            // `idle=poll` is gone. It arrived as the other half of
+            // `mitigations=off` when the VERW MDS mitigation was
+            // faulting AMD Zen guests after restore; `CONFIG_CPU_MITIGATIONS`
+            // being unset in `guest/kernel/config-minimal` retired that
+            // reason. What it was then paying for is wake latency: a
+            // guest that HLTs has to be woken by an interrupt for every
+            // host round trip, and dropping the flag took
+            // the virtiofs write path from 1.2 ms (1.14–1.34 across ten
+            // runs) to a mean of 1.7 ms with a tail that broke the 2 ms
+            // budget twice in ten. Boot-to-agent did not move either
+            // way. The price was a whole host core per idle vCPU —
+            // measured at 100% of a core against 1% for a guest that
+            // halts — which a warm pool of idle VMs must not pay.
+            //
+            // The replacement is the guest haltpoll cpuidle governor
+            // (`CONFIG_CPU_IDLE` + `CONFIG_HALTPOLL_CPUIDLE`): poll
+            // briefly in guest mode, then HLT. Host-side
+            // `kvm.halt_poll_ns` (200 µs, already on) is a different
+            // mechanism — it keeps the host thread from scheduling out
+            // after a vmexit, it does not remove the vmexit. Measured
+            // with idle=poll off and the old kernel: default 200 µs
+            // still broke the virtiofs budget in 2 of 10, and bumping
+            // it to 2 ms did the same (still 2 of 10). The 0.5 ms is
+            // the vmexit, which only guest-side polling removes.
+            //
+            // The governor starts `poll_limit_ns` at 0 and shrinks it
+            // whenever an idle exceeds `guest_halt_poll_ns`, so a
+            // warm-pool VM that has been sitting idle is back to
+            // plain HLT on the next request. Vanilla haltpoll is
+            // written for a recently-busy guest; k7d's is a parked
+            // one. `guest/kernel/patches/haltpoll-seed-poll-limit.patch`
+            // seeds the window at `guest_halt_poll_ns` instead of 0,
+            // and the cmdline pins the vanilla 200 µs window, jumps
+            // there on grow, and never shrinks. `CONFIG_NO_HZ_IDLE` +
+            // `HIGH_RES_TIMERS` plus leaving `stop_tick` true in
+            // `haltpoll_select` keep that window from being charged
+            // once per HZ=250 tick. Leftover PIT IRQs at ~43 Hz
+            // (`noapic`) still charge it: 43 Hz × 2 ms was 8.6% of a
+            // host core; 43 Hz × 200 µs is ~0.86% predicted,
+            // measured 1.0% over 5 s, under the 2% budget.
+            // The 2 ms pin was trying to catch a virtiofs write after
+            // a 1 s settle, which cannot work — after 1 s the guest
+            // has already HLTed.
+            //
+            // Haltpoll only helps a request that arrives *during* the
+            // poll window after the previous wakeup. `test_latency_virtiofs_write`
+            // therefore settles 50 ms (not 1 s) and issues two warmups
+            // so the timed write is that request; a 1 s gap is many
+            // governor cycles past the window and takes the HLT path
+            // (~1.9 ms, flaky against the 2 ms budget).
+            //
+            // `cpuidle_haltpoll.force=1` rather than advertising
+            // `KVM_HINTS_REALTIME` (CPUID.0x4000_0001:EDX[0]). The
+            // driver only installs if that hint is set or force=1 is
+            // on the cmdline (`haltpoll_want()` in
+            // `drivers/cpuidle/cpuidle-haltpoll.c`), and it also
+            // refuses to load if any `idle=` override is present.
+            // The hint is a claim that every vCPU has a dedicated host
+            // CPU. k7d does not pin vCPUs and pods carry CPU quotas, so
+            // force=1 is "I know what I am asking for" without a
+            // promise `patch_cpuid_for_kvm_guest` would have to keep.
+            // `mitigations=off` and `clocksource=kvm-clock` stay.
             cmdline: String::from(
-                "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic reboot=k panic=1 pci=off rdinit=/init initcall_debug mitigations=off idle=poll",
+                "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic reboot=k panic=1 pci=off rdinit=/init initcall_debug mitigations=off cpuidle_haltpoll.force=1 haltpoll.guest_halt_poll_ns=200000 haltpoll.guest_halt_poll_grow_start=200000 haltpoll.guest_halt_poll_allow_shrink=0 clocksource=kvm-clock",
             ),
             vsock_enabled: false,
             // Every fresh VmBuilder gets a unique vsock CID from the
@@ -355,6 +457,8 @@ impl VmBuilder {
             block_devices: Vec::new(),
             guest_dirs: Vec::new(),
             network: None,
+            scratch_disk: None,
+            container_scratch_disks: Vec::new(),
         }
     }
 
@@ -372,9 +476,9 @@ impl VmBuilder {
         self
     }
 
-    /// Set both kernel and initrd from default guest artifact paths.
-    /// Searches relative to `CARGO_MANIFEST_DIR` for
-    /// `guest/kernel/vmlinux` and `guest/rootfs/initramfs.cpio.gz`.
+    /// Set both kernel and initrd from [`default_guest_paths`], which
+    /// prefers `K7D_KERNEL`/`K7D_INITRD`, then the build workspace, then
+    /// the installed share dir.
     #[must_use]
     pub fn kernel_and_initrd(self) -> Self {
         let (kernel, initrd) = default_guest_paths();
@@ -436,7 +540,7 @@ impl VmBuilder {
     /// multiple times **replaces** the primary share — for true
     /// multi-share use [`Self::virtiofs_share`] directly.
     ///
-    /// Backward compatibility: this preserves the pre-10b single-
+    /// Backward compatibility: this preserves the legacy single-
     /// share semantics. The primary share gets tag `k7fs` and is
     /// the one returned by [`Vm::virtiofs_config`].
     #[must_use]
@@ -476,7 +580,7 @@ impl VmBuilder {
     /// the `runc` `ConfigMap` / `Secret` contract.
     ///
     /// The host-side `virtiofsd --readonly` belt-and-suspenders that
-    /// internal notes's design sketch describes does not exist in the
+    /// the original design sketch describes does not exist in the
     /// rust-vmm `virtiofsd` (≥1.7 removed the flag); see
     /// [`crate::virtiofs::VirtiofsdProcess::spawn_with_options`] for
     /// the place to add it back if a future virtiofsd build re-
@@ -496,8 +600,8 @@ impl VmBuilder {
         self
     }
 
-    /// Attach a virtio-blk device backed by a raw host file (internal notes
-    /// Inc 1). Devices appear in the guest in declaration order
+    /// Attach a virtio-blk device backed by a raw host file.
+    /// Devices appear in the guest in declaration order
     /// (`/dev/vda`, `/dev/vdb`, …).
     ///
     /// The file is opened at [`Self::build`] time (`O_RDONLY` when
@@ -515,8 +619,8 @@ impl VmBuilder {
 
     /// Attach a virtio-blk device like [`Self::block_device`], and have
     /// the guest agent mount it at `guest_mount` (with `mount -t
-    /// <fstype>`, `-o ro` when `readonly`) before containers start
-    ///. The builder encodes the instruction into the
+    /// <fstype>`, `-o ro` when `readonly`) before containers start.
+    /// The builder encodes the instruction into the
     /// `k7d.blk=` kernel cmdline param, mirroring `k7d.virtiofs=`:
     /// `k7d.blk=vda:/run/k7d/rootfs:erofs:ro,…`.
     #[must_use]
@@ -555,12 +659,51 @@ impl VmBuilder {
         self
     }
 
+    /// Attach the sandbox's writable scratch disk: the image
+    /// becomes one more read-write virtio-blk device, agent-mounted at
+    /// [`crate::disks::SCRATCH_GUEST_MOUNT`], and the built [`Vm`] owns
+    /// it (the image is removed when the VM goes away).
+    ///
+    /// The guest agent puts every container's overlay `upper`/`work`
+    /// there, so container writes land on the host image instead of
+    /// guest RAM. Declare it LAST if the caller also assigns guest
+    /// device names by index — like every other block device, position
+    /// determines `/dev/vdX`.
+    #[must_use]
+    pub fn scratch_disk(self, disk: crate::disks::ScratchDisk) -> Self {
+        let mut builder = self.block_device_mounted(
+            disk.path(),
+            false,
+            crate::disks::SCRATCH_GUEST_MOUNT,
+            "ext4",
+        );
+        builder.scratch_disk = Some(disk);
+        builder
+    }
+
+    /// Attach a container's **own** scratch disk: one more
+    /// read-write virtio-blk image, agent-mounted at
+    /// [`crate::disks::container_scratch_mount`], owned by the built
+    /// [`Vm`] exactly like the sandbox scratch.
+    ///
+    /// `name` is the Kubernetes container name. A container that has
+    /// one of these puts its overlay `upper`/`work` on it instead of
+    /// on the shared sandbox scratch, which is what scopes a full
+    /// writable layer to the container that filled it.
+    #[must_use]
+    pub fn container_scratch_disk(self, name: &str, disk: crate::disks::ScratchDisk) -> Self {
+        let mount = crate::disks::container_scratch_mount(name);
+        let mut builder = self.block_device_mounted(disk.path(), false, &mount, "ext4");
+        builder.container_scratch_disks.push(disk);
+        builder
+    }
+
     /// Build and return a configured (but not started) VM.
     #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<Vm, VmError> {
         let kernel_path = self.kernel_path.expect("kernel path is required");
 
-        // internal notes: validate the vCPU count loudly before any resource
+        // Validate the vCPU count loudly before any resource
         // is allocated — never clamp silently.
         if self.vcpus == 0 || self.vcpus > u32::from(crate::mptable::MAX_SUPPORTED_CPUS) {
             return Err(VmError::Pipe(std::io::Error::other(format!(
@@ -571,6 +714,12 @@ impl VmBuilder {
         }
 
         let mem_size = self.memory_mb * 1024 * 1024;
+        // Guest RAM straddles the 32-bit MMIO hole once it
+        // passes `MMIO_HOLE_START`. `mem_span` is the guest physical
+        // address space (and therefore the host mapping) length — RAM
+        // plus the hole; `mem_size` stays the RAM total.
+        let layout = MemLayout::from_ram(mem_size);
+        let mem_span = layout.span();
 
         let kvm = Kvm::new().map_err(VmError::KvmOpen)?;
         let vm_fd = kvm.create_vm().map_err(VmError::CreateVm)?;
@@ -596,8 +745,10 @@ impl VmBuilder {
             return Err(VmError::Pipe(std::io::Error::last_os_error()));
         }
         #[allow(clippy::cast_possible_wrap)]
-        // SAFETY: mem_fd_raw is a valid memfd; setting the file size to mem_size.
-        if unsafe { libc::ftruncate(mem_fd_raw, mem_size as libc::off_t) } < 0 {
+        // SAFETY: mem_fd_raw is a valid memfd; setting the file size to the
+        // full GPA span. The MMIO hole inside it is never touched by anyone,
+        // so it costs address space but no pages.
+        if unsafe { libc::ftruncate(mem_fd_raw, mem_span as libc::off_t) } < 0 {
             // SAFETY: mem_fd_raw is valid.
             unsafe { libc::close(mem_fd_raw) };
             return Err(VmError::Pipe(std::io::Error::last_os_error()));
@@ -613,27 +764,32 @@ impl VmBuilder {
 
         let guest_memory = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
             GuestAddress(0),
-            mem_size as usize,
+            mem_span as usize,
             Some(vm_memory::FileOffset::new(mem_file, 0)),
         )])
         .map_err(VmError::CreateMemory)?;
 
         let mem_host_addr = guest_memory.get_host_address(GuestAddress(0)).unwrap() as u64;
 
-        // Register memory with KVM
-        let mem_region = kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: mem_size,
-            userspace_addr: mem_host_addr,
-            flags: 0,
-        };
-        // SAFETY: guest_memory is valid and will outlive the VM; the region
-        // describes a contiguous mmap'd range owned by GuestMemoryMmap.
-        unsafe {
-            vm_fd
-                .set_user_memory_region(mem_region)
-                .map_err(VmError::SetUserMemoryRegion)?;
+        // Register the RAM regions with KVM — one below the MMIO hole and,
+        // for guests larger than it, one past 4 GiB. The hole itself is
+        // deliberately left unmapped so accesses there reach the devices
+        // (virtio-mmio, IOAPIC, LAPIC, KVM's TSS) instead of RAM.
+        for (slot, gpa, size) in layout.slots() {
+            let mem_region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: gpa,
+                memory_size: size,
+                userspace_addr: mem_host_addr + gpa,
+                flags: 0,
+            };
+            // SAFETY: guest_memory is valid and will outlive the VM; the region
+            // describes a sub-range of the contiguous mmap it owns.
+            unsafe {
+                vm_fd
+                    .set_user_memory_region(mem_region)
+                    .map_err(VmError::SetUserMemoryRegion)?;
+            }
         }
 
         // Load kernel
@@ -653,7 +809,7 @@ impl VmBuilder {
         // Set up virtio-MMIO devices and build cmdline with device params.
         //
         // Slot layout: each virtio-mmio device gets a 4 KiB GPA window
-        // starting at `mem_size + MMIO_GAP` and a unique IRQ starting
+        // starting at `MMIO_HOLE_START` and a unique IRQ starting
         // at `MMIO_IRQ_BASE` (= 5). Slots are allocated sequentially
         // by `next_slot` as devices are added — the order is fixed at
         // (vsock?, virtiofs[0..N]?, blk[0..N]?, net?), matching the
@@ -663,7 +819,7 @@ impl VmBuilder {
         let mut full_cmdline = self.cmdline.clone();
         let mmio_registry = Arc::new(std::sync::Mutex::new(MmioDeviceRegistry::new()));
 
-        // internal notes: every virtio-mmio device consumes one IOAPIC
+        // Every virtio-mmio device consumes one IOAPIC
         // pin (IRQ `MMIO_IRQ_BASE + idx`, 24 pins total). Fail loud
         // BEFORE allocating past the budget — a device on a phantom
         // pin would silently never deliver interrupts.
@@ -683,7 +839,7 @@ impl VmBuilder {
         let mut next_slot: u32 = 0;
         let mmio_slot = |idx: u32| -> (u64, u32) {
             (
-                mem_size + MMIO_GAP + u64::from(idx) * 0x1000,
+                MMIO_HOLE_START + u64::from(idx) * 0x1000,
                 MMIO_IRQ_BASE + idx,
             )
         };
@@ -698,7 +854,7 @@ impl VmBuilder {
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
             let irq_evt = Arc::new(irq_evt);
 
-            let vsock_backend = VhostVsockBackend::new(self.guest_cid, mem_host_addr, mem_size)
+            let vsock_backend = VhostVsockBackend::new(self.guest_cid, mem_host_addr, mem_span)
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
 
             let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(vsock_backend));
@@ -725,8 +881,8 @@ impl VmBuilder {
         // process reuse the same `virtiofs-k7fs.sock` path, the second
         // virtiofsd dies at startup ("Resource temporarily
         // unavailable" on its pid file), and the build times out —
-        // exactly what wedged pod recovery after a shim crash (spec
-        // 11a increment 4). A per-process sequence number makes the
+        // exactly what wedged pod recovery after a shim crash.
+        // A per-process sequence number makes the
         // path unique per VM.
         let mut virtiofsd_processes: Vec<VirtiofsdProcess> = Vec::new();
         let mut virtiofs_share_specs: Vec<String> = Vec::new();
@@ -768,7 +924,7 @@ impl VmBuilder {
                     &socket_path,
                     &tag,
                     mem_host_addr,
-                    mem_size,
+                    mem_span,
                     mem_fd_for_virtiofs,
                 )
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -800,12 +956,12 @@ impl VmBuilder {
             }
         }
 
-        // Add one virtio-blk MMIO device per configured block device
-        //. Userspace backend — no vhost handshake, no
+        // Add one virtio-blk MMIO device per configured block device.
+        // Userspace backend — no vhost handshake, no
         // guest-memory fd requirement, so block-backed VMs stay on the
         // CoW fork path. Devices with a mount spec are collected into
-        // the `k7d.blk=` cmdline param the guest agent mounts from
-        //, keyed by the guest device name that
+        // the `k7d.blk=` cmdline param the guest agent mounts from,
+        // keyed by the guest device name that
         // declaration order determines (`vda`, `vdb`, …).
         let mut blk_mount_specs: Vec<String> = Vec::new();
         for (idx, blk) in self.block_devices.iter().enumerate() {
@@ -836,7 +992,7 @@ impl VmBuilder {
             let irq_evt = Arc::new(irq_evt);
 
             let blk_backend =
-                BlockBackend::new(&blk.host_path, blk.readonly, mem_host_addr, mem_size)
+                BlockBackend::new(&blk.host_path, blk.readonly, mem_host_addr, mem_span)
                     .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
 
             let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(blk_backend));
@@ -858,8 +1014,8 @@ impl VmBuilder {
             full_cmdline.push_str(&format!(" k7d.blk={}", blk_mount_specs.join(",")));
         }
 
-        // Guest directories the agent creates at boot (internal notes,
-        // emptyDir on guest tmpfs). Validated loudly: an absolute,
+        // Guest directories the agent creates at boot (emptyDir on
+        // guest tmpfs). Validated loudly: an absolute,
         // comma-free path or the build fails.
         if !self.guest_dirs.is_empty() {
             for dir in &self.guest_dirs {
@@ -910,12 +1066,24 @@ impl VmBuilder {
         load_cmdline(&guest_memory, GuestAddress(CMDLINE_START), &cmdline)
             .map_err(VmError::CmdlineLoad)?;
 
-        // Load initrd if provided
+        // Load initrd if provided, at the top of the LOW RAM region. The
+        // Linux boot protocol carries the initrd address in the 32-bit
+        // `hdr.ramdisk_image` (the 64-bit `ext_ramdisk_image` extension
+        // is not used here), so an initrd placed at the top of a >4 GiB
+        // guest's RAM would be truncated and the kernel would panic with
+        // "VFS: Unable to mount root fs" — the actual breaker.
         let initrd_config = if let Some(ref initrd_path) = self.initrd_path {
             let initrd_data = std::fs::read(initrd_path).map_err(VmError::InitrdFile)?;
             let initrd_size = initrd_data.len();
+            if initrd_size as u64 + HIMEM_START >= layout.low_size {
+                return Err(VmError::Pipe(std::io::Error::other(format!(
+                    "initrd of {initrd_size} bytes does not fit below the guest's low RAM \
+                     end ({:#x}) — raise memory_mb",
+                    layout.low_size
+                ))));
+            }
             // Align initrd address down to page boundary
-            let initrd_addr_raw = (mem_size - initrd_size as u64) & !0xFFF;
+            let initrd_addr_raw = (layout.low_size - initrd_size as u64) & !0xFFF;
             let initrd_addr = GuestAddress(initrd_addr_raw);
             guest_memory
                 .write_slice(&initrd_data, initrd_addr)
@@ -930,7 +1098,7 @@ impl VmBuilder {
             None
         };
 
-        // internal notes: multi-vCPU guests discover CPUs via the MP table
+        // Multi-vCPU guests discover CPUs via the MP table
         // (ACPI is compiled out of the guest kernel). Gated on
         // `CpuTopology` so single-vCPU boots stay byte-identical (no MP
         // table bytes, no extra E820 entry) — the fork/tree suites and
@@ -949,7 +1117,7 @@ impl VmBuilder {
             &guest_memory,
             GuestAddress(CMDLINE_START),
             full_cmdline.len(),
-            mem_size,
+            layout,
             initrd_config,
             mptable_reservation,
         )?;
@@ -959,9 +1127,10 @@ impl VmBuilder {
         // reset state (`KVM_MP_STATE_UNINITIALIZED`) awaiting the
         // INIT/SIPI sequence the Linux guest itself sends during SMP
         // bring-up.
-        let kvm_cpuid = kvm
+        let mut kvm_cpuid = kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .map_err(VmError::GetCpuid)?;
+        patch_cpuid_for_kvm_guest(&mut kvm_cpuid);
         let mut vcpu_fds = Vec::with_capacity(self.vcpus as usize);
         for cpu_index in 0..self.vcpus {
             let vcpu_fd = vm_fd
@@ -1049,6 +1218,8 @@ impl VmBuilder {
             accumulated_dirty: None,
             fork_source_dir: None,
             slow_fork_allowed: false,
+            scratch_disk: self.scratch_disk,
+            container_scratch_disks: self.container_scratch_disks,
         })
     }
 }
@@ -1109,7 +1280,7 @@ pub struct Vm {
     /// `pthread_t` of each vCPU thread (for sending signals to break
     /// `KVM_RUN`), in vCPU-index order.
     vcpu_tids: Vec<Arc<AtomicU64>>,
-    /// Kernel TID of each vCPU thread (internal notes: written to a CPU
+    /// Kernel TID of each vCPU thread (written to a CPU
     /// cgroup's `cgroup.threads` — pthread ids are useless there).
     /// `0` while the thread hasn't published it yet / isn't running.
     vcpu_kernel_tids: Vec<Arc<AtomicU64>>,
@@ -1135,12 +1306,24 @@ pub struct Vm {
     /// Parent directory holding the `base.mem` + `cpu.json` for this fork source.
     /// Cleaned up on Drop when the VM owns it.
     fork_source_dir: Option<PathBuf>,
-    /// internal notes: explicit opt-in for slow (full-memfd) forks of
+    /// Explicit opt-in for slow (full-memfd) forks of
     /// virtiofs-backed VMs. `prepare_fork_source*` on a VM with any
     /// virtiofs share fails loudly unless [`Self::allow_slow_fork`]
     /// was called first — silent degradation from the `CoW` fast path
     /// to a full memory copy is forbidden.
     slow_fork_allowed: bool,
+    /// The sandbox's writable scratch image (containers'
+    /// overlay upper). Declared LAST so it drops after the devices that
+    /// read and write it — dropping it unlinks the host image.
+    ///
+    /// A fork does not inherit this handle: `fork::restore_vm_from_state`
+    /// reflinks every read-write image into the fork's own directory,
+    /// which the fork owns via `fork_state_dir`.
+    scratch_disk: Option<crate::disks::ScratchDisk>,
+    /// Per-container writable images, one per container that
+    /// asked for its own writable-space limit. Same ownership and fork
+    /// rules as `scratch_disk`.
+    container_scratch_disks: Vec<crate::disks::ScratchDisk>,
 }
 
 impl Vm {
@@ -1190,7 +1373,7 @@ impl Vm {
         Self {
             _kvm: kvm,
             vm_fd,
-            // internal notes: restored/forked VMs inherit the captured vCPU
+            // Restored/forked VMs inherit the captured vCPU
             // count — one fd per captured CpuState, in index order.
             vcpus: vcpu_fds.len() as u32,
             vcpu_fds,
@@ -1221,7 +1404,30 @@ impl Vm {
             accumulated_dirty: None,
             fork_source_dir: None,
             slow_fork_allowed: false,
+            // A restored VM either replaces its source (the swap in
+            // `prepare_fork_source_in` moves the handle across) or is a
+            // fork owning reflinked copies via `fork_state_dir`.
+            scratch_disk: None,
+            container_scratch_disks: Vec::new(),
         }
+    }
+
+    /// Host path of this VM's scratch image, when it has one.
+    #[must_use]
+    pub fn scratch_disk_path(&self) -> Option<&Path> {
+        self.scratch_disk
+            .as_ref()
+            .map(crate::disks::ScratchDisk::path)
+    }
+
+    /// Host paths of this VM's per-container scratch images,
+    /// in declaration order.
+    #[must_use]
+    pub fn container_scratch_paths(&self) -> Vec<&Path> {
+        self.container_scratch_disks
+            .iter()
+            .map(crate::disks::ScratchDisk::path)
+            .collect()
     }
 
     /// Attach the memfd backing a virtiofs-capable fork's memory (see
@@ -1250,7 +1456,7 @@ impl Vm {
                 let kernel_tid = Arc::clone(&kernel_tid);
                 thread::Builder::new()
                     // Visible in /proc/<tid>/comm — used by ps/gdb and the
-                    // internal notes
+                    // Cgroup-membership integration test.
                     .name(format!("vcpu{cpu_index}"))
                     .spawn(move || {
                         // SAFETY: pthread_self() returns the calling thread's ID.
@@ -1384,7 +1590,7 @@ impl Vm {
 
     /// Get the **primary** virtiofs share's configuration, if any.
     ///
-    /// Backward-compatible accessor for code that predates internal notes's
+    /// Backward-compatible accessor for code that predates
     /// multi-share support — returns the share at index 0, which is
     /// the one set by [`VmBuilder::virtiofs`] and the one that
     /// `fork::warm_fork`'s reflink-copy operates on. New code that
@@ -1411,7 +1617,7 @@ impl Vm {
     /// Whether this VM's memory is a full memfd copy of its fork source
     /// (the virtiofs / vhost-user path) rather than a `CoW`
     /// `MAP_PRIVATE` mapping of `base.mem`. Always `false` for cold-boot
-    /// and plain restored VMs. Test hook for internal notes's "block-only VMs
+    /// and plain restored VMs. Test hook for the "block-only VMs
     /// stay on the `CoW` fork path" invariant.
     #[must_use]
     pub fn fork_memory_is_full_copy(&self) -> bool {
@@ -1499,7 +1705,7 @@ impl Vm {
         self.vcpu_fds.first()
     }
 
-    /// All vCPU fds in vCPU-index order.
+    /// All vCPU fds in vCPU-index order (capture loop).
     /// Complete only while the VM is stopped/paused — empty (or
     /// partially drained) while the run-loop threads own the fds.
     #[must_use]
@@ -1517,7 +1723,7 @@ impl Vm {
     /// `timeout` for the freshly spawned thread to publish it (storing
     /// the TID is the thread's first action, so the wait is
     /// microseconds in practice). `None` when the VM isn't running or
-    /// the wait times out. internal notes
+    /// the wait times out. uses this to place the vCPU thread
     /// into a CPU cgroup — `cgroup.threads` takes kernel TIDs, not
     /// pthread ids. Multi-vCPU callers must use
     /// [`Self::vcpu_kernel_tids`] so the cap covers every thread.
@@ -1530,7 +1736,7 @@ impl Vm {
     /// Kernel TIDs of **all** running vCPU threads, in vCPU-index
     /// order, waiting up to `timeout` for every freshly spawned thread
     /// to publish its TID. `None` when the VM isn't running or the
-    /// wait times out. internal notes: the per-VM CPU cgroup must contain
+    /// wait times out. The per-VM CPU cgroup must contain
     /// every vCPU thread so the pod's CFS quota caps the whole VM.
     #[must_use]
     pub fn vcpu_kernel_tids(&self, timeout: Duration) -> Option<Vec<u32>> {
@@ -1574,10 +1780,28 @@ impl Vm {
         &self.guest_memory
     }
 
-    /// Get the guest memory size in bytes.
+    /// Guest RAM in bytes — what the guest reports as `MemTotal` (before
+    /// its own kernel reservations). Not the same as [`Self::mem_span`]
+    /// once the guest is large enough to straddle the 32-bit MMIO hole.
     #[must_use]
     pub fn memory_size(&self) -> u64 {
         self.memory_size
+    }
+
+    /// Length of this VM's guest physical address space, and therefore of
+    /// its host mapping, its `memory.bin`, and its dirty bitmaps.
+    /// Equals [`Self::memory_size`] plus the 32-bit MMIO hole
+    /// for guests with RAM past 4 GiB, and exactly [`Self::memory_size`]
+    /// for every smaller guest.
+    #[must_use]
+    pub fn mem_span(&self) -> u64 {
+        self.mem_layout().span()
+    }
+
+    /// This VM's guest RAM split across the 32-bit MMIO hole.
+    #[must_use]
+    pub fn mem_layout(&self) -> MemLayout {
+        MemLayout::from_ram(self.memory_size)
     }
 
     /// Get the kernel path.
@@ -1639,7 +1863,7 @@ impl Vm {
     /// Prepare this VM as a fork source.
     ///
     /// Performs the **one-time** cold snapshot + restore + dirty-tracking-enable
-    /// sequence described in internal notes, the VM is "fork-ready":
+    /// sequence described in part 1. After this call, the VM is "fork-ready":
     /// subsequent `fork_warm()` calls only copy the pages dirtied since this point.
     ///
     /// Returns the path to the `base.mem` file that all future warm forks will use
@@ -1677,7 +1901,7 @@ impl Vm {
         if !self.virtiofs_shares.is_empty() {
             log::warn!(
                 "allow_slow_fork: VM (cid {}) has {} virtiofs share(s) — forks will be \
-                 full-memfd copies, not CoW",
+                 full-memfd copies, not CoW (slow path, explicitly opted in)",
                 self.guest_cid,
                 self.virtiofs_shares.len()
             );
@@ -1692,9 +1916,9 @@ impl Vm {
         &mut self,
         base_dir: &Path,
     ) -> Result<PathBuf, crate::fork::ForkError> {
-        // internal notes: virtiofs shares force
+        // Forkability validation: virtiofs shares force
         // every fork onto the slow full-memfd path (vhost-user needs
-        // fd-backed shared memory — see the parent spec's "Why"). That
+        // fd-backed shared memory). That
         // trade must be taken knowingly, never inherited silently.
         if !self.virtiofs_shares.is_empty() && !self.slow_fork_allowed {
             return Err(crate::fork::ForkError::VirtiofsSlowForkNotAllowed {
@@ -1733,7 +1957,7 @@ impl Vm {
         // for every subsequent warm fork.
         let tap = self.take_tap();
 
-        // internal notes: the restored copy must keep the source's vsock
+        // The restored copy must keep the source's vsock
         // CID. The pod's shim caches the CID at Create and has no refresh
         // channel once the daemon drops the sandbox records at adopt
         // (CHALLENGES.md #39/#47 territory) — restoring on a fresh CID
@@ -1754,6 +1978,16 @@ impl Vm {
         // silently from base.mem and corrupt every future fork's memory.
         restored.enable_dirty_tracking()?;
         restored.start()?;
+
+        // Hand the scratch image to the restored copy, for the
+        // same reason as the TAP above — the restored VM's block backend
+        // is already reading and writing that file, and dropping the
+        // husk's handle would unlink it out from under the live guest
+        // (and out from under every later fork's FICLONE).
+        restored.scratch_disk = self.scratch_disk.take();
+        // The per-container images are the same class of
+        // resource — the live guest is reading and writing them too.
+        restored.container_scratch_disks = std::mem::take(&mut self.container_scratch_disks);
 
         // The old source was already shut down above (CID release);
         // dropping the swapped-out husk just unmaps its memory.
@@ -1804,8 +2038,8 @@ impl Vm {
 
     /// Enable KVM dirty page tracking on the VM's memory slot.
     ///
-    /// Re-registers slot 0 with `KVM_MEM_LOG_DIRTY_PAGES`. Allocates the
-    /// `accumulated_dirty` bitmap. Idempotent: no-op if already enabled.
+    /// Re-registers every RAM slot with `KVM_MEM_LOG_DIRTY_PAGES`. Allocates
+    /// the `accumulated_dirty` bitmap. Idempotent: no-op if already enabled.
     ///
     /// Also enables `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` (Linux 5.0+) so we can
     /// re-arm write protection between `KVM_GET_DIRTY_LOG` calls without
@@ -1834,27 +2068,32 @@ impl Vm {
             self.pause()?;
         }
 
-        let mem_region = kvm_bindings::kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: self.memory_size,
-            userspace_addr: self.mem_host_addr(),
-            flags: kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES,
-        };
-        // SAFETY: userspace_addr points to the VM's existing memory mapping,
-        // which is kept alive by self.guest_memory / self.cow_mmap_addr.
-        unsafe {
-            self.vm_fd
-                .set_user_memory_region(mem_region)
-                .map_err(VmError::SetUserMemoryRegion)?;
+        let mem_host_addr = self.mem_host_addr();
+        for (slot, gpa, size) in self.mem_layout().slots() {
+            let mem_region = kvm_bindings::kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: gpa,
+                memory_size: size,
+                userspace_addr: mem_host_addr + gpa,
+                flags: kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            // SAFETY: userspace_addr points into the VM's existing memory
+            // mapping, kept alive by self.guest_memory / self.cow_mmap_addr.
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(mem_region)
+                    .map_err(VmError::SetUserMemoryRegion)?;
+            }
         }
 
         if was_running {
             self.resume()?;
         }
 
-        // Bitmap: one bit per 4 KiB page. 256 MB / 4 KiB = 65 536 pages = 1024 u64s.
-        let pages = self.memory_size.div_ceil(4096);
+        // Bitmap: one bit per 4 KiB page of the GPA span (so page index ==
+        // `memory.bin` offset / 4096, hole included and never dirty).
+        // 256 MB / 4 KiB = 65 536 pages = 1024 u64s.
+        let pages = self.mem_span().div_ceil(4096);
         let words = (pages as usize).div_ceil(64);
         self.accumulated_dirty = Some(vec![0u64; words]);
         self.dirty_tracking_enabled = true;
@@ -1873,15 +2112,38 @@ impl Vm {
             )));
         }
 
-        let bitmap = self
-            .vm_fd
-            .get_dirty_log(0, self.memory_size as usize)
-            .map_err(|e| VmError::Pipe(std::io::Error::other(format!("KVM_GET_DIRTY_LOG: {e}"))))?;
+        // One KVM bitmap per RAM slot, OR'd into the span-indexed
+        // accumulated bitmap. Both region boundaries are whole bitmap words
+        // (see `mem_layout::tests::region_boundaries_are_bitmap_word_aligned`),
+        // so a slot's bits land at a word offset with no shifting.
+        let slots = self.mem_layout().slots();
+        let mut per_slot = Vec::with_capacity(slots.len());
+        for &(slot, gpa, size) in &slots {
+            let bitmap = self.vm_fd.get_dirty_log(slot, size as usize).map_err(|e| {
+                VmError::Pipe(std::io::Error::other(format!(
+                    "KVM_GET_DIRTY_LOG slot {slot}: {e}"
+                )))
+            })?;
+            per_slot.push((gpa, bitmap));
+        }
 
         let acc = self.accumulated_dirty.as_mut().expect("bitmap allocated");
-        for (i, &w) in bitmap.iter().enumerate() {
-            if i < acc.len() {
-                acc[i] |= w;
+        let acc_words = acc.len();
+        for (gpa, bitmap) in per_slot {
+            let word_offset = (gpa / 4096 / 64) as usize;
+            // Dropping words here would silently lose dirty pages and hand
+            // forks a stale copy of them, so a short bitmap is an error.
+            let dst = acc
+                .get_mut(word_offset..word_offset + bitmap.len())
+                .ok_or_else(|| {
+                    VmError::Pipe(std::io::Error::other(format!(
+                        "dirty bitmap of the slot at {gpa:#x} ({} words at word {word_offset}) \
+                         does not fit the {acc_words}-word span bitmap",
+                        bitmap.len(),
+                    )))
+                })?;
+            for (d, w) in dst.iter_mut().zip(bitmap) {
+                *d |= w;
             }
         }
 
@@ -1898,7 +2160,9 @@ impl Vm {
         // Re-arm write protection. With MANUAL_DIRTY_LOG_PROTECT2, KVM_GET_DIRTY_LOG
         // no longer clears the bitmap — we must do it explicitly via KVM_CLEAR_DIRTY_LOG
         // so that subsequent guest writes are tracked again.
-        clear_dirty_log(&self.vm_fd, 0, self.memory_size)?;
+        for &(slot, _, size) in &slots {
+            clear_dirty_log(&self.vm_fd, slot, size)?;
+        }
 
         Ok(acc.as_slice())
     }
@@ -1914,7 +2178,7 @@ impl Vm {
     ///
     /// The source must have been prepared via `prepare_fork_source()` first.
     ///
-    /// Steps:
+    /// Steps (part 1, §Warm fork):
     /// 1. Pause source.
     /// 2. Read dirty bitmap, accumulate, save CPU+devices+IRQ state in memory.
     /// 3. Resume source immediately (steps 5–11 run while source is live).
@@ -1955,7 +2219,7 @@ impl Vm {
 
         // The source must stay paused during memcpy: if it resumes, it may write
         // to pages we're about to copy, making the fork's memory inconsistent
-        // with its captured vCPU state. Per internal notes, memcpy time is
+        // with its captured vCPU state. Per fork, memcpy time is
         // O(dirty_pages) — 0.5 µs/page, so ≤15 ms even at 100% dirty on 256 MB.
         let mut forks = Vec::with_capacity(fork_ids.len());
         let mut fork_err: Option<crate::fork::ForkError> = None;
@@ -2270,14 +2534,14 @@ fn install_vcpu_signal_handler() {
 /// Configure the "zero page" (`boot_params`) for the Linux boot protocol.
 ///
 /// `mptable_reservation` is `Some((addr, size))` when an MP table was
-/// written to guest memory — the region is
+/// written to guest memory (`vcpus > 1` only) — the region is
 /// reported as E820-reserved so the guest never allocates over it.
-/// `None` keeps the E820 map byte-identical to the pre-17a layout.
+/// `None` keeps the E820 map byte-identical to the original layout.
 fn configure_boot_params(
     guest_memory: &GuestMemoryMmap,
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
-    mem_size: u64,
+    layout: MemLayout,
     initrd_config: Option<(GuestAddress, usize)>,
     mptable_reservation: Option<(u64, u64)>,
 ) -> Result<(), VmError> {
@@ -2302,14 +2566,28 @@ fn configure_boot_params(
     // E820 memory map: report usable RAM
     // Entry 0: low memory [0, 0x9fc00) — conventional RAM below EBDA
     add_e820_entry(&mut params, 0, 0x9fc00, E820_RAM);
-    // Reserve the MP table region (internal notes, multi-vCPU boots only —
+    // Reserve the MP table region (multi-vCPU boots only —
     // it lives at 0x9fc00, just past usable low RAM, like Firecracker).
     if let Some((addr, size)) = mptable_reservation {
         add_e820_entry(&mut params, addr, size, E820_RESERVED);
     }
-    // Entry 1: high memory [1MB, end of RAM)
-    let high_mem_size = mem_size.saturating_sub(HIMEM_START);
-    add_e820_entry(&mut params, HIMEM_START, high_mem_size, E820_RAM);
+    // Entry 1: [1MB, end of the low RAM region)
+    add_e820_entry(
+        &mut params,
+        HIMEM_START,
+        layout.low_size.saturating_sub(HIMEM_START),
+        E820_RAM,
+    );
+    // Entry 2: RAM past the 32-bit MMIO hole. The hole itself
+    // is simply absent from the map, which Linux treats as reserved.
+    if layout.has_high_mem() {
+        add_e820_entry(
+            &mut params,
+            crate::mem_layout::HIGH_MEM_START,
+            layout.high_size,
+            E820_RAM,
+        );
+    }
 
     LinuxBootConfigurator::write_bootparams(
         &BootParams::new(&params, GuestAddress(ZERO_PAGE_START)),
@@ -2470,7 +2748,7 @@ fn setup_sregs(guest_memory: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<(), VmEr
 }
 
 /// Patch the per-CPU identity leaves of a host-supported CPUID for one
-/// vCPU of a multi-vCPU guest (internal notes, following Firecracker's
+/// vCPU of a multi-vCPU guest (following Firecracker's
 /// `normalize`): leaf 0x1 gets the initial APIC ID (EBX[31:24]), the
 /// max-addressable-IDs field (EBX[23:16]) and the HTT flag (EDX[28]);
 /// leaf 0xB (extended topology) gets the x2APIC ID in EDX plus sane
@@ -2523,6 +2801,50 @@ pub(crate) fn patch_cpuid_for_vcpu(
     }
 }
 
+/// Tell the guest it is a guest, and offer it exactly the paravirt
+/// features k7d can carry across a snapshot.
+///
+/// `KVM_GET_SUPPORTED_CPUID` hands back the KVM signature leaves
+/// (`0x4000_0000`/`0x4000_0001`) but leaves CPUID.1:ECX[31] clear, and
+/// the guest gates its whole paravirt path on that one bit
+/// (`kvm_para_available()` → `kvm_cpuid_base()`). Without it the guest
+/// logs "Booting paravirtualized kernel on bare hardware",
+/// `kvmclock_init` returns early, and `CONFIG_KVM_GUEST=y` buys nothing
+/// — which is how k7d guests ran for their whole history.
+///
+/// Leaf `0x4000_0001` is narrowed to kvmclock: `CLOCKSOURCE2` (the
+/// `MSR_KVM_*_NEW` pair) and the TSC-stable bit. Every other feature
+/// KVM offers there — async page faults, steal time, PV EOI, PV TLB
+/// flush, poll control — has the guest hand the host a guest physical
+/// address through a per-vCPU MSR, and a restored guest whose MSR was
+/// not carried across keeps a page the host has stopped writing.
+/// Advertising one of them is therefore a promise to snapshot it: add
+/// its MSR to `snapshot::MSR_INDICES` in the same commit.
+pub(crate) fn patch_cpuid_for_kvm_guest(cpuid: &mut kvm_bindings::CpuId) {
+    /// CPUID.1:ECX[31] — "running under a hypervisor".
+    const HYPERVISOR: u32 = 1 << 31;
+    /// `KVM_FEATURE_CLOCKSOURCE2` | `KVM_FEATURE_CLOCKSOURCE_STABLE_BIT`.
+    const KVM_PV_FEATURES: u32 = (1 << 3) | (1 << 24);
+
+    for entry in cpuid.as_mut_slice().iter_mut() {
+        match entry.function {
+            0x1 => entry.ecx |= HYPERVISOR,
+            0x4000_0001 => {
+                entry.eax &= KVM_PV_FEATURES;
+                // EDX carries hints, not features. Bit 0 is
+                // `KVM_HINTS_REALTIME` — the bit the guest haltpoll
+                // driver looks for. It means "every vCPU has a
+                // dedicated host CPU". k7d does not pin vCPUs, so we
+                // keep this clear on purpose and load haltpoll with
+                // `cpuidle_haltpoll.force=1` on the cmdline instead.
+                // Do not set this bit to get a side effect.
+                entry.edx = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Set up FPU registers.
 fn setup_fpu(vcpu: &VcpuFd) -> Result<(), VmError> {
     let fpu = kvm_bindings::kvm_fpu {
@@ -2565,41 +2887,53 @@ fn sync_dir_to_guest(
 mod verification {
     use super::*;
 
+    /// The initrd goes at the top of the LOW RAM region, so its
+    /// address must stay page-aligned, clear of the kernel, inside low RAM
+    /// — and, because the boot protocol carries it in a 32-bit field,
+    /// below 4 GiB for every guest size including the huge ones.
     #[kani::proof]
     #[kani::unwind(2)]
     fn verify_initrd_placement_within_bounds() {
         let mem_mb: u64 = kani::any();
-        kani::assume(mem_mb >= 64 && mem_mb <= 4096);
-        let mem_size = mem_mb * 1024 * 1024;
+        kani::assume(mem_mb >= 64 && mem_mb <= 64 * 1024);
+        let layout = MemLayout::from_ram(mem_mb * 1024 * 1024);
 
         let initrd_size: u64 = kani::any();
-        kani::assume(initrd_size > 0 && initrd_size < mem_size / 2);
+        kani::assume(initrd_size > 0 && initrd_size + HIMEM_START < layout.low_size);
 
-        let initrd_addr_raw = (mem_size - initrd_size) & !0xFFF;
+        let initrd_addr_raw = (layout.low_size - initrd_size) & !0xFFF;
 
         assert!(
             initrd_addr_raw >= HIMEM_START,
             "initrd overlaps kernel area"
         );
         assert!(
-            initrd_addr_raw + initrd_size <= mem_size,
-            "initrd extends past guest memory"
+            initrd_addr_raw + initrd_size <= layout.low_size,
+            "initrd extends past low guest memory"
         );
         assert!(initrd_addr_raw % 4096 == 0, "initrd not page-aligned");
+        assert!(
+            initrd_addr_raw + initrd_size <= u64::from(u32::MAX),
+            "initrd address must fit the 32-bit boot_params field"
+        );
     }
 
+    /// The E820 low-RAM entry must never underflow, and RAM must never be
+    /// reported inside the 32-bit MMIO hole.
     #[kani::proof]
-    fn verify_high_mem_no_underflow() {
+    fn verify_e820_regions_are_sane() {
         let mem_size: u64 = kani::any();
         kani::assume(mem_size >= 2 * 1024 * 1024);
         kani::assume(mem_size <= 64 * 1024 * 1024 * 1024);
+        let layout = MemLayout::from_ram(mem_size);
 
-        let high_mem_size = mem_size.saturating_sub(HIMEM_START);
-        if mem_size > HIMEM_START {
-            assert!(high_mem_size > 0);
-            assert!(high_mem_size == mem_size - HIMEM_START);
+        let low_entry = layout.low_size.saturating_sub(HIMEM_START);
+        assert!(HIMEM_START + low_entry <= MMIO_HOLE_START);
+        assert!(layout.low_size + layout.high_size == mem_size);
+        if layout.has_high_mem() {
+            assert!(layout.span() > crate::mem_layout::HIGH_MEM_START);
         } else {
-            assert!(high_mem_size == 0);
+            assert!(layout.span() == mem_size);
         }
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Aeneas + Charon + Lean (elan) on the bare-metal node so
 # `make remote-verif` can regenerate `verif/Verif/TreeModel.lean` and
-# `lake build` it. See internal notes §"Step 2".
+# `lake build` it. See §"Step 2".
 #
 # Idempotent: each section short-circuits if the tool it installs is
 # already on PATH (or available at the well-known location this script
@@ -9,8 +9,7 @@
 set -euo pipefail
 
 AENEAS_REPO_URL="${AENEAS_REPO_URL:-https://github.com/AeneasVerif/aeneas}"
-# Default rev = the pin in `verif/lakefile.toml` (internal notes
-# task 0). Bump both together.
+# Default rev = the pin in `verif/lakefile.toml`. Bump both together.
 AENEAS_REV="${AENEAS_REV:-044c73b72171670cbe3a245ee7bccc4d626f0113}"
 OCAML_VERSION="${OCAML_VERSION:-5.3.0}"
 

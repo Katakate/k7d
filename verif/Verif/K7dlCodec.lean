@@ -17,7 +17,7 @@
 -- little-endian round-trip on `idx` after separating the page payload,
 -- which is preserved verbatim through both halves of the codec.
 --
--- Since internal notes**machine-checked equivalent** to
+-- This mirror is **machine-checked equivalent** to
 -- the Aeneas translation of the Rust source (`Verif/Equiv/K7dl.lean`,
 -- up to `absBytes : Array U8 n → List Byte`), and the round-trips
 -- transfer to the generated code as `k7dl_header_roundtrip_rust` /

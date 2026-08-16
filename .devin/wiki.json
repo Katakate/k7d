@@ -2,18 +2,18 @@
   "repo_notes": [
     {
       "author": "k7d maintainers",
-      "content": "k7d is a Rust microVM runtime (VMM + containerd shim + guest agent) for forking live Kubernetes environments in ~100ms. Architecture: long-running k7d daemon owns KVM VMs, vsock, virtio devices, and cluster bridges; containerd-shim-k7-v1 is a thin client over /run/k7d/k7d.sock; guest k7-agent speaks JSON over vsock. Start with README.md and docs/architecture.md, then docs/concepts.md (CoW memory, zero-restart networking, snapshot tree). Latency claims are CI-enforced via crates/k7d/src/latency.rs + LATENCY_BUDGETS.md. Debugging war stories live in CHALLENGES.md. Formal methods: Kani harnesses beside unsafe code; Aeneas→Lean proofs for crates/k7d/src/tree_model.rs under verif/. Sibling project Katakate/k7 orchestrates sandboxes with Python SDKs."
+      "content": "k7d is a Rust microVM runtime (VMM + containerd shim + guest agent) for forking live Kubernetes environments in ~100ms. Architecture: long-running k7d daemon owns KVM VMs, vsock, virtio devices, and cluster bridges; containerd-shim-k7-v1 is a thin client over /run/k7d/k7d.sock; guest k7-agent speaks JSON over vsock. Start with README.md and https://docs.katakate.org/k7d (architecture + CoW fork + snapshot tree). Latency claims are CI-enforced via crates/k7d/src/latency.rs + LATENCY_BUDGETS.md. Debugging war stories live in CHALLENGES.md. Formal methods: Kani harnesses beside unsafe code; Aeneas→Lean proofs for crates/k7d/src/tree_model.rs under verif/. Sibling project Katakate/k7 orchestrates sandboxes with Python SDKs. Product docs live in Katakate/docs (k7d/); do not recreate architecture/concepts guides in this repo."
     }
   ],
   "pages": [
     {
       "title": "Architecture overview",
-      "purpose": "Explain the daemon/shim/agent split, control socket, and how a kubectl pod with runtimeClassName k7 becomes a microVM. Anchor on docs/architecture.md and docs/concepts.md.",
+      "purpose": "Explain the daemon/shim/agent split, control socket, and how a kubectl pod with runtimeClassName k7 becomes a microVM. Anchor on https://docs.katakate.org/k7d/concepts/architecture and https://docs.katakate.org/k7d/concepts/cow-fork.",
       "parent": null
     },
     {
       "title": "Crate map",
-      "purpose": "Map crates/k7d (VMM library + daemon), crates/shim (containerd shim v2), crates/agent (guest agent), crates/replicate. Point readers to docs/file-map.md for per-file orientation.",
+      "purpose": "Map crates/k7d (VMM library + daemon control plane), crates/shim (containerd shim v2 thin client), crates/agent (guest agent), crates/replicate (placeholder). Orientation comes from the Mintlify architecture page — there is no in-repo file-map.",
       "parent": null
     },
     {
@@ -23,7 +23,7 @@
     },
     {
       "title": "containerd / k3s integration",
-      "purpose": "Document RuntimeClass k7 registration, pod_annotations for k7d.katakate.org/*, why BinaryName must not be set, multi-container pods, and multi-vCPU sizing from pod CPU limits. Anchors: crates/shim/src/task.rs, packaging/install.sh, HACKING.md.",
+      "purpose": "Document RuntimeClass k7 registration, pod_annotations for k7d.katakate.org/*, why BinaryName must not be set, multi-container pods, and multi-vCPU sizing from pod CPU limits. Anchors: crates/shim/src/task.rs, packaging/install.sh, HACKING.md, https://docs.katakate.org/k7d/guides/runtime-class.",
       "parent": "Architecture overview"
     },
     {

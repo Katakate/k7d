@@ -1,5 +1,5 @@
--- internal notes"What to build / 4" — the payoff. Every Group A–D
--- theorem (plus, since internal notes, the Group F latency-budget and
+-- The payoff. Every Group A–D
+-- theorem (plus the Group F latency-budget and
 -- Group E codec theorems), restated on the **Aeneas-generated**
 -- definitions as a corollary of `mirror theorem + equivalence`. These
 -- `_rust` corollaries are the ones `crates/k7d/src/tree_model.rs` doc

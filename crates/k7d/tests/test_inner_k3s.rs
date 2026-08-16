@@ -1,26 +1,26 @@
-//! internal notes� inner k3s / sidecar CRI socket over emptyDir.
+//! Inner k3s / sidecar CRI socket over emptyDir.
 //!
-//! Increment 1: two containers share `/cri` via emptyDir; sidecar runs a
+//! Two containers share `/cri` via emptyDir; sidecar runs a
 //! real containerd; main talks to it with `ctr --address /cri/containerd.sock`.
 //!
-//! Increment 2: the main container runs a full `k3s server` against the
+//! The main container runs a full `k3s server` against the
 //! sidecar containerd (`--container-runtime-endpoint`) and the inner node
 //! goes Ready.
 //!
-//! Increment 3: three outer pods (same `k7d.katakate.org/cluster-id`,
+//! Three outer pods (same `k7d.katakate.org/cluster-id`,
 //! `fork-vm-index` 0/1/2 → guest IPs 10.200.0.2/.3/.4 on one shared L2
 //! bridge) run a 3-node inner cluster — `k3s server` + two `k3s agent`s —
 //! with flannel host-gw and kube-proxy enabled on the netfilter/veth/
 //! bridge-capable guest kernel, and an inner pause pod on an agent node
 //! is reachable from the server node.
 //!
-//! Increment 4: adopt the live Inc 3 cluster as a `ClusterSnapshotTree`
+//! Adopt the live three-pod cluster as a `ClusterSnapshotTree`
 //! root via `TreeAdoptCluster`, warm-fork it under
 //! `FORK_INNER_K3S_CLUSTER_3VM` while a host-side TLS probe against the
 //! source inner API server stays alive, and assert the fork shows 3
 //! Ready nodes at the same guest IPs.
 //!
-//! Increment 5: same adopt + fork, but driven by kubectl — a trigger
+//! Same adopt + fork, but driven by kubectl — a trigger
 //! pod carrying the `k7d.katakate.org/tree-*` annotations makes the
 //! shim call `TreeAdoptCluster` + `TreeFork` during its sandbox
 //! Create; the daemon socket is only used for discovery/teardown.
@@ -41,11 +41,11 @@ const K3S_IMAGE: &str = "docker.io/rancher/k3s:v1.32.5-k3s1@sha256:b75eac801bbc9
 
 const POD_NAME: &str = "test-inner-k3s-cri-emptydir";
 
-/// internal notes/ internal notes� memory limit of the `k3s server` container.
+/// / — memory limit of the `k3s server` container.
 /// A full k3s server (apiserver + kine/sqlite + scheduler +
 /// controller-manager + kubelet) plus the in-guest tmpfs holding its data
-/// dir does not fit the 256 MB BestEffort default; the spec floor for this
-/// increment is >= 2 Gi of VM budget. Inc 4 adds ~300 MB: the k3s binary
+/// dir does not fit the 256 MB BestEffort default; the floor here is
+/// >= 2 Gi of VM budget. Adopt adds ~300 MB: the k3s binary
 /// is copied to tmpfs so warm forks never fault it in from virtiofs
 /// (see `inner3_pod_yaml`).
 const INNER_K3S_MEMORY_MB: u32 = 2560;
@@ -57,12 +57,12 @@ const INNER_K3S_SIDECAR_MEMORY_MB: u32 = 640;
 
 const K3S_POD_NAME: &str = "test-inner-k3s-single-node";
 
-// ── internal notes: 3-node inner cluster ──
+// ──: 3-node inner cluster ──
 
 /// Shared cluster identity: all three outer pods carry this
 /// `k7d.katakate.org/cluster-id`, so the k7d daemon puts their TAPs on
 /// one `k7-br-…` bridge and each guest keeps its sticky
-/// `10.200.0.{2 + vm_index}` IP.
+/// `10.200.0.{2 + vm_index}` IP (cluster mode).
 const INNER3_CLUSTER_ID: &str = "inner3";
 /// Pre-shared k3s join token (test-only cluster on an isolated bridge).
 const INNER3_TOKEN: &str = "k7-inner3-token";
@@ -87,7 +87,7 @@ const INNER3_PAUSE_IMAGE: &str = "docker.io/rancher/mirrored-pause:3.6@sha256:74
 /// use (`ctr images import` preserves the tag from the export).
 const INNER3_PAUSE_REF: &str = "docker.io/rancher/mirrored-pause:3.6";
 /// Host directory (hostPath-mounted into the sidecars) holding the
-/// airgap `pause.tar`. internal notes+ API
+/// airgap `pause.tar`. dirties via a pause Deployment + API
 /// churn (needs guest `CONFIG_CFS_BANDWIDTH` — CHALLENGES #51).
 const INNER3_AIRGAP_DIR: &str = "/tmp/k7-inner3-airgap";
 
@@ -270,7 +270,7 @@ fn pull_k3s_image() {
     );
 }
 
-/// internal notes� sidecar containerd CRI socket via emptyDir.
+/// Sidecar containerd CRI socket via emptyDir.
 #[test]
 fn test_sidecar_containerd_socket_via_emptydir() {
     let _leak_guard = ensure_shim_installed();
@@ -282,7 +282,7 @@ fn test_sidecar_containerd_socket_via_emptydir() {
     // Sidecar: real containerd listening on the shared emptyDir socket.
     // Main: wait for the socket, then `ctr version` against it and write
     // a marker file so the host can poll without scraping container logs.
-    // Combined memory limits = 1Gi.
+    // Combined memory limits = 1Gi (/ 10c floor).
     //
     // containerd's root must be tmpfs (bolt databases need writable shared
     // mmap, which virtiofs `--cache never` rejects with ENODEV) and `lo`
@@ -309,6 +309,10 @@ spec:
       mkdir -p /var/lib/containerd /run/containerd /cri
       mount -t tmpfs -o size=256m tmpfs /var/lib/containerd
       mount -t tmpfs -o size=64m tmpfs /run/containerd
+      mkdir -p /sys/fs/cgroup/init
+      xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || true
+      sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+        > /sys/fs/cgroup/cgroup.subtree_control
       exec /bin/containerd \
         --address /cri/containerd.sock \
         --root /var/lib/containerd \
@@ -398,7 +402,7 @@ spec:
     }
 }
 
-/// internal notes� single-node inner k3s goes Ready against the
+/// Single-node inner k3s goes Ready against the
 /// sidecar containerd's CRI socket over the shared `/cri` emptyDir.
 ///
 /// Guest-environment constraints encoded in the entrypoints (found the
@@ -412,7 +416,7 @@ spec:
 /// - The guest kernel has no netfilter -> flannel and kube-proxy are
 ///   disabled; a static bridge CNI conf on `/cri/cni/net.d` satisfies the
 ///   CRI NetworkReady condition (no inner pods are scheduled here; real
-///   inner-pod networking is Increment 3).
+///   inner-pod networking comes later).
 /// - The guest brings up `eth0` but leaves `lo` down; both containerd's
 ///   CRI stream server and the k3s apiserver bind 127.0.0.1.
 /// - kubelet needs `/dev/kmsg` and a mounted cgroup2 hierarchy with the
@@ -446,6 +450,10 @@ spec:
       mkdir -p /var/lib/containerd /run/containerd /cri/cni/net.d
       mount -t tmpfs -o size=256m tmpfs /var/lib/containerd || exit 1
       mount -t tmpfs -o size=64m tmpfs /run/containerd || exit 1
+      mkdir -p /sys/fs/cgroup/init
+      xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || true
+      sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+        > /sys/fs/cgroup/cgroup.subtree_control || exit 1
       cat > /cri/cni/net.d/10-inner.conflist <<EOF
       {{
         "cniVersion": "1.0.0",
@@ -493,8 +501,11 @@ spec:
     - |
       set -x
       ip link set lo up
-      mkdir -p /sys/fs/cgroup /var/lib/rancher /var/lib/kubelet
-      mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup || exit 1
+      mkdir -p /var/lib/rancher /var/lib/kubelet
+      mkdir -p /sys/fs/cgroup/init
+      xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || true
+      sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+        > /sys/fs/cgroup/cgroup.subtree_control || exit 1
       mount -t tmpfs -o size=768m tmpfs /var/lib/rancher || exit 1
       mount -t tmpfs -o size=128m tmpfs /var/lib/kubelet || exit 1
       if ! [ -e /dev/kmsg ]; then
@@ -674,7 +685,7 @@ fn stage_pause_airgap() {
 ///
 /// Cross-container file contracts (all plain files, virtiofs-safe; the
 /// mmap-hungry state stays on in-guest tmpfs per CHALLENGES.md #34):
-/// - `/cri/containerd.sock` — CRI socket (Inc 1/2).
+/// - `/cri/containerd.sock` — CRI socket.
 /// - `/cri/cni/net.d` — flannel writes the CNI conflist from the k3s
 ///   container (bind of k3s's `agent/etc/cni/net.d`); the sidecar
 ///   containerd reads it as its CNI `conf_dir`.
@@ -690,7 +701,7 @@ fn stage_pause_airgap() {
 fn inner3_pod_yaml(idx: usize) -> String {
     let pod = INNER3_PODS[idx];
     let node = INNER3_NODES[idx];
-    // `/bin/k3s` directly: internal notes
+    // `/bin/k3s` directly: moved the container rootfs
     // off virtiofs onto an erofs virtio-blk device (overlay with a
     // guest-tmpfs upper), so mmap'd binary pages fault in from the
     // block device — which survives forks (both CoW warm forks and
@@ -750,11 +761,14 @@ spec:
       ip link set lo up
       mkdir -p /var/lib/containerd /run/containerd /var/lib/cni /var/log/pods \
         /var/lib/kubelet /cri/cni/net.d /cri/run-flannel /cri/kubelet-pods \
-        /cri/log-pods /run/flannel /sys/fs/cgroup
+        /cri/log-pods /run/flannel
       mount -t tmpfs -o size=512m tmpfs /var/lib/containerd || exit 1
       mount -t tmpfs -o size=64m tmpfs /run/containerd || exit 1
       mount -t tmpfs -o size=16m tmpfs /var/lib/cni || exit 1
-      mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup || exit 1
+      mkdir -p /sys/fs/cgroup/init
+      xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || true
+      sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+        > /sys/fs/cgroup/cgroup.subtree_control || exit 1
       mount --bind /cri/run-flannel /run/flannel || exit 1
       mkdir -p /var/lib/kubelet/pods
       mount --bind /cri/kubelet-pods /var/lib/kubelet/pods || exit 1
@@ -803,9 +817,12 @@ spec:
     - |
       set -x
       ip link set lo up
-      mkdir -p /sys/fs/cgroup /var/lib/rancher /var/lib/kubelet /var/log/pods \
+      mkdir -p /var/lib/rancher /var/lib/kubelet /var/log/pods \
         /cri/cni/net.d /cri/run-flannel /cri/kubelet-pods /cri/log-pods /run/flannel
-      mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup || exit 1
+      mkdir -p /sys/fs/cgroup/init
+      xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || true
+      sed -e 's/ / +/g' -e 's/^/+/' < /sys/fs/cgroup/cgroup.controllers \
+        > /sys/fs/cgroup/cgroup.subtree_control || exit 1
       mount -t tmpfs -o size=768m tmpfs /var/lib/rancher || exit 1
       mount -t tmpfs -o size=128m tmpfs /var/lib/kubelet || exit 1
       mkdir -p /var/lib/kubelet/pods /var/lib/rancher/k3s/agent/etc/cni/net.d
@@ -878,7 +895,7 @@ fn inner3_logs() -> String {
     out
 }
 
-/// internal notes� 3-node inner k3s cluster on one shared
+/// 3-node inner k3s cluster on one shared
 /// cluster-mode bridge: server + two agents, flannel host-gw +
 /// kube-proxy on the netfilter/veth/bridge guest kernel, and an inner
 /// pause pod on an agent node reachable from the server node.
@@ -1115,14 +1132,14 @@ fn test_inner_k3s_three_node_cluster_ready() {
     delete_inner3_pods();
 }
 
-// ── internal notes: warm cluster fork without restart ──
+// ──: warm cluster fork without restart ──
 
 /// Drive-path note (parent status log): this test talks to the running
 /// k7d daemon over `/run/k7d/k7d.sock` directly (`Client::connect_env`)
 /// — it exercises the raw `TreeAdoptCluster` + `TreeFork` primitives.
 /// The operator-facing kubectl-annotation route over the same
-/// primitives is Increment 5
-/// (`test_inner_k3s_cluster_warm_fork_via_annotation` below).
+/// primitives is
+/// `test_inner_k3s_cluster_warm_fork_via_annotation` (below).
 
 /// Generous tree budget for 2 live 3-VM inner-k3s payloads (root + fork).
 /// Default daemon budget is sized for 256 MiB busybox guests.
@@ -1184,7 +1201,7 @@ const INNER3_CERTS_DIR: &str = "/tmp/k7-inner3-certs";
 /// Historical note: this originally *had* to run pre-adopt because the
 /// prepare swap killed virtiofs in the source (CHALLENGES.md #39). The
 /// #39 fix keeps virtiofs-backed sources running in place, so in-guest
-/// exec now survives adopt (asserted by the Inc 5 annotation test) —
+/// exec now survives adopt (asserted by the annotation test) —
 /// extracting pre-adopt is merely the natural point in the flow.
 fn extract_inner_certs() {
     let yaml = kubectl_exec_retry(INNER3_PODS[0], "k3s", "cat /etc/rancher/k3s/k3s.yaml", 5)
@@ -1369,7 +1386,7 @@ fn assert_three_ready_nodes_via(bridge_dev: &str, label: &str) {
     }
 }
 
-/// internal notes� deploy a pause Deployment and churn the API so the warm
+/// Deploy a pause Deployment and churn the API so the warm
 /// fork copies real dirty pages. HostNetwork www images fail nested
 /// etc-hosts binds (CHALLENGES #50); nested runc needs guest
 /// `CONFIG_CFS_BANDWIDTH` for `cpu.max` (CHALLENGES #51). Post-fork we
@@ -1501,7 +1518,7 @@ fn assert_inner_load_ready_via(bridge: &str, label: &str) {
     }
 }
 
-/// Bring the Inc 3 fixture to "3 Ready nodes", deploy the dirtier
+/// Bring the three-pod fixture to "3 Ready nodes", deploy the dirtier
 /// workload, and leave the pods running for adopt/fork.
 fn bring_up_inner3_cluster() {
     common::ensure_pod_annotations_forwarded();
@@ -1517,7 +1534,7 @@ fn bring_up_inner3_cluster() {
         wait_for_pod_running(pod, Duration::from_secs(300));
     }
 
-    // internal notes: the airgap RO hostPath rides a cached erofs
+    // The airgap RO hostPath rides a cached erofs
     // image on virtio-blk, so cluster pods must carry ZERO virtiofs
     // shares — that is what puts adopt/fork on the CoW path. Assert
     // BEFORE adopt: the daemon drops the sandbox records at adopt,
@@ -1573,13 +1590,13 @@ fn bring_up_inner3_cluster() {
         if start.elapsed() > Duration::from_secs(600) {
             let logs = inner3_logs();
             delete_inner3_pods();
-            panic!("Inc4 bring-up: 3 inner nodes never Ready (last: {attempt:?})\n{logs}");
+            panic!("cluster bring-up: 3 inner nodes never Ready (last: {attempt:?})\n{logs}");
         }
         thread::sleep(Duration::from_secs(5));
     }
 }
 
-/// internal notes� warm-fork the live 3-VM inner-k3s cluster
+/// Warm-fork the live 3-VM inner-k3s cluster
 /// without restarting the source control plane.
 #[test]
 fn test_inner_k3s_cluster_warm_fork_no_restart() {
@@ -1588,7 +1605,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
 
     // Certs come out pre-adopt. (Historical: adopt/prepare used to
     // kill in-guest exec by re-CIDing the source — CHALLENGES.md #39.
-    // internal notes, proven post-fork below; the
+    // Preserves the CID, proven post-fork below; the
     // pre-adopt extraction simply keeps this test's probe path
     // independent of that fix.)
     extract_inner_certs();
@@ -1610,7 +1627,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
 
     // Adopt first (prepare_fork_source pauses each member for seconds
     // to snapshot 2.6 GiB — a probe started before adopt would
-    // false-fail). Spec order: prepare → probe → fork.
+    // false-fail). Required order: prepare → probe → fork.
     let tree_id = format!("inner3-adopt-{}", std::process::id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
         vm_ids,
@@ -1682,7 +1699,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
             fork_memory_full_copy,
         }) => {
             assert_eq!(guest_cids.len(), 3, "fork must clone every member");
-            // internal notes: share-less cluster members must ride the
+            // Share-less cluster members must ride the
             // CoW path — a full memfd copy anywhere is a regression to
             // the slow fork (and would blow the < 1 s budget below).
             assert_eq!(
@@ -1708,7 +1725,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
         "  TreeFork node={fork_node} cids={fork_cids:?} elapsed={fork_elapsed:?} \
          budget={FORK_INNER_K3S_CLUSTER_3VM:?}"
     );
-    // internal notes: surface the daemon's per-member memfd copy and
+    // Surface the daemon's per-member memfd copy and
     // materialise timings (plus the cluster total) in the test output so
     // budget regressions are diagnosable from the test log alone.
     if let Ok(journal) = Command::new("journalctl")
@@ -1757,7 +1774,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
         thread::sleep(Duration::from_millis(500));
     }
 
-    // internal notes: adopt swapped each share-less
+    // CID stability: adopt swapped each share-less
     // source for a restored copy on the SAME vsock CID, so the member
     // pods' shims (which cached that CID at Create and dial it fresh
     // per exec) must still reach their guests.
@@ -1776,7 +1793,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     assert_three_ready_nodes_via(&source_bridge, "source");
     assert_three_ready_nodes_via(&fork_bridge, "fork");
 
-    // internal notes: dirtier fixture — pause Deployment must still report
+    // Dirtier fixture — pause Deployment must still report
     // ≥3 readyReplicas on both bridges (workload state, not just /readyz).
     assert_inner_load_ready_via(&source_bridge, "source");
     assert_inner_load_ready_via(&fork_bridge, "fork");
@@ -1796,7 +1813,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     }
 }
 
-// ── internal notes: annotation-driven cluster fork ──
+// ──: annotation-driven cluster fork ──
 
 /// Fork-trigger pod: its `k7d.katakate.org/tree-*`
 /// annotations make the shim adopt the live inner3 cluster and fork it
@@ -1806,7 +1823,7 @@ const INNER3_TRIGGER_POD: &str = "test-inner3-fork-trigger";
 /// Manifest for the fork-trigger pod. A plain BestEffort k7 pod (its
 /// own VM and bridge — deliberately NOT on [`INNER3_CLUSTER_ID`]; the
 /// shim rejects a trigger that is a member of the cluster it adopts)
-/// whose annotations carry the whole Inc 5 contract: adopt `inner3`
+/// whose annotations carry the whole contract: adopt `inner3`
 /// as the root of `tree_id`, then fork `root` under label `warm`.
 /// The pod reaching Running IS the success signal — the shim fails
 /// sandbox Create loudly when adopt or fork fails.
@@ -1846,22 +1863,22 @@ fn bridge_port_count(name: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// internal notes� the Inc 4 warm fork driven entirely by
+/// The warm fork driven entirely by
 /// kubectl: a trigger pod's `k7d.katakate.org/tree-*` annotations make
 /// the shim call `TreeAdoptCluster` + `TreeFork`. No
 /// `Client::connect_env` for the fork itself — the daemon socket is
-/// only used for teardown (`TreeDrop`), which the Inc 5 spec allows.
+/// only used for teardown (`TreeDrop`), which is allowed.
 ///
 /// The held watch stream starts BEFORE the trigger pod is applied and
 /// must survive both the adopt pause (root snapshot) and the fork
-/// pause — unlike Inc 4 there is no socket-driven gap between the two
+/// pause — unlike the socket-driven route there is no gap between the two
 /// to start a probe in, which makes this the stronger survival claim.
 #[test]
 fn test_inner_k3s_cluster_warm_fork_via_annotation() {
     let _leak_guard = ensure_shim_installed();
     bring_up_inner3_cluster();
 
-    // Certs come out pre-adopt like Inc 4 (host-side authenticated
+    // Certs come out pre-adopt as before (host-side authenticated
     // probes are the assertion path either way).
     extract_inner_certs();
     let source_bridge = "k7-br-inner3".to_string();
@@ -1887,7 +1904,7 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
 
     let tree_id = format!("inner3-ann-{}", std::process::id());
     let teardown = || {
-        // Socket use here is teardown-only (allowed by the Inc 5 spec).
+        // Socket use here is teardown-only (allowed).
         if let Ok(mut client) = Client::connect_env() {
             let _ = client.call(&Request::TreeDrop {
                 tree_id: tree_id.clone(),
@@ -1925,10 +1942,10 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
         thread::sleep(Duration::from_millis(500));
     }
 
-    // Spec criterion "shim CIDs still valid / exec still works": the
+    // Criterion "shim CIDs still valid / exec still works": the
     // member pods' shims still dial their cached vsock CIDs (the shim
-    // failed the trigger Create if adopt changed any CID). internal notes
-    // Inc 5: the members are share-less, so prepare swapped each for a
+    // failed the trigger Create if adopt changed any CID).
+    // The members are share-less, so prepare swapped each for a
     // restored copy on the SAME CID — this exec proves the preserved
     // CID answers.
     let echo = kubectl_exec_retry(INNER3_PODS[0], "k3s", "echo post-adopt-exec-ok", 5);

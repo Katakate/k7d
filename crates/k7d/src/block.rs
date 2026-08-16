@@ -433,7 +433,7 @@ impl VirtioBackend for BlockBackend {
         self.paused.store(false, Ordering::SeqCst);
         self.parked.store(false, Ordering::SeqCst);
         // Named so it doesn't inherit the activating vCPU thread's comm
-        // (device activation runs on a vCPU thread — see internal notes).
+        // (device activation runs on a vCPU thread — see).
         self.worker = Some(
             std::thread::Builder::new()
                 .name("virtio-blk".to_string())

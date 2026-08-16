@@ -137,7 +137,7 @@ impl BlockVolumes {
                 // Unknown plugins (local-volume PVCs, CSI) are not
                 // this module's problem: writable PVCs go through
                 // `crate::disks` images, everything else stays on the
-                // opt-in virtiofs slow path (PVC matrix, internal notes).
+                // opt-in virtiofs slow path (PVC matrix).
                 log::debug!("BlockVolumes: skipping kubelet plugin {plugin_str:?}");
                 continue;
             };
@@ -179,7 +179,7 @@ impl BlockVolumes {
             log::warn!(
                 "BlockVolumes: packed {staged_ro} read-only kubelet volume(s) into {} — \
                  ConfigMap/Secret updates after this point will NOT propagate into the \
-                 pod (packed-image semantics, internal notes)",
+                 pod (packed-image semantics)",
                 image.display()
             );
             self.ro_image = Some(image);

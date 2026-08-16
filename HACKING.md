@@ -50,6 +50,41 @@ make remote-verif             # Aeneas/Lean tree proofs (after remote-install-ve
 | `K7_NODE_IP` | `(required: set K7_NODE_IP)` | Build/test node IP |
 | `K7_NODE_USER` | `root` | SSH user |
 | `K7_SSH_KEY` | (uses `~/.ssh/id_ed25519`) | Private key content (PEM) |
+| `K7_REMOTE_RESTART` | `0` | `1` kills an in-flight run and starts fresh |
+| `K7_REMOTE_LOCK_WAIT` | `2700` | Seconds to wait for the node's workspace lock |
+
+### Surviving a dropped connection
+
+The full suite takes 25-40 minutes, so the long `remote-*` targets do not
+run over the SSH connection — `utils/remote-run.sh` starts them detached
+on the node (`nohup setsid`, output to `/run/k7d-remote/<target>/log`)
+and the local side is only a viewer that streams that log and exits with
+the run's recorded exit code.
+
+Losing the connection therefore costs nothing. The viewer reconnects on
+its own; if the local process dies too, re-running the same target
+**reattaches to the run in flight** rather than starting a second one
+(it skips the rsync in that case, since the run is building the sources
+already on the node). `Ctrl-C` detaches without stopping the run. To
+abandon a run and start over, `K7_REMOTE_RESTART=1 make remote-check`.
+
+`utils/rsync-to-node.sh` syncs with `--checksum` and bumps the mtime of
+every file it transfers, so a source on the node can never end up older
+than an artifact built from different content (CHALLENGES.md #64).
+
+### One workspace, one run at a time
+
+A run of a *different* name on the same node waits instead of rsyncing
+into a live build — the node has one `/root/k7d` and one `/dev/kvm`, and
+two runs sharing them fail in a different place each time, which reads as
+flakiness rather than contention. The waiter prints who holds the lock.
+
+The lock lives on the node and is held by a detached process, not by the
+SSH connection, so a dropped connection cannot release it mid-build and a
+killed client cannot wedge the node (the kernel drops the `flock` when
+that process dies). `K7_REMOTE_LOCK_WAIT` (default 2700s) bounds the
+wait; past it the run fails loudly naming the holder. See
+CHALLENGES.md #75.
 
 ## Verification suite
 
@@ -72,9 +107,20 @@ make remote-verif             # Aeneas/Lean tree proofs (after remote-install-ve
 Four steps register the `k7` RuntimeClass on a k3s node:
 
 1. **Install + start the daemon.** `cp dist/k7d /usr/local/bin/`,
-   create a `k7d.service` systemd unit
-   (`ExecStart=/usr/local/bin/k7d`, `Environment=RUST_LOG=info`), then
-   `systemctl enable --now k7d`. The shim is a thin client: sandbox
+   install the guest kernel and initramfs somewhere the daemon can read
+   them (`packaging/install.sh` uses `/usr/local/share/k7d/`), then
+   create a `k7d.service` systemd unit with `ExecStart=/usr/local/bin/k7d`,
+   `Environment=RUST_LOG=info` and — required — the guest pair:
+
+   ```ini
+   Environment=K7D_KERNEL=/usr/local/share/k7d/vmlinux
+   Environment=K7D_INITRD=/usr/local/share/k7d/initramfs.cpio.gz
+   ```
+
+   Then `systemctl enable --now k7d`. The daemon is the *only* process
+   that decides which guest a VM boots; nothing else may pass a path,
+   and a daemon without these refuses to create a VM rather than
+   guessing (CHALLENGES #72). The shim is a thin client: sandbox
    `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly
    if it is not running.
 2. **Install the shim.**

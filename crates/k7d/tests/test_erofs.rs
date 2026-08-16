@@ -1,4 +1,4 @@
-//! Integration tests for internal notes: erofs container rootfs on
+//! Integration tests for: erofs container rootfs on
 //! virtio-blk — the zero-virtiofs pod. Requires KVM, /dev/vhost-vsock,
 //! built guest kernel (CONFIG_EROFS_FS, CONFIG_OVERLAY_FS,
 //! CONFIG_VIRTIO_BLK), built initramfs, busybox and mkfs.erofs
@@ -73,7 +73,7 @@ fn build_vm_with_erofs_rootfs(img: &Path, memory_mb: u64) -> Vm {
 }
 
 /// Push the static runc binary into the guest's tmpfs — the whole
-/// point of Inc 2 is that no virtiofs share exists to carry it.
+/// point is that no virtiofs share exists to carry it.
 fn push_runc(agent: &mut k7d::api::AgentClient) {
     let runc_src = workspace_path("guest/rootfs/runc.amd64");
     assert!(
@@ -314,7 +314,7 @@ fn test_zero_virtiofs_pod_warm_fork() {
 
     let mut forked = source.fork_warm("zero-virtiofs-fork").expect("warm fork");
 
-    // The Inc 2 payoff: with no virtiofs share the fork must stay on
+    // The payoff: with no virtiofs share the fork must stay on
     // the CoW (MAP_PRIVATE base.mem + dirty delta) path, not full-memfd.
     assert!(
         !forked.fork_memory_is_full_copy(),

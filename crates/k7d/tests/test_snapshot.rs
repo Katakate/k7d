@@ -1,4 +1,4 @@
-//! Integration test for Milestone 7: Memory snapshot.
+//! Integration test: memory snapshot.
 //! Requires KVM, /dev/vhost-vsock, built guest kernel, and built initramfs.
 
 use std::path::PathBuf;
@@ -67,7 +67,7 @@ fn test_snapshot_creates_valid_files() {
 
     let cpu_json = std::fs::read_to_string(snapshot_dir.path().join("cpu.json")).unwrap();
     let cpus: serde_json::Value = serde_json::from_str(&cpu_json).unwrap();
-    // internal notes: cpu.json is an array, one entry per vCPU.
+    // Cpu.json is an array, one entry per vCPU.
     let cpus_arr = cpus.as_array().expect("cpu.json should be an array");
     assert_eq!(cpus_arr.len(), 1, "1-vCPU VM captures one CpuState");
     let cpu = &cpus_arr[0];
