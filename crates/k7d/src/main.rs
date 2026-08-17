@@ -41,7 +41,40 @@ fn socket_path() -> String {
     control::socket_path_from_env()
 }
 
+/// `--version` and `--help` must be answered before anything else happens.
+/// Without this they fell through to "start a daemon", so an operator
+/// checking which version was installed booted a second daemon that took
+/// the control socket from the running one and deleted it on the way out.
+fn handle_info_flags() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("k7d {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "k7d {} — microVM runtime daemon (one per node, root)\n\n\
+                     Usage: k7d [--socket <path>]\n\n\
+                     Options:\n\
+                     \x20 --socket <path>  control socket (default: {}; env K7D_SOCKET)\n\
+                     \x20 -V, --version    print version and exit\n\
+                     \x20 -h, --help       print this help and exit\n\n\
+                     Guest artifacts are required and come from the environment:\n\
+                     \x20 K7D_KERNEL       guest kernel (vmlinux)\n\
+                     \x20 K7D_INITRD       guest initramfs\n",
+                    env!("CARGO_PKG_VERSION"),
+                    control::DEFAULT_SOCKET,
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn main() {
+    handle_info_flags();
     env_logger::init();
     let socket = socket_path();
     log::info!("k7d starting (socket={socket})");
@@ -100,11 +133,19 @@ fn main() {
         });
     }
 
-    if let Err(e) = control::serve(&socket, &daemon, &shutdown) {
+    // A daemon that could not serve must exit non-zero: logging and
+    // returning 0 told systemd the unit succeeded, so a k7d that never
+    // bound its socket looked like a clean shutdown.
+    let serve_result = control::serve(&socket, &daemon, &shutdown);
+    if let Err(e) = &serve_result {
         log::error!("serve failed: {e}");
     }
 
     log::info!("k7d draining {} VM(s)", daemon.vm_count());
     daemon.shutdown_all();
     log::info!("k7d stopped");
+
+    if serve_result.is_err() {
+        std::process::exit(1);
+    }
 }

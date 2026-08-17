@@ -110,6 +110,69 @@ fn create_vm(guard: &DaemonGuard, config: VmConfig) -> (String, u64, Option<u32>
     }
 }
 
+/// `--version` and `--help` must answer and exit, not boot a daemon.
+///
+/// They used to fall through to the serve path, so `k7d --version` from an
+/// operator's shell started a second daemon, took the control socket from
+/// the running one, and unlinked it on exit — the node's whole runtime went
+/// away because someone asked which version was installed.
+#[test]
+fn test_info_flags_do_not_start_a_daemon() {
+    for flag in ["--version", "-V", "--help", "-h"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_k7d"))
+            .arg(flag)
+            .output()
+            .expect("run k7d");
+        assert!(out.status.success(), "{flag} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(env!("CARGO_PKG_VERSION")),
+            "{flag} should print the version, got: {stdout}"
+        );
+        // A daemon would still be running; an informational flag returns.
+        assert!(
+            !stdout.contains("listening on"),
+            "{flag} must not start serving, got: {stdout}"
+        );
+    }
+}
+
+/// A second daemon must refuse the socket rather than displace the first.
+///
+/// `serve` used to unlink whatever was at the path, assuming it was stale.
+/// That made the original daemon serve an unlinked listener no client could
+/// reach, and let whichever process exited first delete the survivor's
+/// socket.
+#[test]
+fn test_second_daemon_refuses_a_live_socket() {
+    let first = spawn_daemon("addrinuse");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_k7d"))
+        .arg("--socket")
+        .arg(&first.socket)
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("run second k7d");
+
+    assert!(
+        !out.status.success(),
+        "second daemon on a live socket must fail, exited {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already serving"),
+        "should say another daemon owns it, got: {stderr}"
+    );
+
+    // The point of the fix: the first daemon is still reachable.
+    assert!(first.socket.exists(), "first daemon's socket was removed");
+    match call(&first, &Request::Ping) {
+        Response::Pong { .. } => {}
+        other => panic!("first daemon stopped answering: {other:?}"),
+    }
+}
+
 fn bridge_exists(name: &str) -> bool {
     Command::new("ip")
         .args(["link", "show", name])

@@ -2752,13 +2752,28 @@ pub fn serve(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Remove a stale socket from a previous run (bind fails on EADDRINUSE
-    // otherwise). Fail loud if removal itself errors for a reason other
-    // than "not there".
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    // A socket file that exists is either a live daemon's or a dead one's
+    // leftover, and only a connect can tell them apart. Removing it blind
+    // meant a second daemon stole the path from the first: the original kept
+    // serving an unlinked listener no client could reach, and whichever
+    // process exited first deleted the survivor's socket. So probe, and
+    // refuse to be the second daemon rather than silently displacing it.
+    if path.exists() {
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("another k7d is already serving {socket_path}"),
+                ));
+            }
+            // Nobody is listening: a leftover from a dead daemon. bind(2)
+            // fails with EADDRINUSE on an existing path, so clear it.
+            Err(_) => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            },
+        }
     }
 
     let listener = UnixListener::bind(&path)?;

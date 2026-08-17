@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-08-16
+
+Patch release. `k7d --version` on a machine with a running daemon no longer
+takes down that daemon's control socket.
+
+### Fixed
+
+- **`k7d --version` used to start a second daemon that stole the live
+  control socket and deleted it on exit.** `main()` parsed only `--socket`
+  and fell through to the serve path for everything else, and `serve()`
+  opened by unconditionally unlinking whatever sat at the socket path — so
+  an informational flag displaced the running daemon's socket and left a
+  unit that reported `active` with no socket for any shim to reach.
+  `--version`/`-V`/`--help`/`-h` now answer and exit before anything else,
+  and `serve()` probes the path with a connect first: a live listener is
+  `AddrInUse` and a refusal to start, not a silent displacement.
+- The test suite runs one integration-test binary at a time (enumerated
+  from `cargo metadata`), so a failure names the binary and VM-booting
+  tests no longer compete across binaries.
+
 ## [0.2.0] — 2026-08-16
 
 Second release. Bigger guests boot, container writes land on a real disk

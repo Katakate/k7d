@@ -1785,12 +1785,70 @@ serializes whole runs. Until that lands, a lone fork/vsock timeout in an
 otherwise green run should be re-run before it is believed — and if it moves
 to a different test on the re-run, it is this.
 
+**Update (serialization landed, and the diagnosis above was wrong):** the
+`test` target now runs unit tests in one pass and then every integration
+test binary alone (enumerated from `cargo metadata`, each still
+`--test-threads=1`), and a failure names the binary. That part worked. The
+flake rate did not move: 6 fully-serialized suite runs across two nodes,
+both after `cargo clean` full rebuilds, produced **2 green** — the same
+one-in-three the parallel suite produced. Every failure is the same shape
+(warm fork or snapshot-restore, then vsock connect `ETIMEDOUT` or a first
+ping between forks failing): `test_tree_auto_evict_lru`,
+`test_cluster_fork_warm_fork_tcp_works`, `test_fork_warm_under_50ms`,
+`test_cluster_fork_warm_source_tcp_undisturbed`. And it reproduces in
+*isolation*: `test_cluster_fork` alone on an otherwise idle node failed 2
+of 10 consecutive runs (`test_tree` alone was 10/10 green). So cross-binary
+parallelism was never the cause — the middle green run that exonerated the
+product in this entry was luck. The residual is an intra-binary,
+per-fork-operation (~1%) reachability race in warm fork / restore, and it
+needs its own investigation (the follow-up spec exists; fork/vsock code was
+explicitly out of scope for the serialization change). The serialization
+stays: it is what made the failures attributable enough to measure this.
+
 **Reference:** none upstream — this is cargo's documented behaviour
 (`--test-threads` is passed to the libtest harness, which only ever sees one
 binary), just not the behaviour the flag's use here assumed.
 
 **Time lost:** ~10 minutes, and it would have been much more if the
 re-run had also failed and sent us into fork's agent-connect path.
+
+---
+
+## 77. `k7d --version` took down the node's runtime
+
+**Symptom:** while verifying the 0.2.0 release tarball, running
+`./k7d --version` on the node hung instead of printing a version. It had
+started a *second* daemon. Killing it left the systemd unit `active` with
+`MainPID` intact but `/run/k7d/k7d.sock` gone, so every shim on the node
+would have failed to reach a daemon that believed it was serving. This is the
+second time it happened — the first cost a live node earlier in the same
+release.
+
+**Root cause:** two bugs that compose into a foot-gun.
+
+`main()` parsed only `--socket` and fell through to the serve path for
+everything else, so an informational flag *is* a daemon start. And `serve`
+opened with an unconditional `remove_file` on the socket path, commented as
+clearing a stale socket from a previous run — but existence cannot
+distinguish a stale socket from a live one. So the second daemon unlinked the
+first's socket and bound its own at the same path: the first kept accepting on
+an inode no client could open, and whichever process exited first deleted the
+other's socket.
+
+**Fix:** answer `--version` / `-V` / `--help` / `-h` before anything else and
+exit. In `serve`, probe the path with `UnixStream::connect` before removing
+it: a successful connect means a live daemon owns it, which is now
+`AddrInUse` and a refusal to start, rather than a silent displacement. Only a
+connect failure — nobody listening — is treated as leftover and unlinked.
+Two tests cover it: informational flags exit 0 without serving, and a second
+daemon on a live socket fails while the first stays reachable.
+
+**Reference:** none upstream; this is the standard Unix-socket daemon
+question ("is this socket stale?") answered by connecting, the way
+`systemd`'s socket activation and most PID-file-free daemons do.
+
+**Time lost:** ~20 minutes across two incidents, plus the cost of doubting a
+release artifact.
 
 ---
 

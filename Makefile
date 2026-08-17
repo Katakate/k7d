@@ -11,6 +11,25 @@ K7D_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 RELEASE_NAME := k7d-v$(K7D_VERSION)-x86_64-linux
 RELEASE_TGZ := dist/$(RELEASE_NAME).tar.gz
 
+# --- Serialized test-binary runner (used by test / test-integration) ---
+# `cargo test -- --test-threads=1` only serializes tests *within* one
+# binary; cargo still runs the many test binaries in crates/*/tests/
+# concurrently, so several VMs boot at once and fork/vsock tests miss
+# their deadlines (CHALLENGES.md #76). Run one test binary at a time,
+# enumerated from cargo metadata so a new tests/*.rs file is picked up
+# without a Makefile edit. $(1) is extra libtest args (e.g. --ignored).
+define run_test_binaries
+set -e; \
+targets="$$(cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | .name as $$p | .targets[] | select(.kind[] == "test") | "\($$p) \(.name)"')"; \
+[ -n "$$targets" ] || { echo "no test targets found in cargo metadata" >&2; exit 1; }; \
+echo "$$targets" | while read -r pkg name; do \
+  echo "==> test binary: $$name (package $$pkg)"; \
+  cargo test -p "$$pkg" --test "$$name" -- $(1) --test-threads=1 \
+    || { echo "FAILED test binary: $$name (package $$pkg)" >&2; exit 1; }; \
+done
+endef
+
 # --- SSH setup (used by all remote-* targets) ---
 # Source utils/ssh-setup.sh to get SSH_OPTS, NODE, SSH_PRIVKEY
 define ssh_setup
@@ -55,10 +74,12 @@ test: build-agent build-guest-rootfs
 	-mount | awk '/k7d-shim/ {print $$3}' | sort -ru | xargs -r umount -l 2>/dev/null
 	-rm -rf /tmp/k7d-shim-* /tmp/k7d-virtiofs-* /tmp/k7d-fork-* 2>/dev/null
 	sleep 2
-	cargo test -- --test-threads=1
+	cargo test --workspace --lib --bins -- --test-threads=1
+	@$(call run_test_binaries,)
+	cargo test --workspace --doc
 
 test-integration:
-	cargo test --test '*' -- --ignored --test-threads=1
+	@$(call run_test_binaries,--ignored)
 
 bench:
 	cargo bench
