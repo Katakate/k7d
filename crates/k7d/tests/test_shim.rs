@@ -731,28 +731,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
-    let output = std::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(yaml.as_bytes())
-                .unwrap();
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("kubectl apply failed: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    common::kubectl_apply(yaml)
 }
 
 /// Defence-in-depth alongside the product fix that unblocks the
@@ -880,9 +859,10 @@ fn test_kubectl_create_pod_with_k7_runtime() {
     eprintln!("\n=== test_kubectl_create_pod_with_k7_runtime: latency report ===");
 
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-shim");
 
     timed!("kubectl delete (cleanup)", {
-        let _ = kubectl_delete("pod", "test-k7d-shim");
+        let _ = kubectl_delete("pod", &pod);
         std::thread::sleep(Duration::from_secs(2));
     });
 
@@ -905,17 +885,17 @@ spec:
     });
 
     let pod_ready_time = timed!("Pod → Running (schedule + pull + shim + VM boot)", {
-        wait_for_pod_ready("test-k7d-shim", Duration::from_secs(120)).unwrap()
+        wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap()
     });
     eprintln!("       (pod ready latency: {pod_ready_time:.2?})");
 
     timed!("kubectl exec: echo", {
-        let output = kubectl_exec("test-k7d-shim", &["echo", "k7d works"]).unwrap();
+        let output = kubectl_exec(&pod, &["echo", "k7d works"]).unwrap();
         assert_eq!(output.trim(), "k7d works");
     });
 
     timed!("kubectl exec: cat /proc/cmdline", {
-        let cmdline = kubectl_exec("test-k7d-shim", &["cat", "/proc/cmdline"]).unwrap();
+        let cmdline = kubectl_exec(&pod, &["cat", "/proc/cmdline"]).unwrap();
         assert!(
             cmdline.contains("virtio_mmio.device="),
             "should run in our KVM VM"
@@ -927,7 +907,7 @@ spec:
     // virtio-blk, runc comes from the tools erofs image), so the pod
     // stays CoW-warm-forkable.
     timed!("daemon vm_status: zero-virtiofs invariant", {
-        let vm = common::pod_vm_state("test-k7d-shim");
+        let vm = common::pod_vm_state(&pod);
         assert_eq!(
             vm.virtiofs_shares, 0,
             "volume-less block-path pod must have zero virtiofs shares"
@@ -964,7 +944,7 @@ spec:
     // it (CHALLENGES #72).
     timed!("guest kernel config: nf_tables address families", {
         let cfg = kubectl_exec(
-            "test-k7d-shim",
+            &pod,
             &[
                 "sh",
                 "-c",
@@ -994,7 +974,7 @@ spec:
     // which is where the clock silently stops.
     timed!("guest clocksource is kvm-clock", {
         let clocksource = kubectl_exec(
-            "test-k7d-shim",
+            &pod,
             &[
                 "cat",
                 "/sys/devices/system/clocksource/clocksource0/current_clocksource",
@@ -1009,11 +989,11 @@ spec:
     });
 
     timed!("kubectl delete pod", {
-        kubectl_delete("pod", "test-k7d-shim").unwrap();
+        kubectl_delete("pod", &pod).unwrap();
     });
 
     let delete_time = timed!("Wait for pod gone", {
-        wait_for_pod_gone("test-k7d-shim", Duration::from_secs(30)).unwrap()
+        wait_for_pod_gone(&pod, Duration::from_secs(30)).unwrap()
     });
     eprintln!("       (pod teardown latency: {delete_time:.2?})");
 
@@ -1038,7 +1018,8 @@ spec:
 #[test]
 fn test_kubectl_cgroup2_mount_and_ipv6_in_guest() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-cg-ipv6");
+    let pod = common::unique_name("test-k7d-cg-ipv6");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1061,13 +1042,13 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-cg-ipv6", Duration::from_secs(120)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
 
     // Plain container: cgroup2 mounted read-only at /sys/fs/cgroup with
     // a populated controllers file (previously the mount was stripped
     // and the directory was empty).
     let mounts = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "plain",
         &["sh", "-c", "grep ' /sys/fs/cgroup cgroup2 ' /proc/mounts"],
     )
@@ -1076,12 +1057,8 @@ spec:
         mounts.contains("ro,"),
         "non-privileged cgroup2 mount should be read-only: {mounts}"
     );
-    let controllers = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
-        "plain",
-        &["cat", "/sys/fs/cgroup/cgroup.controllers"],
-    )
-    .unwrap();
+    let controllers =
+        kubectl_exec_c(&pod, "plain", &["cat", "/sys/fs/cgroup/cgroup.controllers"]).unwrap();
     assert!(
         controllers.contains("memory"),
         "guest cgroup2 controllers should include memory: {controllers}"
@@ -1090,14 +1067,14 @@ spec:
     // Namespaced view: each container's cgroup2 mount is its
     // OWN subtree root — /proc/self/cgroup reads `0::/`, and the guest
     // root hierarchy (e.g. init.sh's /init leaf) is invisible.
-    let out = kubectl_exec_c("test-k7d-cg-ipv6", "plain", &["cat", "/proc/self/cgroup"]).unwrap();
+    let out = kubectl_exec_c(&pod, "plain", &["cat", "/proc/self/cgroup"]).unwrap();
     assert_eq!(
         out.trim(),
         "0::/",
         "container should be at its own namespaced cgroup root"
     );
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "plain",
         &["sh", "-c", "test ! -d /sys/fs/cgroup/init && echo NS-OK"],
     )
@@ -1110,7 +1087,7 @@ spec:
     // Privileged container: writable cgroup2 — creating (and removing)
     // a child cgroup must work, which is what dockerd does at startup.
     let mounts = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "priv",
         &["sh", "-c", "grep ' /sys/fs/cgroup cgroup2 ' /proc/mounts"],
     )
@@ -1120,7 +1097,7 @@ spec:
         "privileged cgroup2 mount should be read-write: {mounts}"
     );
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "priv",
         &[
             "sh",
@@ -1138,7 +1115,7 @@ spec:
     // Sibling invisibility: the cgroup dir the privileged container
     // just created must NOT appear in the plain container's view.
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "plain",
         &[
             "sh",
@@ -1152,7 +1129,7 @@ spec:
         "sibling container's cgroup dir must not be visible: {out}"
     );
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "priv",
         &[
             "sh",
@@ -1169,7 +1146,7 @@ spec:
     // Guest IPv6 contract: the stack is compiled in (proc entries
     // exist) and eth0 got a link-local inet6 address.
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "plain",
         &[
             "sh",
@@ -1189,7 +1166,7 @@ spec:
     // ip6tables support (dockerd 27+ programs ip6tables NAT rules): the
     // ip6_tables proc registry exists in the guest kernel.
     let out = kubectl_exec_c(
-        "test-k7d-cg-ipv6",
+        &pod,
         "priv",
         &[
             "sh",
@@ -1203,8 +1180,8 @@ spec:
         "guest kernel should have ip6_tables support: {out}"
     );
 
-    kubectl_delete("pod", "test-k7d-cg-ipv6").unwrap();
-    wait_for_pod_gone("test-k7d-cg-ipv6", Duration::from_secs(30)).unwrap();
+    kubectl_delete("pod", &pod).unwrap();
+    wait_for_pod_gone(&pod, Duration::from_secs(30)).unwrap();
 }
 
 /// A STOCK `docker:27.5-dind` sidecar works in-guest with no
@@ -1219,7 +1196,8 @@ spec:
 #[test]
 fn test_kubectl_stock_dind_sidecar() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-stock-dind");
+    let pod = common::unique_name("test-k7d-stock-dind");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1266,20 +1244,20 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-stock-dind", Duration::from_secs(180)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).unwrap();
 
     // dockerd takes a few seconds to come up; poll `docker info`.
     let start = Instant::now();
     let info = loop {
-        match kubectl_exec_c("test-k7d-stock-dind", "client", &["docker", "info"]) {
+        match kubectl_exec_c(&pod, "client", &["docker", "info"]) {
             Ok(out) if out.contains("Server Version") => break out,
             attempt => {
                 if start.elapsed() > Duration::from_secs(120) {
                     let logs = std::process::Command::new("kubectl")
-                        .args(["logs", "test-k7d-stock-dind", "-c", "dind", "--tail=100"])
+                        .args(["logs", &pod, "-c", "dind", "--tail=100"])
                         .output()
                         .expect("kubectl logs dind");
-                    let _ = kubectl_delete("pod", "test-k7d-stock-dind");
+                    let _ = kubectl_delete("pod", &pod);
                     panic!(
                         "stock dind never answered docker info (last: {attempt:?})\ndind logs:\n{}",
                         String::from_utf8_lossy(&logs.stdout)
@@ -1301,7 +1279,7 @@ spec:
         .args([
             "get",
             "pod",
-            "test-k7d-stock-dind",
+            &pod,
             "-o",
             "jsonpath={.status.containerStatuses[?(@.name=='dind')].restartCount}",
         ])
@@ -1311,10 +1289,10 @@ spec:
         String::from_utf8_lossy(&restarts.stdout).trim(),
         "0",
         "stock dind must not CrashLoop: {}",
-        kubectl_logs_c("test-k7d-stock-dind", "dind").unwrap_or_default()
+        kubectl_logs_c(&pod, "dind").unwrap_or_default()
     );
     let out = kubectl_exec_c(
-        "test-k7d-stock-dind",
+        &pod,
         "dind",
         &[
             "sh",
@@ -1334,7 +1312,7 @@ spec:
     // (exercises evacuation, vfs graph driver, and in-guest ip(6)tables
     // NAT — all with the stock entrypoint).
     let out = kubectl_exec_c(
-        "test-k7d-stock-dind",
+        &pod,
         "client",
         &[
             "docker",
@@ -1351,8 +1329,8 @@ spec:
         "docker run inside stock dind should echo the marker: {out}"
     );
 
-    kubectl_delete("pod", "test-k7d-stock-dind").unwrap();
-    wait_for_pod_gone("test-k7d-stock-dind", Duration::from_secs(30)).unwrap();
+    kubectl_delete("pod", &pod).unwrap();
+    wait_for_pod_gone(&pod, Duration::from_secs(30)).unwrap();
 }
 
 /// A kubectl pod with only block-supported volume
@@ -1363,7 +1341,8 @@ spec:
 #[test]
 fn test_kubectl_pod_block_path_warm_fork_cow() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-cowfork");
+    let pod = common::unique_name("test-k7d-cowfork");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1387,9 +1366,9 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-cowfork", Duration::from_secs(120)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
 
-    let src = common::pod_vm_state("test-k7d-cowfork");
+    let src = common::pod_vm_state(&pod);
     assert_eq!(
         src.virtiofs_shares, 0,
         "emptyDir pod must be block-backed (zero virtiofs)"
@@ -1434,7 +1413,7 @@ spec:
     // cached CID fresh per exec — the prepare swap must not have
     // changed it.
     let exec = std::process::Command::new("kubectl")
-        .args(["exec", "test-k7d-cowfork", "--", "echo", "src-alive"])
+        .args(["exec", &pod, "--", "echo", "src-alive"])
         .output()
         .expect("kubectl exec");
     assert!(
@@ -1446,7 +1425,7 @@ spec:
     );
 
     let _ = daemon.call(&k7d::control::Request::StopVm { vm_id: fork_id });
-    let _ = kubectl_delete("pod", "test-k7d-cowfork");
+    let _ = kubectl_delete("pod", &pod);
 }
 
 fn kubectl_exec_c(pod: &str, container: &str, cmd: &[&str]) -> Result<String, String> {
@@ -1477,10 +1456,10 @@ fn kubectl_logs_c(pod: &str, container: &str) -> Result<String, String> {
 
 /// Deletes the named pod on drop — panic-safe cleanup so a failing
 /// test doesn't leak its pod (and shim process) into later tests.
-struct PodGuard(&'static str);
+struct PodGuard(String);
 impl Drop for PodGuard {
     fn drop(&mut self) {
-        let _ = kubectl_delete("pod", self.0);
+        let _ = kubectl_delete("pod", &self.0);
     }
 }
 
@@ -1520,8 +1499,9 @@ fn wait_for_all_containers_ready(name: &str, timeout: Duration) -> Result<(), St
 #[test]
 fn test_kubectl_pod_two_images() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-twoimg");
-    let _pod_guard = PodGuard("test-k7d-twoimg");
+    let pod = common::unique_name("test-k7d-twoimg");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1550,58 +1530,47 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-twoimg", Duration::from_secs(180)).unwrap();
-    wait_for_all_containers_ready("test-k7d-twoimg", Duration::from_secs(60)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).unwrap();
+    wait_for_all_containers_ready(&pod, Duration::from_secs(60)).unwrap();
 
     // Exec works in BOTH containers (both rootfs mounts are live).
-    let out = kubectl_exec_c("test-k7d-twoimg", "web", &["sh", "-c", "echo web-ok"]).unwrap();
+    let out = kubectl_exec_c(&pod, "web", &["sh", "-c", "echo web-ok"]).unwrap();
     assert_eq!(out.trim(), "web-ok");
-    let out = kubectl_exec_c("test-k7d-twoimg", "side", &["sh", "-c", "echo side-ok"]).unwrap();
+    let out = kubectl_exec_c(&pod, "side", &["sh", "-c", "echo side-ok"]).unwrap();
     assert_eq!(out.trim(), "side-ok");
 
     // The images are genuinely distinct: nginx exists in web only.
-    let out =
-        kubectl_exec_c("test-k7d-twoimg", "web", &["nginx", "-v"]).map(|o| o.trim().to_string());
+    let out = kubectl_exec_c(&pod, "web", &["nginx", "-v"]).map(|o| o.trim().to_string());
     // nginx -v prints to stderr; success of the exec is the signal.
     assert!(out.is_ok(), "nginx binary must exist in web: {out:?}");
-    let err = kubectl_exec_c("test-k7d-twoimg", "side", &["nginx", "-v"])
+    let err = kubectl_exec_c(&pod, "side", &["nginx", "-v"])
         .expect_err("busybox side container must NOT have nginx");
     assert!(!err.is_empty());
 
     // Shared emptyDir is visible from both sides.
     kubectl_exec_c(
-        "test-k7d-twoimg",
+        &pod,
         "side",
         &["sh", "-c", "echo cross-container > /shared/x"],
     )
     .unwrap();
-    let out = kubectl_exec_c("test-k7d-twoimg", "web", &["cat", "/shared/x"]).unwrap();
+    let out = kubectl_exec_c(&pod, "web", &["cat", "/shared/x"]).unwrap();
     assert_eq!(out.trim(), "cross-container");
 
     // Logs from both containers. nginx logs access lines to stdout —
     // generate them over pod-local loopback, from the web container
     // itself AND from the sidecar (containers of a pod share the
     // guest netns, so cross-container localhost must work).
-    kubectl_exec_c(
-        "test-k7d-twoimg",
-        "web",
-        &["wget", "-qO-", "http://127.0.0.1/"],
-    )
-    .unwrap();
-    kubectl_exec_c(
-        "test-k7d-twoimg",
-        "side",
-        &["wget", "-qO-", "http://127.0.0.1/"],
-    )
-    .unwrap();
-    let side_logs = kubectl_logs_c("test-k7d-twoimg", "side").unwrap();
+    kubectl_exec_c(&pod, "web", &["wget", "-qO-", "http://127.0.0.1/"]).unwrap();
+    kubectl_exec_c(&pod, "side", &["wget", "-qO-", "http://127.0.0.1/"]).unwrap();
+    let side_logs = kubectl_logs_c(&pod, "side").unwrap();
     assert!(side_logs.contains("side-started"), "side logs: {side_logs}");
-    let web_logs = kubectl_logs_c("test-k7d-twoimg", "web").unwrap();
+    let web_logs = kubectl_logs_c(&pod, "web").unwrap();
     assert!(web_logs.contains("GET /"), "web logs: {web_logs}");
 
     // The pod stays on the zero-virtiofs block path; the device list
     // includes tools + boot rootfs + the 4 default spare slots.
-    let vm = common::pod_vm_state("test-k7d-twoimg");
+    let vm = common::pod_vm_state(&pod);
     assert_eq!(
         vm.virtiofs_shares, 0,
         "two-image pod must stay zero-virtiofs"
@@ -1612,7 +1581,7 @@ spec:
         vm.block_devices
     );
 
-    kubectl_delete("pod", "test-k7d-twoimg").unwrap();
+    kubectl_delete("pod", &pod).unwrap();
 }
 
 /// A two-distinct-image pod on the zero-virtiofs
@@ -1623,8 +1592,9 @@ spec:
 #[test]
 fn test_multi_image_pod_warm_fork_cow() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-mimg-cow");
-    let _pod_guard = PodGuard("test-k7d-mimg-cow");
+    let pod = common::unique_name("test-k7d-mimg-cow");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1653,10 +1623,10 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-mimg-cow", Duration::from_secs(180)).unwrap();
-    wait_for_all_containers_ready("test-k7d-mimg-cow", Duration::from_secs(60)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).unwrap();
+    wait_for_all_containers_ready(&pod, Duration::from_secs(60)).unwrap();
 
-    let src = common::pod_vm_state("test-k7d-mimg-cow");
+    let src = common::pod_vm_state(&pod);
     assert_eq!(
         src.virtiofs_shares, 0,
         "two-image emptyDir pod must stay zero-virtiofs"
@@ -1704,15 +1674,7 @@ spec:
     // Source CID stability (same invariant as block-path CoW test):
     // prepare swap must leave the shim-cached CID answering.
     let exec = std::process::Command::new("kubectl")
-        .args([
-            "exec",
-            "test-k7d-mimg-cow",
-            "-c",
-            "side",
-            "--",
-            "echo",
-            "src-alive",
-        ])
+        .args(["exec", &pod, "-c", "side", "--", "echo", "src-alive"])
         .output()
         .expect("kubectl exec");
     assert!(
@@ -1724,7 +1686,7 @@ spec:
     );
 
     let _ = daemon.call(&k7d::control::Request::StopVm { vm_id: fork_id });
-    let _ = kubectl_delete("pod", "test-k7d-mimg-cow");
+    let _ = kubectl_delete("pod", &pod);
 }
 
 /// More distinct images than spare slots must fail
@@ -1733,11 +1695,12 @@ spec:
 #[test]
 fn test_image_slot_exhaustion_fails_loud() {
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-slotfull");
     // The image-slots annotation only reaches the shim when containerd
     // forwards k7d.katakate.org/* pod annotations into the OCI spec.
     common::ensure_pod_annotations_forwarded();
-    let _ = kubectl_delete("pod", "test-k7d-slotfull");
-    let _pod_guard = PodGuard("test-k7d-slotfull");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     // 1 spare slot, 3 distinct images: the first image boots the VM
@@ -1773,7 +1736,7 @@ spec:
     let deadline = Instant::now() + Duration::from_secs(240);
     let describe = loop {
         let output = std::process::Command::new("kubectl")
-            .args(["describe", "pod", "test-k7d-slotfull"])
+            .args(["describe", "pod", &pod])
             .output()
             .expect("kubectl describe");
         let describe = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1796,7 +1759,7 @@ spec:
         "exhaustion error must name the image-slots annotation; describe:\n{describe}"
     );
 
-    let _ = kubectl_delete("pod", "test-k7d-slotfull");
+    let _ = kubectl_delete("pod", &pod);
 }
 
 fn pod_jsonpath(name: &str, path: &str) -> String {
@@ -1814,8 +1777,9 @@ fn pod_jsonpath(name: &str, path: &str) -> String {
 #[test]
 fn test_container_natural_exit() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-natexit");
-    let _pod_guard = PodGuard("test-k7d-natexit");
+    let pod = common::unique_name("test-k7d-natexit");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1841,15 +1805,9 @@ spec:
     // enough of the restart in that case).
     let deadline = Instant::now() + Duration::from_secs(180);
     let (first_id, first_restart_count) = loop {
-        let id = pod_jsonpath(
-            "test-k7d-natexit",
-            ".status.containerStatuses[0].containerID",
-        );
+        let id = pod_jsonpath(&pod, ".status.containerStatuses[0].containerID");
         if !id.is_empty() {
-            let rc = pod_jsonpath(
-                "test-k7d-natexit",
-                ".status.containerStatuses[0].restartCount",
-            );
+            let rc = pod_jsonpath(&pod, ".status.containerStatuses[0].restartCount");
             break (id, rc);
         }
         assert!(
@@ -1864,11 +1822,11 @@ spec:
     // state.terminated during the restart window).
     loop {
         let last = pod_jsonpath(
-            "test-k7d-natexit",
+            &pod,
             ".status.containerStatuses[0].lastState.terminated.exitCode",
         );
         let current = pod_jsonpath(
-            "test-k7d-natexit",
+            &pod,
             ".status.containerStatuses[0].state.terminated.exitCode",
         );
         if last == "7" || current == "7" {
@@ -1884,18 +1842,9 @@ spec:
     // restartPolicy: Always — the kubelet restarts it: restartCount
     // rises and the container runs again under a NEW containerd id.
     loop {
-        let restart_count = pod_jsonpath(
-            "test-k7d-natexit",
-            ".status.containerStatuses[0].restartCount",
-        );
-        let running = pod_jsonpath(
-            "test-k7d-natexit",
-            ".status.containerStatuses[0].state.running.startedAt",
-        );
-        let id = pod_jsonpath(
-            "test-k7d-natexit",
-            ".status.containerStatuses[0].containerID",
-        );
+        let restart_count = pod_jsonpath(&pod, ".status.containerStatuses[0].restartCount");
+        let running = pod_jsonpath(&pod, ".status.containerStatuses[0].state.running.startedAt");
+        let id = pod_jsonpath(&pod, ".status.containerStatuses[0].containerID");
         let restarted = restart_count.parse::<u32>().unwrap_or(0) >= 1;
         let new_id = first_restart_count != "0" || (!id.is_empty() && id != first_id);
         if restarted && !running.is_empty() && new_id {
@@ -1909,7 +1858,7 @@ spec:
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    kubectl_delete("pod", "test-k7d-natexit").unwrap();
+    kubectl_delete("pod", &pod).unwrap();
 }
 
 /// Init containers sequence end-to-end with NO shim
@@ -1932,8 +1881,9 @@ spec:
 #[test]
 fn test_init_container_sequencing() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-initseq");
-    let _pod_guard = PodGuard("test-k7d-initseq");
+    let pod = common::unique_name("test-k7d-initseq");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -1967,24 +1917,21 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-initseq", Duration::from_secs(240)).unwrap();
-    wait_for_all_containers_ready("test-k7d-initseq", Duration::from_secs(60)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(240)).unwrap();
+    wait_for_all_containers_ready(&pod, Duration::from_secs(60)).unwrap();
 
     // Both init containers report Terminated/Completed with the REAL
     // exit code 0 (natural-exit observation).
     for (idx, name) in [(0, "init-marker"), (1, "init-same")] {
-        let got_name = pod_jsonpath(
-            "test-k7d-initseq",
-            &format!(".status.initContainerStatuses[{idx}].name"),
-        );
+        let got_name = pod_jsonpath(&pod, &format!(".status.initContainerStatuses[{idx}].name"));
         assert_eq!(got_name, name, "init container order in pod status");
         let exit_code = pod_jsonpath(
-            "test-k7d-initseq",
+            &pod,
             &format!(".status.initContainerStatuses[{idx}].state.terminated.exitCode"),
         );
         assert_eq!(exit_code, "0", "{name} must terminate with exit 0");
         let reason = pod_jsonpath(
-            "test-k7d-initseq",
+            &pod,
             &format!(".status.initContainerStatuses[{idx}].state.terminated.reason"),
         );
         assert_eq!(reason, "Completed", "{name} termination reason");
@@ -1995,21 +1942,18 @@ spec:
     // UTC of equal length, so lexicographic comparison is
     // chronological.
     let init1_finished = pod_jsonpath(
-        "test-k7d-initseq",
+        &pod,
         ".status.initContainerStatuses[0].state.terminated.finishedAt",
     );
     let init2_started = pod_jsonpath(
-        "test-k7d-initseq",
+        &pod,
         ".status.initContainerStatuses[1].state.terminated.startedAt",
     );
     let init2_finished = pod_jsonpath(
-        "test-k7d-initseq",
+        &pod,
         ".status.initContainerStatuses[1].state.terminated.finishedAt",
     );
-    let main_started = pod_jsonpath(
-        "test-k7d-initseq",
-        ".status.containerStatuses[0].state.running.startedAt",
-    );
+    let main_started = pod_jsonpath(&pod, ".status.containerStatuses[0].state.running.startedAt");
     assert!(
         !init1_finished.is_empty() && !init2_started.is_empty() && !main_started.is_empty(),
         "pod status timestamps must be populated \
@@ -2028,12 +1972,12 @@ spec:
 
     // Marker-based ordering proof: main checked for the marker at ITS
     // startup, so the log line is only right if init ran first.
-    let main_logs = kubectl_logs_c("test-k7d-initseq", "main").unwrap();
+    let main_logs = kubectl_logs_c(&pod, "main").unwrap();
     assert!(
         main_logs.contains("main-saw-marker"),
         "main must see the init marker at startup; logs: {main_logs}"
     );
-    let out = kubectl_exec_c("test-k7d-initseq", "main", &["cat", "/shared/init-done"]).unwrap();
+    let out = kubectl_exec_c(&pod, "main", &["cat", "/shared/init-done"]).unwrap();
     assert_eq!(out.trim(), "from-init");
 
     // ── Same-image share survives init Delete ──
@@ -2042,11 +1986,8 @@ spec:
     // init's claim on the shared erofs key and must NOT unmount the
     // rootfs the main container still runs from (it fails loud if
     // the refcount invariant is violated — which would fail the rm).
-    let main_id_before = pod_jsonpath(
-        "test-k7d-initseq",
-        ".status.containerStatuses[0].containerID",
-    );
-    let sandbox_id = common::pod_sandbox_id("test-k7d-initseq");
+    let main_id_before = pod_jsonpath(&pod, ".status.containerStatuses[0].containerID");
+    let sandbox_id = common::pod_sandbox_id(&pod);
     let ps = std::process::Command::new("k3s")
         .args([
             "crictl",
@@ -2084,28 +2025,20 @@ spec:
 
     // Main still runs from the shared erofs mount: a rootfs read
     // (uncached file off the erofs device) and an exec both work.
-    let out = kubectl_exec_c("test-k7d-initseq", "main", &["cat", "/etc/os-release"]).unwrap();
+    let out = kubectl_exec_c(&pod, "main", &["cat", "/etc/os-release"]).unwrap();
     assert!(out.contains("Alpine"), "rootfs read after init rm: {out}");
-    let out = kubectl_exec_c(
-        "test-k7d-initseq",
-        "main",
-        &["sh", "-c", "echo still-alive"],
-    )
-    .unwrap();
+    let out = kubectl_exec_c(&pod, "main", &["sh", "-c", "echo still-alive"]).unwrap();
     assert_eq!(out.trim(), "still-alive");
 
     // And the removal did not disturb the main container.
     std::thread::sleep(Duration::from_secs(3));
-    let main_id_after = pod_jsonpath(
-        "test-k7d-initseq",
-        ".status.containerStatuses[0].containerID",
-    );
+    let main_id_after = pod_jsonpath(&pod, ".status.containerStatuses[0].containerID");
     assert_eq!(
         main_id_before, main_id_after,
         "main must not be restarted when the exited init is removed"
     );
 
-    kubectl_delete("pod", "test-k7d-initseq").unwrap();
+    kubectl_delete("pod", &pod).unwrap();
 }
 
 /// Two containers with different memory limits.
@@ -2125,8 +2058,9 @@ spec:
 #[test]
 fn test_kubectl_pod_per_container_memory_limits() {
     let _leak_guard = ensure_shim_installed();
-    let _ = kubectl_delete("pod", "test-k7d-ctrmem");
-    let _pod_guard = PodGuard("test-k7d-ctrmem");
+    let pod = common::unique_name("test-k7d-ctrmem");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(
@@ -2153,14 +2087,14 @@ spec:
 "#,
     ))
     .unwrap();
-    wait_for_pod_ready("test-k7d-ctrmem", Duration::from_secs(180)).unwrap();
-    wait_for_all_containers_ready("test-k7d-ctrmem", Duration::from_secs(60)).unwrap();
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).unwrap();
+    wait_for_all_containers_ready(&pod, Duration::from_secs(60)).unwrap();
 
     // A single 40 MiB dd buffer, faulted in by the read: over small's
     // 32Mi cgroup limit, under big's 256Mi. Guest OOM kills the small
     // exec (exit 137).
     let hog = ["dd", "if=/dev/zero", "of=/dev/null", "bs=40M", "count=1"];
-    let small_hog = kubectl_exec_c("test-k7d-ctrmem", "small", &hog);
+    let small_hog = kubectl_exec_c(&pod, "small", &hog);
     assert!(
         small_hog.is_err(),
         "40Mi anonymous allocation in a 32Mi cgroup must fail, got: {small_hog:?}"
@@ -2173,16 +2107,16 @@ spec:
 
     // The same allocation in the sibling must succeed — proves the
     // limits are per-container, not a shared VM-wide cap alone.
-    kubectl_exec_c("test-k7d-ctrmem", "big", &hog)
+    kubectl_exec_c(&pod, "big", &hog)
         .expect("40Mi anonymous allocation in a 256Mi cgroup must succeed");
-    let out = kubectl_exec_c("test-k7d-ctrmem", "big", &["echo", "still-alive"]).unwrap();
+    let out = kubectl_exec_c(&pod, "big", &["echo", "still-alive"]).unwrap();
     assert!(out.contains("still-alive"));
 
     // Small's main process survived the exec OOM (process-level).
-    let out = kubectl_exec_c("test-k7d-ctrmem", "small", &["echo", "small-alive"]).unwrap();
+    let out = kubectl_exec_c(&pod, "small", &["echo", "small-alive"]).unwrap();
     assert!(out.contains("small-alive"));
 
-    let _ = kubectl_delete("pod", "test-k7d-ctrmem");
+    let _ = kubectl_delete("pod", &pod);
 }
 
 /// kubectl logs latency.
@@ -2192,8 +2126,9 @@ fn test_kubectl_logs_works() {
     eprintln!("\n=== test_kubectl_logs_works: latency report ===");
 
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-logs");
 
-    let _ = kubectl_delete("pod", "test-k7d-logs");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     timed!("kubectl apply", {
@@ -2215,18 +2150,18 @@ spec:
     });
 
     timed!("Pod → Running", {
-        wait_for_pod_ready("test-k7d-logs", Duration::from_secs(120)).unwrap();
+        wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
     });
 
     std::thread::sleep(Duration::from_secs(3));
 
     timed!("kubectl logs", {
-        let logs = kubectl_logs("test-k7d-logs").unwrap();
+        let logs = kubectl_logs(&pod).unwrap();
         assert!(logs.contains("hello-from-k7d"), "kubectl logs: {:?}", logs);
     });
 
     timed!("kubectl delete + cleanup", {
-        kubectl_delete("pod", "test-k7d-logs").unwrap();
+        kubectl_delete("pod", &pod).unwrap();
     });
 
     eprintln!("  ⏱  {:.<50} {:>8.2?}", "TOTAL", total.elapsed());
@@ -2240,8 +2175,9 @@ fn test_kubectl_exec_non_interactive() {
     eprintln!("\n=== test_kubectl_exec_non_interactive: latency report ===");
 
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-exec");
 
-    let _ = kubectl_delete("pod", "test-k7d-exec");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     timed!("kubectl apply", {
@@ -2263,32 +2199,32 @@ spec:
     });
 
     timed!("Pod → Running", {
-        wait_for_pod_ready("test-k7d-exec", Duration::from_secs(120)).unwrap();
+        wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
     });
 
     timed!("kubectl exec: echo (1st)", {
-        let output = kubectl_exec("test-k7d-exec", &["echo", "k7d-exec"]).unwrap();
+        let output = kubectl_exec(&pod, &["echo", "k7d-exec"]).unwrap();
         assert_eq!(output.trim(), "k7d-exec");
     });
 
     timed!("kubectl exec: write file", {
-        kubectl_exec("test-k7d-exec", &["sh", "-c", "echo persist > /tmp/test"]).unwrap();
+        kubectl_exec(&pod, &["sh", "-c", "echo persist > /tmp/test"]).unwrap();
     });
 
     timed!("kubectl exec: read file", {
-        let read = kubectl_exec("test-k7d-exec", &["cat", "/tmp/test"]).unwrap();
+        let read = kubectl_exec(&pod, &["cat", "/tmp/test"]).unwrap();
         assert_eq!(read.trim(), "persist");
     });
 
     timed!("5x sequential kubectl exec", {
         for i in 0..5 {
-            let r = kubectl_exec("test-k7d-exec", &["echo", &format!("iter-{i}")]).unwrap();
+            let r = kubectl_exec(&pod, &["echo", &format!("iter-{i}")]).unwrap();
             assert_eq!(r.trim(), format!("iter-{i}"));
         }
     });
 
     timed!("kubectl delete", {
-        kubectl_delete("pod", "test-k7d-exec").unwrap();
+        kubectl_delete("pod", &pod).unwrap();
     });
 
     eprintln!("  ⏱  {:.<50} {:>8.2?}", "TOTAL", total.elapsed());
@@ -2352,8 +2288,9 @@ fn test_shim_survives_shim_kill() {
     eprintln!("\n=== test_shim_survives_shim_kill: latency report ===");
 
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-crash");
 
-    let _ = kubectl_delete("pod", "test-k7d-crash");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     timed!("kubectl apply", {
@@ -2375,12 +2312,12 @@ spec:
     });
 
     timed!("Pod → Running", {
-        wait_for_pod_ready("test-k7d-crash", Duration::from_secs(120)).unwrap();
+        wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
     });
 
     timed!("kubectl exec: write marker", {
-        kubectl_exec("test-k7d-crash", &["sh", "-c", "echo persist > /tmp/m"]).unwrap();
-        let read = kubectl_exec("test-k7d-crash", &["cat", "/tmp/m"]).unwrap();
+        kubectl_exec(&pod, &["sh", "-c", "echo persist > /tmp/m"]).unwrap();
+        let read = kubectl_exec(&pod, &["cat", "/tmp/m"]).unwrap();
         assert_eq!(read.trim(), "persist");
     });
 
@@ -2417,18 +2354,12 @@ spec:
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let phase = std::process::Command::new("kubectl")
-                .args([
-                    "get",
-                    "pod",
-                    "test-k7d-crash",
-                    "-o",
-                    "jsonpath={.status.phase}",
-                ])
+                .args(["get", "pod", &pod, "-o", "jsonpath={.status.phase}"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default();
             if phase == "Running" {
-                if let Ok(out) = kubectl_exec("test-k7d-crash", &["echo", "recovered"]) {
+                if let Ok(out) = kubectl_exec(&pod, &["echo", "recovered"]) {
                     if out.trim() == "recovered" {
                         break start.elapsed();
                     }
@@ -2477,8 +2408,8 @@ spec:
     );
 
     timed!("kubectl delete + cleanup", {
-        kubectl_delete("pod", "test-k7d-crash").unwrap();
-        wait_for_pod_gone("test-k7d-crash", Duration::from_secs(30)).unwrap();
+        kubectl_delete("pod", &pod).unwrap();
+        wait_for_pod_gone(&pod, Duration::from_secs(30)).unwrap();
     });
 
     eprintln!("  ⏱  {:.<50} {:>8.2?}", "TOTAL", total.elapsed());
@@ -2492,8 +2423,9 @@ fn test_pod_delete_cleans_up() {
     eprintln!("\n=== test_pod_delete_cleans_up: latency report ===");
 
     let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-cleanup");
 
-    let _ = kubectl_delete("pod", "test-k7d-cleanup");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     timed!("kubectl apply", {
@@ -2515,15 +2447,15 @@ spec:
     });
 
     timed!("Pod → Running", {
-        wait_for_pod_ready("test-k7d-cleanup", Duration::from_secs(120)).unwrap();
+        wait_for_pod_ready(&pod, Duration::from_secs(120)).unwrap();
     });
 
     timed!("kubectl delete pod", {
-        kubectl_delete("pod", "test-k7d-cleanup").unwrap();
+        kubectl_delete("pod", &pod).unwrap();
     });
 
     let teardown = timed!("Wait for pod gone (VM shutdown + cleanup)", {
-        wait_for_pod_gone("test-k7d-cleanup", Duration::from_secs(30)).unwrap()
+        wait_for_pod_gone(&pod, Duration::from_secs(30)).unwrap()
     });
     eprintln!("       (teardown latency: {teardown:.2?})");
 
@@ -2576,8 +2508,8 @@ fn vcpu_comms_in_cgroup(cg: &std::path::Path) -> Vec<String> {
 #[test]
 fn test_kubectl_pod_multi_vcpu_fork() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-mvcpu-fork";
-    let _ = kubectl_delete("pod", pod);
+    let pod = common::unique_name("test-k7d-mvcpu-fork");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -2598,13 +2530,13 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 
-    let nproc = kubectl_exec(pod, &["nproc"]).expect("nproc");
+    let nproc = kubectl_exec(&pod, &["nproc"]).expect("nproc");
     assert_eq!(nproc.trim(), "2", "cpu: \"2\" pod must see 2 vCPUs");
 
-    let src = common::pod_vm_state(pod);
-    let sandbox_id = common::pod_sandbox_id(pod);
+    let src = common::pod_vm_state(&pod);
+    let sandbox_id = common::pod_sandbox_id(&pod);
     let record_path = std::path::PathBuf::from(k7d::control::DEFAULT_SANDBOX_ROOT)
         .join(format!("{sandbox_id}.json"));
     let record: k7d::control::SandboxRecord =
@@ -2677,11 +2609,11 @@ spec:
     );
 
     // CID stability: source pod still answers after prepare swap.
-    let src_alive = kubectl_exec(pod, &["echo", "src-alive"]).expect("kubectl exec source");
+    let src_alive = kubectl_exec(&pod, &["echo", "src-alive"]).expect("kubectl exec source");
     assert!(src_alive.contains("src-alive"));
 
     let _ = daemon.call(&k7d::control::Request::StopVm { vm_id: fork_id });
-    let _ = kubectl_delete("pod", pod);
+    let _ = kubectl_delete("pod", &pod);
 }
 
 /// Annotation-driven cluster fork with mixed per-member vCPU
@@ -2700,12 +2632,12 @@ fn test_cluster_annotation_mixed_vcpus() {
         "cluster_id {cluster_id:?} too long for bridge name"
     );
     let pods = [
-        format!("test-k7d-mixvcpu-0-{}", std::process::id()),
-        format!("test-k7d-mixvcpu-1-{}", std::process::id()),
-        format!("test-k7d-mixvcpu-2-{}", std::process::id()),
+        common::unique_name("test-k7d-mixvcpu-0"),
+        common::unique_name("test-k7d-mixvcpu-1"),
+        common::unique_name("test-k7d-mixvcpu-2"),
     ];
     let vcpu_counts: [u32; 3] = [1, 2, 1];
-    let trigger = format!("test-k7d-mixvcpu-trig-{}", std::process::id());
+    let trigger = common::unique_name("test-k7d-mixvcpu-trig");
     let tree_id = format!("mixvcpu-{}", std::process::id());
 
     let teardown = |daemon: &mut k7d::control::Client| {
@@ -2757,11 +2689,11 @@ spec:
         .unwrap_or_else(|e| panic!("apply {pod}: {e}"));
     }
     for pod in &pods {
-        wait_for_pod_ready(pod, Duration::from_secs(180))
+        wait_for_pod_ready(&pod, Duration::from_secs(180))
             .unwrap_or_else(|e| panic!("pod {pod} ready: {e}"));
     }
     for (pod, &want) in pods.iter().zip(&vcpu_counts) {
-        let nproc = kubectl_exec(pod, &["nproc"]).expect("nproc");
+        let nproc = kubectl_exec(&pod, &["nproc"]).expect("nproc");
         assert_eq!(
             nproc.trim(),
             want.to_string(),
@@ -2877,16 +2809,16 @@ fn test_kubectl_fork_source_annotation() {
     let _leak_guard = ensure_shim_installed();
     common::ensure_pod_annotations_forwarded();
 
-    let src = "test-k7d-fsrc-a";
-    let fork = "test-k7d-fsrc-b";
+    let src = common::unique_name("test-k7d-fsrc-a");
+    let fork = common::unique_name("test-k7d-fsrc-b");
     let cluster_id = format!("fsrc{}", std::process::id() % 10_000);
     assert!(
         cluster_id.len() <= 9,
         "cluster_id {cluster_id:?} too long for bridge name"
     );
 
-    let _ = kubectl_delete("pod", src);
-    let _ = kubectl_delete("pod", fork);
+    let _ = kubectl_delete("pod", &src);
+    let _ = kubectl_delete("pod", &fork);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -2912,14 +2844,14 @@ spec:
 "#
     )))
     .expect("apply source");
-    wait_for_pod_ready(src, Duration::from_secs(120)).expect("source ready");
+    wait_for_pod_ready(&src, Duration::from_secs(120)).expect("source ready");
 
-    let src_state = common::pod_vm_state(src);
+    let src_state = common::pod_vm_state(&src);
     assert_eq!(
         src_state.virtiofs_shares, 0,
         "emptyDir source must be block-backed (zero virtiofs)"
     );
-    let src_sandbox = common::pod_sandbox_id(src);
+    let src_sandbox = common::pod_sandbox_id(&src);
 
     // Annotation-only drive path: the fork pod's Create performs
     // LookupSandbox + ForkVm. `fork-source-vm` is the CRI sandbox id
@@ -2943,9 +2875,9 @@ spec:
 "#
     )))
     .expect("apply fork");
-    wait_for_pod_ready(fork, Duration::from_secs(180)).expect("fork pod Running");
+    wait_for_pod_ready(&fork, Duration::from_secs(180)).expect("fork pod Running");
 
-    let fork_state = common::pod_vm_state(fork);
+    let fork_state = common::pod_vm_state(&fork);
     assert!(
         !fork_state.fork_memory_full_copy,
         "annotation fork of share-less source must be CoW, not full memfd copy"
@@ -2956,7 +2888,7 @@ spec:
         "fork must be a distinct VM id from the source"
     );
 
-    let alive = kubectl_exec(fork, &["echo", "fork-alive"]).expect("exec in fork");
+    let alive = kubectl_exec(&fork, &["echo", "fork-alive"]).expect("exec in fork");
     assert!(
         alive.contains("fork-alive"),
         "fork workload must answer kubectl exec: {alive:?}"
@@ -2964,14 +2896,14 @@ spec:
 
     // CID stability (/ CHALLENGES #39): source still
     // answers after the prepare swap triggered by the annotation fork.
-    let src_alive = kubectl_exec(src, &["echo", "src-alive"]).expect("exec in source");
+    let src_alive = kubectl_exec(&src, &["echo", "src-alive"]).expect("exec in source");
     assert!(
         src_alive.contains("src-alive"),
         "source must still exec after annotation ForkVm: {src_alive:?}"
     );
 
-    let _ = kubectl_delete("pod", fork);
-    let _ = kubectl_delete("pod", src);
+    let _ = kubectl_delete("pod", &fork);
+    let _ = kubectl_delete("pod", &src);
 }
 
 /// / 18a: half-specified `fork-source-*` annotations fail
@@ -2983,15 +2915,15 @@ fn test_kubectl_fork_source_half_specified_fails_loud() {
 
     for (name, annotations) in [
         (
-            "test-k7d-fsrc-half-vm",
+            common::unique_name("test-k7d-fsrc-half-vm"),
             r#"    k7d.katakate.org/fork-source-vm: "deadbeef""#,
         ),
         (
-            "test-k7d-fsrc-half-cl",
+            common::unique_name("test-k7d-fsrc-half-cl"),
             r#"    k7d.katakate.org/fork-source-cluster: "orphan""#,
         ),
     ] {
-        let _ = kubectl_delete("pod", name);
+        let _ = kubectl_delete("pod", &name);
         std::thread::sleep(Duration::from_secs(1));
         kubectl_apply(&common::pin_to_local_node(&format!(
             r#"
@@ -3015,7 +2947,7 @@ spec:
         let deadline = Instant::now() + Duration::from_secs(120);
         let describe = loop {
             let output = std::process::Command::new("kubectl")
-                .args(["describe", "pod", name])
+                .args(["describe", "pod", &name])
                 .output()
                 .expect("kubectl describe");
             let describe = String::from_utf8_lossy(&output.stdout).to_string();
@@ -3034,12 +2966,12 @@ spec:
             "error must name both annotation keys; describe:\n{describe}"
         );
         // Must never reach Running — Create failed.
-        let phase = pod_jsonpath(name, ".status.phase");
+        let phase = pod_jsonpath(&name, ".status.phase");
         assert_ne!(
             phase, "Running",
             "half-specified fork-source pod must not become Running"
         );
-        let _ = kubectl_delete("pod", name);
+        let _ = kubectl_delete("pod", &name);
     }
 }
 
@@ -3050,8 +2982,8 @@ spec:
 #[test]
 fn test_kubectl_pause_resume_over_socket() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-pause-sock";
-    let _ = kubectl_delete("pod", pod);
+    let pod = common::unique_name("test-k7d-pause-sock");
+    let _ = kubectl_delete("pod", &pod);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -3072,12 +3004,12 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 
-    let pre = kubectl_exec(pod, &["echo", "pre-pause"]).expect("exec before pause");
+    let pre = kubectl_exec(&pod, &["echo", "pre-pause"]).expect("exec before pause");
     assert!(pre.contains("pre-pause"));
 
-    let sandbox_id = common::pod_sandbox_id(pod);
+    let sandbox_id = common::pod_sandbox_id(&pod);
     let mut daemon = k7d::control::Client::connect_env().expect("connect k7d daemon");
     let (vm_id, guest_cid) = match daemon
         .call(&k7d::control::Request::LookupSandbox {
@@ -3122,7 +3054,7 @@ spec:
     assert!(!pong.version.is_empty());
     drop(agent);
 
-    let post = kubectl_exec(pod, &["echo", "post-resume"]).expect("exec after resume");
+    let post = kubectl_exec(&pod, &["echo", "post-resume"]).expect("exec after resume");
     assert!(post.contains("post-resume"));
 
     // Invariant: resume re-attaches fresh vCPU TIDs to the CFS cgroup.
@@ -3144,7 +3076,7 @@ spec:
         "both vCPU TIDs must be in the CFS cgroup after resume"
     );
 
-    let _ = kubectl_delete("pod", pod);
+    let _ = kubectl_delete("pod", &pod);
 }
 
 /// / CHALLENGES #60: after an annotation-driven fork, deleting
@@ -3156,13 +3088,13 @@ fn test_kubectl_fork_source_teardown() {
     let _leak_guard = ensure_shim_installed();
     common::ensure_pod_annotations_forwarded();
 
-    let src = "test-k7d-fsrc-td-a";
-    let fork = "test-k7d-fsrc-td-b";
+    let src = common::unique_name("test-k7d-fsrc-td-a");
+    let fork = common::unique_name("test-k7d-fsrc-td-b");
     let cluster_id = format!("fstd{}", std::process::id() % 10_000);
     assert!(cluster_id.len() <= 9);
 
-    let _ = kubectl_delete("pod", src);
-    let _ = kubectl_delete("pod", fork);
+    let _ = kubectl_delete("pod", &src);
+    let _ = kubectl_delete("pod", &fork);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -3188,8 +3120,8 @@ spec:
 "#
     )))
     .expect("apply source");
-    wait_for_pod_ready(src, Duration::from_secs(120)).expect("source ready");
-    let src_sandbox = common::pod_sandbox_id(src);
+    wait_for_pod_ready(&src, Duration::from_secs(120)).expect("source ready");
+    let src_sandbox = common::pod_sandbox_id(&src);
 
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -3210,7 +3142,7 @@ spec:
 "#
     )))
     .expect("apply fork");
-    wait_for_pod_ready(fork, Duration::from_secs(180)).expect("fork ready");
+    wait_for_pod_ready(&fork, Duration::from_secs(180)).expect("fork ready");
 
     // Fire-and-forget delete of both; the regression is the source
     // wedging in Terminating after prepare_fork_source swapped its
@@ -3219,8 +3151,8 @@ spec:
         .args([
             "delete",
             "pod",
-            src,
-            fork,
+            &src,
+            &fork,
             "--ignore-not-found",
             "--wait=false",
             "--grace-period=1",
@@ -3243,7 +3175,7 @@ spec:
                 .expect("kubectl get");
             o.status.success() && o.stdout.is_empty()
         };
-        if gone(src) && gone(fork) {
+        if gone(&src) && gone(&fork) {
             break;
         }
         assert!(
@@ -3252,8 +3184,8 @@ spec:
              source={:?} fork={:?}\n\
              (CHALLENGES #60: source stuck in Terminating = Kill on dead agent)",
             start.elapsed(),
-            pod_jsonpath(src, ".status.phase"),
-            pod_jsonpath(fork, ".status.phase"),
+            pod_jsonpath(&src, ".status.phase"),
+            pod_jsonpath(&fork, ".status.phase"),
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -3310,7 +3242,7 @@ fn crictl_stats() -> (bool, Vec<String>) {
 /// Container ids of a pod, per crictl.
 fn pod_container_ids(pod: &str) -> Vec<String> {
     let out = std::process::Command::new("k3s")
-        .args(["crictl", "ps", "-q", "--pod", &common::pod_sandbox_id(pod)])
+        .args(["crictl", "ps", "-q", "--pod", &common::pod_sandbox_id(&pod)])
         .output()
         .expect("k3s crictl ps should run");
     String::from_utf8_lossy(&out.stdout)
@@ -3343,9 +3275,9 @@ fn test_kubectl_pod_per_container_scratch_limits() {
         "crictl stats must work on this node before the test starts"
     );
 
-    let pod = "test-k7d-cscratch";
-    let _ = kubectl_delete("pod", pod);
-    let _pod_guard = PodGuard(pod);
+    let pod = common::unique_name("test-k7d-cscratch");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     // 64Mi for `builder`, 1Gi shared for everyone else. Both numbers
@@ -3375,11 +3307,11 @@ spec:
 "#
     )))
     .expect("apply per-container scratch pod");
-    wait_for_pod_ready(pod, Duration::from_secs(240)).expect("pod ready");
-    wait_for_all_containers_ready(pod, Duration::from_secs(120)).expect("both containers ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(240)).expect("pod ready");
+    wait_for_all_containers_ready(&pod, Duration::from_secs(120)).expect("both containers ready");
 
     // Two images on the host: the pod's shared scratch and builder's own.
-    let vm_id = common::pod_vm_id(pod);
+    let vm_id = common::pod_vm_id(&pod);
     let shared =
         std::path::PathBuf::from(k7d::disks::DISKS_DIR).join(format!("scratch-{vm_id}.img"));
     let builder = std::path::PathBuf::from(k7d::disks::DISKS_DIR)
@@ -3398,7 +3330,7 @@ spec:
     // the daemon attached the image at.
     let mount = k7d::disks::container_scratch_mount("builder");
     let mounts =
-        kubectl_exec_c(pod, "builder", &["cat", "/proc/mounts"]).expect("read /proc/mounts");
+        kubectl_exec_c(&pod, "builder", &["cat", "/proc/mounts"]).expect("read /proc/mounts");
     assert!(
         mounts
             .lines()
@@ -3411,7 +3343,7 @@ spec:
     // `; echo rc=` so the exec itself succeeds and dd's own complaint
     // comes back on stdout — only the write is expected to fail.
     let attempt = kubectl_exec_c(
-        pod,
+        &pod,
         "builder",
         &[
             "sh",
@@ -3430,7 +3362,7 @@ spec:
         "builder must hit a clean ENOSPC on its own device, got: {attempt}"
     );
     kubectl_exec_c(
-        pod,
+        &pod,
         "sidecar",
         &[
             "sh",
@@ -3451,7 +3383,7 @@ spec:
     while Instant::now() < deadline && !saw_usage {
         let (ok, ids) = crictl_stats();
         assert!(ok, "crictl stats must keep working while k7 pods report");
-        for id in pod_container_ids(pod) {
+        for id in pod_container_ids(&pod) {
             assert!(
                 ids.contains(&id),
                 "container {id} of {pod} is missing from crictl stats"
@@ -3485,7 +3417,7 @@ spec:
     );
 
     // Both images are scratch: deleting the pod takes them with it.
-    kubectl_delete("pod", pod).expect("delete pod");
+    kubectl_delete("pod", &pod).expect("delete pod");
     let deadline = Instant::now() + Duration::from_secs(60);
     while shared.exists() || builder.exists() {
         assert!(
@@ -3508,12 +3440,12 @@ spec:
 fn test_non_k7_pod_still_reports_stats_beside_a_k7_pod() {
     let _leak_guard = ensure_shim_installed();
 
-    let stock = "test-k7d-stock-stats";
-    let k7 = "test-k7d-stats-neighbour";
-    let _ = kubectl_delete("pod", stock);
-    let _ = kubectl_delete("pod", k7);
-    let _stock_guard = PodGuard(stock);
-    let _k7_guard = PodGuard(k7);
+    let stock = common::unique_name("test-k7d-stock-stats");
+    let k7 = common::unique_name("test-k7d-stats-neighbour");
+    let _ = kubectl_delete("pod", &stock);
+    let _ = kubectl_delete("pod", &k7);
+    let _stock_guard = PodGuard(stock.clone());
+    let _k7_guard = PodGuard(k7.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     // No runtimeClassName: stock containerd + runc, pinned to this node.
@@ -3549,12 +3481,12 @@ spec:
 "#
     )))
     .expect("apply k7 pod");
-    wait_for_pod_ready(stock, Duration::from_secs(180)).expect("stock pod ready");
-    wait_for_pod_ready(k7, Duration::from_secs(240)).expect("k7 pod ready");
+    wait_for_pod_ready(&stock, Duration::from_secs(180)).expect("stock pod ready");
+    wait_for_pod_ready(&k7, Duration::from_secs(240)).expect("k7 pod ready");
 
-    let want = pod_container_ids(stock);
+    let want = pod_container_ids(&stock);
     assert!(!want.is_empty(), "no CRI containers for {stock}");
-    let k7_containers = pod_container_ids(k7);
+    let k7_containers = pod_container_ids(&k7);
     assert!(!k7_containers.is_empty(), "no CRI containers for {k7}");
 
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -3577,8 +3509,8 @@ spec:
         std::thread::sleep(Duration::from_secs(3));
     }
 
-    kubectl_delete("pod", k7).expect("delete k7 pod");
-    kubectl_delete("pod", stock).expect("delete stock pod");
+    kubectl_delete("pod", &k7).expect("delete k7 pod");
+    kubectl_delete("pod", &stock).expect("delete stock pod");
 }
 
 /// End to end through kubectl: a pod annotated with
@@ -3593,9 +3525,9 @@ fn test_kubectl_pod_scratch_disk_off_guest_ram() {
     // forwards k7d.katakate.org/* pod annotations into the OCI spec.
     common::ensure_pod_annotations_forwarded();
 
-    let pod = "test-k7d-scratch";
-    let _ = kubectl_delete("pod", pod);
-    let _pod_guard = PodGuard(pod);
+    let pod = common::unique_name("test-k7d-scratch");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
     std::thread::sleep(Duration::from_secs(2));
 
     // 512Mi limit ⇒ a ~576 MB guest (adds 64 MB overhead), so
@@ -3621,10 +3553,10 @@ spec:
 "#
     )))
     .expect("apply scratch pod");
-    wait_for_pod_ready(pod, Duration::from_secs(180)).expect("scratch pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).expect("scratch pod ready");
 
     // The daemon named the image after the VM it belongs to.
-    let vm_id = common::pod_vm_id(pod);
+    let vm_id = common::pod_vm_id(&pod);
     let image =
         std::path::PathBuf::from(k7d::disks::DISKS_DIR).join(format!("scratch-{vm_id}.img"));
     assert!(
@@ -3633,7 +3565,7 @@ spec:
         image.display()
     );
 
-    let mem_before = kubectl_exec(pod, &["grep", "MemAvailable", "/proc/meminfo"])
+    let mem_before = kubectl_exec(&pod, &["grep", "MemAvailable", "/proc/meminfo"])
         .expect("read guest MemAvailable");
     let mem_before: u64 = mem_before
         .split_whitespace()
@@ -3644,7 +3576,7 @@ spec:
 
     let write_mib = 1024u32;
     let digest_hot = kubectl_exec(
-        pod,
+        &pod,
         &[
             "sh",
             "-c",
@@ -3664,7 +3596,7 @@ spec:
     // it necessarily comes back off the virtio-blk device rather than
     // out of the page cache — a matching digest is proof the bytes are
     // on the host image and intact.
-    let digest_cold = kubectl_exec(pod, &["sh", "-c", "md5sum /big | cut -d' ' -f1"])
+    let digest_cold = kubectl_exec(&pod, &["sh", "-c", "md5sum /big | cut -d' ' -f1"])
         .expect("re-read the file")
         .trim()
         .to_string();
@@ -3680,7 +3612,7 @@ spec:
         image.display()
     );
 
-    let mem_after = kubectl_exec(pod, &["grep", "MemAvailable", "/proc/meminfo"])
+    let mem_after = kubectl_exec(&pod, &["grep", "MemAvailable", "/proc/meminfo"])
         .expect("read guest MemAvailable again");
     let mem_after: u64 = mem_after
         .split_whitespace()
@@ -3695,7 +3627,7 @@ spec:
     );
 
     // Scratch is scratch: deleting the pod takes the host image with it.
-    kubectl_delete("pod", pod).expect("delete scratch pod");
+    kubectl_delete("pod", &pod).expect("delete scratch pod");
     let deadline = Instant::now() + Duration::from_secs(60);
     while image.exists() {
         assert!(

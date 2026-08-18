@@ -134,28 +134,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
-    let output = std::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(yaml.as_bytes())
-                .unwrap();
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("kubectl apply: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    common::kubectl_apply(yaml)
 }
 
 /// Graceful pod delete used at the end of every kubectl-driven
@@ -328,8 +307,10 @@ fn wait_for_pod_running(name: &str, timeout: Duration) -> Result<(), String> {
 #[test]
 fn test_configmap_mount_ro_and_readable() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_configmap(CONFIGMAP_NAME);
-    kubectl_delete_pod(POD_CFGMAP);
+    let pod_cfgmap = common::unique_name(POD_CFGMAP);
+    let configmap_name = common::unique_name(CONFIGMAP_NAME);
+    kubectl_delete_configmap(&configmap_name);
+    kubectl_delete_pod(&pod_cfgmap);
     std::thread::sleep(Duration::from_secs(2));
 
     // Apply ConfigMap first so kubelet has the source materialized
@@ -340,7 +321,7 @@ fn test_configmap_mount_ro_and_readable() {
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {CONFIGMAP_NAME}
+  name: {configmap_name}
 data:
   greeting: "hello from configmap"
   app.yaml: |
@@ -355,7 +336,7 @@ data:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_CFGMAP}
+  name: {pod_cfgmap}
 spec:
   runtimeClassName: k7
   containers:
@@ -369,17 +350,17 @@ spec:
   volumes:
   - name: cfg
     configMap:
-      name: {CONFIGMAP_NAME}
+      name: {configmap_name}
 "#
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_CFGMAP, Duration::from_secs(90))
+    wait_for_pod_running(&pod_cfgmap, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     // ConfigMap rides the block path (packed erofs
     // image on virtio-blk) — the pod must carry ZERO virtiofs shares.
-    let vm = common::pod_vm_state(POD_CFGMAP);
+    let vm = common::pod_vm_state(&pod_cfgmap);
     assert_eq!(
         vm.virtiofs_shares, 0,
         "configMap pod must be block-backed (zero virtiofs shares)"
@@ -391,7 +372,7 @@ spec:
     );
 
     // Flow 1: greeting file is readable with the expected content.
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_CFGMAP, None, &["cat", "/etc/app/greeting"]);
+    let (rc, stdout, stderr) = kubectl_exec_in(&pod_cfgmap, None, &["cat", "/etc/app/greeting"]);
     assert_eq!(
         rc, 0,
         "cat /etc/app/greeting should succeed: stderr={stderr}"
@@ -399,7 +380,7 @@ spec:
     assert_eq!(stdout, "hello from configmap");
 
     // Flow 2: multi-line yaml file mounted correctly.
-    let (rc, stdout, _) = kubectl_exec_in(POD_CFGMAP, None, &["cat", "/etc/app/app.yaml"]);
+    let (rc, stdout, _) = kubectl_exec_in(&pod_cfgmap, None, &["cat", "/etc/app/app.yaml"]);
     assert_eq!(rc, 0);
     assert!(
         stdout.contains("workers: 4") && stdout.contains("mode: production"),
@@ -411,7 +392,7 @@ spec:
     // Either the kernel EROFS or the FUSE-layer denial is fine;
     // we just assert "no, you can't write here".
     let (rc, _, stderr) = kubectl_exec_in(
-        POD_CFGMAP,
+        &pod_cfgmap,
         None,
         &["sh", "-c", "echo nope > /etc/app/greeting"],
     );
@@ -421,8 +402,8 @@ spec:
     );
 
     // Cleanup.
-    kubectl_delete_pod(POD_CFGMAP);
-    kubectl_delete_configmap(CONFIGMAP_NAME);
+    kubectl_delete_pod(&pod_cfgmap);
+    kubectl_delete_configmap(&configmap_name);
 }
 
 /// `emptyDir` shared between two containers in the same pod: the
@@ -434,7 +415,8 @@ spec:
 #[test]
 fn test_emptydir_shared_between_two_containers() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_EMPTYDIR);
+    let pod_emptydir = common::unique_name(POD_EMPTYDIR);
+    kubectl_delete_pod(&pod_emptydir);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -442,7 +424,7 @@ fn test_emptydir_shared_between_two_containers() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_EMPTYDIR}
+  name: {pod_emptydir}
 spec:
   runtimeClassName: k7
   containers:
@@ -463,7 +445,7 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_EMPTYDIR, Duration::from_secs(90))
+    wait_for_pod_running(&pod_emptydir, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     // The writer's command races with kubelet's "container started"
@@ -472,7 +454,7 @@ spec:
     std::thread::sleep(Duration::from_secs(1));
 
     let (rc, stdout, stderr) =
-        kubectl_exec_in(POD_EMPTYDIR, Some("reader"), &["cat", "/shared/msg"]);
+        kubectl_exec_in(&pod_emptydir, Some("reader"), &["cat", "/shared/msg"]);
     assert_eq!(
         rc, 0,
         "reader should see writer's file via emptyDir; stderr={stderr}"
@@ -487,7 +469,7 @@ spec:
     // directions, this confirms it's the same backing dir not two
     // independent copies.
     let (rc, _, stderr) = kubectl_exec_in(
-        POD_EMPTYDIR,
+        &pod_emptydir,
         Some("reader"),
         &["sh", "-c", "echo reader-was-here > /shared/reply"],
     );
@@ -495,11 +477,11 @@ spec:
         rc, 0,
         "reader should be able to write to emptyDir: {stderr}"
     );
-    let (rc, stdout, _) = kubectl_exec_in(POD_EMPTYDIR, Some("writer"), &["cat", "/shared/reply"]);
+    let (rc, stdout, _) = kubectl_exec_in(&pod_emptydir, Some("writer"), &["cat", "/shared/reply"]);
     assert_eq!(rc, 0);
     assert_eq!(stdout.trim(), "reader-was-here");
 
-    kubectl_delete_pod(POD_EMPTYDIR);
+    kubectl_delete_pod(&pod_emptydir);
 }
 
 // ----------------------------------------------------------------
@@ -522,8 +504,10 @@ spec:
 #[test]
 fn test_secret_mount_ro_and_readable() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_secret(SECRET_NAME);
-    kubectl_delete_pod(POD_SECRET);
+    let pod_secret = common::unique_name(POD_SECRET);
+    let secret_name = common::unique_name(SECRET_NAME);
+    kubectl_delete_secret(&secret_name);
+    kubectl_delete_pod(&pod_secret);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&format!(
@@ -531,7 +515,7 @@ fn test_secret_mount_ro_and_readable() {
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {SECRET_NAME}
+  name: {secret_name}
 type: Opaque
 stringData:
   api-key: "sk-test-1234567890"
@@ -545,7 +529,7 @@ stringData:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_SECRET}
+  name: {pod_secret}
 spec:
   runtimeClassName: k7
   containers:
@@ -559,33 +543,33 @@ spec:
   volumes:
   - name: creds
     secret:
-      secretName: {SECRET_NAME}
+      secretName: {secret_name}
 "#
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_SECRET, Duration::from_secs(90))
+    wait_for_pod_running(&pod_secret, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     // The two Secret keys land as files under the mount path.
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_SECRET, None, &["cat", "/run/creds/api-key"]);
+    let (rc, stdout, stderr) = kubectl_exec_in(&pod_secret, None, &["cat", "/run/creds/api-key"]);
     assert_eq!(rc, 0, "cat /run/creds/api-key should succeed: {stderr}");
     assert_eq!(stdout, "sk-test-1234567890");
 
-    let (rc, stdout, _) = kubectl_exec_in(POD_SECRET, None, &["cat", "/run/creds/db-password"]);
+    let (rc, stdout, _) = kubectl_exec_in(&pod_secret, None, &["cat", "/run/creds/db-password"]);
     assert_eq!(rc, 0);
     assert_eq!(stdout, "hunter2");
 
     // RO enforcement — same VFS-layer EROFS path as ConfigMap.
     let (rc, _, _) = kubectl_exec_in(
-        POD_SECRET,
+        &pod_secret,
         None,
         &["sh", "-c", "echo nope > /run/creds/api-key"],
     );
     assert_ne!(rc, 0, "write to ro Secret mount should have failed");
 
-    kubectl_delete_pod(POD_SECRET);
-    kubectl_delete_secret(SECRET_NAME);
+    kubectl_delete_pod(&pod_secret);
+    kubectl_delete_secret(&secret_name);
 }
 
 /// `downwardAPI` volume: kubelet writes pod-metadata files into
@@ -598,7 +582,8 @@ spec:
 #[test]
 fn test_downwardapi_pod_name_and_namespace_visible() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_DOWNWARD);
+    let pod_downward = common::unique_name(POD_DOWNWARD);
+    kubectl_delete_pod(&pod_downward);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -606,7 +591,7 @@ fn test_downwardapi_pod_name_and_namespace_visible() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_DOWNWARD}
+  name: {pod_downward}
 spec:
   runtimeClassName: k7
   containers:
@@ -628,20 +613,20 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_DOWNWARD, Duration::from_secs(90))
+    wait_for_pod_running(&pod_downward, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     let (rc, stdout, stderr) =
-        kubectl_exec_in(POD_DOWNWARD, None, &["cat", "/etc/podinfo/pod-name"]);
+        kubectl_exec_in(&pod_downward, None, &["cat", "/etc/podinfo/pod-name"]);
     assert_eq!(rc, 0, "cat /etc/podinfo/pod-name should succeed: {stderr}");
-    assert_eq!(stdout.trim(), POD_DOWNWARD);
+    assert_eq!(stdout.trim(), pod_downward);
 
     let (rc, stdout, _) =
-        kubectl_exec_in(POD_DOWNWARD, None, &["cat", "/etc/podinfo/pod-namespace"]);
+        kubectl_exec_in(&pod_downward, None, &["cat", "/etc/podinfo/pod-namespace"]);
     assert_eq!(rc, 0);
     assert_eq!(stdout.trim(), "default");
 
-    kubectl_delete_pod(POD_DOWNWARD);
+    kubectl_delete_pod(&pod_downward);
 }
 
 /// `projected` volume combining a `configMap` source and a
@@ -664,9 +649,12 @@ spec:
 #[test]
 fn test_projected_combines_configmap_and_secret() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_PROJECTED);
-    kubectl_delete_configmap(PROJECTED_CFGMAP);
-    kubectl_delete_secret(PROJECTED_SECRET);
+    let pod_projected = common::unique_name(POD_PROJECTED);
+    let projected_cfgmap = common::unique_name(PROJECTED_CFGMAP);
+    let projected_secret = common::unique_name(PROJECTED_SECRET);
+    kubectl_delete_pod(&pod_projected);
+    kubectl_delete_configmap(&projected_cfgmap);
+    kubectl_delete_secret(&projected_secret);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&format!(
@@ -674,14 +662,14 @@ fn test_projected_combines_configmap_and_secret() {
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {PROJECTED_CFGMAP}
+  name: {projected_cfgmap}
 data:
   greeting: "hello from projected cm"
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {PROJECTED_SECRET}
+  name: {projected_secret}
 type: Opaque
 stringData:
   token: "tk-projected-001"
@@ -694,7 +682,7 @@ stringData:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_PROJECTED}
+  name: {pod_projected}
 spec:
   runtimeClassName: k7
   containers:
@@ -710,12 +698,12 @@ spec:
     projected:
       sources:
       - configMap:
-          name: {PROJECTED_CFGMAP}
+          name: {projected_cfgmap}
           items:
           - key: greeting
             path: cm-greeting
       - secret:
-          name: {PROJECTED_SECRET}
+          name: {projected_secret}
           items:
           - key: token
             path: secret-token
@@ -723,11 +711,11 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_PROJECTED, Duration::from_secs(90))
+    wait_for_pod_running(&pod_projected, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     let (rc, stdout, stderr) =
-        kubectl_exec_in(POD_PROJECTED, None, &["cat", "/etc/combined/cm-greeting"]);
+        kubectl_exec_in(&pod_projected, None, &["cat", "/etc/combined/cm-greeting"]);
     assert_eq!(
         rc, 0,
         "cat /etc/combined/cm-greeting should succeed: {stderr}"
@@ -735,13 +723,13 @@ spec:
     assert_eq!(stdout.trim(), "hello from projected cm");
 
     let (rc, stdout, _) =
-        kubectl_exec_in(POD_PROJECTED, None, &["cat", "/etc/combined/secret-token"]);
+        kubectl_exec_in(&pod_projected, None, &["cat", "/etc/combined/secret-token"]);
     assert_eq!(rc, 0);
     assert_eq!(stdout.trim(), "tk-projected-001");
 
-    kubectl_delete_pod(POD_PROJECTED);
-    kubectl_delete_configmap(PROJECTED_CFGMAP);
-    kubectl_delete_secret(PROJECTED_SECRET);
+    kubectl_delete_pod(&pod_projected);
+    kubectl_delete_configmap(&projected_cfgmap);
+    kubectl_delete_secret(&projected_secret);
 }
 
 /// DNS in the guest VM — the long-deferred CNI follow-up.
@@ -779,7 +767,8 @@ spec:
 #[test]
 fn test_dns_resolution_inside_guest() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_DNS);
+    let pod_dns = common::unique_name(POD_DNS);
+    kubectl_delete_pod(&pod_dns);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -787,7 +776,7 @@ fn test_dns_resolution_inside_guest() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_DNS}
+  name: {pod_dns}
 spec:
   runtimeClassName: k7
   containers:
@@ -798,11 +787,12 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_DNS, Duration::from_secs(90)).expect("pod should reach Running+Ready");
+    wait_for_pod_running(&pod_dns, Duration::from_secs(90))
+        .expect("pod should reach Running+Ready");
 
     // Step 1: /etc/resolv.conf is visible AND contains a
     // `nameserver` directive.
-    let (rc, resolv, stderr) = kubectl_exec_in(POD_DNS, None, &["cat", "/etc/resolv.conf"]);
+    let (rc, resolv, stderr) = kubectl_exec_in(&pod_dns, None, &["cat", "/etc/resolv.conf"]);
     assert_eq!(
         rc, 0,
         "cat /etc/resolv.conf should succeed inside guest: stderr={stderr}"
@@ -815,11 +805,11 @@ spec:
 
     // Step 2: /etc/hostname matches the pod name. kubelet sets
     // hostname to the pod name unless `spec.hostname` overrides it.
-    let (rc, hostname, _) = kubectl_exec_in(POD_DNS, None, &["cat", "/etc/hostname"]);
+    let (rc, hostname, _) = kubectl_exec_in(&pod_dns, None, &["cat", "/etc/hostname"]);
     assert_eq!(rc, 0);
     assert_eq!(
         hostname.trim(),
-        POD_DNS,
+        pod_dns,
         "guest /etc/hostname should be the pod name, got: {hostname:?}"
     );
 
@@ -834,7 +824,7 @@ spec:
     // Service). If this resolves, every other k8s in-cluster
     // name resolution path also works.
     let (rc, stdout, stderr) = kubectl_exec_in(
-        POD_DNS,
+        &pod_dns,
         None,
         &["nslookup", "kubernetes.default.svc.cluster.local"],
     );
@@ -853,7 +843,7 @@ spec:
         "nslookup output should mention an Address or Server line: {stdout}"
     );
 
-    kubectl_delete_pod(POD_DNS);
+    kubectl_delete_pod(&pod_dns);
 }
 
 // ----------------------------------------------------------------
@@ -878,7 +868,8 @@ spec:
 #[test]
 fn test_hostpath_file_ro() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_HOSTPATH_FILE);
+    let pod_hostpath_file = common::unique_name(POD_HOSTPATH_FILE);
+    kubectl_delete_pod(&pod_hostpath_file);
     std::thread::sleep(Duration::from_secs(2));
 
     // Per-test host file under /tmp so concurrent test runs and
@@ -892,7 +883,7 @@ fn test_hostpath_file_ro() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_HOSTPATH_FILE}
+  name: {pod_hostpath_file}
 spec:
   runtimeClassName: k7
   containers:
@@ -912,7 +903,7 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_HOSTPATH_FILE, Duration::from_secs(90))
+    wait_for_pod_running(&pod_hostpath_file, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     // A `readOnly: true` hostPath rides the block
@@ -920,7 +911,7 @@ spec:
     // on virtio-blk, so the pod carries ZERO virtiofs shares and
     // stays CoW-forkable. Asserted loudly so a silent regression to
     // the virtiofs fallback (slow-fork) is caught.
-    let vm = common::pod_vm_state(POD_HOSTPATH_FILE);
+    let vm = common::pod_vm_state(&pod_hostpath_file);
     assert_eq!(
         vm.virtiofs_shares, 0,
         "RO hostPath must ride an erofs image on virtio-blk, not the virtiofs fallback"
@@ -933,7 +924,8 @@ spec:
 
     // Host content visible inside the container at the requested
     // mount path (via the erofs image's guest mount).
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_HOSTPATH_FILE, None, &["cat", "/host/file.txt"]);
+    let (rc, stdout, stderr) =
+        kubectl_exec_in(&pod_hostpath_file, None, &["cat", "/host/file.txt"]);
     assert_eq!(
         rc, 0,
         "cat /host/file.txt inside container should succeed: {stderr}"
@@ -943,14 +935,14 @@ spec:
     // RO enforced — erofs is a read-only filesystem; the write dies
     // with EROFS inside the guest.
     let (rc, _, _) = kubectl_exec_in(
-        POD_HOSTPATH_FILE,
+        &pod_hostpath_file,
         None,
         &["sh", "-c", "echo nope > /host/file.txt"],
     );
     assert_ne!(rc, 0, "write to ro hostPath should have failed");
 
     // Cleanup.
-    kubectl_delete_pod(POD_HOSTPATH_FILE);
+    kubectl_delete_pod(&pod_hostpath_file);
     let _ = std::fs::remove_file(&host_path);
 }
 
@@ -963,7 +955,8 @@ spec:
 #[test]
 fn test_hostpath_directory_rw() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_HOSTPATH_DIR);
+    let pod_hostpath_dir = common::unique_name(POD_HOSTPATH_DIR);
+    kubectl_delete_pod(&pod_hostpath_dir);
     std::thread::sleep(Duration::from_secs(2));
 
     let host_dir = format!("/tmp/k7d-test-hostpath-dir-{}", std::process::id());
@@ -977,7 +970,7 @@ fn test_hostpath_directory_rw() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_HOSTPATH_DIR}
+  name: {pod_hostpath_dir}
 spec:
   runtimeClassName: k7
   containers:
@@ -996,12 +989,12 @@ spec:
     )))
     .expect("kubectl apply pod");
 
-    wait_for_pod_running(POD_HOSTPATH_DIR, Duration::from_secs(90))
+    wait_for_pod_running(&pod_hostpath_dir, Duration::from_secs(90))
         .expect("pod should reach Running+Ready");
 
     // HostPath RW = explicit virtiofs fallback,
     // slow-fork (asserted loudly; see test_hostpath_file_ro).
-    let vm = common::pod_vm_state(POD_HOSTPATH_DIR);
+    let vm = common::pod_vm_state(&pod_hostpath_dir);
     assert_eq!(
         vm.virtiofs_shares, 2,
         "hostPath-RW pod must carry the two explicit virtiofs fallback shares"
@@ -1009,13 +1002,13 @@ spec:
 
     // Host → container: seeded file shows up.
     let (rc, stdout, _) =
-        kubectl_exec_in(POD_HOSTPATH_DIR, None, &["cat", "/shared/from-host.txt"]);
+        kubectl_exec_in(&pod_hostpath_dir, None, &["cat", "/shared/from-host.txt"]);
     assert_eq!(rc, 0);
     assert_eq!(stdout, "pre-existing\n");
 
     // Container → host: write inside the container, read on host.
     let (rc, _, stderr) = kubectl_exec_in(
-        POD_HOSTPATH_DIR,
+        &pod_hostpath_dir,
         None,
         &[
             "sh",
@@ -1031,7 +1024,7 @@ spec:
         .expect("host should see container's write");
     assert_eq!(host_content.trim(), "from-container");
 
-    kubectl_delete_pod(POD_HOSTPATH_DIR);
+    kubectl_delete_pod(&pod_hostpath_dir);
     let _ = std::fs::remove_dir_all(&host_dir);
 }
 
@@ -1051,8 +1044,10 @@ spec:
 #[test]
 fn test_local_path_pvc_works() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_PVC);
-    kubectl_delete_pvc(PVC_NAME);
+    let pod_pvc = common::unique_name(POD_PVC);
+    let pvc_name = common::unique_name(PVC_NAME);
+    kubectl_delete_pod(&pod_pvc);
+    kubectl_delete_pvc(&pvc_name);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&format!(
@@ -1060,7 +1055,7 @@ fn test_local_path_pvc_works() {
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {PVC_NAME}
+  name: {pvc_name}
 spec:
   accessModes: [ReadWriteOnce]
   resources:
@@ -1076,7 +1071,7 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: {POD_PVC}
+  name: {pod_pvc}
 spec:
   runtimeClassName: k7
   containers:
@@ -1089,7 +1084,7 @@ spec:
   volumes:
   - name: d
     persistentVolumeClaim:
-      claimName: {PVC_NAME}
+      claimName: {pvc_name}
 "#
     )))
     .expect("kubectl apply pod");
@@ -1097,13 +1092,13 @@ spec:
     // local-path PVC bind can take longer than a normal pod boot
     // because `local-path-provisioner` runs a helper pod to
     // create the backing directory. Give it 180 s.
-    wait_for_pod_running(POD_PVC, Duration::from_secs(180))
+    wait_for_pod_running(&pod_pvc, Duration::from_secs(180))
         .expect("pod should reach Running+Ready");
 
     // PVC matrix: local-path PVCs are hostPath-backed
     // (arbitrary host dirs under /var/lib/rancher/k3s/storage/) —
     // the explicit virtiofs fallback, slow-fork.
-    let vm = common::pod_vm_state(POD_PVC);
+    let vm = common::pod_vm_state(&pod_pvc);
     assert_eq!(
         vm.virtiofs_shares, 2,
         "local-path PVC pod must be on the explicit virtiofs fallback"
@@ -1112,7 +1107,7 @@ spec:
     // Give the writer's `echo` a beat after Ready.
     std::thread::sleep(Duration::from_secs(2));
 
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_PVC, None, &["cat", "/data/marker"]);
+    let (rc, stdout, stderr) = kubectl_exec_in(&pod_pvc, None, &["cat", "/data/marker"]);
     assert_eq!(
         rc, 0,
         "PVC content should be readable inside the container: {stderr}"
@@ -1121,7 +1116,7 @@ spec:
 
     // Round-trip write to prove rw works end-to-end.
     let (rc, _, stderr) = kubectl_exec_in(
-        POD_PVC,
+        &pod_pvc,
         None,
         &[
             "sh",
@@ -1131,8 +1126,8 @@ spec:
     );
     assert_eq!(rc, 0, "container should be able to append to PVC: {stderr}");
 
-    kubectl_delete_pod(POD_PVC);
-    kubectl_delete_pvc(PVC_NAME);
+    kubectl_delete_pod(&pod_pvc);
+    kubectl_delete_pvc(&pvc_name);
 }
 
 /// K7d-provisioned RWO disk volume. A hostPath under
@@ -1145,8 +1140,10 @@ spec:
 #[test]
 fn test_k7d_disk_rwo_volume_block_backed_and_persistent() {
     let _leak_guard = ensure_shim_installed();
-    kubectl_delete_pod(POD_K7D_DISK);
-    kubectl_delete_pod(POD_K7D_DISK_2);
+    let pod_k7d_disk = common::unique_name(POD_K7D_DISK);
+    let pod_k7d_disk_2 = common::unique_name(POD_K7D_DISK_2);
+    kubectl_delete_pod(&pod_k7d_disk);
+    kubectl_delete_pod(&pod_k7d_disk_2);
     std::thread::sleep(Duration::from_secs(2));
 
     // Fresh volume per run: remove the backing image AND the
@@ -1181,16 +1178,16 @@ spec:
     };
 
     kubectl_apply(&pod_yaml(
-        POD_K7D_DISK,
+        &pod_k7d_disk,
         "echo disk-bytes > /data/marker && sleep infinity",
     ))
     .expect("kubectl apply pod 1");
-    wait_for_pod_running(POD_K7D_DISK, Duration::from_secs(90))
+    wait_for_pod_running(&pod_k7d_disk, Duration::from_secs(90))
         .expect("pod 1 should reach Running+Ready");
 
     // Block-backed, not virtiofs: the k7d disk must NOT force the
     // fallback (that's the whole point of the convention).
-    let vm = common::pod_vm_state(POD_K7D_DISK);
+    let vm = common::pod_vm_state(&pod_k7d_disk);
     assert_eq!(
         vm.virtiofs_shares, 0,
         "k7d disk volume must be a virtio-blk ext4 image, not a virtiofs share"
@@ -1202,7 +1199,7 @@ spec:
     );
 
     std::thread::sleep(Duration::from_secs(2));
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_K7D_DISK, None, &["cat", "/data/marker"]);
+    let (rc, stdout, stderr) = kubectl_exec_in(&pod_k7d_disk, None, &["cat", "/data/marker"]);
     assert_eq!(rc, 0, "read own write on the k7d disk: {stderr}");
     assert_eq!(stdout.trim(), "disk-bytes");
 
@@ -1214,15 +1211,15 @@ spec:
 
     // Persistence: pod 2 reattaches the same image and reads pod 1's
     // data (ext4 on the image, untouched by pod teardown).
-    kubectl_delete_pod(POD_K7D_DISK);
-    kubectl_apply(&pod_yaml(POD_K7D_DISK_2, "sleep infinity")).expect("kubectl apply pod 2");
-    wait_for_pod_running(POD_K7D_DISK_2, Duration::from_secs(90))
+    kubectl_delete_pod(&pod_k7d_disk);
+    kubectl_apply(&pod_yaml(&pod_k7d_disk_2, "sleep infinity")).expect("kubectl apply pod 2");
+    wait_for_pod_running(&pod_k7d_disk_2, Duration::from_secs(90))
         .expect("pod 2 should reach Running+Ready");
-    let (rc, stdout, stderr) = kubectl_exec_in(POD_K7D_DISK_2, None, &["cat", "/data/marker"]);
+    let (rc, stdout, stderr) = kubectl_exec_in(&pod_k7d_disk_2, None, &["cat", "/data/marker"]);
     assert_eq!(rc, 0, "pod 2 should see pod 1's data: {stderr}");
     assert_eq!(stdout.trim(), "disk-bytes");
 
-    kubectl_delete_pod(POD_K7D_DISK_2);
+    kubectl_delete_pod(&pod_k7d_disk_2);
     let _ = std::fs::remove_file(format!("/var/lib/k7d/disks/{vol_name}.img"));
     let _ = std::fs::remove_dir_all(format!("/var/lib/k7d/disks/{vol_name}"));
 }

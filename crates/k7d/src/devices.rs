@@ -125,6 +125,14 @@ pub struct PipeWriter {
     fd: std::os::unix::io::RawFd,
 }
 
+impl Drop for PipeWriter {
+    fn drop(&mut self) {
+        // SAFETY: fd is the pipe write end this writer owns; closed once
+        // here (PipeWriter is not Clone).
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 impl std::io::Write for PipeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: self.fd is a valid pipe write end, buf is a valid byte slice.
@@ -186,6 +194,17 @@ impl PipeSerialDevice {
     /// Enqueue a byte into the serial input FIFO (host → guest).
     pub fn enqueue_input(&mut self, byte: u8) {
         self.serial.enqueue_raw_bytes(&[byte]).ok();
+    }
+}
+
+impl Drop for PipeSerialDevice {
+    fn drop(&mut self) {
+        // SAFETY: read_fd is the pipe read end this device owns; consumers
+        // (`AgentClient::new`) dup it rather than taking ownership, and the
+        // device is not Clone, so this is the single close. Without it every
+        // dropped VM leaked the pipe pair — a fork-heavy daemon hit EMFILE
+        // after ~500 forks (found by the the referenced work repro loop).
+        unsafe { libc::close(self.read_fd) };
     }
 }
 

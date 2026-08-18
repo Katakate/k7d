@@ -1028,6 +1028,29 @@ pub(crate) struct VirtqDesc {
 pub(crate) const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub(crate) const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+const PAGE_SIZE: u64 = 4096;
+
+/// Mark the pages covering guest-physical range `[gpa, gpa + len)` dirty in
+/// a device-DMA bitmap (one bit per 4 KiB page, `u64` words). Out-of-range
+/// pages are ignored (the bitmap is sized to guest memory and every write
+/// is bounds-checked before it happens). Shared by the userspace virtio-net
+/// and virtio-blk workers: KVM's dirty log only sees vCPU writes, so device
+/// writes through the host mapping must be recorded here or warm forks on
+/// the base.mem + dirty-delta path silently miss them.
+pub(crate) fn mark_dirty(dirty: &[std::sync::atomic::AtomicU64], gpa: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let first = gpa / PAGE_SIZE;
+    let last = (gpa + len - 1) / PAGE_SIZE;
+    for page in first..=last {
+        let word = (page / 64) as usize;
+        if let Some(w) = dirty.get(word) {
+            w.fetch_or(1u64 << (page % 64), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Userspace virtio-net backend. Spawns a thread that handles RX/TX between
 /// TAP and guest virtqueues, like Firecracker.
 pub struct TapNetBackend {
@@ -1040,6 +1063,15 @@ pub struct TapNetBackend {
     running: Arc<AtomicBool>,
     /// When true the worker skips TAP/virtqueue processing (warm-fork pause).
     paused: Arc<AtomicBool>,
+    /// True while the worker is parked in the paused state (or exited) —
+    /// i.e. no more guest-memory writes will happen until unpause. Without
+    /// this the fork memcpy can race a mid-flight used-ring update and hand
+    /// the fork a torn ring (CHALLENGES.md #79).
+    parked: Arc<AtomicBool>,
+    /// Pages this device wrote through the host mapping (RX payloads,
+    /// used-ring entries + idx). Merged into the warm-fork dirty delta;
+    /// KVM's dirty log cannot see these writes (CHALLENGES.md #79).
+    dirty: Arc<Vec<std::sync::atomic::AtomicU64>>,
     /// Seeded `last_avail`/`last_used` for RX (queue 0). Zero on cold boot;
     /// set via [`Self::seed_indices_from_guest`] before activate on restore.
     rx_idx_seed: u16,
@@ -1048,9 +1080,14 @@ pub struct TapNetBackend {
 }
 
 impl TapNetBackend {
-    /// Create a userspace virtio-net backend using the TAP fd.
+    /// Create a userspace virtio-net backend using the TAP fd. `mem_size`
+    /// is the guest-physical span the device-DMA dirty bitmap must cover.
     #[must_use]
-    pub fn new(mac: [u8; 6], tap_fd: RawFd, mem_addr: u64) -> Self {
+    pub fn new(mac: [u8; 6], tap_fd: RawFd, mem_addr: u64, mem_size: u64) -> Self {
+        let words = (mem_size.div_ceil(PAGE_SIZE) as usize).div_ceil(64);
+        let dirty = (0..words)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         Self {
             mac,
             mem_addr,
@@ -1060,6 +1097,8 @@ impl TapNetBackend {
             worker: None,
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(true)),
+            dirty: Arc::new(dirty),
             rx_idx_seed: 0,
             tx_idx_seed: 0,
         }
@@ -1142,13 +1181,38 @@ impl VirtioBackend for TapNetBackend {
 
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
-        // Wake only on unpause so the worker leaves its sleep promptly.
-        // Kicking on pause can race with the vCPU's MMIO lock and inflate
-        // warm-fork latency.
-        if !paused {
-            if let Some(ref kick) = self.tx_kick {
-                let _ = kick.write(1);
+        // Wake the worker in both directions: on pause so it leaves its
+        // (up to 100 ms) poll and parks promptly — `Vm::pause` waits for
+        // the park via `wait_quiescent` — and on unpause so it resumes
+        // processing promptly. The eventfd write takes no locks.
+        if let Some(ref kick) = self.tx_kick {
+            let _ = kick.write(1);
+        }
+    }
+
+    fn wait_quiescent(&self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.parked.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                log::warn!(
+                    "virtio-net: worker did not park within 2s — fork memory \
+                     capture may race in-flight ring writes"
+                );
+                return;
             }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn merge_dirty_pages(&self, acc: &mut [u64]) {
+        for (i, w) in self.dirty.iter().enumerate() {
+            if i >= acc.len() {
+                break;
+            }
+            acc[i] |= w.load(Ordering::SeqCst);
         }
     }
 
@@ -1173,10 +1237,13 @@ impl VirtioBackend for TapNetBackend {
         let irq_fd = irq_evt.as_raw_fd();
         let running = Arc::clone(&self.running);
         let paused = Arc::clone(&self.paused);
+        let parked = Arc::clone(&self.parked);
+        let dirty = Arc::clone(&self.dirty);
         let rx_idx_seed = self.rx_idx_seed;
         let tx_idx_seed = self.tx_idx_seed;
         running.store(true, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        self.parked.store(false, Ordering::SeqCst);
 
         // Dup the TAP fd so the worker thread owns its copy
         // SAFETY: tap_fd is valid; dup returns a new fd.
@@ -1205,6 +1272,8 @@ impl VirtioBackend for TapNetBackend {
                 &tx_q,
                 &running,
                 &paused,
+                &parked,
+                &dirty,
                 (rx_idx_seed, tx_idx_seed),
             );
             // SAFETY: closing our dup'd fds.
@@ -1227,6 +1296,17 @@ impl VirtioBackend for TapNetBackend {
 
         self.tx_kick = Some(tx_kick);
         self.worker = Some(handle);
+
+        // A fork/restore can capture the source between the guest's TX kick
+        // and the worker draining it: the kick lives in the source's eventfd,
+        // which does not survive the fork, and virtio drivers never re-notify
+        // for descriptors already made available. Without this self-kick the
+        // pending TX frames sit in the ring forever — the guest's TX queue
+        // stays stopped waiting for completions and dies with NETDEV WATCHDOG
+        // (CHALLENGES.md #79). Harmless on cold boot (the ring is empty).
+        if let Some(ref kick) = self.tx_kick {
+            let _ = kick.write(1);
+        }
 
         log::info!(
             "virtio-net activated (userspace): mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1282,6 +1362,8 @@ fn net_worker(
     tx_q: &VirtqueueState,
     running: &AtomicBool,
     paused: &AtomicBool,
+    parked: &AtomicBool,
+    dirty: &[std::sync::atomic::AtomicU64],
     idx_seed: (u16, u16),
 ) {
     // Both last_avail and last_used start at used.idx (see seed_indices_from_guest).
@@ -1298,11 +1380,17 @@ fn net_worker(
 
     while running.load(Ordering::SeqCst) {
         // Warm-fork pause: do not touch TAP or guest rings while the vCPU is
-        // stopped for dirty-page capture. Leave frames in the kernel TAP
-        // buffer until resume.
+        // stopped for memory capture. Leave frames in the kernel TAP buffer
+        // until resume. Park so `wait_quiescent` (called by `Vm::pause`)
+        // knows no ring write is in flight — a fork memcpy racing a
+        // mid-flight `put_used_desc` hands the fork a torn used ring and the
+        // guest driver marks the queue broken forever (CHALLENGES.md #79).
         if paused.load(Ordering::SeqCst) {
-            // Short sleep so unpause is snappy; tx_kick also wakes us.
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            parked.store(true, Ordering::SeqCst);
+            while paused.load(Ordering::SeqCst) && running.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            parked.store(false, Ordering::SeqCst);
             continue;
         }
 
@@ -1346,8 +1434,15 @@ fn net_worker(
                     pkt_buf[11] = 0;
                 }
                 if let Some(desc_idx) = get_avail_desc(mem_base, rx_q, &mut rx_last_avail) {
-                    write_to_desc_chain(mem_base, rx_q, desc_idx, &pkt_buf[..pkt_len]);
+                    write_to_desc_chain(mem_base, rx_q, desc_idx, &pkt_buf[..pkt_len], dirty);
+                    let slot = u64::from(rx_last_used % rx_q.size);
                     put_used_desc(mem_base, rx_q, &mut rx_last_used, desc_idx, pkt_len as u32);
+                    // Used-ring entry + idx are device writes into guest
+                    // memory — record them or the fork's driver sees a
+                    // stale ring (CHALLENGES.md #79).
+                    let used_gpa = rx_q.used_addr.raw_value();
+                    mark_dirty(dirty, used_gpa + 4 + slot * 8, 8);
+                    mark_dirty(dirty, used_gpa + 2, 2);
                     signal_irq(irq_fd);
                 } else {
                     break;
@@ -1372,11 +1467,18 @@ fn net_worker(
                         libc::write(tap_fd, pkt_buf.as_ptr().cast::<libc::c_void>(), len);
                     }
                 }
+                let slot = u64::from(tx_last_used % tx_q.size);
                 put_used_desc(mem_base, tx_q, &mut tx_last_used, desc_idx, 0);
+                let used_gpa = tx_q.used_addr.raw_value();
+                mark_dirty(dirty, used_gpa + 4 + slot * 8, 8);
+                mark_dirty(dirty, used_gpa + 2, 2);
                 signal_irq(irq_fd);
             }
         }
     }
+    // Report quiescence on exit too, so wait_quiescent never hangs on a
+    // shut-down device.
+    parked.store(true, Ordering::SeqCst);
 }
 
 fn signal_irq(irq_fd: RawFd) {
@@ -1407,8 +1509,15 @@ pub(crate) fn get_avail_desc(
     Some(desc_idx)
 }
 
-/// Write data to a descriptor chain (for RX: TAP -> guest).
-fn write_to_desc_chain(mem_base: u64, q: &VirtqueueState, first_desc: u16, data: &[u8]) {
+/// Write data to a descriptor chain (for RX: TAP -> guest), recording every
+/// written page in the device-DMA dirty bitmap.
+fn write_to_desc_chain(
+    mem_base: u64,
+    q: &VirtqueueState,
+    first_desc: u16,
+    data: &[u8],
+    dirty: &[std::sync::atomic::AtomicU64],
+) {
     let desc_base = mem_base + q.desc_addr.raw_value();
     let mut desc_idx = first_desc;
     let mut offset = 0usize;
@@ -1427,6 +1536,7 @@ fn write_to_desc_chain(mem_base: u64, q: &VirtqueueState, first_desc: u16, data:
                 let dst = (mem_base + desc.addr) as *mut u8;
                 std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), dst, copy_len);
             }
+            mark_dirty(dirty, desc.addr, copy_len as u64);
             offset += copy_len;
         }
 

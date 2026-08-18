@@ -72,6 +72,31 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     curl -fSL "$KERNEL_URL" | tar -xJ -C "$SCRIPT_DIR"
 fi
 
+# CONFIG_DEBUG_INFO_BTF is gated on `PAHOLE_VERSION >= 116`, and
+# PAHOLE_VERSION comes from scripts/pahole-version.sh, which prints 0
+# when pahole is not installed. So a node without the `dwarves` package
+# does not fail the build — kconfig just drops BTF, the guest boots
+# fine, and Cilium is the thing that discovers /sys/kernel/btf/vmlinux
+# is missing, three increments later. Check it here instead, using the
+# tree's own version script so the floor cannot drift from Kconfig's.
+echo "==> Checking pahole (BTF generation)"
+PAHOLE_MIN_VERSION=116
+command -v "${PAHOLE:-pahole}" >/dev/null 2>&1 || {
+    cat >&2 <<EOF
+pahole not found. CONFIG_DEBUG_INFO_BTF would be silently dropped and
+the guest would ship without /sys/kernel/btf/vmlinux, which Cilium
+(CO-RE) hard-requires. Install it:  apt-get install -y dwarves
+EOF
+    exit 1
+}
+pahole_version="$("$BUILD_DIR/scripts/pahole-version.sh" "${PAHOLE:-pahole}")"
+((pahole_version >= PAHOLE_MIN_VERSION)) || {
+    echo "pahole version $pahole_version is below the $PAHOLE_MIN_VERSION" \
+        "CONFIG_DEBUG_INFO_BTF requires ($(pahole --version))" >&2
+    exit 1
+}
+echo "    pahole version $pahole_version (>= $PAHOLE_MIN_VERSION)"
+
 echo "==> Applying haltpoll warm-pool patches"
 python3 - "$BUILD_DIR/drivers/cpuidle/governors/haltpoll.c" <<'PY'
 import sys
@@ -122,4 +147,31 @@ make -j"$(nproc)" vmlinux
 
 cp vmlinux "$SCRIPT_DIR/vmlinux"
 strip --strip-all "$SCRIPT_DIR/vmlinux" 2>/dev/null || true
+
+# The strip above is best-effort on purpose (binutils is noisy about
+# vmlinux), so its exit code proves nothing — assert the two properties
+# the shipped image must have instead. `.BTF` is what CO-RE consumers
+# read back as /sys/kernel/btf/vmlinux; whether `--strip-all` keeps it
+# depends on the section being SHF_ALLOC in this layout, which is not
+# something to reason about across kernel versions. And `.debug_info`
+# absent is what keeps the DWARF this config now generates (a ~1 GB
+# intermediate vmlinux) out of a guest image that boots in ~230 ms.
+echo "==> Checking the shipped vmlinux sections"
+sections="$(readelf -S "$SCRIPT_DIR/vmlinux")"
+grep -q '\.BTF\b' <<<"$sections" || {
+    cat >&2 <<EOF
+The stripped vmlinux has no .BTF section, so the guest will have no
+/sys/kernel/btf/vmlinux and Cilium (CO-RE) cannot load. Either BTF was
+never generated (check CONFIG_DEBUG_INFO_BTF survived olddefconfig) or
+strip ate it — in the latter case use
+  strip --strip-all --keep-section=.BTF
+above.
+EOF
+    exit 1
+}
+if grep -q '\.debug_info' <<<"$sections"; then
+    echo "strip left DWARF in the shipped vmlinux ($(du -h "$SCRIPT_DIR/vmlinux" |
+        cut -f1)); the guest image would carry the whole debug build" >&2
+    exit 1
+fi
 echo "==> Guest kernel built: ${SCRIPT_DIR}/vmlinux ($(du -h "$SCRIPT_DIR/vmlinux" | cut -f1))"

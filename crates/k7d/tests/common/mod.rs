@@ -14,9 +14,11 @@
 //! best-effort style into product code.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Idempotent, best-effort cleanup of host-side k7 runtime leaks left
 /// by a prior integration test: orphan `virtiofsd` / shim processes,
@@ -65,6 +67,12 @@ pub fn cleanup_k7_runtime_leaks() {
     // Give kubelet/containerd a beat to observe the teardown before
     // the next pod is created.
     std::thread::sleep(Duration::from_millis(1500));
+
+    // Once per test binary: reap stranded host leftovers and
+    // age-gated cluster resources from crashed prior runs. After the
+    // daemon restart above there are no live VMs on this node, so
+    // leftover bridges / TAPs / disk images are safe to collect.
+    maybe_hygiene_once();
 }
 
 /// RAII guard returned by each test's `ensure_shim_installed()`.
@@ -497,4 +505,553 @@ pub fn pin_to_local_node(pod_yaml: &str) -> String {
         "  nodeSelector:\n    kubernetes.io/hostname: \"{host}\"\n  runtimeClassName: k7\n"
     );
     pod_yaml.replace("  runtimeClassName: k7\n", &inject)
+}
+
+/// Label key stamped on every cluster-scoped resource a test creates.
+pub const TEST_RUN_LABEL: &str = "k7-test-run";
+
+/// Age after which a leftover `k7-test-run` resource is treated as
+/// stranded (crashed prior run) rather than a live concurrent suite.
+pub const STALE_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// Per-process test-run id: 6 hex chars from pid XOR boot-time nanos.
+///
+/// Stable for the life of this test binary so every resource this
+/// process creates shares one selector. Distinct processes (two
+/// concurrent `make check` runs) get distinct ids.
+pub fn run_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let pid = u64::from(std::process::id());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        format!(
+            "{:06x}",
+            (pid.wrapping_mul(0x9E37_79B9) ^ nanos) & 0x00ff_ffff
+        )
+    })
+}
+
+/// `{base}-{run_id}` — every cluster-scoped name a test creates.
+pub fn unique_name(base: &str) -> String {
+    let name = format!("{base}-{}", run_id());
+    assert!(
+        name.len() <= 63,
+        "unique name {name} exceeds the 63-char Kubernetes DNS-1123 limit"
+    );
+    name
+}
+
+/// Suffix `metadata.name` values that start with `test-` and inject
+/// `k7-test-run: <run_id>` into every resource. Idempotent when the
+/// name is already suffixed or the label is already present.
+pub fn isolate_manifest(yaml: &str) -> String {
+    stamp_test_labels(&suffix_test_names(yaml))
+}
+
+/// `kubectl apply -f -` that always isolates the manifest (unique
+/// `test-*` names + `k7-test-run` label).
+pub fn kubectl_apply(yaml: &str) -> Result<(), String> {
+    let yaml = isolate_manifest(yaml);
+    let output = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(yaml.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("kubectl apply failed: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn leading_spaces(s: &str) -> usize {
+    s.chars().take_while(|&c| c == ' ').count()
+}
+
+fn suffix_test_names(yaml: &str) -> String {
+    let rid = run_id();
+    let suffix = format!("-{rid}");
+    let mut out = Vec::new();
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == "metadata:" {
+            out.push(line.to_string());
+            let meta_indent = leading_spaces(line);
+            let key_indent = meta_indent + 2;
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                if !l.trim().is_empty() && leading_spaces(l) <= meta_indent {
+                    break;
+                }
+                if leading_spaces(l) == key_indent {
+                    if let Some(name) = l.trim().strip_prefix("name:") {
+                        let name = name.trim();
+                        if name.starts_with("test-") && !name.ends_with(&suffix) {
+                            let pad = " ".repeat(key_indent);
+                            out.push(format!("{pad}name: {name}{suffix}"));
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                out.push(l.to_string());
+                i += 1;
+            }
+            continue;
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    if yaml.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// Inject `k7-test-run: <run_id>` into every resource `metadata` block.
+pub fn stamp_test_labels(yaml: &str) -> String {
+    let rid = run_id();
+    let mut parts = Vec::new();
+    for (idx, doc) in yaml.split("---").enumerate() {
+        if idx > 0 {
+            parts.push("---".to_string());
+        }
+        parts.push(stamp_one_doc(doc, rid));
+    }
+    parts.join("")
+}
+
+fn stamp_one_doc(doc: &str, rid: &str) -> String {
+    if !doc.contains("metadata:") || doc.contains("k7-test-run:") {
+        return doc.to_string();
+    }
+    let lines: Vec<&str> = doc.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        out.push(lines[i].to_string());
+        if lines[i].trim() == "metadata:" {
+            let meta_indent = leading_spaces(lines[i]);
+            let key_indent = meta_indent + 2;
+            let label_indent = key_indent + 2;
+            i += 1;
+            let mut block = Vec::new();
+            while i < lines.len() {
+                if !lines[i].trim().is_empty() && leading_spaces(lines[i]) <= meta_indent {
+                    break;
+                }
+                block.push(lines[i].to_string());
+                i += 1;
+            }
+            let has_labels = block
+                .iter()
+                .any(|l| leading_spaces(l) == key_indent && l.trim() == "labels:");
+            if has_labels {
+                for l in &block {
+                    out.push(l.clone());
+                    if leading_spaces(l) == key_indent && l.trim() == "labels:" {
+                        out.push(format!(
+                            "{}k7-test-run: \"{rid}\"",
+                            " ".repeat(label_indent)
+                        ));
+                    }
+                }
+            } else if block
+                .iter()
+                .any(|l| leading_spaces(l) == key_indent && l.trim().starts_with("name:"))
+            {
+                for l in &block {
+                    out.push(l.clone());
+                    if leading_spaces(l) == key_indent && l.trim().starts_with("name:") {
+                        out.push(format!("{}labels:", " ".repeat(key_indent)));
+                        out.push(format!(
+                            "{}k7-test-run: \"{rid}\"",
+                            " ".repeat(label_indent)
+                        ));
+                    }
+                }
+            } else {
+                out.push(format!("{}labels:", " ".repeat(key_indent)));
+                out.push(format!(
+                    "{}k7-test-run: \"{rid}\"",
+                    " ".repeat(label_indent)
+                ));
+                out.extend(block);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    if doc.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+fn maybe_hygiene_once() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = sweep_stranded_resources();
+    });
+}
+
+/// Loud stranded-resource sweep. Cleans and prints one line per
+/// resource reaped. A sweep that finds nothing prints nothing.
+///
+/// Reaps: `k7*` bridges with no live owning VM (delegates `k7-br-*`
+/// to [`k7d::network::cleanup_stale_k7_bridges`]), TAP devices
+/// matching our naming with no attached fd, disk images under
+/// `/var/lib/k7d/disks` not referenced by any live VM, and `test-*`
+/// / `k7-test-run` cluster resources older than [`STALE_AGE`].
+pub fn sweep_stranded_resources() -> Vec<String> {
+    let mut report = Vec::new();
+    sweep_bridges(&mut report);
+    sweep_taps(&mut report);
+    sweep_disks(&mut report);
+    report.extend(cleanup_stale_labeled_resources());
+    report
+}
+
+fn live_vm_ids() -> Vec<String> {
+    let mut client = match k7d::control::Client::connect_env() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    match client.call(&k7d::control::Request::ListVms) {
+        Ok(k7d::control::Response::VmList { vms }) => vms.into_iter().map(|v| v.vm_id).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn k7d_main_pid() -> Option<u32> {
+    let out = Command::new("systemctl")
+        .args(["show", "k7d", "-p", "MainPID", "--value"])
+        .output()
+        .ok()?;
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    if pid == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+fn held_tap_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(pid) = k7d_main_pid() else {
+        return names;
+    };
+    let dir = format!("/proc/{pid}/fdinfo");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(name) = line.trim().strip_prefix("iff:") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn list_links_with_prefix(prefix: &str) -> Vec<String> {
+    let out = Command::new("ip").args(["-o", "link", "show"]).output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let after_idx = line.split(':').nth(1)?;
+            let name = after_idx.trim().split('@').next()?.trim();
+            if name.starts_with(prefix) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_bridge(name: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{name}/bridge")).is_dir()
+}
+
+fn bridge_has_held_tap(bridge: &str, held: &HashSet<String>) -> bool {
+    let dir = format!("/sys/class/net/{bridge}/brif");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| held.contains(&e.file_name().to_string_lossy().into_owned()))
+}
+
+fn delete_link(name: &str) {
+    let _ = Command::new("ip")
+        .args(["link", "set", "dev", name, "down"])
+        .output();
+    let _ = Command::new("ip").args(["link", "delete", name]).output();
+}
+
+fn sweep_bridges(report: &mut Vec<String>) {
+    let live = live_vm_ids();
+    let held = held_tap_names();
+    if live.is_empty() {
+        for b in k7d::network::cleanup_stale_k7_bridges() {
+            reap(report, "bridge", &b);
+        }
+    }
+    for name in list_links_with_prefix("k7") {
+        if !is_bridge(&name) {
+            continue;
+        }
+        if name.starts_with("k7-br-") && !live.is_empty() {
+            continue;
+        }
+        if bridge_has_held_tap(&name, &held) {
+            continue;
+        }
+        delete_link(&name);
+        reap(report, "bridge", &name);
+    }
+}
+
+fn is_k7_tap_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('t') else {
+        return false;
+    };
+    let Some((tag, idx)) = rest.split_once('t') else {
+        return false;
+    };
+    tag.len() == 5
+        && tag.chars().all(|c| c.is_ascii_hexdigit())
+        && !idx.is_empty()
+        && idx.chars().all(|c| c.is_ascii_digit())
+}
+
+fn sweep_taps(report: &mut Vec<String>) {
+    let held = held_tap_names();
+    for name in list_links_with_prefix("t") {
+        if !is_k7_tap_name(&name) || held.contains(&name) {
+            continue;
+        }
+        delete_link(&name);
+        reap(report, "tap", &name);
+    }
+}
+
+fn live_disk_paths() -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    if let Some(pid) = k7d_main_pid() {
+        let dir = format!("/proc/{pid}/fd");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    if target.starts_with(k7d::disks::DISKS_DIR) {
+                        out.insert(target);
+                    }
+                }
+            }
+        }
+    }
+    for id in live_vm_ids() {
+        out.insert(PathBuf::from(k7d::disks::DISKS_DIR).join(format!("scratch-{id}.img")));
+    }
+    out
+}
+
+fn sweep_disks(report: &mut Vec<String>) {
+    let live = live_disk_paths();
+    let dir = Path::new(k7d::disks::DISKS_DIR);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("img") {
+            continue;
+        }
+        if live.contains(&path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => reap(report, "disk", &path.display().to_string()),
+            Err(e) => eprintln!("sweep: failed to remove {}: {e}", path.display()),
+        }
+    }
+}
+
+/// Delete `k7-test-run` resources (and unlabeled `test-*` pods) older
+/// than [`STALE_AGE`]. Safe against a live concurrent run: those
+/// resources are younger than 30 minutes.
+pub fn cleanup_stale_labeled_resources() -> Vec<String> {
+    let mut report = Vec::new();
+    reap_stale_labeled(&mut report);
+    reap_stale_unlabeled_test_pods(&mut report);
+    report
+}
+
+fn reap_stale_labeled(report: &mut Vec<String>) {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods,configmaps,secrets,persistentvolumeclaims",
+            "-A",
+            "-l",
+            TEST_RUN_LABEL,
+            "-o",
+            "json",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return;
+    };
+    let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
+        return;
+    };
+    for item in items {
+        let Some(meta) = item.get("metadata") else {
+            continue;
+        };
+        let name = meta.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let ns = meta
+            .get("namespace")
+            .and_then(|n| n.as_str())
+            .unwrap_or("default");
+        let created = meta
+            .get("creationTimestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !is_older_than(created, STALE_AGE) {
+            continue;
+        }
+        let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("pod");
+        delete_k8s(ns, kind, name);
+        reap(report, kind, &format!("{ns}/{name}"));
+    }
+}
+
+fn reap_stale_unlabeled_test_pods(report: &mut Vec<String>) {
+    let out = Command::new("kubectl")
+        .args(["get", "pods", "-A", "-o", "json"])
+        .output();
+    let Ok(out) = out else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return;
+    };
+    let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
+        return;
+    };
+    for item in items {
+        let Some(meta) = item.get("metadata") else {
+            continue;
+        };
+        let name = meta.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if !name.starts_with("test-") {
+            continue;
+        }
+        let labels = meta.get("labels").and_then(|l| l.as_object());
+        if labels.is_some_and(|l| l.contains_key(TEST_RUN_LABEL)) {
+            continue;
+        }
+        let ns = meta
+            .get("namespace")
+            .and_then(|n| n.as_str())
+            .unwrap_or("default");
+        if ns == "kube-system" {
+            continue;
+        }
+        let created = meta
+            .get("creationTimestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !is_older_than(created, STALE_AGE) {
+            continue;
+        }
+        delete_k8s(ns, "pod", name);
+        reap(report, "pod", &format!("{ns}/{name}"));
+    }
+}
+
+fn delete_k8s(ns: &str, kind: &str, name: &str) {
+    let _ = Command::new("kubectl")
+        .args([
+            "delete",
+            kind,
+            name,
+            "-n",
+            ns,
+            "--ignore-not-found",
+            "--wait=false",
+            "--grace-period=1",
+        ])
+        .output();
+}
+
+fn is_older_than(creation: &str, age: Duration) -> bool {
+    if creation.is_empty() {
+        return false;
+    }
+    let out = Command::new("date")
+        .args(["-u", "-d", creation, "+%s"])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(created) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(created) >= age.as_secs()
+}
+
+fn reap(report: &mut Vec<String>, kind: &str, name: &str) {
+    let line = format!("sweep: reaped {kind} {name}");
+    eprintln!("{line}");
+    report.push(line);
 }

@@ -31,7 +31,8 @@ use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::network::{
-    get_avail_desc, put_used_desc, read_used_idx, VirtqDesc, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    get_avail_desc, mark_dirty, put_used_desc, read_used_idx, VirtqDesc, VIRTQ_DESC_F_NEXT,
+    VIRTQ_DESC_F_WRITE,
 };
 use crate::virtio_mmio::{VirtioBackend, VirtqueueState};
 
@@ -177,25 +178,6 @@ pub fn io_byte_offset(sector: u64, data_len: u64, capacity_sectors: u64) -> Opti
         return None;
     }
     sector.checked_mul(SECTOR_SIZE)
-}
-
-// --- Device-DMA dirty bitmap ---
-
-/// Mark the pages covering guest-physical range `[gpa, gpa + len)` dirty.
-/// Out-of-range pages are ignored (the bitmap is sized to guest memory and
-/// every write is bounds-checked before it happens).
-fn mark_dirty(dirty: &[AtomicU64], gpa: u64, len: u64) {
-    if len == 0 {
-        return;
-    }
-    let first = gpa / PAGE_SIZE;
-    let last = (gpa + len - 1) / PAGE_SIZE;
-    for page in first..=last {
-        let word = (page / 64) as usize;
-        if let Some(w) = dirty.get(word) {
-            w.fetch_or(1u64 << (page % 64), Ordering::Relaxed);
-        }
-    }
 }
 
 // --- Backend ---
@@ -441,6 +423,15 @@ impl VirtioBackend for BlockBackend {
                 .map_err(|e| format!("spawn virtio-blk worker: {e}"))?,
         );
         self.kick = Some(kick);
+
+        // Drain any requests captured avail-but-unprocessed by a fork (the
+        // guest's kick was an eventfd write on the source and does not
+        // survive the fork; the guest will not re-notify). Same discipline
+        // as TapNetBackend::activate (CHALLENGES.md #79); harmless on cold
+        // boot.
+        if let Some(ref kick) = self.kick {
+            let _ = kick.write(1);
+        }
 
         log::info!(
             "virtio-blk activated (userspace): file={} ro={} capacity={} sectors",

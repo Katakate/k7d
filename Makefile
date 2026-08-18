@@ -68,7 +68,9 @@ lint:
 # suite never runs against a stale guest (rsync excludes the initramfs
 # artifact; both builds are no-op-fast when nothing changed).
 test: build-agent build-guest-rootfs
-	-kubectl delete pod -l '!component' --field-selector=status.phase!=Succeeded --force --grace-period=0 -A 2>/dev/null
+	# Cluster leftovers are reaped by the spec-22d sweep (age-gated
+	# `k7-test-run` selector). A cluster-wide `kubectl delete` here
+	# would kill a concurrent suite's live pods and kube-system.
 	-pkill -9 virtiofsd 2>/dev/null
 	-pkill -9 -f containerd-shim-k7-v1 2>/dev/null
 	-mount | awk '/k7d-shim/ {print $$3}' | sort -ru | xargs -r umount -l 2>/dev/null

@@ -1,0 +1,51 @@
+# Node storage userspace: the whole alpine root, packed into a
+# read-only erofs image and attached to a guest on virtio-blk
+# (`crates/k7d/tests/test_iscsi_nfs.rs`). Longhorn v1 attaches every
+# volume to the node as an iSCSI target and serves RWX volumes over
+# NFSv4, so `iscsiadm`/`iscsid` and `mount.nfs4` are the userspace half
+# of the kernel support the referenced work added.
+#
+# Three delivery mechanisms were available and two are wrong:
+#
+#   * the initramfs is decompressed on every VM's boot path, and
+#     24a-inc1 measured 2.4 MB of iproute2 alone costing ~16 ms against
+#     a 250 ms VM_BOOT_TO_AGENT budget. This root is ~65 MB.
+#   * virtiofs does not survive a warm fork — the child does not
+#     inherit its source's vhost-user connection to virtiofsd, so any
+#     read under the share blocks forever (24a-inc1 hit this in
+#     test_fork_carries_ebpf_state).
+#
+# erofs on virtio-blk has neither problem, which is why this is a whole
+# filesystem rather than the handful of binaries the sibling Dockerfile
+# stages: `iscsid` reads /etc/iscsi, writes /var/lib/iscsi and /run and
+# forks helpers, so it is entered with `chroot` and needs a real root —
+# the `ld-musl --library-path` trick in test_kernel_features.rs's
+# `tool_at()` does not survive contact with any of that.
+#
+# Digest-pinned: the erofs cache is keyed by the built image's ID, and a
+# floating `alpine:3.20` tag would silently change the userspace under a
+# passing test.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+
+# open-iscsi: iscsiadm + iscsid. nfs-utils: mount.nfs4 (a symlink to
+# mount.nfs). e2fsprogs: mkfs.ext4, to prove a filesystem survives the
+# round trip through the target. util-linux: the mount(8)/umount(8) a
+# real node userspace has, where busybox's would silently not exec a
+# /sbin/mount.<fstype> helper. The test calls mount.nfs4 directly rather
+# than through it, precisely so a passing NFS mount cannot be credited
+# to the wrong binary.
+#
+# Versions are pinned, so an alpine 3.20 security bump breaks the build
+# loudly instead of changing the userspace under a passing test. Bump
+# with `apk policy <pkg>` inside the pinned base image.
+RUN apk add --no-cache \
+        open-iscsi=2.1.9-r3 \
+        nfs-utils=2.6.4-r1 \
+        e2fsprogs=1.47.0-r5 \
+        util-linux=2.40.1-r1
+
+# /etc/iscsi is tmpfs-mounted in the guest (erofs is read-only and
+# iscsid writes there), which hides whatever the package installed. Keep
+# a pristine copy outside the mount point to seed it from.
+RUN mkdir -p /usr/share/k7-iscsi /var/lib/iscsi /run/lock /mnt/iscsi /mnt/nfs \
+    && cp -a /etc/iscsi/. /usr/share/k7-iscsi/

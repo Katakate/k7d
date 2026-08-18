@@ -464,7 +464,8 @@ fn restore_vm_inner(
                 })
                 .collect();
 
-            let mut net_backend = TapNetBackend::new(net_tap.mac(), net_tap.fd(), mem_host_addr);
+            let mut net_backend =
+                TapNetBackend::new(net_tap.mac(), net_tap.fd(), mem_host_addr, mem_span);
             net_backend.ack_features(dev_state.acked_features);
             // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
             net_backend.seed_indices_from_guest(&queues);
@@ -986,9 +987,65 @@ fn restore_cpu_state(
         }
     }
 
-    // 5b. Skip vcpu_events restore for now — on AMD, the snapshotted
-    // vcpu_events may contain stale exception state that causes #BR.
-    // TODO: investigate which fields of vcpu_events are safe to restore on AMD.
+    // 5b. Re-queue the event injection the pause interrupted .
+    //
+    // The pause signal can kick a vCPU out of KVM_RUN *between* KVM
+    // staging an event injection and the VM entry that would deliver
+    // it: KVM cancels the injection and reports it via
+    // KVM_GET_VCPU_EVENTS (`interrupt.injected`). By that point the
+    // interrupt controller has already ACKed the vector — the 8259's
+    // in-service bit is set (this guest boots `noapic`) / the LAPIC
+    // moved IRR→ISR — so nothing ever re-sends it. Dropping the event
+    // here strands the restored controller waiting for an EOI from a
+    // handler that never ran, which blocks that IRQ line (and every
+    // lower-priority one) forever: the VM is alive but permanently
+    // deaf on vsock/net — the ~1%-per-fork unreachable-fork flake.
+    //
+    // Exception state stays deliberately dropped: stale snapshotted
+    // exception state caused #BR on AMD Zen 4, and exceptions are
+    // synchronous — re-executing the faulting instruction regenerates
+    // them. Only the asynchronous, non-regenerating state is restored:
+    // the in-flight external interrupt, NMI state, and the
+    // interrupt-shadow window.
+    if let Some(ev) = &state.vcpu_events {
+        let ev_size = std::mem::size_of::<kvm_bindings::kvm_vcpu_events>();
+        if ev.data.len() >= ev_size {
+            let mut events = kvm_bindings::kvm_vcpu_events::default();
+            // SAFETY: ev.data holds a kvm_vcpu_events captured by
+            // KVM_GET_VCPU_EVENTS; the length is checked above and the
+            // struct is plain-old-data.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    ev.data.as_ptr(),
+                    (&raw mut events).cast::<u8>(),
+                    ev_size,
+                );
+            }
+            // Keep only the interrupt/NMI/shadow slice; everything else
+            // (exception state, SMM, SIPI) is deliberately zeroed.
+            let events = kvm_bindings::kvm_vcpu_events {
+                interrupt: events.interrupt,
+                nmi: events.nmi,
+                flags: kvm_bindings::KVM_VCPUEVENT_VALID_NMI_PENDING
+                    | kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW,
+                ..kvm_bindings::kvm_vcpu_events::default()
+            };
+            if events.interrupt.injected != 0 || events.nmi.injected != 0 {
+                log::info!(
+                    "restore: re-queueing interrupted event injection \
+                     (interrupt: injected={} nr={:#x} soft={}, nmi: injected={} pending={})",
+                    events.interrupt.injected,
+                    events.interrupt.nr,
+                    events.interrupt.soft,
+                    events.nmi.injected,
+                    events.nmi.pending,
+                );
+            }
+            vcpu_fd
+                .set_vcpu_events(&events)
+                .map_err(|e| RestoreError::Kvm(format!("KVM_SET_VCPU_EVENTS: {e}")))?;
+        }
+    }
 
     // 6. MP_STATE must be LAST (zeroboot: "MUST be last"):
     // restore the captured per-vCPU value — an AP may legitimately be
@@ -1816,7 +1873,8 @@ fn build_vm_from_state_and_mem_inner(
                     })
                     .collect();
 
-                let mut net_backend = TapNetBackend::new(tap.mac(), tap.fd(), fork_mem_addr);
+                let mut net_backend =
+                    TapNetBackend::new(tap.mac(), tap.fd(), fork_mem_addr, mem_span);
                 // Replay the driver's feature-negotiation outcome from the snapshot.
                 net_backend.ack_features(dev_state.acked_features);
                 // Guest rings survived the snapshot — seed worker counters or eth0 hangs.

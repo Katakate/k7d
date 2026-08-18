@@ -192,6 +192,9 @@ start_run() {
     fi
     echo "==> Starting '$RUN_NAME' on $NODE: $REMOTE_CMD"
     node_sh "mkdir -p '$RUN_DIR' && cat > '$RUN_DIR/cmd.sh'" <<<"$REMOTE_CMD"
+    # Stamp who dispatched this run so a job found on a node is always
+    # attributable (host, agent id if any, user, time). See the referenced work.
+    node_sh "cat > '$RUN_DIR/origin'" <<<"host=$(hostname) agent=${CURSOR_CONVERSATION_ID:-none} user=$(whoami) at=$(date -Is)"
     # The wrapper records its own pid (setsid --fork means the starting
     # shell never sees it) and, from an EXIT trap, always records an
     # exit code — a run that dies without one is a failure we report

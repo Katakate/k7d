@@ -136,28 +136,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
-    let output = std::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(yaml.as_bytes())
-                .unwrap();
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("kubectl apply: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    common::kubectl_apply(yaml)
 }
 
 /// Graceful pod delete used by every CNI test. See the
@@ -277,9 +256,10 @@ fn wait_for_pod_ip(name: &str, timeout: Duration) -> Result<String, String> {
 #[test]
 fn test_cni_pod_traffic_flows() {
     let _leak_guard = ensure_shim_installed();
+    let pod_name = common::unique_name(POD_NAME);
 
     // Best-effort cleanup from prior runs.
-    kubectl_delete_pod(POD_NAME);
+    kubectl_delete_pod(&pod_name);
     std::thread::sleep(Duration::from_secs(2));
 
     kubectl_apply(&common::pin_to_local_node(POD_YAML)).expect("kubectl apply test-cni-nginx");
@@ -289,7 +269,7 @@ fn test_cni_pod_traffic_flows() {
     // `attach_to_pod_netns` had silently failed (Bug 1 in PR #27's
     // commit log), the pod would still come up but the shim's
     // pod-netns assertions would not fire.
-    let pod_ip = wait_for_pod_ip(POD_NAME, Duration::from_secs(60))
+    let pod_ip = wait_for_pod_ip(&pod_name, Duration::from_secs(60))
         .expect("Flow 1 (pod-IP visible) — pod did not get a pod IP");
     eprintln!("Flow 1: pod IP {pod_ip}");
     assert!(
@@ -350,7 +330,7 @@ fn test_cni_pod_traffic_flows() {
     // reading the static-ARP'd `10.200.0.1` gateway we configured.
     // A working ping proves both directions of the bridge and the
     // SNAT path are alive.
-    let ping_out = kubectl_exec(POD_NAME, &["ping", "-c", "2", "-W", "2", "10.200.0.1"])
+    let ping_out = kubectl_exec(&pod_name, &["ping", "-c", "2", "-W", "2", "10.200.0.1"])
         .expect("Flow 3 (VM -> host gateway): kubectl exec ping");
     assert!(
         ping_out.contains("2 received") || ping_out.contains("2 packets received"),
@@ -371,7 +351,7 @@ fn test_cni_pod_traffic_flows() {
     // kube-proxy sees our SNAT'd source incorrectly, the SYN-ACK
     // can't come back and the connect times out.
     assert!(
-        tcp_open_via_nc(POD_NAME, "10.43.0.10", "53"),
+        tcp_open_via_nc(&pod_name, "10.43.0.10", "53"),
         "Flow 4 (VM -> Service IP 10.43.0.10:53): TCP connect did not succeed"
     );
     eprintln!("Flow 4: VM -> 10.43.0.10:53 (Service IP) OK");
@@ -380,15 +360,15 @@ fn test_cni_pod_traffic_flows() {
     // (1.1.1.1:443). We're only asserting TCP reachability — no
     // TLS, no HTTP, just that the SYN-ACK comes back.
     assert!(
-        tcp_open_via_nc(POD_NAME, "1.1.1.1", "443"),
+        tcp_open_via_nc(&pod_name, "1.1.1.1", "443"),
         "Flow 5 (VM -> internet 1.1.1.1:443): TCP connect did not succeed"
     );
     eprintln!("Flow 5: VM -> 1.1.1.1:443 (internet egress) OK");
 
-    eprintln!("\nAll five CNI flows green for {POD_NAME} (pod_ip={pod_ip})\n");
+    eprintln!("\nAll five CNI flows green for {pod_name} (pod_ip={pod_ip})\n");
 
     // Cleanup. Don't fail the test if delete hits a transient
     // kubectl issue — the next run's pre-test cleanup will catch
     // it.
-    kubectl_delete_pod(POD_NAME);
+    kubectl_delete_pod(&pod_name);
 }

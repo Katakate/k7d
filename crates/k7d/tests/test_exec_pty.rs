@@ -96,27 +96,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
-    let output = std::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(yaml.as_bytes())
-                .unwrap();
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("kubectl apply: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    common::kubectl_apply(yaml)
 }
 
 /// Graceful pod delete (see test_cni.rs / for the rationale).
@@ -440,10 +420,10 @@ fn expect_stty_size(t: &mut TtyKubectl, rows: u16, cols: u16, timeout: Duration)
 #[test]
 fn test_kubectl_exec_pty_resize() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-pty-resize";
-    create_pty_pod(pod);
+    let pod = common::unique_name("test-k7d-pty-resize");
+    create_pty_pod(&pod);
 
-    let mut t = TtyKubectl::spawn(&["exec", "-it", pod, "--", "sh"], 24, 80);
+    let mut t = TtyKubectl::spawn(&["exec", "-it", &pod, "--", "sh"], 24, 80);
     expect_stty_size(&mut t, 24, 80, Duration::from_secs(60));
 
     t.resize(40, 120);
@@ -453,7 +433,7 @@ fn test_kubectl_exec_pty_resize() {
     assert_eq!(t.wait_exit(Duration::from_secs(30)), Ok(0));
     drop(t);
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// Ctrl+C reaches the foreground job via the PTY line discipline: the
@@ -461,10 +441,10 @@ fn test_kubectl_exec_pty_resize() {
 #[test]
 fn test_kubectl_exec_pty_ctrl_c() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-pty-intr";
-    create_pty_pod(pod);
+    let pod = common::unique_name("test-k7d-pty-intr");
+    create_pty_pod(&pod);
 
-    let mut t = TtyKubectl::spawn(&["exec", "-it", pod, "--", "sh"], 24, 80);
+    let mut t = TtyKubectl::spawn(&["exec", "-it", &pod, "--", "sh"], 24, 80);
     // Wait for the shell before starting the job so ^C can't race the
     // prompt.
     t.send("echo SH''ELL-UP\n");
@@ -485,7 +465,7 @@ fn test_kubectl_exec_pty_ctrl_c() {
     assert_eq!(t.wait_exit(Duration::from_secs(30)), Ok(0));
     drop(t);
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// Detach mid-session: killing the kubectl client hangs the exec
@@ -494,14 +474,14 @@ fn test_kubectl_exec_pty_ctrl_c() {
 #[test]
 fn test_kubectl_exec_pty_detach_sighup() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-pty-detach";
-    create_pty_pod(pod);
+    let pod = common::unique_name("test-k7d-pty-detach");
+    create_pty_pod(&pod);
 
     let mut t = TtyKubectl::spawn(
         &[
             "exec",
             "-it",
-            pod,
+            &pod,
             "--",
             "sh",
             "-c",
@@ -513,7 +493,7 @@ fn test_kubectl_exec_pty_detach_sighup() {
     t.read_until("PTY-READY", Duration::from_secs(60)).unwrap();
 
     // The exec process is visible inside the container's pid ns.
-    let ps = kubectl_exec(pod, &["sh", "-c", "ps -o args | grep -c 'slee[p] 31337'"])
+    let ps = kubectl_exec(&pod, &["sh", "-c", "ps -o args | grep -c 'slee[p] 31337'"])
         .expect("ps in container");
     assert_eq!(ps.trim(), "1", "exec process should be running: {ps:?}");
 
@@ -525,7 +505,7 @@ fn test_kubectl_exec_pty_detach_sighup() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let count = kubectl_exec(
-            pod,
+            &pod,
             &["sh", "-c", "ps -o args | grep -c 'slee[p] 31337' || true"],
         )
         .expect("ps in container");
@@ -540,7 +520,7 @@ fn test_kubectl_exec_pty_detach_sighup() {
     }
 
     // The pod (and a fresh PTY session — no leaked PTY state) still works.
-    let mut t2 = TtyKubectl::spawn(&["exec", "-it", pod, "--", "sh"], 24, 80);
+    let mut t2 = TtyKubectl::spawn(&["exec", "-it", &pod, "--", "sh"], 24, 80);
     t2.send("echo AFTER''-DETACH\n");
     t2.read_until("AFTER-DETACH", Duration::from_secs(60))
         .unwrap();
@@ -548,7 +528,7 @@ fn test_kubectl_exec_pty_detach_sighup() {
     assert_eq!(t2.wait_exit(Duration::from_secs(30)), Ok(0));
     drop(t2);
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// Five parallel interactive sessions on the same pod: isolated I/O
@@ -556,19 +536,16 @@ fn test_kubectl_exec_pty_detach_sighup() {
 #[test]
 fn test_kubectl_exec_pty_concurrent() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-pty-conc";
-    create_pty_pod(pod);
+    let pod = common::unique_name("test-k7d-pty-conc");
+    create_pty_pod(&pod);
 
     let handles: Vec<_> = (0..5u16)
         .map(|i| {
+            let pod = pod.clone();
             std::thread::spawn(move || -> Result<(), String> {
                 let rows = 20 + i;
                 let cols = 90 + i;
-                let mut t = TtyKubectl::spawn(
-                    &["exec", "-it", "test-k7d-pty-conc", "--", "sh"],
-                    rows,
-                    cols,
-                );
+                let mut t = TtyKubectl::spawn(&["exec", "-it", &pod, "--", "sh"], rows, cols);
                 t.send_until(
                     &format!("echo \"M-{i}: $(stty size)\"\n"),
                     &format!("M-{i}: {rows} {cols}"),
@@ -589,5 +566,5 @@ fn test_kubectl_exec_pty_concurrent() {
         assert!(r.is_ok(), "concurrent session {i} failed: {r:?}");
     }
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }

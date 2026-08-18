@@ -85,27 +85,7 @@ fn ensure_shim_installed() -> common::LeakGuard {
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
-    let output = Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(yaml.as_bytes())
-                .unwrap();
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("kubectl apply: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    common::kubectl_apply(yaml)
 }
 
 /// Graceful pod delete (see test_cni.rs / for the rationale).
@@ -286,8 +266,8 @@ fn host_oom_kill_count() -> u64 {
 #[test]
 fn test_pod_memory_limit_sizes_vm() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-mem";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-mem");
+    kubectl_delete_pod(&pod);
     let host_oom_before = host_oom_kill_count();
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -308,12 +288,12 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 
     // 256 Mi limit + 64 MB overhead = 320 MB VM; the guest kernel
     // reserves ~18 MB, so MemTotal lands between the pod limit and
     // the raw VM size.
-    let mem_total_kb = guest_mem_total_kb(pod);
+    let mem_total_kb = guest_mem_total_kb(&pod);
     assert!(
         (256 * 1024..=320 * 1024).contains(&mem_total_kb),
         "guest MemTotal {mem_total_kb} kB outside expected 256–320 MB for a 256Mi pod"
@@ -323,7 +303,7 @@ spec:
     // preserves linux.resources.memory.limit). Process-level OOM
     // kills the hog exec; the main sleep (and agent) survive.
     let start = Instant::now();
-    let hog = kubectl_exec(pod, &["sh", "-c", "a=x; while true; do a=\"$a$a\"; done"]);
+    let hog = kubectl_exec(&pod, &["sh", "-c", "a=x; while true; do a=\"$a$a\"; done"]);
     assert!(
         hog.is_err(),
         "in-guest allocation past 256Mi cgroup limit should OOM, got: {hog:?}"
@@ -335,7 +315,7 @@ spec:
     );
 
     // The pod (and its agent plumbing) survived the in-guest OOM.
-    let alive = kubectl_exec(pod, &["echo", "still-alive"]).expect("pod alive after guest OOM");
+    let alive = kubectl_exec(&pod, &["echo", "still-alive"]).expect("pod alive after guest OOM");
     assert!(alive.contains("still-alive"));
 
     // ... and the host kernel never OOMed.
@@ -345,7 +325,7 @@ spec:
         "host kernel logged new OOM kill events — guest memory must be contained in the VM"
     );
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// A pod asking for 8Gi boots a VM whose RAM straddles the
@@ -361,9 +341,9 @@ spec:
 #[test]
 fn test_pod_large_memory_boots() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-mem-8gi";
-    kubectl_delete_pod(pod);
-    let _pod_guard = PodGuard(pod);
+    let pod = common::unique_name("test-k7d-res-mem-8gi");
+    kubectl_delete_pod(&pod);
+    let _pod_guard = PodGuard(pod.clone());
 
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -385,12 +365,12 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(180)).expect("8Gi pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(180)).expect("8Gi pod ready");
 
     // 8 Gi limit + 64 MB overhead = 8256 MB of guest RAM; the guest
     // kernel reserves ~230 MB of it (mostly `struct page`), so MemTotal
     // must land comfortably above 4 GiB and never above the VM size.
-    let mem_total_kb = guest_mem_total_kb(pod);
+    let mem_total_kb = guest_mem_total_kb(&pod);
     assert!(
         (7 * 1024 * 1024..=8256 * 1024).contains(&mem_total_kb),
         "guest MemTotal {mem_total_kb} kB outside expected 7 GiB–8256 MB for an 8Gi pod \
@@ -399,7 +379,7 @@ spec:
 
     // ZONE_NORMAL only exists when the guest has RAM past 4 GiB — proof
     // the high region reached the E820 map and the guest accepted it.
-    let zones = kubectl_exec(pod, &["cat", "/proc/zoneinfo"]).expect("read guest zoneinfo");
+    let zones = kubectl_exec(&pod, &["cat", "/proc/zoneinfo"]).expect("read guest zoneinfo");
     assert!(
         zones.contains("zone   Normal"),
         "guest has no ZONE_NORMAL — RAM past 4 GiB never made it into the E820 map"
@@ -410,7 +390,7 @@ spec:
     // outside the `yes` pattern would mean that GPA range is not backed by
     // real RAM (e.g. aliased onto the LAPIC / IOAPIC / KVM TSS windows).
     let stray = kubectl_exec(
-        pod,
+        &pod,
         &[
             "sh",
             "-c",
@@ -424,7 +404,7 @@ spec:
         "guest memory past 4 GiB returned bytes outside the written pattern"
     );
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// A pod with `cpu: "0.5"` gets its vCPU thread capped host-side: four
@@ -434,8 +414,8 @@ spec:
 #[test]
 fn test_pod_cpu_limit_caps_host_usage() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-cpu";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-cpu");
+    kubectl_delete_pod(&pod);
     let baseline = vm_cpu_cgroups();
 
     kubectl_apply(&common::pin_to_local_node(&format!(
@@ -456,7 +436,7 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 
     // Exactly one capped VM (this pod's) with the pod's CFS quota.
     let cgroups = vm_cpu_cgroups_since(&baseline);
@@ -498,7 +478,7 @@ spec:
         "vCPU thread used only {utilization:.2} of one host core — were the busy loops running?"
     );
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 
     // Teardown removes the per-VM cgroup (Vm drop joins the vCPU
     // thread first, then the cgroup drops).
@@ -518,10 +498,10 @@ spec:
 /// Deletes the named pod on drop — panic-safe cleanup so a failing
 /// test doesn't leak its pod (whose per-VM CPU cgroup would break the
 /// `vm_cpu_cgroups().len() == 1` assertions of every later test).
-struct PodGuard(&'static str);
+struct PodGuard(String);
 impl Drop for PodGuard {
     fn drop(&mut self) {
-        kubectl_delete_pod(self.0);
+        kubectl_delete_pod(&self.0);
     }
 }
 
@@ -546,7 +526,7 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 }
 
 /// A pod with `cpu: "2"` boots a 2-vCPU guest (`nproc` = 2)
@@ -557,13 +537,13 @@ spec:
 #[test]
 fn test_pod_cpu_limit_multi_vcpu() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-mvcpu";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-mvcpu");
+    kubectl_delete_pod(&pod);
     let baseline = vm_cpu_cgroups();
-    let _pod_guard = PodGuard(pod);
-    apply_multi_vcpu_pod(pod);
+    let _pod_guard = PodGuard(pod.clone());
+    apply_multi_vcpu_pod(&pod);
 
-    let nproc = kubectl_exec(pod, &["nproc"]).expect("nproc in guest");
+    let nproc = kubectl_exec(&pod, &["nproc"]).expect("nproc in guest");
     assert_eq!(nproc.trim(), "2", "cpu: \"2\" pod must see 2 vCPUs");
 
     let cgroups = vm_cpu_cgroups_since(&baseline);
@@ -600,7 +580,7 @@ fn test_pod_cpu_limit_multi_vcpu() {
         "VM used only {utilization:.2} host cores — is the second vCPU actually running?"
     );
 
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
 }
 
 /// Every vCPU kernel TID lands in the per-VM cgroup's
@@ -614,11 +594,11 @@ fn test_pod_cpu_limit_multi_vcpu() {
 #[test]
 fn test_multi_vcpu_all_tids_in_cgroup() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-mvcpu-tids";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-mvcpu-tids");
+    kubectl_delete_pod(&pod);
     let baseline = vm_cpu_cgroups();
-    let _pod_guard = PodGuard(pod);
-    apply_multi_vcpu_pod(pod);
+    let _pod_guard = PodGuard(pod.clone());
+    apply_multi_vcpu_pod(&pod);
 
     let cgroups = vm_cpu_cgroups_since(&baseline);
     assert_eq!(
@@ -648,11 +628,11 @@ fn test_multi_vcpu_all_tids_in_cgroup() {
 #[test]
 fn test_multi_vcpu_teardown() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-mvcpu-teardown";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-mvcpu-teardown");
+    kubectl_delete_pod(&pod);
     let baseline = vm_cpu_cgroups();
-    let _pod_guard = PodGuard(pod);
-    apply_multi_vcpu_pod(pod);
+    let _pod_guard = PodGuard(pod.clone());
+    apply_multi_vcpu_pod(&pod);
     assert_eq!(
         vm_cpu_cgroups_since(&baseline).len(),
         1,
@@ -660,7 +640,7 @@ fn test_multi_vcpu_teardown() {
     );
 
     let start = Instant::now();
-    kubectl_delete_pod(pod);
+    kubectl_delete_pod(&pod);
     assert!(
         start.elapsed() <= Duration::from_secs(15),
         "2-vCPU pod delete took {:?} (> 15 s) — teardown must join both vCPU threads promptly",
@@ -683,10 +663,10 @@ fn test_multi_vcpu_teardown() {
 #[test]
 fn test_besteffort_pod_gets_defaults() {
     let _leak_guard = ensure_shim_installed();
-    let pod = "test-k7d-res-be";
-    kubectl_delete_pod(pod);
+    let pod = common::unique_name("test-k7d-res-be");
+    kubectl_delete_pod(&pod);
     let baseline = vm_cpu_cgroups();
-    let _pod_guard = PodGuard(pod);
+    let _pod_guard = PodGuard(pod.clone());
 
     kubectl_apply(&common::pin_to_local_node(&format!(
         r#"
@@ -703,17 +683,17 @@ spec:
 "#
     )))
     .expect("kubectl apply");
-    wait_for_pod_ready(pod, Duration::from_secs(120)).expect("pod ready");
+    wait_for_pod_ready(&pod, Duration::from_secs(120)).expect("pod ready");
 
     // 256 MB VM: the guest kernel reserves ~18 MB, so MemTotal sits
     // just under 256 MB.
-    let mem_total_kb = guest_mem_total_kb(pod);
+    let mem_total_kb = guest_mem_total_kb(&pod);
     assert!(
         (200 * 1024..=256 * 1024).contains(&mem_total_kb),
         "guest MemTotal {mem_total_kb} kB outside expected range for the 256 MB default VM"
     );
 
-    let nproc = kubectl_exec(pod, &["nproc"]).expect("nproc in guest");
+    let nproc = kubectl_exec(&pod, &["nproc"]).expect("nproc in guest");
     assert_eq!(nproc.trim(), "1", "BestEffort pod should get 1 vCPU");
 
     // No CPU limit -> no per-VM cgroup, vCPU thread uncapped.

@@ -64,19 +64,55 @@ CONFIG_PRINTK_TIME=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
 
-# ── Debug: NONE (critical for small vmlinux) ──
-CONFIG_DEBUG_INFO_NONE=y
-# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
-# CONFIG_DEBUG_INFO_DWARF4 is not set
-# CONFIG_DEBUG_INFO_DWARF5 is not set
-# CONFIG_DEBUG_INFO_BTF is not set
+# ── Debug info: DWARF, only because BTF needs it ──
+# This used to be DEBUG_INFO_NONE, which is what you want for a small
+# vmlinux — and it is still what the *shipped* image gets, because
+# build.sh strips the DWARF back out. What cannot be stripped out is
+# `.BTF`: Cilium is CO-RE and hard-requires /sys/kernel/btf/vmlinux,
+# and pahole can only synthesise BTF from DWARF the compiler emitted.
+# So: build with DWARF (the intermediate vmlinux is ~1 GB), emit BTF,
+# strip DWARF, keep .BTF (~4-5 MB in the image). The "Debug
+# information" choice is only *visible* under DEBUG_KERNEL, which is
+# why that had to come back on too — it gates prompts, it does not by
+# itself add code paths this guest runs.
+# DEBUG_INFO_BTF additionally depends on !DEBUG_INFO_REDUCED and
+# !DEBUG_INFO_SPLIT: both are left unset and the drift check proves it
+# (a reduced or split DWARF build silently produces no BTF).
+CONFIG_DEBUG_KERNEL=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+# CONFIG_DEBUG_INFO_NONE is not set
+# CONFIG_DEBUG_INFO_REDUCED is not set
+# CONFIG_DEBUG_INFO_SPLIT is not set
+CONFIG_DEBUG_INFO_BTF=y
+# DEBUG_KERNEL is a prompt gate, but two options default to y *because*
+# of it and they are not free: X86_DEBUG_FPU puts WARN checks in the FPU
+# switch path every VM runs forever, and DEBUG_MISC adds assorted
+# runtime checks. Neither is wanted; both are answerable, so they are
+# asked for off rather than absorbed.
+# CONFIG_X86_DEBUG_FPU is not set
+# CONFIG_DEBUG_MISC is not set
 CONFIG_STRIP_ASM_SYMS=y
 CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
 # CONFIG_SYMBOLIC_ERRNAME is not set
 # CONFIG_DEBUG_BUGVERBOSE is not set
 
-# ── No modules ──
-# CONFIG_MODULES is not set
+# ── Module loader: on, with nothing to load ──
+# The guest ships no .ko files and never will — every driver and
+# netfilter/BPF feature this kernel needs is built in. What
+# CONFIG_MODULES buys is `/proc/modules`, which does not exist without
+# it, and which Cilium's agent opens unconditionally at startup: its
+# kernel-modules-manager reads the loaded-module list before any
+# datapath work and its Start hook is fatal on failure, so a
+# modules-less kernel takes Cilium down with
+# "failed to open loaded modules information at /proc/modules"
+# . Every real node has this file, and
+# on this guest it is correctly empty.
+CONFIG_MODULES=y
+# Nothing loads or unloads modules here, so the rest of the subsystem
+# stays off: no unload path, no signature/compression machinery.
+# CONFIG_MODULE_UNLOAD is not set
+# CONFIG_MODULE_SIG is not set
+# CONFIG_MODULE_COMPRESS is not set
 
 # ── Serial console ──
 CONFIG_SERIAL_8250=y
@@ -155,6 +191,36 @@ CONFIG_NETFILTER_XT_MATCH_MARK=y
 CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
 CONFIG_NETFILTER_XT_MATCH_PHYSDEV=y
 CONFIG_NETFILTER_XT_MATCH_STATISTIC=y
+# NetworkPolicy enforcement : k3s's embedded netpol
+# controller (the kube-router lib) probes the guest with `ipset save`
+# at startup and, when the ipset netlink subsystem is absent, logs
+# "Skipping network policy controller start, ipset save failed: ipset
+# v7.16: Kernel error received: Invalid argument" — and enforcement
+# silently never starts. hash:ip and hash:net are the set types it
+# creates (pod selectors / ipBlocks); xt_set is the
+# `-m set --match-set` iptables match its rules reference the sets by.
+CONFIG_IP_SET=y
+CONFIG_IP_SET_HASH_IP=y
+CONFIG_IP_SET_HASH_NET=y
+CONFIG_NETFILTER_XT_SET=y
+# With ipset present the controller starts, but every sync then aborts
+# ("Aborting sync. Failed to run iptables-restore: exit status 4 …
+# RULE_APPEND failed (No such file or directory): rule in chain
+# KUBE-POD-FW-…"): the per-pod firewall chains end in a rate-limited
+# NFLOG rule before the reject. k3s's iptables-restore runs the
+# nf_tables backend, which translates `-j NFLOG` / `-m limit` into the
+# *native* nft_log / nft_limit expressions — the xt_* pair only serves
+# the legacy backend (kept because k3s autodetects the mode, and the
+# xt revision probes warn loudly when they are absent).
+CONFIG_NFT_LOG=y
+CONFIG_NFT_LIMIT=y
+CONFIG_NETFILTER_XT_MATCH_LIMIT=y
+CONFIG_NETFILTER_XT_TARGET_NFLOG=y
+# kube-proxy and the netpol controller both list/flush conntrack
+# entries over netlink ("Failed to list conntrack entries: invalid
+# argument" every sync without it); stale-flow cleanup after a policy
+# or endpoint change silently does nothing when this is absent.
+CONFIG_NF_CT_NETLINK=y
 CONFIG_IP_NF_IPTABLES=y
 CONFIG_IP_NF_FILTER=y
 CONFIG_IP_NF_NAT=y
@@ -178,6 +244,58 @@ CONFIG_VETH=y
 CONFIG_BRIDGE=y
 CONFIG_BRIDGE_NETFILTER=y
 
+# ── Cilium eBPF datapath ──
+# Cilium's sysreq set, minus what the cgroup/BPF_SYSCALL block above
+# already provides for runc. This is what makes a k7d VM usable as a
+# real k8s *node* : without it Cilium's agent aborts at
+# startup on probe failures instead of loading a datapath.
+#
+# JIT: BPF_JIT_ALWAYS_ON is not a performance knob here, it is what
+# makes the JIT *assertable* — it pins net.core.bpf_jit_enable to a
+# read-only 1 instead of a tunable default nobody checks.
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
+# tc hooks: NET_SCHED is the dependency root; NET_SCH_INGRESS is what
+# actually provides the `clsact` qdisc Cilium attaches its programs to,
+# and NET_CLS_BPF is the classifier those programs load as.
+CONFIG_NET_SCHED=y
+CONFIG_NET_CLS_ACT=y
+CONFIG_NET_SCH_INGRESS=y
+CONFIG_NET_CLS_BPF=y
+# BPF perf event arrays / ring buffers (Cilium monitor, drop notify).
+CONFIG_PERF_EVENTS=y
+# Cilium per-endpoint policy routing needs more than the main table.
+CONFIG_IP_ADVANCED_ROUTER=y
+CONFIG_IP_MULTIPLE_TABLES=y
+CONFIG_IPV6_MULTIPLE_TABLES=y
+# Native-routing mode is the expected first deployment on a k7d bridge
+# (all node VMs are L2-adjacent on `k7-br-*`, so no encapsulation is
+# needed), but VXLAN is Cilium's *default* tunnel mode and costs little
+# built in. Both get tested; whichever one 24a-inc3 picks, the kernel
+# is not the thing that has to change.
+CONFIG_VXLAN=y
+# Cilium's tunnel/IPsec key handling and the NFSv4 client below both
+# want a hash; SHA1 via the userspace AF_ALG API is the common floor.
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_SHA1=y
+CONFIG_CRYPTO_USER_API_HASH=y
+# The XFRM *netlink* interface, not IPsec. Cilium's transparent
+# encryption is off and stays off (out of scope for 24a-inc3), but the
+# agent's datapath (re)initialisation unconditionally lists and deletes
+# xfrm policies and state before it programs anything — on a kernel with
+# no NETLINK_XFRM that socket() returns EPROTONOSUPPORT and the agent
+# dies with "failed to delete xfrm policies on node configuration
+# changed: protocol not supported" (CHALLENGES #100). XFRM_USER selects
+# XFRM_ALGO, which selects XFRM itself.
+CONFIG_XFRM=y
+CONFIG_XFRM_USER=y
+# Deliberately NOT added, so this does not get re-litigated silently:
+#   CONFIG_GENEVE      — VXLAN covers the encapsulated case
+#   CONFIG_NET_SCH_FQ  — bandwidth manager; no pod bandwidth story yet
+#   CONFIG_NETKIT      — needs Cilium 1.16+ and a veth-free datapath
+#   CONFIG_KPROBES / BPF LSM — Hubble kprobe hooks and Tetragon are
+#     out of scope, and KPROBES is explicitly off further down
+
 # ── Filesystems ──
 CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
@@ -193,7 +311,6 @@ CONFIG_FUSE_FS=y
 # Overlayfs so containerd-in-guest can use the overlay snapshotter
 # instead of the slow `native` one.
 CONFIG_OVERLAY_FS=y
-# CONFIG_NFS_FS is not set
 # ext4 for read-write virtio-blk images (tests) and erofs
 # for the immutable container rootfs images.
 CONFIG_EXT4_FS=y
@@ -207,6 +324,47 @@ CONFIG_QUOTA_TREE=y
 CONFIG_QFMT_V2=y
 # CONFIG_XFS_FS is not set
 # CONFIG_BTRFS_FS is not set
+
+# ── Longhorn v1 / generic CSI storage ──
+# Longhorn v1's engine exposes each volume to the node as an iSCSI
+# target reached over the pod network, so the *node* — which for k7d is
+# this guest — needs the SCSI midlayer, the sd disk driver, and the
+# iSCSI-over-TCP initiator. RWX volumes go through Longhorn's
+# share-manager, which exports NFSv4, so the NFS client is the other
+# half. Neither existed here: SCSI and NFS_FS were both explicitly off.
+#
+# ISCSI_TCP registers its transport at boot with no userspace at all
+# (/sys/class/iscsi_transport/tcp), which is what makes this kernel
+# assertable today; the iscsiadm/iscsid userspace is 24a-inc2's rootfs
+# problem, not this kernel's.
+#
+# Deliberately out: Longhorn v2 (SPDK — nvme-tcp, hugepages, uio),
+# dm-crypt (encrypted volumes), and XFS. v2 is a different engine with
+# a different kernel surface and no k7d story yet; XFS stays off for
+# the same size reasons as above (ext4 + erofs cover this guest).
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
+# Selected by ISCSI_TCP, pinned anyway: without the transport class
+# there is no /sys/class/iscsi_* at all and the failure is a silent
+# absence rather than an error.
+CONFIG_SCSI_ISCSI_ATTRS=y
+CONFIG_ISCSI_TCP=y
+CONFIG_NFS_FS=y
+CONFIG_NFS_V4=y
+CONFIG_NFS_V4_1=y
+CONFIG_NFS_V4_2=y
+# NFS_FS and NFS_V4 default extras to y that Longhorn's share-manager (a
+# plain NFSv4 server, no Kerberos) never touches, and each one is
+# boot-time initcalls in every VM: NFSv3 and the Kerberos RPC security
+# mechanism with the crypto it pulls behind it.
+# CONFIG_NFS_V3 is not set
+# CONFIG_RPCSEC_GSS_KRB5 is not set
+# PNFS_FILE_LAYOUT and PNFS_FLEXFILE_LAYOUT are not asked for here even
+# though they cost ~1.5 ms of initcalls between them: both are
+# promptless tristates with `default NFS_V4` (fs/nfs/Kconfig), so
+# kconfig turns them on for any NFSv4 client and the request would only
+# earn a config-drift-allowed line. Dropping them needs NFS_V4_1 gone,
+# which Longhorn RWX needs.
 
 # ── Namespaces (runc needs these) ──
 CONFIG_NAMESPACES=y
@@ -253,7 +411,8 @@ CONFIG_KEYS=y
 # ── Disable everything we don't need ──
 # CONFIG_SOUND is not set
 # CONFIG_USB_SUPPORT is not set
-# CONFIG_SCSI is not set
+# SCSI is on now (Longhorn v1 iSCSI, see the storage block above); ATA
+# stays off — there is no emulated IDE/SATA controller in a k7d VM.
 # CONFIG_ATA is not set
 # CONFIG_INPUT_KEYBOARD is not set
 # CONFIG_INPUT_MOUSE is not set
@@ -279,7 +438,8 @@ CONFIG_BLOCK=y
 # CONFIG_KPROBES is not set
 # CONFIG_KALLSYMS is not set
 # CONFIG_DEBUG_FS is not set
-# CONFIG_DEBUG_KERNEL is not set
+# DEBUG_KERNEL is on now — it is the gate on the "Debug information"
+# choice BTF needs (see the debug-info block above), not a feature.
 # CONFIG_SCHED_DEBUG is not set
 # CONFIG_STACKTRACE is not set
 # CONFIG_RCU_TRACE is not set

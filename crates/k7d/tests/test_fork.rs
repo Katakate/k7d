@@ -459,3 +459,122 @@ fn test_fork_latency_cold_source() {
     forked.shutdown();
     vm.shutdown();
 }
+
+/// Regression for the referenced work: an external interrupt captured *mid-injection*
+/// (the pause signal cancels `KVM_RUN` between KVM staging the injection and
+/// the VM entry delivering it) must be re-queued on the restored vCPU. The
+/// interrupt controller has already ACKed the vector by that point, so
+/// dropping it strands the 8259 waiting for an EOI that never comes and the
+/// fork is permanently deaf on that IRQ line (~1% of warm forks).
+///
+/// Deterministic: force `interrupt.injected = 1, nr = 0x35` (the vsock IRQ
+/// vector the repro loop observed) into the captured state and assert the
+/// restored vCPU reports it queued before its first `KVM_RUN`. The spurious
+/// injection is harmless — the guest handler finds an empty ring and EOIs.
+#[test]
+fn test_fork_requeues_interrupted_injection() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut source = create_vm_without_virtiofs();
+    source.start().unwrap();
+    let _ = source
+        .connect_agent(Duration::from_secs(90))
+        .expect("initial agent connect");
+    source.prepare_fork_source().expect("prepare_fork_source");
+    let mut agent = source
+        .connect_agent(Duration::from_secs(30))
+        .expect("reconnect after prepare_fork_source");
+    agent.exec(&["echo", "warm"]).unwrap();
+
+    // Capture by hand (what fork_warm does) so vcpu_events is editable.
+    let base_path = source
+        .fork_source_base_path()
+        .expect("fork source prepared")
+        .to_path_buf();
+    source.pause().expect("pause source");
+    let dirty = source.get_and_accumulate_dirty().unwrap().to_vec();
+    let mut state = k7d::snapshot::capture_vm_state(&source).expect("capture state");
+    let src_mem = source.mem_host_addr();
+
+    // kvm_vcpu_events layout: interrupt.injected at byte 8, nr at byte 9.
+    let events = state.cpus[0]
+        .vcpu_events
+        .as_mut()
+        .expect("capture records vcpu_events");
+    events.data[8] = 1;
+    events.data[9] = 0x35;
+
+    let fork = k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, "reinject");
+    source.resume().expect("resume source");
+    let mut fork = fork.expect("materialise fork");
+
+    // Before the first KVM_RUN the queued injection must be visible.
+    let restored_events = fork
+        .vcpu_fd()
+        .expect("restored vCPU fd available before start")
+        .get_vcpu_events()
+        .expect("KVM_GET_VCPU_EVENTS on restored vCPU");
+    assert_eq!(
+        restored_events.interrupt.injected, 1,
+        "restore must re-queue the in-flight interrupt injection"
+    );
+    assert_eq!(
+        restored_events.interrupt.nr, 0x35,
+        "re-queued injection must carry the captured vector"
+    );
+    assert_eq!(
+        restored_events.exception.injected, 0,
+        "exception state stays dropped (AMD #BR workaround)"
+    );
+
+    // And the fork must still come up reachable after the spurious vector.
+    fork.start().unwrap();
+    let mut fork_agent = fork
+        .connect_agent(Duration::from_secs(30))
+        .expect("fork with re-queued injection reachable via vsock");
+    fork_agent.ping().unwrap();
+
+    fork.shutdown();
+    source.shutdown();
+}
+
+/// Stress regression for the referenced work: 100 back-to-back warm forks, each with
+/// agent traffic immediately before the pause (the window that puts a vsock
+/// interrupt mid-injection), each fork probed over vsock. Pre-fix this
+/// failed ~6% per fork (18/300 in the diagnostic loop); post-fix it is
+/// deterministic and the whole loop runs in a few seconds.
+#[test]
+fn test_fork_warm_repeated_reachable() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut source = create_vm_without_virtiofs();
+    source.start().unwrap();
+    let _ = source
+        .connect_agent(Duration::from_secs(90))
+        .expect("initial agent connect");
+    source.prepare_fork_source().expect("prepare_fork_source");
+    let mut agent = source
+        .connect_agent(Duration::from_secs(30))
+        .expect("reconnect after prepare_fork_source");
+
+    for i in 0..100 {
+        // Traffic right before the pause keeps vsock interrupts in flight.
+        agent
+            .exec(&["sh", "-c", "echo x > /tmp/m"])
+            .unwrap_or_else(|e| panic!("source exec before fork {i}: {e:?}"));
+        let mut fork = source
+            .fork_warm(&format!("stress-{i}"))
+            .unwrap_or_else(|e| panic!("warm fork {i}: {e:?}"));
+        fork.start().unwrap();
+        let mut fork_agent = fork
+            .connect_agent(Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("fork {i} unreachable via vsock: {e:?}"));
+        fork_agent
+            .ping()
+            .unwrap_or_else(|e| panic!("fork {i} ping: {e:?}"));
+        drop(fork_agent);
+        fork.shutdown();
+    }
+
+    source.shutdown();
+}

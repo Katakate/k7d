@@ -623,6 +623,260 @@ fn test_cluster_fork_warm_fork_tcp_works() {
     drop(src_net);
 }
 
+/// Regression for CHALLENGES.md #79: a warm fork inherits the guest's TX
+/// ring but not the guest's kick.
+///
+/// A busy ping loop on both sources keeps TX descriptors permanently in
+/// flight, so each fork's pause captures the ring between the guest's MMIO
+/// notify (an eventfd write on the *source*, which does not survive the
+/// fork) and the worker's drain. Without the `activate` self-kick the
+/// fork's worker never touches those descriptors, the guest's TX queue
+/// stays stopped waiting for completions, and eth0 is transmit-dead
+/// (NETDEV WATCHDOG) while RX and vsock still work. Eight forks from the
+/// same source pair, one ping each way per fork — pre-fix this failed on
+/// most iterations; post-fix it is deterministic.
+#[test]
+fn test_cluster_fork_warm_inflight_tx_survives() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let mut src_net = ClusterNetwork::create("itx-src").expect("source bridge");
+    let mut vm0 = create_vm_on_cluster(&mut src_net);
+    let mut vm1 = create_vm_on_cluster(&mut src_net);
+    let vm0_ip = vm0.guest_ip().expect("vm0 ip");
+    let vm1_ip = vm1.guest_ip().expect("vm1 ip");
+
+    vm0.start().expect("vm0 start");
+    vm1.start().expect("vm1 start");
+    let mut a0 = vm0
+        .connect_agent(Duration::from_secs(90))
+        .expect("vm0 agent");
+    let mut a1 = vm1
+        .connect_agent(Duration::from_secs(90))
+        .expect("vm1 agent");
+
+    std::thread::sleep(Duration::from_secs(2));
+    configure_eth0(&mut a0, vm0_ip);
+    configure_eth0(&mut a1, vm1_ip);
+
+    // Background ping loops: continuous eth0 TX on both guests so every
+    // pause window has avail-but-undrained TX descriptors with high
+    // probability. The forks inherit the loops (same peer IPs on the
+    // fork bridge), which only adds more traffic through the fixed path.
+    for (agent, peer) in [(&mut a0, vm1_ip), (&mut a1, vm0_ip)] {
+        let loop_cmd = format!(
+            "while true; do ping -c 1 -W 1 {peer} >/dev/null 2>&1; done </dev/null >/dev/null 2>&1 & echo PINGING"
+        );
+        let started = agent.exec(&["sh", "-c", &loop_cmd]).expect("start pinger");
+        assert!(
+            started.stdout.contains("PINGING"),
+            "background pinger did not start: {started:?}"
+        );
+    }
+
+    drop(a0);
+    drop(a1);
+    vm0.prepare_fork_source().expect("vm0 prepare");
+    vm1.prepare_fork_source().expect("vm1 prepare");
+    let _ = vm0
+        .connect_agent(Duration::from_secs(30))
+        .expect("vm0 reconnect");
+    let _ = vm1
+        .connect_agent(Duration::from_secs(30))
+        .expect("vm1 reconnect");
+
+    for i in 0..8 {
+        let mut sources: Vec<(&mut Vm, u32)> = vec![(&mut vm0, 0), (&mut vm1, 1)];
+        let (fork_net, mut forks) = fork_cluster_warm(
+            &src_net,
+            &mut sources,
+            &format!("itx-f{i}"),
+            &[],
+            &[],
+            &[&format!("itx-f{i}-0"), &format!("itx-f{i}-1")],
+        )
+        .expect("cluster warm fork");
+
+        forks[0].start().expect("fork0 start");
+        forks[1].start().expect("fork1 start");
+        let mut f0 = forks[0]
+            .connect_agent(Duration::from_secs(30))
+            .expect("fork0 agent");
+        let mut f1 = forks[1]
+            .connect_agent(Duration::from_secs(30))
+            .expect("fork1 agent");
+
+        // One ping each way exercises both forks' TX paths (request out,
+        // reply out). No retries: the source neighbour tables are warm.
+        let p01 = f0
+            .exec(&["ping", "-c", "1", "-W", "3", &vm1_ip.to_string()])
+            .expect("fork0 ping");
+        assert_eq!(
+            p01.exit_code, 0,
+            "iteration {i}: fork0→fork1 ping failed (TX ring captured \
+             mid-kick? CHALLENGES.md #79): {}",
+            p01.stdout
+        );
+        let p10 = f1
+            .exec(&["ping", "-c", "1", "-W", "3", &vm0_ip.to_string()])
+            .expect("fork1 ping");
+        assert_eq!(
+            p10.exit_code, 0,
+            "iteration {i}: fork1→fork0 ping failed (TX ring captured \
+             mid-kick? CHALLENGES.md #79): {}",
+            p10.stdout
+        );
+
+        drop(f0);
+        drop(f1);
+        for mut f in forks {
+            f.shutdown();
+        }
+        drop(fork_net);
+    }
+
+    vm0.shutdown();
+    vm1.shutdown();
+    drop(src_net);
+}
+
+/// Deterministic regression for CHALLENGES.md #79 hole 1: the guest's TX
+/// queue-notify is an eventfd write on the *source* and does not survive a
+/// fork, and virtio drivers never re-notify for descriptors already made
+/// available — so `TapNetBackend::activate` must self-kick once to drain
+/// anything captured avail-but-unprocessed.
+///
+/// Instead of racing the (sub-millisecond) capture window, force the
+/// condition the way `test_fork_requeues_interrupted_injection` forces
+/// `interrupt.injected`: capture the source by hand, then post one extra TX
+/// descriptor into the captured ring exactly as the guest would (write a
+/// previously-used head id at `avail.ring[avail.idx % size]`, bump
+/// `avail.idx`) — but with no kick anywhere. Restore, never start the vCPU,
+/// and assert the fork's worker advances `used.idx` to the crafted
+/// `avail.idx` on its own. Without the self-kick, `used.idx` never moves.
+#[test]
+fn test_cluster_fork_activate_drains_pending_tx_without_kick() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let mut src_net = ClusterNetwork::create("kick-src").expect("source bridge");
+    let mut vm = create_vm_on_cluster(&mut src_net);
+    let vm_ip = vm.guest_ip().expect("vm ip");
+    vm.start().expect("vm start");
+    let mut agent = vm.connect_agent(Duration::from_secs(90)).expect("vm agent");
+    std::thread::sleep(Duration::from_secs(2));
+    configure_eth0(&mut agent, vm_ip);
+    // Drive real TX (an ARP request to a free address on the subnet) so the
+    // TX descriptor table and used ring hold at least one completed chain
+    // whose head id and buffers we can re-post.
+    let probe_ip = Ipv4Addr::new(vm_ip.octets()[0], vm_ip.octets()[1], vm_ip.octets()[2], 254);
+    let _ = agent.exec(&["ping", "-c", "1", "-W", "1", &probe_ip.to_string()]);
+    drop(agent);
+
+    vm.prepare_fork_source().expect("prepare_fork_source");
+    let _ = vm
+        .connect_agent(Duration::from_secs(30))
+        .expect("reconnect after prepare");
+
+    // Capture by hand (what fork_warm does) so guest memory is editable
+    // between the capture and the fork memcpy.
+    let base_path = vm
+        .fork_source_base_path()
+        .expect("fork source prepared")
+        .to_path_buf();
+    vm.pause().expect("pause source");
+    let mut dirty = vm.get_and_accumulate_dirty().expect("dirty").to_vec();
+    let state = k7d::snapshot::capture_vm_state(&vm).expect("capture state");
+    let src_mem = vm.mem_host_addr();
+
+    // TX queue (index 1) of the virtio-net device (device_type 1).
+    let net = state
+        .devices
+        .iter()
+        .find(|d| d.device_type == 1)
+        .expect("captured state has virtio-net");
+    let txq = &net.queues[1];
+    assert!(txq.ready, "TX queue not ready in captured state");
+    let size = u64::from(txq.size);
+    let avail = src_mem + txq.avail_addr;
+    let used = src_mem + txq.used_addr;
+
+    // SAFETY: avail/used point into the paused source's guest RAM
+    // (memfd-backed, mapped for the whole test); all offsets are within
+    // the split-ring layouts for a ring of `size` entries. The ring may
+    // already hold pending descriptors (a guest TX landing between the
+    // worker's park and the vCPU stop is exactly the captured-kick bug this
+    // test guards) — the crafted post simply goes on top.
+    let (crafted_avail_idx, avail_idx_before) = unsafe {
+        let avail_idx = std::ptr::read_volatile((avail + 2) as *const u16);
+        let used_idx = std::ptr::read_volatile((used + 2) as *const u16);
+        assert!(
+            used_idx > 0,
+            "guest never transmitted — no chain to re-post"
+        );
+        // Head id of the most recently completed chain; its descriptor
+        // table entries still describe a valid frame.
+        let last_slot = u64::from(used_idx.wrapping_sub(1) % txq.size);
+        let head = std::ptr::read_volatile((used + 4 + last_slot * 8) as *const u32);
+        assert!(u64::from(head) < size, "bogus head id in used ring");
+        // Post it again, exactly as the guest driver would — minus the kick.
+        let slot = u64::from(avail_idx % txq.size);
+        std::ptr::write_volatile((avail + 4 + slot * 2) as *mut u16, head as u16);
+        std::ptr::write_volatile((avail + 2) as *mut u16, avail_idx.wrapping_add(1));
+        (avail_idx.wrapping_add(1), avail_idx)
+    };
+    // The mutated pages are device/driver ring pages the vCPU did not
+    // touch since the last capture — mark them or the fork won't see the
+    // crafted entry.
+    for gpa in [txq.avail_addr, txq.avail_addr + 4 + size * 2] {
+        let page = (gpa / 4096) as usize;
+        dirty[page / 64] |= 1u64 << (page % 64);
+    }
+
+    let mut fork_net = ClusterNetwork::create("kick-f").expect("fork bridge");
+    let tap = fork_net.add_tap().expect("fork tap");
+    let fork = k7d::fork::restore_vm_from_state_with_tap(
+        &base_path,
+        &dirty,
+        src_mem,
+        &state,
+        "kick-fork",
+        tap,
+    );
+    // Undo the crafted post on the source before it resumes (its own worker
+    // must not emit the stale frame).
+    // SAFETY: same mapping as above; the source is still paused.
+    unsafe {
+        std::ptr::write_volatile((avail + 2) as *mut u16, avail_idx_before);
+    }
+    vm.resume().expect("resume source");
+    let fork = fork.expect("materialise fork");
+
+    // The fork's vCPU is never started: the only thing that can drain the
+    // crafted descriptor is the activate self-kick.
+    let fork_used = fork.mem_host_addr() + txq.used_addr;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // SAFETY: fork guest RAM stays mapped while `fork` is alive.
+        let used_idx = unsafe { std::ptr::read_volatile((fork_used + 2) as *const u16) };
+        if used_idx == crafted_avail_idx {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fork worker never drained the captured avail TX descriptor \
+             (used.idx={used_idx}, want {crafted_avail_idx}) — activate \
+             self-kick regressed (CHALLENGES.md #79)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(fork);
+    drop(fork_net);
+    vm.shutdown();
+    drop(src_net);
+}
+
 /// 3-VM warm cluster fork latency target (headline).
 ///
 /// Takes the minimum of `REPEATS` independently-prepared clusters

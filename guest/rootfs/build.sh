@@ -40,6 +40,18 @@ for cmd in ifconfig route; do
     ln -sf ../bin/busybox "$ROOTFS/sbin/$cmd"
 done
 
+# iproute2 (`ip` with vxlan link types, `tc`) is NOT in the initramfs
+# either, for the same reason as runc below and with a measurement to
+# back it: alpine's iproute2-minimal + iproute2-tc plus the musl loader
+# and libelf/libzstd they link against is 2.4 MB uncompressed, which
+# took the gzipped initramfs from 1.6 MB to 3.0 MB and boot-to-agent
+# from ~205 ms to ~221 ms — a third of the runs then missed the 250 ms
+# VM_BOOT_TO_AGENT budget. Every k7d VM would pay that so that one test
+# could run `tc`. The Dockerfile here defines the image, and
+# crates/k7d/tests/test_kernel_features.rs hands it to its guest over
+# virtiofs. 24a-inc2's node rootfs is where this userspace belongs for
+# real.
+#
 # runc is NOT included in the initramfs — it's loaded via virtiofs
 # at /mnt/state/bin/runc to keep initramfs small (<2MB) for fast boot.
 # The shim/daemon is responsible for placing the runc binary on the

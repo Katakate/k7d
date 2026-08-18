@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-08-19
+
+Inner-cluster fidelity and guest-kernel work. Add-ons survive a warm fork,
+Cilium can replace kube-proxy inside the guest cluster, and the guest grows
+iSCSI/NFS plus eBPF plumbing.
+
+### Added
+
+- CoreDNS, ServiceLB + Traefik, local-path PVCs, metrics-server, and
+  NetworkPolicy proven across a warm fork on inner-k3s.
+- HPA scale-up with post-fork divergence, an etcd datastore profile, and
+  ArgoCD GitOps on a forked cluster, plus an add-on support matrix.
+- Guest kernel: Cilium eBPF datapath and Longhorn v1 iSCSI/NFS, with BTF.
+- iSCSI + NFSv4 guest userspace, checked against a real target.
+- Cilium as the inner CNI (kube-proxy replaced), riding a warm fork.
+- Guest-kernel hooks for kprobes, ftrace, and BPF LSM.
+
+### Fixed
+
+- A ~1% unreachable warm fork (`vcpu_events` + net TX kick) and an fd leak.
+- Shared-cluster integration tests no longer collide; stranded host
+  resources are swept.
+- The test suite runs one VM-booting binary at a time so a failure names
+  the binary.
+
+### Changed
+
+- The VMM+shim size claim is now ≤30k LOC (was ≤25k).
+
 ## [0.2.1] — 2026-08-16
 
 Patch release. `k7d --version` on a machine with a running daemon no longer

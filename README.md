@@ -11,7 +11,7 @@
   </a>
   <a href="https://deepwiki.com/Katakate/k7d"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
-  <img src="https://img.shields.io/badge/VMM%2Bshim-%E2%89%A425k%20LOC-lightgrey" alt="VMM + shim ≤25k LOC"/>
+  <img src="https://img.shields.io/badge/VMM%2Bshim-%E2%89%A430k%20LOC-lightgrey" alt="VMM + shim ≤30k LOC"/>
   <a href="#formal-verification"><img src="https://img.shields.io/badge/formal-Kani%20%2F%20Aeneas-informational.svg" alt="Formal verification: Kani / Aeneas"/></a>
   <a href="https://beci.me/blog"><img src="https://img.shields.io/badge/blog-6--part%20series-blue.svg" alt="Blog: 6-part series on building k7d"/></a>
 </p>
@@ -70,7 +70,7 @@ CLI / API / Python SDK for agents — see the sibling project
   [Aeneas](https://aeneasverif.github.io/)→Lean on the tree
   budget/eviction model. Not a claim that everything is proven —
   details [below](#formal-verification).
-- 🪶 **≤25k lines of Rust for the VMM + shim** — small enough to read
+- 🪶 **≤30k lines of Rust for the VMM + shim** — small enough to read
   and audit. Deliberately not a kitchen-sink VMM.
 - ✅ **Every number here is a CI assertion** — not a one-off benchmark
   paste. If a latency claim drifts, a test fails. Methodology:
@@ -231,9 +231,10 @@ This is the k3s that lives *inside* the VMs you fork. The fork engine
 is **N-node** (`tree_create_cluster(vm_count)` / adopt any live set) —
 there is no hard-coded 3. The CI fixture that proves the headline
 numbers is a 3-node control plane with flannel + kube-proxy and a real
-in-cluster Deployment; several stock k3s add-ons are still disabled
-there to keep that path lean. Status below mixes “API can do it” with
-“fixture exercises it.”
+in-cluster Deployment. That **default profile** keeps stock k3s add-ons
+off so the lean path stays lean; each add-on below is an opt-in
+profile on the same switchboard, with its own proving test. Status
+below mixes “API can do it” with “fixture exercises it.”
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -244,19 +245,23 @@ there to keep that path lean. Status below mixes “API can do it” with
 | Deployments / ReplicaSets / Pods | ✅ Today | e.g. `inner-load` Ready on source *and* fork |
 | ConfigMaps / Secrets (as in-cluster objects) | ✅ Today | Exercised under churn before fork |
 | overlayfs snapshotter (guest containerd) | ✅ Today | |
-| CoreDNS | 🔜 Soon | Disabled in the current fixture; re-enable is next |
-| Traefik / Ingress | 🔜 Soon | Same — disabled today, queued with CoreDNS |
-| ServiceLB / metrics-server | 🔜 Soon | Disabled in the fixture |
-| `local-path` / in-cluster PVC provisioning | 🔜 Soon | Disabled (`local-storage` off) |
-| NetworkPolicy | 🔜 Later | Disabled today (`--disable-network-policy`) |
+| CoreDNS | ✅ Today | Fixture proves DNS on all members across a warm fork — `test_inner_k3s_coredns_dns_fork` |
+| Traefik / Ingress | ✅ Today | HTTP through an Ingress on source and fork — `test_inner_k3s_ingress_fork` |
+| ServiceLB | ✅ Today | Traefik Service reports guest IPs as LB ingress; same proving test as Ingress — `test_inner_k3s_ingress_fork` |
+| metrics-server | ✅ Today | `kubectl top` / `metrics.k8s.io` Available on all three nodes across a warm fork — `test_inner_k3s_metrics_server_fork` |
+| `local-path` / in-cluster PVC provisioning | ✅ Today | Same bytes on source and fork, then independent divergence — `test_inner_k3s_local_path_pvc_fork` |
+| NetworkPolicy | ✅ Today | Default-deny + allow enforced on source and fork — `test_inner_k3s_network_policy_fork`. Guest kernel needs ipset + `xt_set`, xt NFLOG/limit, and `nft_log`/`nft_limit` ([CHALLENGES.md #93](CHALLENGES.md)) |
+| HPA | ✅ Today | CPU-metrics scale-up on source and fork; observed utilization diverges after a fork-only load change — `test_inner_k3s_hpa_scale_fork` |
+| Embedded etcd datastore | ✅ Today | Single-member `--cluster-init` WAL and writes survive a warm fork; per-bridge writes stay isolated — `test_inner_k3s_etcd_datastore_fork` |
+| ArgoCD core GitOps | ✅ Today | In-cluster `git://`; Application Synced/Healthy + `reconciledAt` on both bridges; fork-only commit syncs only on the fork — `test_inner_k3s_argocd_gitops_fork`. application-controller shards and does not hold a coordination Lease ([CHALLENGES.md #96](CHALLENGES.md)) |
 | Cilium (eBPF CNI / policies) | 🔜 Later | Not validated inside the guest; outer host may run Cilium |
 | Longhorn / CSI drivers (iSCSI, NFS, …) | 🔜 Later | Guest kernel is minimal; no CSI path yet |
 | Nested `hostNetwork` pods | ❌ Not today | Known failure mode in the guest |
 
-If your scenario needs CoreDNS + Ingress tomorrow, say so — re-enabling
-the stock add-ons is the next fidelity bump, not a redesign. Same for
-a larger CI fixture: wiring 20 nodes is configuration + RAM, not a new
-fork feature.
+Need CoreDNS + Ingress on one cluster? Flip the profile flags — the
+switchboard is configuration, not a redesign. Same for a larger CI
+fixture: wiring 20 nodes is configuration + RAM, not a new fork
+feature.
 
 ### Host RuntimeClass (pods *as* k7d VMs)
 
@@ -307,7 +312,7 @@ Deliberately not E2B-API compatible — different job.
   host-facing identity is new.
 - **Single host, x86_64 Linux + KVM only.** Cross-node fork is on the
   roadmap. Does not build on macOS/Windows.
-- **Young project.** ≤25k LOC for the VMM + shim, one primary test
+- **Young project.** ≤30k LOC for the VMM + shim, one primary test
   machine, no security audit yet. Small surface by design.
 
 ## Formal verification
@@ -339,6 +344,7 @@ make verif-gen verif-build     # regenerate Lean model + prove it
 - [beci.me/blog](https://beci.me/blog) — a six-part write-up on how and why k7d was built, from the RL motivation to the formal verification
 - [`docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md`](docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md) — hardware, exact commands, methodology
 - [`CHALLENGES.md`](CHALLENGES.md) — 56 non-trivial bugs with root causes and time lost (the three above are the headline; start anywhere)
+- [`todo-ideas.md`](todo-ideas.md) — maturity-fixture backlog (write-during-fork, dirty floods, Kafka/KRaft, …) — not a spec
 - [docs.katakate.org/k7d](https://docs.katakate.org/k7d) — architecture, concepts, daemon API, guides ([source](https://github.com/Katakate/docs/tree/main/k7d))
 - [`HACKING.md`](HACKING.md) — build, test, and the RuntimeClass install steps
 - [Katakate/k7](https://github.com/Katakate/k7) — sibling project: use k7d-class VM sandboxes at scale with Kubernetes orchestration, a CLI/API, and a Python SDK for your agents

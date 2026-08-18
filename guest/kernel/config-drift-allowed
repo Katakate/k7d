@@ -27,8 +27,9 @@ CONFIG_STACKTRACE
 CONFIG_CPU_FREQ
 CONFIG_X86_INTEL_PSTATE
 
-# The "Debug information" choice depends on DEBUG_KERNEL, so with
-# DEBUG_KERNEL off the choice is invisible and NONE cannot be selected.
-# No CONFIG_DEBUG_INFO* is set either, which is the point of the line:
-# the answered config generates no debug info.
-CONFIG_DEBUG_INFO_NONE
+# The "Debug information" choice used to be listed here: with
+# DEBUG_KERNEL off it is invisible, so DEBUG_INFO_NONE could not be
+# selected and kconfig always won. DEBUG_KERNEL is on now (BTF needs
+# the DWARF machinery, see config-minimal), the choice is visible, and
+# the request is answerable — so the entry is gone and the drift check
+# is what proves DWARF_TOOLCHAIN_DEFAULT actually took.

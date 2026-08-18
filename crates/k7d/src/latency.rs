@@ -146,6 +146,12 @@ pub const FORK_CLUSTER_WARM_BATCH_8: Duration = Duration::from_secs(2);
 /// Enforced by `test_inner_k3s_cluster_warm_fork_no_restart`.
 pub const FORK_INNER_K3S_CLUSTER_3VM: Duration = Duration::from_millis(1_000);
 
+/// Warm-fork the 3-VM inner-k3s cluster with Argo CD core + in-cluster
+/// git + a synced Application . Dirtier than the shared
+/// [`FORK_INNER_K3S_CLUSTER_3VM`] 1 s ceiling — do not widen that one.
+/// Enforced by `test_inner_k3s_argocd_gitops_fork`.
+pub const FORK_INNER_K3S_CLUSTER_3VM_ARGOCD: Duration = Duration::from_millis(2_000);
+
 /// 3-VM cluster suspend via the cluster snapshot tree.
 ///
 /// Per-member pause + dirty bitmap capture + `delta.pack` write +

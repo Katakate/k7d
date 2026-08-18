@@ -1044,8 +1044,12 @@ impl VmBuilder {
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
             let irq_evt = Arc::new(irq_evt);
 
-            let net_backend =
-                TapNetBackend::new(net_config.tap.mac(), net_config.tap.fd(), mem_host_addr);
+            let net_backend = TapNetBackend::new(
+                net_config.tap.mac(),
+                net_config.tap.fd(),
+                mem_host_addr,
+                mem_span,
+            );
 
             let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(net_backend));
             dev.set_vhost(true);

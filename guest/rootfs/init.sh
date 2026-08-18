@@ -17,6 +17,14 @@ mount -t devpts -o mode=620,ptmxmode=666 devpts /dev/pts 2>/dev/null || true
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 
+# bpffs, where Cilium (and anything else CO-RE) pins maps and programs
+# so they survive an agent restart. Fail loud: the kernel is built with
+# CONFIG_BPF_SYSCALL=y, so this mount has no excuse — a silent `|| true`
+# here would surface much later as an agent that cannot pin its maps.
+mkdir -p /sys/fs/bpf
+mount -t bpf bpf /sys/fs/bpf \
+    || { echo "k7-init: failed to mount bpffs on /sys/fs/bpf" >&2; exit 1; }
+
 # No-internal-process constraint: a cgroup cannot both host processes
 # and enable domain controllers in subtree_control. Move this shell
 # (and the agent we exec next) into a leaf, then delegate ALL
