@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.2.2
+# Version: 0.3.0
 set -euo pipefail
 
-VERSION="0.2.2"
+VERSION="0.3.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"

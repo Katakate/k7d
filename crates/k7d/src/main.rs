@@ -90,6 +90,19 @@ fn main() {
 
     install_signal_handlers();
 
+    // the referenced work layer 4. Installed before the first VM (and before the
+    // pool's threads) exists: a filter on this thread is inherited by
+    // every thread and child process created afterwards, which is what
+    // makes a daemon-wide filter possible at all in a process that owns
+    // every tree's VMs as threads. Defaults to `enforce`.
+    match k7d::seccomp::install() {
+        Ok(mode) => log::info!("seccomp mode: {mode:?}"),
+        Err(e) => {
+            log::error!("seccomp: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Warm pool from env (K7D_POOL_SIZE > 0
     // enables it). A malformed pool config must stop the daemon loudly
     // — silently running without the pool the operator asked for would
@@ -118,6 +131,14 @@ fn main() {
     // GC per-VM CPU cgroups a crashed previous daemon left
     // under this service's cgroup (their vCPU threads died with it).
     k7d::cgroup::clean_stale_vm_cgroups();
+    // Same contract for the tree jail's leftovers : an empty
+    // cgroup is harmless, but a stale nft table silently filters the
+    // next bridge that reuses the name.
+    k7d::cgroup::clean_stale_tree_cgroups();
+    let reaped_jails = k7d::netjail::clean_stale_jails();
+    if !reaped_jails.is_empty() {
+        log::warn!("reaped stale net jails: {reaped_jails:?}");
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Bridge the C signal handler's static flag into the Arc the serve

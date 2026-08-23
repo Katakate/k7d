@@ -54,6 +54,11 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 /// Per-device MMIO region size.
 pub const MMIO_DEVICE_SIZE: u64 = 0x1000;
 
+/// Virtio device-type ID for `virtio-vsock`. The only vhost device whose
+/// rings live in guest memory this process maps, hence the only one whose
+/// kernel-side DMA has to be reported to the warm-fork dirty delta by hand.
+pub const VIRTIO_ID_VSOCK: u32 = 19;
+
 /// State of a single virtqueue as programmed by the guest.
 #[derive(Debug, Clone, Default)]
 pub struct VirtqueueState {
@@ -113,8 +118,12 @@ pub trait VirtioBackend: Send {
     /// writes guest memory through k7d's own mapping (virtio-blk reads,
     /// used-ring updates) must report those pages itself or warm forks on
     /// the `base.mem + dirty delta` path silently miss them (the host-side
-    /// CHALLENGES.md #27 class of bug). Default: no-op (vhost devices force
-    /// the full-memfd fork path instead).
+    /// CHALLENGES.md #27 class of bug). Default: no-op.
+    ///
+    /// A vhost device has no userspace worker to report anything, but the
+    /// kernel DMAs into its rings just as invisibly — those pages are
+    /// marked by [`MmioDevice::merge_dirty_pages`] instead, so a vsock-only
+    /// VM on the `CoW` fork path is not exempt from this class of bug.
     fn merge_dirty_pages(&self, _acc: &mut [u64]) {}
 }
 
@@ -439,9 +448,103 @@ impl MmioDevice {
     }
 
     /// Merge the backend's device-DMA dirty pages into `acc` (see
-    /// [`VirtioBackend::merge_dirty_pages`]).
-    pub fn merge_dirty_pages(&self, acc: &mut [u64]) {
+    /// [`VirtioBackend::merge_dirty_pages`]), then — for vhost-vsock — mark
+    /// the pages the kernel vhost worker DMAs into.
+    ///
+    /// `KVM_GET_DIRTY_LOG` only reports vCPU writes, so a warm fork that
+    /// copies `base.mem` plus that log carries vsock rings as they were when
+    /// `base.mem` was dumped. Restore then programs `VHOST_SET_VRING_BASE`
+    /// from that stale `used.idx` and the guest's vsock stack is deaf
+    /// (CHALLENGES.md #101).
+    pub fn merge_dirty_pages(&self, acc: &mut [u64], mem_host_addr: u64, mem_span: u64) {
         self.backend.merge_dirty_pages(acc);
+        if self.backend.device_type() == VIRTIO_ID_VSOCK {
+            mark_virtqueue_pages_dirty(&self.queues, acc, mem_host_addr, mem_span);
+        }
+    }
+}
+
+/// Virtio descriptor flag: the descriptor points at an indirect table, not
+/// at a buffer.
+const VIRTQ_DESC_F_INDIRECT: u16 = 4;
+
+/// Mark every ready virtqueue's rings — and the buffers its descriptors
+/// point at — dirty in `acc`.
+///
+/// vhost-vsock DMA-writes both the used ring and RX payloads, so copying the
+/// rings without their buffers would hand the fork completions that point at
+/// stale bytes. The cost is bounded by the queue size (256 descriptors of at
+/// most a page each on both vsock queues), which is why this is limited to
+/// vsock: a net or blk descriptor `len` can legitimately be megabytes, and
+/// walking those would mark gigabytes on every fork.
+///
+/// Avail ring is `flags:u16 + idx:u16 + ring[size]:u16 + used_event:u16`.
+/// Used ring is `flags:u16 + idx:u16 + elem[size]:{id:u32,len:u32} + avail_event:u16`.
+/// Descriptor table is `size` 16-byte entries.
+fn mark_virtqueue_pages_dirty(
+    queues: &[VirtqueueState],
+    acc: &mut [u64],
+    mem_host_addr: u64,
+    mem_span: u64,
+) {
+    for q in queues {
+        if !q.ready || q.size == 0 {
+            continue;
+        }
+        let n = u64::from(q.size);
+        let desc_gpa = q.desc_addr.raw_value();
+        mark_gpa_range_dirty(acc, desc_gpa, n * 16);
+        mark_gpa_range_dirty(acc, q.avail_addr.raw_value(), 6 + n * 2);
+        mark_gpa_range_dirty(acc, q.used_addr.raw_value(), 6 + n * 8);
+        if mem_host_addr == 0 || mem_span == 0 {
+            continue;
+        }
+        for i in 0..n {
+            let desc_hva = mem_host_addr + desc_gpa + i * 16;
+            // SAFETY: desc_hva is a descriptor of a ready virtqueue inside the
+            // caller's live guest mapping, which outlives this call. The caller
+            // has paused the vCPUs, so the guest is not rewriting the table.
+            let (buf_gpa, buf_len, flags) = unsafe {
+                (
+                    std::ptr::read_volatile(desc_hva as *const u64),
+                    u64::from(std::ptr::read_volatile((desc_hva + 8) as *const u32)),
+                    std::ptr::read_volatile((desc_hva + 12) as *const u16),
+                )
+            };
+            // An indirect descriptor's `addr` is a descriptor table, not a
+            // buffer; the ring pages above already cover what vhost writes.
+            if flags & VIRTQ_DESC_F_INDIRECT != 0 || buf_gpa == 0 || buf_len == 0 {
+                continue;
+            }
+            if buf_gpa >= mem_span || buf_len > mem_span - buf_gpa {
+                continue;
+            }
+            mark_gpa_range_dirty(acc, buf_gpa, buf_len);
+        }
+    }
+}
+
+/// Set the bits covering `[gpa, gpa + len)` in a warm-fork dirty bitmap (one
+/// bit per 4 KiB page, `u64` words). A range that starts past the bitmap is a
+/// bug in the caller's queue state, not something to paper over — it means
+/// the fork will miss that DMA, so say so.
+fn mark_gpa_range_dirty(acc: &mut [u64], gpa: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let first = gpa / 4096;
+    let last = (gpa + len - 1) / 4096;
+    let last_tracked = (acc.len() as u64).saturating_mul(64).saturating_sub(1);
+    if first > last_tracked {
+        log::error!(
+            "virtqueue dirty range {gpa:#x}+{len} is outside the {}-word bitmap — \
+             a warm fork will miss this vhost DMA",
+            acc.len()
+        );
+        return;
+    }
+    for page in first..=last.min(last_tracked) {
+        acc[(page / 64) as usize] |= 1u64 << (page % 64);
     }
 }
 
@@ -527,10 +630,14 @@ impl MmioDeviceRegistry {
         }
     }
 
-    /// Merge every backend's device-DMA dirty pages into `acc`.
-    pub fn merge_dirty_pages_all(&self, acc: &mut [u64]) {
+    /// Merge every backend's device-DMA dirty pages into `acc`. `mem_host_addr`
+    /// and `mem_span` describe the caller's guest mapping, which vsock ring
+    /// walking reads through (see [`MmioDevice::merge_dirty_pages`]).
+    pub fn merge_dirty_pages_all(&self, acc: &mut [u64], mem_host_addr: u64, mem_span: u64) {
         for dev in &self.devices {
-            dev.lock().unwrap().merge_dirty_pages(acc);
+            dev.lock()
+                .unwrap()
+                .merge_dirty_pages(acc, mem_host_addr, mem_span);
         }
     }
 }
@@ -614,3 +721,81 @@ impl MmioDeviceRegistry {
 
 /// Shared MMIO device registry.
 pub type SharedMmioRegistry = Arc<Mutex<MmioDeviceRegistry>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_queue(desc: u64, avail: u64, used: u64) -> VirtqueueState {
+        VirtqueueState {
+            max_size: 256,
+            size: 256,
+            ready: true,
+            desc_addr: GuestAddress(desc),
+            avail_addr: GuestAddress(avail),
+            used_addr: GuestAddress(used),
+        }
+    }
+
+    fn is_dirty(acc: &[u64], page: u64) -> bool {
+        acc[(page / 64) as usize] & (1u64 << (page % 64)) != 0
+    }
+
+    #[test]
+    fn mark_gpa_range_covers_every_page_it_touches() {
+        let mut acc = vec![0u64; 4];
+        mark_gpa_range_dirty(&mut acc, 4090, 16);
+        assert!(is_dirty(&acc, 0) && is_dirty(&acc, 1), "spans the boundary");
+        assert!(!is_dirty(&acc, 2));
+    }
+
+    #[test]
+    fn mark_gpa_range_ignores_a_range_past_the_bitmap() {
+        let mut acc = vec![0u64; 1];
+        mark_gpa_range_dirty(&mut acc, 1 << 40, 4096);
+        assert_eq!(acc[0], 0);
+    }
+
+    #[test]
+    fn ring_pages_are_marked_without_a_mapping_to_walk() {
+        let mut acc = vec![0u64; 4];
+        mark_virtqueue_pages_dirty(&[ready_queue(0x1000, 0x2000, 0x3000)], &mut acc, 0, 0);
+        assert!(is_dirty(&acc, 1), "descriptor table");
+        assert!(is_dirty(&acc, 2), "avail ring");
+        assert!(is_dirty(&acc, 3), "used ring");
+        assert!(!is_dirty(&acc, 4));
+    }
+
+    #[test]
+    fn a_queue_the_guest_never_readied_is_skipped() {
+        let mut acc = vec![0u64; 4];
+        let mut q = ready_queue(0x1000, 0x2000, 0x3000);
+        q.ready = false;
+        mark_virtqueue_pages_dirty(&[q], &mut acc, 0, 0);
+        assert_eq!(acc, [0; 4]);
+    }
+
+    #[test]
+    fn descriptor_buffers_are_marked_and_bogus_ones_rejected() {
+        // A one-descriptor queue whose buffer sits at page 8, plus a second
+        // descriptor pointing outside the span and a third marked indirect.
+        let span = 64 * 4096;
+        let mut mem = vec![0u8; span as usize];
+        let write_desc = |mem: &mut [u8], i: usize, addr: u64, len: u32, flags: u16| {
+            let at = 0x1000 + i * 16;
+            mem[at..at + 8].copy_from_slice(&addr.to_le_bytes());
+            mem[at + 8..at + 12].copy_from_slice(&len.to_le_bytes());
+            mem[at + 12..at + 14].copy_from_slice(&flags.to_le_bytes());
+        };
+        write_desc(&mut mem, 0, 8 * 4096, 4096, 0);
+        write_desc(&mut mem, 1, span + 4096, 4096, 0);
+        write_desc(&mut mem, 2, 9 * 4096, 4096, VIRTQ_DESC_F_INDIRECT);
+
+        let mut q = ready_queue(0x1000, 0x2000, 0x3000);
+        q.size = 3;
+        let mut acc = vec![0u64; 1];
+        mark_virtqueue_pages_dirty(&[q], &mut acc, mem.as_ptr() as u64, span);
+        assert!(is_dirty(&acc, 8), "buffer of a plain descriptor");
+        assert!(!is_dirty(&acc, 9), "indirect descriptor is not a buffer");
+    }
+}

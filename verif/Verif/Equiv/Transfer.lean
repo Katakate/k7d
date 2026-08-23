@@ -11,6 +11,7 @@
 -- equivalence theorems; on any realistic tree they hold trivially.
 
 import Verif.Equiv.Evict
+import Verif.Equiv.Chain
 import Verif.Equiv.Latency
 import Verif.Equiv.K7dl
 
@@ -149,6 +150,32 @@ theorem ram_soft_limit_below_max_rust (b : tree_model.TreeBudget) :
   rw [hpost]
   exact Tree.ram_soft_limit_below_max (absBudget b)
 
+/-- Group B on the Rust code : with zero incoming bytes
+the disk-headroom check decides exactly `over_disk`. -/
+theorem over_disk_incoming_zero_rust (t : tree_model.TreeModel) :
+    ∃ b, tree_model.over_disk_incoming t 0#u64 = ok b
+      ∧ (b = true ↔ Tree.overDisk (absTree t)) := by
+  obtain ⟨b, hpb, hpost⟩ := spec_imp_exists (over_disk_incoming_equiv t 0#u64)
+  refine ⟨b, hpb, ?_⟩
+  rw [hpost]
+  simp [Tree.over_disk_incoming_zero]
+
+/-- Group B on the Rust code : the disk-headroom check is
+monotone in the projected write — if `i` bytes do not fit, neither does
+any `j ≥ i`. -/
+theorem over_disk_incoming_mono_rust (t : tree_model.TreeModel)
+    (i j : Std.U64) (hij : i.val ≤ j.val) :
+    ∃ bi bj, tree_model.over_disk_incoming t i = ok bi
+      ∧ tree_model.over_disk_incoming t j = ok bj
+      ∧ (bi = true → bj = true) := by
+  obtain ⟨bi, hpi, hposti⟩ := spec_imp_exists (over_disk_incoming_equiv t i)
+  obtain ⟨bj, hpj, hpostj⟩ := spec_imp_exists (over_disk_incoming_equiv t j)
+  refine ⟨bi, bj, hpi, hpj, ?_⟩
+  rw [hposti, hpostj]
+  intro h
+  simp only [decide_eq_true_eq] at h ⊢
+  exact Tree.over_disk_incoming_mono (absTree t) i.val j.val hij h
+
 -- ## Group C — eviction policy
 
 /-- Group C on the Rust code: the fuel `max_id().saturating_add(2)`
@@ -228,6 +255,37 @@ theorem leaf_subtree_has_no_live_descendants_rust (t : tree_model.TreeModel)
   refine ⟨o, hp, ?_⟩
   rw [hpost]
   exact Tree.leaf_subtree_has_no_live_descendants (absTree t)
+
+/-- Group C on the Rust code : `restore_chain_depth`
+never panics, and a checkpoint node's restore chain is 0 — resume reads
+its own `memory.bin`, no deltas. -/
+theorem restore_chain_depth_checkpoint_rust (t : tree_model.TreeModel)
+    (id : Std.U64) (n : Tree.NodeInfo)
+    (hl : Tree.lookup (absTree t) id.val = some n)
+    (hb : n.hasBase = true) :
+    ∃ o, tree_model.restore_chain_depth t id = ok o
+      ∧ o.map (·.val) = some 0 := by
+  obtain ⟨o, hp, hpost⟩ := spec_imp_exists (restore_chain_depth_equiv t id)
+  refine ⟨o, hp, ?_⟩
+  rw [hpost]
+  exact Tree.restore_chain_depth_checkpoint (absTree t) id.val n hl hb
+
+/-- Group C on the Rust code (the referenced work, the load-bearing
+distinction): a non-checkpoint node whose parent is a checkpoint has
+restore chain exactly 1, however deep it sits in the tree graph —
+`root → child → grandchild` is graph depth 2 but restore depth 1 once
+the child was prepared. -/
+theorem restore_chain_depth_hop_rust (t : tree_model.TreeModel)
+    (id : Std.U64) (p : Nat) (n m : Tree.NodeInfo)
+    (hl : Tree.lookup (absTree t) id.val = some n)
+    (hb : n.hasBase = false) (hp' : n.parent = some p)
+    (hlp : Tree.lookup (absTree t) p = some m) (hbp : m.hasBase = true) :
+    ∃ o, tree_model.restore_chain_depth t id = ok o
+      ∧ o.map (·.val) = some 1 := by
+  obtain ⟨o, hp, hpost⟩ := spec_imp_exists (restore_chain_depth_equiv t id)
+  refine ⟨o, hp, ?_⟩
+  rw [hpost]
+  exact Tree.restore_chain_depth_hop (absTree t) id.val p n m hl hb hp' hlp hbp
 
 -- ## Group D — the Tier-1 RAM eviction loop
 

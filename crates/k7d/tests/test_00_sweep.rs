@@ -96,3 +96,45 @@ fn test_stranded_resource_sweep_reports_and_removes() {
         orphan.display()
     );
 }
+
+/// Persistent data disks  are reaped by **age**, not by
+/// "no live VM holds it": between two VMs, a correctly retained disk is
+/// held by nobody, so the ephemeral rule would delete exactly the disks
+/// the primitive exists to keep.
+#[test]
+fn test_sweep_reaps_orphan_data_disks_and_spares_fresh_ones() {
+    let dir = k7d::disks::data_disks_dir();
+    std::fs::create_dir_all(&dir).expect("create data-disks dir");
+
+    let stale = dir.join("test-sweep-stale.img");
+    let fresh = dir.join("test-sweep-fresh.img");
+    std::fs::write(&stale, b"stale-data-disk").expect("plant stale data disk");
+    std::fs::write(&fresh, b"fresh-data-disk").expect("plant fresh data disk");
+    // An hour back: past the sweep's 30-minute staleness gate, so this
+    // stands in for a run that died without deleting its disk.
+    let aged = Command::new("touch")
+        .args(["-d", "-1 hour"])
+        .arg(&stale)
+        .status()
+        .expect("touch runs");
+    assert!(aged.success(), "failed to age {}", stale.display());
+
+    let report = common::sweep_stranded_resources();
+    let joined = report.join("\n");
+    assert!(
+        report.iter().any(|l| l.contains("test-sweep-stale.img")),
+        "sweep must report the aged data disk: {joined}"
+    );
+    assert!(
+        !stale.exists(),
+        "aged data disk {} must be gone after sweep",
+        stale.display()
+    );
+    assert!(
+        fresh.exists(),
+        "sweep deleted {} — a data disk younger than the staleness gate belongs to a \
+         possibly-live run",
+        fresh.display()
+    );
+    std::fs::remove_file(&fresh).expect("clean up the fresh data disk");
+}

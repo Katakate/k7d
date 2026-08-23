@@ -189,6 +189,12 @@ def overCount (t : TreeModel) (incoming : Nat) : Prop :=
 def overDisk (t : TreeModel) : Prop :=
   t.budget.maxDiskBytes < (usage t).diskBytes
 
+/-- Mirror of `tree_model::over_disk_incoming` (the referenced work: disk
+headroom check before writing a projected base snapshot; the Rust
+`u64::saturating_add` is mirrored saturation-exactly). -/
+def overDiskIncoming (t : TreeModel) (incoming : Nat) : Prop :=
+  t.budget.maxDiskBytes < satAdd U64_MAX (usage t).diskBytes incoming
+
 instance (t : TreeModel) : Decidable (overRam t) := by
   unfold overRam; infer_instance
 
@@ -197,6 +203,39 @@ instance (t : TreeModel) (i : Nat) : Decidable (overCount t i) := by
 
 instance (t : TreeModel) : Decidable (overDisk t) := by
   unfold overDisk; infer_instance
+
+instance (t : TreeModel) (i : Nat) : Decidable (overDiskIncoming t i) := by
+  unfold overDiskIncoming; infer_instance
+
+/-- The saturating fold never exceeds its cap (from a below-cap seed) —
+`usage()`'s byte counters cannot report above `u64::MAX`. -/
+theorem satSum_le_cap (cap : Nat) (l : List Nat) (acc : Nat)
+    (h : acc ≤ cap) : satSum cap l acc ≤ cap := by
+  induction l generalizing acc with
+  | nil => simpa [satSum]
+  | cons x xs ih =>
+    show satSum cap xs (satAdd cap acc x) ≤ cap
+    exact ih _ (by unfold satAdd; omega)
+
+/-- With no incoming bytes, the headroom check degenerates to
+`over_disk` — the two predicates agree on the current footprint. -/
+theorem over_disk_incoming_zero (t : TreeModel) :
+    overDiskIncoming t 0 ↔ overDisk t := by
+  have hle : (usage t).diskBytes ≤ U64_MAX := by
+    have : (usage t).diskBytes
+        = satSum U64_MAX (t.nodes.map NodeInfo.diskBytes) 0 := by
+      simp [usage, usageAux_spec]
+    rw [this]
+    exact satSum_le_cap U64_MAX _ 0 (by omega)
+  unfold overDiskIncoming overDisk satAdd
+  omega
+
+/-- Monotone in the projected write: if `incoming` bytes do not fit,
+neither does anything larger. -/
+theorem over_disk_incoming_mono (t : TreeModel) (i j : Nat) (hij : i ≤ j)
+    (h : overDiskIncoming t i) : overDiskIncoming t j := by
+  unfold overDiskIncoming satAdd at h ⊢
+  omega
 
 /-- A tree with no Live nodes is under both RAM and count budgets — the
 base case of the Group D eviction-loop proofs. -/

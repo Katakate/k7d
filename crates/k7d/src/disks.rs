@@ -25,9 +25,19 @@ pub const DISKS_DIR: &str = "/var/lib/k7d/disks";
 /// Default backing image for the loopback XFS behind [`DISKS_DIR`].
 pub const DISKS_IMAGE: &str = "/var/lib/k7d/disks.img";
 
-/// Default size of the sparse XFS backing image: 32 GiB. Sparse — real
+/// Default size of the sparse XFS backing image: 96 GiB. Sparse — real
 /// disk usage grows with actual volume writes only.
-pub const DISKS_IMAGE_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+///
+/// Sized for the Ubuntu bare-VM ladder rather than the minimal guest: a
+/// 3-node cluster is three reflinks of a 16 GiB node image, each growing
+/// by whatever its containerd pulls (a CSI stack is several GiB per
+/// node), plus the fork's three children and a data disk each. At 32 GiB
+/// that ran the XFS out of space mid-install, which surfaces as a
+/// `DiskPressure` eviction inside the *guest* — a long way from the
+/// host filesystem that actually filled up. [`ensure_loopback_xfs`]
+/// grows an existing smaller image to this size rather than silently
+/// keeping the capacity it was created with.
+pub const DISKS_IMAGE_SIZE: u64 = 96 * 1024 * 1024 * 1024;
 
 /// In-VM mount point of a sandbox's writable **scratch** disk.
 /// The guest agent puts every container's overlay
@@ -165,6 +175,174 @@ impl Drop for ScratchDisk {
     }
 }
 
+/// Subdirectory of [`DISKS_DIR`] holding **persistent** data-disk
+/// images, one per `id` .
+///
+/// A subdirectory and not [`DISKS_DIR`] itself for the same reason the
+/// Ubuntu base images live in one (CHALLENGES #106): everything directly
+/// under [`DISKS_DIR`] is by contract a per-VM image the test suite's
+/// hygiene sweep deletes as soon as no live VM holds it open, and a
+/// retained disk there would be reaped between two VMs that are supposed
+/// to share it. Still the same filesystem, so a fork's `FICLONE` of the
+/// image lands next to it.
+pub const DATA_DISKS_SUBDIR: &str = "data";
+
+/// Smallest data disk we will format, same reasoning as
+/// [`MIN_SCRATCH_SIZE`]: below this `mkfs.ext4` leaves no usable space.
+pub const MIN_DATA_DISK_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Where persistent data-disk images live: `<DISKS_DIR>/data`.
+#[must_use]
+pub fn data_disks_dir() -> PathBuf {
+    Path::new(DISKS_DIR).join(DATA_DISKS_SUBDIR)
+}
+
+/// Host path of the image backing data disk `id`.
+#[must_use]
+pub fn data_disk_path(id: &str) -> PathBuf {
+    data_disks_dir().join(format!("{id}.img"))
+}
+
+/// A **named, persistent** read-write disk that outlives the VM it is
+/// attached to .
+///
+/// The image is `<DISKS_DIR>/data/<id>.img` on the reflink XFS — never
+/// the node's root FS, which is ext4 on md RAID and cannot `FICLONE`, so
+/// a disk provisioned there would silently cost every warm fork a byte
+/// copy. First attach creates it sparse and `mkfs.ext4`'s it; every later
+/// attach of the same `id` reuses it **as-is**, which is what makes
+/// `/var/lib/longhorn` survive the VM that was the node.
+///
+/// Unlike [`ScratchDisk`] there is **no `Drop`**: retention is the whole
+/// point. Deleting the data is the explicit [`DataDisk::delete`]
+/// (the daemon's `delete_data_disk`), and orphans are reaped by the
+/// age-gated spec-22d sweep. Attach it with
+/// [`crate::vm::VmBuilder::data_disk`].
+///
+/// A warm fork clones each attached image into the child's own file
+/// through the generic read-write virtio-blk path (`fork::reflink_file`),
+/// so two live VMs never write one ext4.
+#[derive(Debug, Clone)]
+pub struct DataDisk {
+    id: String,
+    path: PathBuf,
+    size_bytes: u64,
+    guest_mount: String,
+}
+
+impl DataDisk {
+    /// Attach the disk named `id`, creating it only if its image does not
+    /// exist yet, and mount it in the guest at `guest_mount`.
+    ///
+    /// Loud on every disagreement: an unusable `id`, a size below
+    /// [`MIN_DATA_DISK_SIZE`], a relative `guest_mount`, a
+    /// non-reflink-capable disks directory, or a `size_bytes` that does
+    /// not match an existing image (a silent resize would either lose
+    /// the caller's capacity assumption or truncate live data).
+    pub fn attach(id: &str, size_bytes: u64, guest_mount: &str) -> Result<Self, DiskError> {
+        Self::validate_id(id)?;
+        if size_bytes < MIN_DATA_DISK_SIZE {
+            return Err(DiskError::DataDiskSize {
+                id: id.to_string(),
+                size_bytes,
+                min: MIN_DATA_DISK_SIZE,
+            });
+        }
+        if !guest_mount.starts_with('/') || guest_mount.contains(',') || guest_mount.contains(':') {
+            return Err(DiskError::DataDiskMount {
+                id: id.to_string(),
+                guest_mount: guest_mount.to_string(),
+            });
+        }
+        ensure_loopback_xfs(
+            Path::new(DISKS_IMAGE),
+            Path::new(DISKS_DIR),
+            DISKS_IMAGE_SIZE,
+        )?;
+        let dir = data_disks_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+        let name = format!("{id}.img");
+        let path = dir.join(&name);
+        let padded = size_bytes.div_ceil(crate::block::SECTOR_SIZE) * crate::block::SECTOR_SIZE;
+        if path.exists() {
+            let existing = std::fs::metadata(&path)
+                .map_err(|e| io_err(&path, e))?
+                .len();
+            if existing != padded {
+                return Err(DiskError::DataDiskResize {
+                    id: id.to_string(),
+                    existing,
+                    requested: padded,
+                });
+            }
+            log::info!(
+                "data-disk {id}: reusing {} ({} MiB) at guest {guest_mount}",
+                path.display(),
+                existing / (1024 * 1024)
+            );
+        } else {
+            create_ext4_volume(&dir, &name, padded)?;
+            log::info!(
+                "data-disk {id}: created {} ({} MiB, sparse) for guest {guest_mount}",
+                path.display(),
+                padded / (1024 * 1024)
+            );
+        }
+        Ok(Self {
+            id: id.to_string(),
+            path,
+            size_bytes: padded,
+            guest_mount: guest_mount.to_string(),
+        })
+    }
+
+    /// Remove the image behind `id`. The **only** way its data goes
+    /// away: `delete_vm` deliberately leaves it. A missing image is a
+    /// loud error, not a silent success — a caller that thinks it
+    /// deleted a disk that was never there is a caller looking at the
+    /// wrong `id`.
+    pub fn delete(id: &str) -> Result<(), DiskError> {
+        Self::validate_id(id)?;
+        let path = data_disk_path(id);
+        std::fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
+        log::info!("data-disk {id}: removed {}", path.display());
+        Ok(())
+    }
+
+    /// Reject an `id` that cannot be a single filename component, so a
+    /// bad annotation fails at parse time rather than at VM boot.
+    pub fn validate_id(id: &str) -> Result<(), DiskError> {
+        if id.is_empty() || id.contains('/') || id.contains("..") || id.starts_with('.') {
+            return Err(DiskError::DataDiskId { id: id.to_string() });
+        }
+        Ok(())
+    }
+
+    /// The persistent identity of this disk.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Host path of the image.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Capacity in bytes (rounded up to a virtio-blk sector).
+    #[must_use]
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    /// Where the guest agent mounts it.
+    #[must_use]
+    pub fn guest_mount(&self) -> &str {
+        &self.guest_mount
+    }
+}
+
 /// Errors from disk provisioning. All loud, no fallbacks.
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
@@ -216,6 +394,59 @@ pub enum DiskError {
         /// The offending key.
         key: String,
     },
+    /// A data-disk `id` is not usable as a filename component.
+    #[error("data-disk id {id:?} is empty, hidden, or contains '/' or '..'")]
+    DataDiskId {
+        /// The offending id.
+        id: String,
+    },
+    /// A requested data disk is too small to hold an ext4 filesystem
+    /// with usable space.
+    #[error("data-disk {id}: size {size_bytes} bytes is below the {min}-byte minimum")]
+    DataDiskSize {
+        /// The disk's id.
+        id: String,
+        /// Requested size.
+        size_bytes: u64,
+        /// Enforced minimum.
+        min: u64,
+    },
+    /// A data disk's guest mount point is not an absolute path, or
+    /// contains a character the `k7d.blk=` cmdline encoding uses as a
+    /// separator.
+    #[error(
+        "data-disk {id}: guest mount {guest_mount:?} must be absolute and free of ',' and ':'"
+    )]
+    DataDiskMount {
+        /// The disk's id.
+        id: String,
+        /// The offending mount point.
+        guest_mount: String,
+    },
+    /// The loopback XFS backing [`DISKS_DIR`] could not be grown to the
+    /// size this build asks for.
+    #[error("cannot grow loopback image {image}: {detail}")]
+    LoopbackGrow {
+        /// The backing image.
+        image: PathBuf,
+        /// What went wrong.
+        detail: String,
+    },
+    /// An existing data-disk image has a different capacity than the
+    /// attach asked for. Resizing is out of scope, and silently
+    /// honouring either number loses data or capacity.
+    #[error(
+        "data-disk {id}: image is {existing} bytes but attach asked for {requested} — \
+         resizing a data disk is not supported; delete it explicitly or ask for its real size"
+    )]
+    DataDiskResize {
+        /// The disk's id.
+        id: String,
+        /// Size on disk.
+        existing: u64,
+        /// Size requested.
+        requested: u64,
+    },
 }
 
 fn io_err(path: &Path, err: std::io::Error) -> DiskError {
@@ -237,6 +468,22 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), DiskError> {
         });
     }
     Ok(())
+}
+
+/// Like [`run`], returning the command's stdout for callers that have
+/// to parse it (`losetup -j`).
+fn run_stdout(cmd: &str, args: &[&str]) -> Result<String, DiskError> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| io_err(Path::new(cmd), e))?;
+    if !output.status.success() {
+        return Err(DiskError::Command {
+            cmd: format!("{cmd} {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Probe whether `dir` supports `FICLONE` reflinks by cloning a tiny
@@ -288,7 +535,8 @@ pub fn ensure_loopback_xfs(
     if is_mounted(mount_point)? {
         // Already mounted — but never trust it silently: the whole
         // point is reflink, so verify or fail loud.
-        return assert_reflink_capable(mount_point);
+        assert_reflink_capable(mount_point)?;
+        return grow_loopback_to(image, mount_point, size_bytes);
     }
 
     if !image.exists() {
@@ -328,7 +576,57 @@ pub fn ensure_loopback_xfs(
         image.display(),
         mount_point.display()
     );
-    assert_reflink_capable(mount_point)
+    assert_reflink_capable(mount_point)?;
+    grow_loopback_to(image, mount_point, size_bytes)
+}
+
+/// Grow the loopback XFS at `mount_point` to `size_bytes` when its
+/// backing `image` is smaller, and do nothing when it is not.
+///
+/// A node keeps `disks.img` across reboots and code changes, so raising
+/// [`DISKS_IMAGE_SIZE`] would otherwise be a no-op on every node that
+/// already has one: the filesystem stays at the size it was created
+/// with, and the extra capacity the new constant promised turns into an
+/// `ENOSPC` (or a guest-side `DiskPressure` eviction) partway through a
+/// test. Shrinking is not attempted — XFS cannot — and is not an error,
+/// because a node provisioned with a bigger image than this build asks
+/// for is fine.
+fn grow_loopback_to(image: &Path, mount_point: &Path, size_bytes: u64) -> Result<(), DiskError> {
+    let current = std::fs::metadata(image)
+        .map_err(|e| io_err(image, e))?
+        .len();
+    if current >= size_bytes {
+        return Ok(());
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(image)
+        .map_err(|e| io_err(image, e))?;
+    f.set_len(size_bytes).map_err(|e| io_err(image, e))?;
+    drop(f);
+    // The loop device caches the backing file's size at attach, so the
+    // kernel has to be told to re-read it before `xfs_growfs` can see
+    // the new blocks.
+    let listed = run_stdout("losetup", &["-j", &image.to_string_lossy()])?;
+    let dev = listed
+        .lines()
+        .next()
+        .and_then(|l| l.split(':').next())
+        .map(str::to_string)
+        .ok_or_else(|| DiskError::LoopbackGrow {
+            image: image.to_path_buf(),
+            detail: format!("no loop device backs it: {listed}"),
+        })?;
+    run("losetup", &["-c", &dev])?;
+    run("xfs_growfs", &[&mount_point.to_string_lossy()])?;
+    log::info!(
+        "disks: grew {} from {} to {} GiB via {dev} (xfs_growfs {})",
+        image.display(),
+        current / (1024 * 1024 * 1024),
+        size_bytes / (1024 * 1024 * 1024),
+        mount_point.display()
+    );
+    Ok(())
 }
 
 /// Create a raw ext4 volume image of `size_bytes` at `dir/name`,
@@ -448,6 +746,53 @@ mod tests {
                 "key {bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn data_disk_attach_validates_before_touching_the_host() {
+        // id, size and mount point are all checked before any mount or
+        // mkfs, so this stays a pure unit test — and every rejection is
+        // loud, because a data disk in the wrong place silently costs
+        // O(1) forks and a wrong size silently loses data.
+        for bad in ["", "../escape", "nested/id", ".hidden"] {
+            assert!(
+                matches!(
+                    DataDisk::attach(bad, 1024 * 1024 * 1024, "/var/lib/longhorn"),
+                    Err(DiskError::DataDiskId { .. })
+                ),
+                "id {bad:?} must be rejected"
+            );
+        }
+        assert!(matches!(
+            DataDisk::attach("longhorn", 4096, "/var/lib/longhorn"),
+            Err(DiskError::DataDiskSize { .. })
+        ));
+        for bad in [
+            "var/lib/longhorn",
+            "/var/lib/long,horn",
+            "/var/lib:longhorn",
+        ] {
+            assert!(
+                matches!(
+                    DataDisk::attach("longhorn", MIN_DATA_DISK_SIZE, bad),
+                    Err(DiskError::DataDiskMount { .. })
+                ),
+                "guest mount {bad:?} must be rejected"
+            );
+        }
+        assert!(matches!(
+            DataDisk::delete("../escape"),
+            Err(DiskError::DataDiskId { .. })
+        ));
+    }
+
+    #[test]
+    fn data_disk_paths_live_under_the_reflink_subdir() {
+        assert_eq!(data_disks_dir(), Path::new(DISKS_DIR).join("data"));
+        assert_eq!(
+            data_disk_path("longhorn-0"),
+            Path::new(DISKS_DIR).join("data/longhorn-0.img")
+        );
     }
 
     #[test]

@@ -99,6 +99,246 @@ impl VmCpuCgroup {
     }
 }
 
+/// Threads one live VM is allowed inside a tree's threaded cgroup:
+/// vCPUs plus the userspace virtio workers (net RX/TX, block) and a
+/// little headroom. Multiplied by `TreeBudget::max_live_vms` to get the
+/// tree's `pids.max`.
+const THREADS_PER_VM: usize = 64;
+
+/// Floor for a tree's `pids.max`. A budget of one VM still needs room
+/// for the daemon's own bookkeeping threads to touch the cgroup.
+const MIN_TREE_PIDS: usize = 128;
+
+/// Parent of every tree's helper-process cgroup. Deliberately *not*
+/// under `system.slice`: that subtree belongs to systemd, and
+/// deliberately not under the daemon's own cgroup either, which
+/// `VmCpuCgroup` has already converted into a *domain threaded* root
+/// (a threaded root may only have threaded children, and `memory` is a
+/// domain-only controller).
+const HELPER_ROOT: &str = "/sys/fs/cgroup/k7d-jail";
+
+/// One tree's cgroup jail .
+///
+/// k7d is a single process, so a tree's VMs are *threads*: cgroup v2
+/// charges memory per process, and a threaded subtree may only enable
+/// threaded controllers (`cpu`, `cpuset`, `pids`, `perf_event`) — a
+/// per-tree `memory.max` over guest RAM is therefore not expressible
+/// without a process per tree, which would break the in-process
+/// `MAP_PRIVATE` warm fork. What *is* expressible is what this builds:
+///
+/// ```text
+/// <daemon cgroup>/tree-<id>/     threaded: pids.max, the tree's own threads
+/// /sys/fs/cgroup/k7d-jail/tree-<id>/  domain: memory.max + pids.max,
+///                                     the tree's virtiofsd helpers
+/// ```
+///
+/// Both limits are derived from the tree's [`TreeBudget`], so no new
+/// budget fields (and no change to the verified `tree_model.rs`).
+#[derive(Debug)]
+pub struct TreeCgroup {
+    threads: PathBuf,
+    parent: PathBuf,
+    helpers: PathBuf,
+}
+
+impl TreeCgroup {
+    /// Create both cgroups for `tree_id`, sized from `budget`.
+    /// Returns `Ok(None)` when `K7D_TREE_CGROUP=off`.
+    ///
+    /// The directory name carries a process-unique suffix: a
+    /// `SnapshotTree`'s own `tree_id` is derived from the daemon's PID
+    /// and is therefore shared by every single-VM tree in one daemon,
+    /// which would make two trees fight over one directory.
+    pub fn create(
+        tree_id: &str,
+        budget: crate::tree_model::TreeBudget,
+    ) -> Result<Option<Self>, CgroupError> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::create_named(&format!("{tree_id}-{seq}"), budget)
+    }
+
+    /// Create both cgroups under an exact `name` (tests pin it).
+    fn create_named(
+        name: &str,
+        budget: crate::tree_model::TreeBudget,
+    ) -> Result<Option<Self>, CgroupError> {
+        let tree_id = name;
+        if !tree_cgroup_enforced()? {
+            log::warn!("K7D_TREE_CGROUP=off: tree {tree_id} runs without a cgroup jail");
+            return Ok(None);
+        }
+        let pids_max = budget
+            .max_live_vms
+            .saturating_mul(THREADS_PER_VM)
+            .max(MIN_TREE_PIDS);
+
+        let parent = self_cgroup_dir()?;
+        let threads = parent.join(format!("tree-{tree_id}"));
+        create_dir(&threads)?;
+        let helpers = PathBuf::from(HELPER_ROOT).join(format!("tree-{tree_id}"));
+        let cg = Self {
+            threads,
+            parent,
+            helpers,
+        };
+        // Same ordering constraint as `VmCpuCgroup`: threaded first,
+        // then the parent delegates, then the limit file exists.
+        write_control_file(&cg.threads.join("cgroup.type"), "threaded")?;
+        write_control_file(&cg.parent.join("cgroup.subtree_control"), "+pids")?;
+        write_control_file(&cg.threads.join("pids.max"), &pids_max.to_string())?;
+
+        create_dir(Path::new(HELPER_ROOT))?;
+        write_control_file(
+            &Path::new(HELPER_ROOT).join("cgroup.subtree_control"),
+            "+memory +pids",
+        )?;
+        create_dir(&cg.helpers)?;
+        write_control_file(
+            &cg.helpers.join("memory.max"),
+            &budget.max_live_ram_bytes.to_string(),
+        )?;
+        write_control_file(&cg.helpers.join("pids.max"), &pids_max.to_string())?;
+        log::info!(
+            "tree {tree_id} jailed: {} (pids.max={pids_max}), {} (memory.max={})",
+            cg.threads.display(),
+            cg.helpers.display(),
+            budget.max_live_ram_bytes
+        );
+        Ok(Some(cg))
+    }
+
+    /// Move one kernel thread (by TID) into the tree's threaded cgroup.
+    /// Fails once the tree is over its `pids.max` — that is the point.
+    pub fn add_thread(&self, tid: u32) -> Result<(), CgroupError> {
+        write_control_file(&self.threads.join("cgroup.threads"), &tid.to_string())
+    }
+
+    /// Move one helper *process* (virtiofsd) into the tree's domain
+    /// cgroup, where `memory.max` applies to it.
+    pub fn add_process(&self, pid: u32) -> Result<(), CgroupError> {
+        write_control_file(&self.helpers.join("cgroup.procs"), &pid.to_string())
+    }
+
+    /// Enroll one live VM: its vCPU threads go into the threaded half,
+    /// its virtiofsd helpers into the domain half.
+    ///
+    /// A VM whose vCPU threads have not published their TIDs yet (or
+    /// that is not running) contributes nothing — the tree's own state
+    /// machine, not this call, decides whether that is legal, and a
+    /// suspended node has no threads to jail by definition.
+    pub fn add_vm(&self, vm: &crate::vm::Vm) -> Result<(), CgroupError> {
+        if let Some(tids) = vm.vcpu_kernel_tids(std::time::Duration::from_secs(5)) {
+            for tid in tids {
+                self.add_thread(tid)?;
+            }
+        }
+        for pid in vm.virtiofsd_pids() {
+            self.add_process(pid)?;
+        }
+        Ok(())
+    }
+
+    /// Directory holding the tree's threads (tests read `pids.max`).
+    #[must_use]
+    pub fn threads_dir(&self) -> &Path {
+        &self.threads
+    }
+
+    /// Directory holding the tree's helper processes (tests read
+    /// `memory.max`).
+    #[must_use]
+    pub fn helpers_dir(&self) -> &Path {
+        &self.helpers
+    }
+}
+
+impl Drop for TreeCgroup {
+    fn drop(&mut self) {
+        move_out_and_remove(&self.threads, &self.parent, "cgroup.threads");
+        // Helper processes are children of this daemon; by the time a
+        // tree drops, its `VirtiofsdProcess`es have been killed and
+        // reaped, so the loop is normally empty.
+        move_out_and_remove(&self.helpers, Path::new(HELPER_ROOT), "cgroup.procs");
+    }
+}
+
+/// Whether per-tree cgroups are enforced (`K7D_TREE_CGROUP`).
+fn tree_cgroup_enforced() -> Result<bool, CgroupError> {
+    match std::env::var("K7D_TREE_CGROUP") {
+        Err(_) => Ok(true),
+        Ok(v) => match v.trim() {
+            "" | "enforce" => Ok(true),
+            "off" => Ok(false),
+            other => Err(CgroupError::SelfCgroup(format!(
+                "K7D_TREE_CGROUP={other:?} is not one of enforce|off"
+            ))),
+        },
+    }
+}
+
+/// `mkdir` one cgroup, treating "already there" as success — a tree id
+/// can be re-created after a crash that left the directory behind.
+fn create_dir(path: &Path) -> Result<(), CgroupError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(CgroupError::CreateDir {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Evacuate `dir` into `parent` through `file` (`cgroup.threads` or
+/// `cgroup.procs`) and remove it. A live member makes `rmdir` fail with
+/// `EBUSY`, so stragglers move out first.
+fn move_out_and_remove(dir: &Path, parent: &Path, file: &str) {
+    if let Ok(members) = std::fs::read_to_string(dir.join(file)) {
+        for id in members.split_whitespace() {
+            if let Err(e) = std::fs::write(parent.join(file), id) {
+                log::error!("move {id} back to {}: {e}", parent.display());
+            }
+        }
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::error!("remove cgroup {}: {e}", dir.display()),
+    }
+}
+
+/// Remove empty `tree-*` cgroups a crashed previous daemon left behind,
+/// in both the threaded parent and the helper root. Same contract as
+/// [`clean_stale_vm_cgroups`]: loud logs, never fatal.
+pub fn clean_stale_tree_cgroups() {
+    let mut roots = Vec::new();
+    match self_cgroup_dir() {
+        Ok(dir) => roots.push(dir),
+        Err(e) => log::error!("clean_stale_tree_cgroups: {e}"),
+    }
+    roots.push(PathBuf::from(HELPER_ROOT));
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_tree_dir = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("tree-"));
+            if is_tree_dir {
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => log::warn!("removed stale tree cgroup {}", path.display()),
+                    Err(e) => log::error!("remove stale tree cgroup {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+}
+
 /// Write one cgroupfs control file, wrapping failures with the path
 /// and value (cgroupfs errors are useless without them).
 fn write_control_file(path: &Path, value: &str) -> Result<(), CgroupError> {
@@ -245,5 +485,92 @@ mod tests {
             "busy thread used only {util:.2} of a core — was it even running?"
         );
         drop(cg); // must rmdir cleanly with the thread already joined
+    }
+
+    fn test_budget() -> crate::tree_model::TreeBudget {
+        crate::tree_model::TreeBudget {
+            max_live_vms: 4,
+            max_live_ram_bytes: 512 * 1024 * 1024,
+            max_disk_bytes: 1024 * 1024 * 1024,
+            max_chain_depth: 1,
+        }
+    }
+
+    /// Both halves of the tree jail carry the budget's limits, accept a
+    /// member, and `rmdir` cleanly on drop.
+    #[test]
+    fn test_tree_cgroup_applies_budget_and_cleans_up() {
+        let budget = test_budget();
+        let cg = TreeCgroup::create_named("cgtest", budget)
+            .expect("create tree cgroup")
+            .expect("enforced by default");
+        let expected_pids = (budget.max_live_vms * THREADS_PER_VM).max(MIN_TREE_PIDS);
+        assert_eq!(
+            read_trimmed(&cg.threads_dir().join("pids.max")),
+            expected_pids.to_string()
+        );
+        assert_eq!(
+            read_trimmed(&cg.helpers_dir().join("memory.max")),
+            budget.max_live_ram_bytes.to_string()
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                tid_tx.send(unsafe { libc::gettid() } as u32).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cg.add_thread(tid).expect("move thread into tree cgroup");
+        assert!(read_trimmed(&cg.threads_dir().join("cgroup.threads")).contains(&tid.to_string()));
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        let threads_dir = cg.threads_dir().to_path_buf();
+        let helpers_dir = cg.helpers_dir().to_path_buf();
+        drop(cg);
+        assert!(!threads_dir.exists(), "{threads_dir:?} should be gone");
+        assert!(!helpers_dir.exists(), "{helpers_dir:?} should be gone");
+    }
+
+    #[test]
+    fn test_tree_cgroup_mode_is_total_and_loud() {
+        let key = "K7D_TREE_CGROUP";
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "off");
+        assert!(TreeCgroup::create("cgoff", test_budget())
+            .expect("off is a valid mode")
+            .is_none());
+        std::env::set_var(key, "sometimes");
+        assert!(
+            TreeCgroup::create("cgbad", test_budget()).is_err(),
+            "unknown mode must fail loudly"
+        );
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// An empty leftover from a crashed daemon is reaped at startup.
+    #[test]
+    fn test_clean_stale_tree_cgroups() {
+        let stale = self_cgroup_dir().unwrap().join("tree-cgstale");
+        std::fs::create_dir(&stale).expect("create stale tree cgroup");
+        clean_stale_tree_cgroups();
+        assert!(!stale.exists(), "{stale:?} should have been reaped");
+    }
+
+    fn read_trimmed(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .trim()
+            .to_string()
     }
 }

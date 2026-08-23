@@ -1,0 +1,28 @@
+[Unit]
+# The k7 guest agent: the host's only interface to this VM (exec, file
+# transfer, container lifecycle) over vsock.
+#
+# `StandardError=journal+console` is load-bearing, not logging taste.
+# `Vm::connect_agent` polls the VM's serial output for the agent's
+# "k7-agent: listening on vsock port …" line before it dials vsock, so
+# without this (and `console=ttyS0` on the kernel command line) every
+# connect times out on a VM that is in fact perfectly healthy.
+Description=k7 guest agent (vsock control plane)
+Documentation=https://github.com/katakate/k7d
+After=k7d-net.service systemd-modules-load.service local-fs.target
+Wants=k7d-net.service
+
+[Service]
+Type=simple
+# vsock is a module in linux-image-virtual and has no autoload trigger
+# on a virtio-mmio-only machine; /etc/modules-load.d/k7d.conf loads it,
+# and this is the belt-and-braces for a boot where that raced.
+ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport
+ExecStart=/usr/local/bin/k7-agent
+Restart=always
+RestartSec=1
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

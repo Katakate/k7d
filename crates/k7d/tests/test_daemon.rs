@@ -11,6 +11,8 @@
 //! bridge only disappears when the *last* VM on it stops (the shim-era
 //! shared-bridge teardown race).
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -350,6 +352,113 @@ fn guest_exec(cid: u64, argv: &[&str]) -> String {
     out.stdout.trim().to_string()
 }
 
+/// `create_vm` with a **named persistent** data disk :
+/// the agent mounts it, `stop_vm` retains the image, `delete_data_disk`
+/// refuses while a live VM holds it, and a tree payload cannot have one.
+///
+/// The lifetime rules are the whole primitive, so every one of them is
+/// checked through the real daemon rather than the library: a disk the
+/// daemon deletes at teardown, or deletes out from under a live guest,
+/// would look exactly like a working disk in a single-VM library test.
+#[test]
+fn test_data_disk_lifetime_through_the_daemon() {
+    let guard = spawn_daemon("datadisk");
+    let id = format!("test-daemon-{}", std::process::id());
+    let image = k7d::disks::data_disk_path(&id);
+    let _ = std::fs::remove_file(&image);
+
+    let config = VmConfig {
+        data_disks: vec![k7d::control::DataDiskConfig {
+            id: id.clone(),
+            size_bytes: 64 * 1024 * 1024,
+            guest_mount: "/run/k7d/data".to_string(),
+        }],
+        ..default_config()
+    };
+    let (vm_id, guest_cid, _) = create_vm(&guard, config.clone());
+    assert!(
+        image.exists(),
+        "create_vm must provision {}",
+        image.display()
+    );
+    assert_eq!(
+        guest_exec(guest_cid, &["sh", "-c", "cat /proc/mounts"])
+            .lines()
+            .filter(|l| l.contains(" /run/k7d/data "))
+            .count(),
+        1,
+        "the agent must mount the data disk exactly once"
+    );
+    guest_exec(
+        guest_cid,
+        &["sh", "-c", "echo daemon-marker > /run/k7d/data/m && sync"],
+    );
+
+    // Deleting a disk a live VM is writing is CHALLENGES #63's bug.
+    match call(&guard, &Request::DeleteDataDisk { id: id.clone() }) {
+        Response::Error { message } => assert!(
+            message.contains(&vm_id),
+            "the refusal must name the holding VM, got: {message}"
+        ),
+        other => panic!("delete of an attached data disk must be refused, got {other:?}"),
+    }
+
+    // Teardown retains it, and a second VM with the same id reads it back.
+    assert!(matches!(
+        call(&guard, &Request::StopVm { vm_id }),
+        Response::Ok
+    ));
+    assert!(
+        image.exists(),
+        "stop_vm removed {} — a data disk must outlive its VM",
+        image.display()
+    );
+    let (vm_id2, cid2, _) = create_vm(&guard, config);
+    assert_eq!(
+        guest_exec(cid2, &["cat", "/run/k7d/data/m"]),
+        "daemon-marker",
+        "the second VM did not see the first VM's write"
+    );
+    assert!(matches!(
+        call(&guard, &Request::StopVm { vm_id: vm_id2 }),
+        Response::Ok
+    ));
+
+    // A tree payload is forked repeatedly; a disk with one identity has
+    // no meaning there, and the refusal says so rather than dropping it.
+    let payload = VmConfig {
+        data_disks: vec![k7d::control::DataDiskConfig {
+            id: id.clone(),
+            size_bytes: 64 * 1024 * 1024,
+            guest_mount: "/run/k7d/data".to_string(),
+        }],
+        ..default_config()
+    };
+    match call(
+        &guard,
+        &Request::TreeCreate {
+            config: payload,
+            budget: None,
+            tree_id: Some("datadisk-tree".to_string()),
+        },
+    ) {
+        Response::Error { message } => assert!(
+            message.contains("data_disks"),
+            "the refusal must name the field, got: {message}"
+        ),
+        other => panic!("a tree payload with a data disk must be refused, got {other:?}"),
+    }
+
+    // Now nothing holds it, so the explicit delete is the thing that
+    // removes it.
+    assert!(matches!(
+        call(&guard, &Request::DeleteDataDisk { id: id.clone() }),
+        Response::Ok
+    ));
+    assert!(!image.exists(), "delete left {} behind", image.display());
+    drop(guard);
+}
+
 /// `fork_vm` — warm-fork a plain daemon VM. The
 /// first fork prepares the source (swaps it for a restored fork-ready
 /// copy on the SAME vsock CID —); both source and fork
@@ -453,9 +562,14 @@ fn test_daemon_tree_lifecycle() {
         Response::TreeForked {
             node_id,
             guest_cids,
+            latency_ns,
             ..
         } => {
             assert_eq!(guest_cids.len(), 1);
+            assert!(
+                latency_ns > 0,
+                "tree_fork must report latency_ns, got {latency_ns}"
+            );
             (node_id, guest_cids[0])
         }
         other => panic!("unexpected tree_fork response: {other:?}"),
@@ -467,6 +581,39 @@ fn test_daemon_tree_lifecycle() {
         "daemon tree fork should be <{:?}, was {fork_elapsed:?}",
         k7d::latency::DAEMON_TREE_FORK,
     );
+
+    match call(
+        &guard,
+        &Request::DumpSerial {
+            vm_id: None,
+            guest_cid: Some(fork_cid),
+        },
+    ) {
+        Response::SerialDump {
+            vm_id,
+            guest_cid,
+            console: _,
+        } => {
+            assert_eq!(guest_cid, fork_cid, "dump_serial echoes the CID");
+            assert!(
+                vm_id.contains(&fork_node),
+                "tree member vm_id should name the node, got {vm_id}"
+            );
+        }
+        other => panic!("dump_serial by fork cid: {other:?}"),
+    }
+    match call(
+        &guard,
+        &Request::DumpSerial {
+            vm_id: Some(format!("{tree_id}/{fork_node}")),
+            guest_cid: None,
+        },
+    ) {
+        Response::SerialDump { guest_cid, .. } => {
+            assert_eq!(guest_cid, fork_cid, "dump_serial by tree/node id");
+        }
+        other => panic!("dump_serial by composite id: {other:?}"),
+    }
 
     // Fork inherited the pre-fork state; its writes don't leak back.
     assert_eq!(guest_exec(fork_cid, &["cat", "/tmp/state"]), "prefork");
@@ -494,13 +641,30 @@ fn test_daemon_tree_lifecycle() {
             tree_id: tree_id.clone(),
         },
     ) {
-        Response::TreeNodeList { nodes } => {
+        Response::TreeNodeList {
+            nodes,
+            usage,
+            budget,
+            live_guest_cids,
+        } => {
             let fork_info = nodes
                 .iter()
                 .find(|n| n.id == fork_node)
                 .expect("fork node listed");
             assert_eq!(fork_info.state, NodeState::Suspended);
             assert_eq!(fork_info.parent.as_deref(), Some("root"));
+            assert_eq!(usage.total_nodes, nodes.len());
+            assert_eq!(usage.live_vm_count, 1, "only root is live after suspend");
+            assert_eq!(budget.max_live_vms, 8);
+            assert_eq!(
+                live_guest_cids.get(&fork_node).map(Vec::as_slice),
+                Some([].as_slice()),
+                "suspended node must not keep a stale CID"
+            );
+            assert_eq!(
+                live_guest_cids.get("root").map(|c| c.as_slice()),
+                Some([root_cid].as_slice())
+            );
         }
         other => panic!("unexpected tree_nodes response: {other:?}"),
     }
@@ -622,7 +786,16 @@ fn test_daemon_tree_rl_verbs() {
             labels: vec!["a".into(), "b".into(), "c".into()],
         },
     ) {
-        Response::TreeForkBatch { forks } => forks,
+        Response::TreeForkBatch { forks, latency_ns } => {
+            assert!(
+                latency_ns > 0,
+                "tree_fork_batch must report latency_ns, got {latency_ns}"
+            );
+            for f in &forks {
+                assert_eq!(f.latency_ns, latency_ns);
+            }
+            forks
+        }
         other => panic!("unexpected tree_fork_batch response: {other:?}"),
     };
     assert_eq!(forks.len(), 3, "batch must return one branch per label");
@@ -686,7 +859,7 @@ fn test_daemon_tree_rl_verbs() {
             tree_id: tree_id.clone(),
         },
     ) {
-        Response::TreeNodeList { nodes } => {
+        Response::TreeNodeList { nodes, .. } => {
             let n = nodes
                 .iter()
                 .find(|n| n.id == rolled.0)
@@ -764,7 +937,12 @@ fn test_daemon_cluster_tree_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
         } => {
+            assert!(
+                latency_ns > 0,
+                "cluster tree_fork must report latency_ns, got {latency_ns}"
+            );
             // Share-less tree members ride the CoW path.
             assert_eq!(
                 fork_memory_full_copy,
@@ -781,6 +959,18 @@ fn test_daemon_cluster_tree_fork() {
     for (i, cid) in root_cids.iter().chain(fork_cids.iter()).enumerate() {
         let tag = format!("m{i}");
         assert_eq!(guest_exec(*cid, &["echo", &tag]), tag);
+        match call(
+            &guard,
+            &Request::DumpSerial {
+                vm_id: None,
+                guest_cid: Some(*cid),
+            },
+        ) {
+            Response::SerialDump { guest_cid, .. } => {
+                assert_eq!(guest_cid, *cid, "dump_serial finds cluster member {i}");
+            }
+            other => panic!("dump_serial cluster member {i} cid {cid}: {other:?}"),
+        }
     }
 
     match call(
@@ -789,7 +979,7 @@ fn test_daemon_cluster_tree_fork() {
             tree_id: tree_id.clone(),
         },
     ) {
-        Response::TreeNodeList { nodes } => {
+        Response::TreeNodeList { nodes, .. } => {
             assert_eq!(nodes.len(), 2, "root + fork: {nodes:?}");
             assert!(nodes.iter().all(|n| n.vm_count == 2));
             let fork_info = nodes
@@ -799,6 +989,49 @@ fn test_daemon_cluster_tree_fork() {
             assert_eq!(fork_info.parent.as_deref(), Some("root"));
         }
         other => panic!("unexpected tree_nodes response: {other:?}"),
+    }
+
+    let (grand_node, _) = match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: fork_node.clone(),
+            label: "grand".to_string(),
+        },
+    ) {
+        Response::TreeForked {
+            node_id,
+            guest_cids,
+            ..
+        } => (node_id, guest_cids),
+        other => panic!("unexpected grandchild tree_fork response: {other:?}"),
+    };
+    match call(
+        &guard,
+        &Request::TreeNodes {
+            tree_id: tree_id.clone(),
+        },
+    ) {
+        Response::TreeNodeList { nodes, .. } => {
+            let grand_info = nodes
+                .iter()
+                .find(|n| n.id == grand_node)
+                .expect("grandchild listed");
+            assert_eq!(
+                grand_info.parent.as_deref(),
+                Some(fork_node.as_str()),
+                "grandchild parent must be the child, not root"
+            );
+            let child_info = nodes
+                .iter()
+                .find(|n| n.id == fork_node)
+                .expect("child listed");
+            assert!(
+                child_info.has_base_snapshot,
+                "fork from child must write a base snapshot"
+            );
+        }
+        other => panic!("unexpected tree_nodes after grandchild: {other:?}"),
     }
 
     assert!(matches!(
@@ -1186,5 +1419,104 @@ fn test_daemon_reattach_verifies_live_vm() {
         Response::Error { .. }
     ));
 
+    drop(guard);
+}
+
+/// Inc 2 observer protocol: `tree_watch` streams a snapshot then
+/// mutation events; `latency_ns` is on the fork event.
+#[test]
+fn test_daemon_tree_watch() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("twatch");
+
+    let (tree_id, root_id, _root_cid) = match call(
+        &guard,
+        &Request::TreeCreate {
+            config: default_config(),
+            budget: None,
+            tree_id: Some("watch-tree".to_string()),
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            root_id,
+            guest_cids,
+        } => {
+            assert_eq!(guest_cids.len(), 1);
+            (tree_id, root_id, guest_cids[0])
+        }
+        other => panic!("unexpected tree_create response: {other:?}"),
+    };
+
+    match call(&guard, &Request::TreeList) {
+        Response::TreeList { trees } => {
+            assert_eq!(trees.len(), 1);
+            assert_eq!(trees[0].usage.live_vm_count, 1);
+            assert_eq!(trees[0].budget.max_live_vms, 8);
+            assert_eq!(trees[0].kind, "vm");
+        }
+        other => panic!("unexpected tree_list response: {other:?}"),
+    }
+
+    let path = guard.socket.to_str().expect("utf8 socket");
+    let mut watch = UnixStream::connect(path).expect("watch connect");
+    watch
+        .write_all(b"{\"op\":\"tree_watch\",\"tree_id\":\"watch-tree\"}\n")
+        .and_then(|()| watch.flush())
+        .expect("write tree_watch");
+    let mut reader = BufReader::new(watch);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read TreeWatching");
+    let snap: Response = serde_json::from_str(line.trim()).expect("parse TreeWatching");
+    match snap {
+        Response::TreeWatching { trees } => {
+            assert_eq!(trees.len(), 1);
+            assert_eq!(trees[0].tree_id, "watch-tree");
+            assert_eq!(trees[0].usage.live_node_count, 1);
+            assert_eq!(trees[0].live_guest_cids.get("root").map(Vec::len), Some(1));
+        }
+        other => panic!("expected TreeWatching, got {other:?}"),
+    }
+
+    let forked = call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id,
+            label: "watched".to_string(),
+        },
+    );
+    let (node_id, latency_ns) = match forked {
+        Response::TreeForked {
+            node_id,
+            latency_ns,
+            ..
+        } => (node_id, latency_ns),
+        other => panic!("unexpected tree_fork response: {other:?}"),
+    };
+    assert!(latency_ns > 0);
+
+    line.clear();
+    reader.read_line(&mut line).expect("read TreeEvent");
+    let ev: Response = serde_json::from_str(line.trim()).expect("parse TreeEvent");
+    match ev {
+        Response::TreeEvent {
+            tree_id: tid,
+            op,
+            node_id: ev_node,
+            latency_ns: ev_lat,
+        } => {
+            assert_eq!(tid, "watch-tree");
+            assert_eq!(op, "fork");
+            assert_eq!(ev_node.as_deref(), Some(node_id.as_str()));
+            assert_eq!(ev_lat, Some(latency_ns));
+        }
+        other => panic!("expected TreeEvent, got {other:?}"),
+    }
+
+    assert!(matches!(
+        call(&guard, &Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
     drop(guard);
 }

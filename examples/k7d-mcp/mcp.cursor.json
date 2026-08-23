@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "k7d": {
+      "command": "/var/lib/k7d/mcp-venv/bin/python",
+      "args": ["examples/k7d-mcp/server.py"],
+      "env": {
+        "K7D_SOCKET": "/run/k7d/k7d.sock",
+        "K7D_TREE_ID": "REPLACE_WITH_TREE_ID",
+        "K7D_MCP_LOG": "examples/k7d-mcp/logs/cursor.jsonl",
+        "K7D_MCP_ARM": "fork",
+        "K7D_SOURCE_NODE": "root",
+        "K7D_CERTS_DIR": "/tmp/k7-gym-ubuntu-REPLACE_WITH_TREE_ID"
+      }
+    }
+  }
+}

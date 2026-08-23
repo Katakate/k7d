@@ -104,7 +104,7 @@ pub const FORK_CLUSTER_WARM_3VM: Duration = Duration::from_millis(150);
 /// 3-VM cluster fork via the cluster snapshot tree.
 ///
 /// [`FORK_CLUSTER_WARM_3VM`] (50 ms — the bare primitive) plus
-/// the tree's bookkeeping: `auto_evict_if_over` + `save_metadata` +
+/// the tree's bookkeeping: `evict_for_incoming` + `save_metadata` +
 /// `cluster.json` write + per-fork bitmap re-seed. §"Latency
 /// expectations" projects ~75 ms; we set the ceiling at 750 ms to
 /// match the run-after-other-tests variance we see for
@@ -151,6 +151,33 @@ pub const FORK_INNER_K3S_CLUSTER_3VM: Duration = Duration::from_millis(1_000);
 /// [`FORK_INNER_K3S_CLUSTER_3VM`] 1 s ceiling — do not widen that one.
 /// Enforced by `test_inner_k3s_argocd_gitops_fork`.
 pub const FORK_INNER_K3S_CLUSTER_3VM_ARGOCD: Duration = Duration::from_millis(2_000);
+
+/// Warm-fork one 2 GB Ubuntu 24.04 bare-VM node — stock distro rootfs
+/// on ext4/virtio-blk with systemd as PID 1, so both the memory `CoW`
+/// and a `FICLONE` reflink of the root disk . A different
+/// substrate from the busybox guest behind [`FORK_WARM`]: 2 GB instead
+/// of 256 MB and a distro's worth of dirty pages between prepare and
+/// fork. Measured ~118 ms; ceiling at 2×.
+/// Enforced by `test_ubuntu_guest_warm_fork`.
+pub const FORK_UBUNTU_NODE_1VM: Duration = Duration::from_millis(250);
+
+/// 3 Ubuntu 24.04 nodes (2 GB / 2 vCPU each) boot systemd + k3s to
+/// three `Ready` nodes on one bridge . Hang-detection
+/// ceiling, not a 2× budget — same rationale as inc1's 120 s
+/// boot-to-agent. Measured ~39–42 s exclusive (2026-08-19); userspace
+/// (k3s + airgap import) dominates. Do not reuse boot ceilings from
+/// `test_ubuntu_guest.rs`.
+/// Enforced by `test_ubuntu_k3s_three_node_cluster_deliveries`.
+pub const BOOT_UBUNTU_K3S_CLUSTER_3NODE: Duration = Duration::from_secs(600);
+
+/// Warm-fork a live 3-node Ubuntu/k3s cluster (3 × 2048 MB) under the
+/// load-churn fixture. Measured 488 ms exclusive (2026-08-19) — under
+/// the sub-second target. Ceiling at 1 s (~2×), matching
+/// [`FORK_INNER_K3S_CLUSTER_3VM`]. Missing the target is a recorded
+/// finding, not a silent pass, and never an edit of
+/// [`FORK_UBUNTU_NODE_1VM`] or any minimal-guest budget.
+/// Enforced by `test_ubuntu_k3s_cluster_warm_fork_no_restart`.
+pub const FORK_UBUNTU_K3S_CLUSTER_3VM: Duration = Duration::from_millis(1_000);
 
 /// 3-VM cluster suspend via the cluster snapshot tree.
 ///

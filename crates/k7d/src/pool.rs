@@ -133,6 +133,7 @@ impl Pool {
             || config.memory_mb != self.config.memory_mb
             || config.vcpus != self.config.vcpus
             || config.cpu_quota.is_some()
+            || config.cmdline.is_some()
         {
             return false;
         }

@@ -865,8 +865,15 @@ fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
             .map_err(|e| SnapshotError::Kvm(format!("failed to get host address: {e}")))?
     };
 
+    // Write to a temp file and rename over `memory.bin`. NEVER truncate
+    // the destination in place: a VM resumed from this very checkpoint
+    // has `memory.bin` MAP_PRIVATE-mmapped as its RAM backing, and
+    // `File::create`'s O_TRUNC would pull the pages out from under KVM
+    // (EFAULT on the vCPU, SIGBUS on host access — CHALLENGES.md #130).
+    // The rename keeps the old inode alive under any existing mapping.
     let mem_path = snapshot_dir.join("memory.bin");
-    let mut mem_file = fs::File::create(&mem_path)?;
+    let tmp_path = snapshot_dir.join("memory.bin.tmp");
+    let mut mem_file = fs::File::create(&tmp_path)?;
     // SAFETY: host_addr points to a valid mmap'd region of mem_size bytes.
     // For fresh VMs this is the memfd-backed GuestMemoryMmap region.
     // For restored VMs this is the MAP_PRIVATE CoW mmap.
@@ -874,6 +881,8 @@ fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
     let mem_slice = unsafe { std::slice::from_raw_parts(host_addr, mem_size) };
     mem_file.write_all(mem_slice)?;
     mem_file.flush()?;
+    drop(mem_file);
+    fs::rename(&tmp_path, &mem_path)?;
     Ok(())
 }
 

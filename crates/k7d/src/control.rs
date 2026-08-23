@@ -20,14 +20,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_tree::{ClusterPayload, ClusterSnapshotTree};
 use crate::network::{ClusterNetwork, TapDevice};
 use crate::pool::Pool;
-use crate::tree::{NodeInfo, SnapshotTree, TreeBudget};
+use crate::tree::{NodeInfo, SnapshotTree, TreeBudget, TreeUsage};
 use crate::vm::Vm;
 
 /// Default control-socket path when neither `--socket` nor `K7D_SOCKET`
@@ -54,6 +54,80 @@ pub fn default_tree_budget() -> TreeBudget {
         max_disk_bytes: 32 * 1024 * 1024 * 1024,
         max_chain_depth: 1,
     }
+}
+
+/// Control-plane (JSON) view of [`TreeUsage`].
+///
+/// Lives here so `tree_model.rs` (the Lean/Aeneas surface) stays
+/// untouched — that type has no serde derives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeUsageInfo {
+    /// Σ of `vm_count` over all Live nodes.
+    pub live_vm_count: usize,
+    /// Estimated non-reclaimable RAM used by live VMs, in bytes.
+    pub live_ram_bytes: u64,
+    /// On-disk `memory.bin` + `delta.pack` footprint, in bytes.
+    pub disk_bytes: u64,
+    /// Live + suspended + evicted node count.
+    pub total_nodes: usize,
+    /// Count of tree nodes currently in `Live` state.
+    pub live_node_count: usize,
+}
+
+impl From<TreeUsage> for TreeUsageInfo {
+    fn from(u: TreeUsage) -> Self {
+        Self {
+            live_vm_count: u.live_vm_count,
+            live_ram_bytes: u.live_ram_bytes,
+            disk_bytes: u.disk_bytes,
+            total_nodes: u.total_nodes,
+            live_node_count: u.live_node_count,
+        }
+    }
+}
+
+/// One mutation pushed on a `tree_watch` connection after the initial
+/// snapshot. Notes/traces stay out of `tree.json` — this is
+/// machine-first (op + `node_id` + optional `latency_ns`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEvent {
+    /// Tree that changed.
+    pub tree_id: String,
+    /// `fork` / `protect` / `unprotect` / `suspend` / `resume` /
+    /// `prune` / `evict` / `drop`.
+    pub op: String,
+    /// Node the op targeted or produced (`None` for tree-wide ops).
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Wall time of a fork/rollback/batch, when the op measured one.
+    #[serde(default)]
+    pub latency_ns: Option<u64>,
+}
+
+/// Current state of one tree, sent as the `tree_watch` snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeWatchSnapshot {
+    /// Tree identifier.
+    pub tree_id: String,
+    /// `"vm"` or `"cluster"`.
+    pub kind: String,
+    /// Every node's metadata (same as `tree_nodes`).
+    pub nodes: Vec<NodeInfo>,
+    /// Current resource usage.
+    pub usage: TreeUsageInfo,
+    /// Resource budget.
+    pub budget: TreeBudget,
+    /// Live vsock CIDs keyed by node id. Empty vec = no live payload.
+    /// Not persisted in `tree.json`.
+    #[serde(default)]
+    pub live_guest_cids: HashMap<String, Vec<u64>>,
+}
+
+/// One subscriber on the control-socket `tree_watch` stream.
+struct WatchSub {
+    /// `None` = every tree.
+    tree_id: Option<String>,
+    tx: std::sync::mpsc::Sender<TreeEvent>,
 }
 
 /// A virtiofs share to plumb into the VM.
@@ -145,9 +219,19 @@ pub struct VmConfig {
     /// Guest kernel path. Falls back to env `K7D_KERNEL`.
     #[serde(default)]
     pub kernel: Option<String>,
-    /// Initramfs path. Falls back to env `K7D_INITRD`.
+    /// Initramfs path. Falls back to env `K7D_INITRD` only when the
+    /// caller did not set a `root=` disk boot (see
+    /// [`crate::config::resolve_vm_guest`]). Empty/omitted on an Ubuntu
+    /// node (`block_devices` + cmdline `root=`) is *no* initrd — never
+    /// the `RuntimeClass` busybox pair (CHALLENGES #72).
     #[serde(default)]
     pub initrd: Option<String>,
+    /// Replacement kernel command line. `None` keeps the builder's
+    /// busybox/`rdinit=/init` default. A guest with a different init
+    /// contract (Ubuntu `root=/dev/vda`, `k7d.k3s=`) must set this;
+    /// there is no merge.
+    #[serde(default)]
+    pub cmdline: Option<String>,
     /// Guest RAM in MiB.
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
@@ -205,6 +289,17 @@ pub struct VmConfig {
     /// the default for all of them.
     #[serde(default)]
     pub container_scratch: Vec<ContainerScratchConfig>,
+    /// **Named persistent** disks to attach, in declaration order after
+    /// `block_devices` . Unlike `scratch_size_bytes`
+    /// these outlive the VM: `stop_vm` leaves the image on the reflink
+    /// XFS, and only an explicit `delete_data_disk` (or the age-gated
+    /// sweep of a vanished test run) removes it. Empty (the default)
+    /// reproduces today's all-ephemeral behaviour exactly.
+    ///
+    /// Each entry costs one virtio-blk device out of the guest's MMIO
+    /// budget, like a per-container scratch disk.
+    #[serde(default)]
+    pub data_disks: Vec<DataDiskConfig>,
     /// Optional caller-supplied sandbox identity, echoed in
     /// `list_vms` so a shim can find its VM after a restart.
     #[serde(default)]
@@ -212,6 +307,25 @@ pub struct VmConfig {
     /// Optional network attachment (bridge + TAP + pod netns).
     #[serde(default)]
     pub network: Option<NetConfig>,
+}
+
+/// One **named persistent** data disk .
+///
+/// `id` is the identity that outlives the VM: the image is
+/// `<disks>/data/<id>.img` on the reflink XFS, created sparse and
+/// `mkfs.ext4`'d on first use and reused as-is on every later attach.
+/// Attaching an `id` whose image exists never reformats it, and a
+/// `size_bytes` that disagrees with the existing image is an error rather
+/// than a silent resize.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataDiskConfig {
+    /// Persistent identity; also the image's filename component.
+    pub id: String,
+    /// Capacity in bytes. Must match an existing image exactly.
+    pub size_bytes: u64,
+    /// Absolute guest path the agent mounts it at (ext4), before
+    /// containers start.
+    pub guest_mount: String,
 }
 
 /// One container's own writable capacity.
@@ -233,6 +347,7 @@ impl Default for VmConfig {
         Self {
             kernel: None,
             initrd: None,
+            cmdline: None,
             memory_mb: default_memory_mb(),
             vcpus: default_vcpus(),
             cpu_quota: None,
@@ -243,6 +358,7 @@ impl Default for VmConfig {
             guest_dirs: Vec::new(),
             scratch_size_bytes: None,
             container_scratch: Vec::new(),
+            data_disks: Vec::new(),
             sandbox_id: None,
             network: None,
         }
@@ -335,6 +451,16 @@ pub enum Request {
     StopVm {
         /// VM identifier from `create_vm`.
         vm_id: String,
+    },
+    /// Delete a **named persistent** data disk's image .
+    ///
+    /// The only way a data disk's data goes away: `stop_vm` deliberately
+    /// retains it. Fails loudly when the image does not exist, or when
+    /// a live VM still has it attached — unlinking a disk out from under
+    /// a running guest is CHALLENGES #63's bug with a new name.
+    DeleteDataDisk {
+        /// Persistent identity given in `VmConfig.data_disks`.
+        id: String,
     },
     /// Resolve a sandbox to its live VM.
     LookupSandbox {
@@ -460,6 +586,18 @@ pub enum Request {
         /// Empty is a loud error — never a silent no-op.
         labels: Vec<String>,
     },
+    /// Snapshot a live tree node so it can be a warm-fork source.
+    ///
+    /// Root nodes are prepared at `tree_create*`. Children from
+    /// `tree_fork*` are not. `tree_fork` / `tree_fork_batch` will call
+    /// this on demand; the explicit op exists so a controller can show
+    /// the checkpoint as its own (slow) step. Idempotent.
+    TreePrepareForkSource {
+        /// Tree identifier.
+        tree_id: String,
+        /// Live (or suspended — resumed first) node to checkpoint.
+        node_id: String,
+    },
     /// Non-destructive rollback: create a new branch from `node_id`'s
     /// state. Semantically equivalent to `tree_fork`.
     TreeRollback {
@@ -518,6 +656,16 @@ pub enum Request {
     },
     /// List all trees the daemon owns.
     TreeList,
+    /// Subscribe this connection to tree mutations. The first response
+    /// is [`Response::TreeWatching`]; further lines are
+    /// [`Response::TreeEvent`] until the client hangs up. `tree_id`
+    /// omitted watches every tree. After this op the connection is
+    /// event-only — do not send more requests on it.
+    TreeWatch {
+        /// Restrict to one tree; omitted / `null` = all trees.
+        #[serde(default)]
+        tree_id: Option<String>,
+    },
     /// Forget a tree: live payloads are torn down, on-disk state under
     /// the tree's directory is kept (re-openable later).
     TreeDrop {
@@ -540,6 +688,11 @@ pub struct TreeForkedBranch {
     /// Per-member `CoW` vs full-copy flag (see [`Response::TreeForked`]).
     #[serde(default)]
     pub fork_memory_full_copy: Vec<bool>,
+    /// Wall time of the whole batch (same value on every branch).
+    /// Per-branch work is not timed separately — the batch is one
+    /// dirty-bitmap capture.
+    #[serde(default)]
+    pub latency_ns: u64,
 }
 
 /// Summary of one VM in a `list_vms` response.
@@ -623,8 +776,12 @@ pub enum Response {
     },
     /// Reply to `dump_serial`.
     SerialDump {
-        /// VM identifier.
+        /// VM identifier. Tree members use `{tree_id}/{node_id}`
+        /// (they carry no daemon-registry `vm_id`).
         vm_id: String,
+        /// Guest vsock CID of the VM whose console was dumped.
+        #[serde(default)]
+        guest_cid: u64,
         /// Everything the guest has written to its console so far
         /// (lossy UTF-8).
         console: String,
@@ -681,11 +838,33 @@ pub enum Response {
         /// only virtiofs-backed sources full-copy).
         #[serde(default)]
         fork_memory_full_copy: Vec<bool>,
+        /// Host wall time of the fork/rollback (control-plane
+        /// measurement; not stored in `tree.json`).
+        #[serde(default)]
+        latency_ns: u64,
     },
     /// Reply to `tree_fork_batch`.
     TreeForkBatch {
         /// One entry per requested label, in the same order.
         forks: Vec<TreeForkedBranch>,
+        /// Host wall time of the whole batch (one dirty-bitmap
+        /// capture + N forks). Same value is copied onto each
+        /// [`TreeForkedBranch::latency_ns`].
+        #[serde(default)]
+        latency_ns: u64,
+    },
+    /// Reply to `tree_prepare_fork_source`.
+    TreePrepared {
+        /// Node that is now a warm-fork source.
+        node_id: String,
+        /// `true` when this call wrote a new base snapshot. `false` when
+        /// the node was already prepared (idempotent no-op).
+        wrote_base: bool,
+        /// Host wall time of the prepare (includes snapshot + restore
+        /// when `wrote_base` is true).
+        latency_ns: u64,
+        /// Guest vsock CIDs after prepare (CID is preserved).
+        guest_cids: Vec<u64>,
     },
     /// Reply to `tree_resume`.
     TreeResumed {
@@ -703,11 +882,41 @@ pub enum Response {
     TreeNodeList {
         /// Every node's metadata.
         nodes: Vec<NodeInfo>,
+        /// Current resource usage (orchestrator-side; not Lean).
+        #[serde(default)]
+        usage: TreeUsageInfo,
+        /// Resource budget.
+        #[serde(default = "default_tree_budget")]
+        budget: TreeBudget,
+        /// Live vsock CIDs keyed by node id. Empty vec = no live
+        /// payload. Not persisted in `tree.json`.
+        #[serde(default)]
+        live_guest_cids: HashMap<String, Vec<u64>>,
     },
     /// Reply to `tree_list`.
     TreeList {
         /// One summary per tree.
         trees: Vec<TreeSummary>,
+    },
+    /// First reply to `tree_watch` — current snapshot(s). Further
+    /// lines on the same connection are [`Response::TreeEvent`].
+    TreeWatching {
+        /// One snapshot per matched tree (empty if the daemon owns
+        /// none and the watch was unscoped).
+        trees: Vec<TreeWatchSnapshot>,
+    },
+    /// Streamed tree mutation (after [`Response::TreeWatching`]).
+    TreeEvent {
+        /// Tree that changed.
+        tree_id: String,
+        /// See [`TreeEvent::op`].
+        op: String,
+        /// Node the op targeted or produced.
+        #[serde(default)]
+        node_id: Option<String>,
+        /// Fork/rollback/batch wall time, when measured.
+        #[serde(default)]
+        latency_ns: Option<u64>,
     },
     /// Reply to `pool_status`.
     PoolStatus {
@@ -738,6 +947,12 @@ pub struct TreeSummary {
     pub kind: String,
     /// Total node count (live + suspended + evicted).
     pub nodes: usize,
+    /// Current resource usage.
+    #[serde(default)]
+    pub usage: TreeUsageInfo,
+    /// Resource budget.
+    #[serde(default = "default_tree_budget")]
+    pub budget: TreeBudget,
 }
 
 /// One VM owned by the daemon. The `vm` field is load-bearing even
@@ -824,6 +1039,14 @@ impl TreePayload {
             Self::Cluster(t) => t.fork_batch(source_id, &refs),
         }
         .map_err(|e| format!("tree fork_batch({source_id}, {labels:?}): {e}"))
+    }
+
+    fn prepare_fork_source(&mut self, node_id: &String) -> Result<bool, String> {
+        match self {
+            Self::Single(t) => t.prepare_fork_source(node_id),
+            Self::Cluster(t) => t.prepare_fork_source(node_id),
+        }
+        .map_err(|e| format!("tree prepare_fork_source({node_id}): {e}"))
     }
 
     /// Find a live VM by guest CID (debug introspection for
@@ -945,6 +1168,49 @@ impl TreePayload {
             Self::Cluster(_) => "cluster",
         }
     }
+
+    fn usage(&self) -> TreeUsage {
+        match self {
+            Self::Single(t) => t.usage(),
+            Self::Cluster(t) => t.usage(),
+        }
+    }
+
+    fn budget(&self) -> TreeBudget {
+        match self {
+            Self::Single(t) => t.budget(),
+            Self::Cluster(t) => t.budget(),
+        }
+    }
+
+    /// Live guest CIDs keyed by node id. Suspended/evicted nodes map to
+    /// an empty vec — the observer must not keep a stale CID.
+    fn live_guest_cids(&self) -> HashMap<String, Vec<u64>> {
+        self.list_nodes()
+            .into_iter()
+            .map(|n| (n.id.clone(), self.node_cids(&n.id)))
+            .collect()
+    }
+
+    fn node_list_response(&self) -> Response {
+        Response::TreeNodeList {
+            nodes: self.list_nodes(),
+            usage: self.usage().into(),
+            budget: self.budget(),
+            live_guest_cids: self.live_guest_cids(),
+        }
+    }
+
+    fn watch_snapshot(&self, tree_id: String) -> TreeWatchSnapshot {
+        TreeWatchSnapshot {
+            tree_id,
+            kind: self.kind().to_string(),
+            nodes: self.list_nodes(),
+            usage: self.usage().into(),
+            budget: self.budget(),
+            live_guest_cids: self.live_guest_cids(),
+        }
+    }
 }
 
 /// The daemon's VM registry and request dispatcher.
@@ -966,6 +1232,8 @@ pub struct Daemon {
     /// Warm pool; `None` when disabled
     /// (`K7D_POOL_SIZE` unset or 0).
     pool: Option<Pool>,
+    /// `tree_watch` subscribers. Dead senders are dropped on emit.
+    watchers: Mutex<Vec<WatchSub>>,
     counter: AtomicU64,
 }
 
@@ -994,6 +1262,7 @@ impl Daemon {
             trees: Mutex::new(HashMap::new()),
             sandboxes: Mutex::new(HashMap::new()),
             pool,
+            watchers: Mutex::new(Vec::new()),
             counter: AtomicU64::new(0),
         }
     }
@@ -1066,6 +1335,7 @@ impl Daemon {
             }
             Request::ListVms => self.list_vms(),
             Request::StopVm { vm_id } => self.stop_vm(&vm_id),
+            Request::DeleteDataDisk { id } => self.delete_data_disk(&id),
             Request::LookupSandbox { sandbox_id } => self.lookup_sandbox(&sandbox_id),
             Request::ReattachSandbox { sandbox_id } => self.reattach_sandbox(&sandbox_id),
             Request::ForkVm { vm_id, sandbox_id } => self.fork_vm(&vm_id, sandbox_id),
@@ -1091,93 +1361,180 @@ impl Daemon {
                 tree_id,
                 source_id,
                 label,
-            } => self.with_tree(&tree_id, |t| match t.fork(&source_id, &label) {
-                Ok(node_id) => {
-                    let guest_cids = t.node_cids(&node_id);
-                    let fork_memory_full_copy = t.node_fork_full_copy(&node_id);
-                    Response::TreeForked {
-                        node_id,
-                        guest_cids,
-                        fork_memory_full_copy,
+            } => {
+                let resp = self.with_tree(&tree_id, |t| {
+                    let start = Instant::now();
+                    match t.fork(&source_id, &label) {
+                        Ok(node_id) => {
+                            let latency_ns =
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            let guest_cids = t.node_cids(&node_id);
+                            let fork_memory_full_copy = t.node_fork_full_copy(&node_id);
+                            Response::TreeForked {
+                                node_id,
+                                guest_cids,
+                                fork_memory_full_copy,
+                                latency_ns,
+                            }
+                        }
+                        Err(message) => Response::Error { message },
                     }
-                }
-                Err(message) => Response::Error { message },
-            }),
+                });
+                self.emit_from_response(&tree_id, &resp);
+                resp
+            }
             Request::TreeForkBatch {
                 tree_id,
                 source_id,
                 labels,
-            } => self.with_tree(&tree_id, |t| match t.fork_batch(&source_id, &labels) {
-                Ok(node_ids) => {
-                    let forks = node_ids
-                        .into_iter()
-                        .map(|node_id| TreeForkedBranch {
-                            guest_cids: t.node_cids(&node_id),
-                            fork_memory_full_copy: t.node_fork_full_copy(&node_id),
-                            node_id,
-                        })
-                        .collect();
-                    Response::TreeForkBatch { forks }
+            } => {
+                let resp = self.with_tree(&tree_id, |t| {
+                    let start = Instant::now();
+                    match t.fork_batch(&source_id, &labels) {
+                        Ok(node_ids) => {
+                            let latency_ns =
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            let forks = node_ids
+                                .into_iter()
+                                .map(|node_id| TreeForkedBranch {
+                                    guest_cids: t.node_cids(&node_id),
+                                    fork_memory_full_copy: t.node_fork_full_copy(&node_id),
+                                    node_id,
+                                    latency_ns,
+                                })
+                                .collect();
+                            Response::TreeForkBatch { forks, latency_ns }
+                        }
+                        Err(message) => Response::Error { message },
+                    }
+                });
+                self.emit_from_response(&tree_id, &resp);
+                resp
+            }
+            Request::TreePrepareForkSource { tree_id, node_id } => {
+                let resp = self.with_tree(&tree_id, |t| {
+                    let start = Instant::now();
+                    match t.prepare_fork_source(&node_id) {
+                        Ok(wrote_base) => {
+                            let latency_ns =
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            Response::TreePrepared {
+                                guest_cids: t.node_cids(&node_id),
+                                latency_ns,
+                                node_id: node_id.clone(),
+                                wrote_base,
+                            }
+                        }
+                        Err(message) => Response::Error { message },
+                    }
+                });
+                if let Response::TreePrepared {
+                    latency_ns,
+                    ref node_id,
+                    ..
+                } = resp
+                {
+                    self.emit_tree_event(
+                        &tree_id,
+                        "prepare_fork_source",
+                        Some(node_id),
+                        Some(latency_ns),
+                    );
                 }
-                Err(message) => Response::Error { message },
-            }),
+                resp
+            }
             Request::TreeRollback {
                 tree_id,
                 node_id,
                 label,
-            } => self.with_tree(&tree_id, |t| match t.rollback(&node_id, &label) {
-                Ok(node_id) => Response::TreeForked {
-                    guest_cids: t.node_cids(&node_id),
-                    fork_memory_full_copy: t.node_fork_full_copy(&node_id),
-                    node_id,
-                },
-                Err(message) => Response::Error { message },
-            }),
+            } => {
+                let resp = self.with_tree(&tree_id, |t| {
+                    let start = Instant::now();
+                    match t.rollback(&node_id, &label) {
+                        Ok(node_id) => {
+                            let latency_ns =
+                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            Response::TreeForked {
+                                guest_cids: t.node_cids(&node_id),
+                                fork_memory_full_copy: t.node_fork_full_copy(&node_id),
+                                node_id,
+                                latency_ns,
+                            }
+                        }
+                        Err(message) => Response::Error { message },
+                    }
+                });
+                self.emit_from_response(&tree_id, &resp);
+                resp
+            }
             Request::TreeProtect { tree_id, node_id } => {
-                self.with_tree(&tree_id, |t| match t.protect(&node_id) {
+                let resp = self.with_tree(&tree_id, |t| match t.protect(&node_id) {
                     Ok(()) => Response::Ok,
                     Err(message) => Response::Error { message },
-                })
+                });
+                if matches!(resp, Response::Ok) {
+                    self.emit_tree_event(&tree_id, "protect", Some(&node_id), None);
+                }
+                resp
             }
             Request::TreeUnprotect { tree_id, node_id } => {
-                self.with_tree(&tree_id, |t| match t.unprotect(&node_id) {
+                let resp = self.with_tree(&tree_id, |t| match t.unprotect(&node_id) {
                     Ok(()) => Response::Ok,
                     Err(message) => Response::Error { message },
-                })
+                });
+                if matches!(resp, Response::Ok) {
+                    self.emit_tree_event(&tree_id, "unprotect", Some(&node_id), None);
+                }
+                resp
             }
             Request::TreeSuspend { tree_id, node_id } => {
-                self.with_tree(&tree_id, |t| match t.suspend(&node_id) {
+                let resp = self.with_tree(&tree_id, |t| match t.suspend(&node_id) {
                     Ok(()) => Response::Ok,
                     Err(message) => Response::Error { message },
-                })
+                });
+                if matches!(resp, Response::Ok) {
+                    self.emit_tree_event(&tree_id, "suspend", Some(&node_id), None);
+                }
+                resp
             }
             Request::TreeResume { tree_id, node_id } => {
-                self.with_tree(&tree_id, |t| match t.resume(&node_id) {
+                let resp = self.with_tree(&tree_id, |t| match t.resume(&node_id) {
                     Ok(()) => Response::TreeResumed {
                         guest_cids: t.node_cids(&node_id),
-                        node_id,
+                        node_id: node_id.clone(),
                     },
                     Err(message) => Response::Error { message },
-                })
+                });
+                if matches!(resp, Response::TreeResumed { .. }) {
+                    self.emit_tree_event(&tree_id, "resume", Some(&node_id), None);
+                }
+                resp
             }
             Request::TreePrune { tree_id, node_id } => {
-                self.with_tree(&tree_id, |t| match t.prune(&node_id) {
+                let resp = self.with_tree(&tree_id, |t| match t.prune(&node_id) {
                     Ok(()) => Response::Ok,
                     Err(message) => Response::Error { message },
-                })
+                });
+                if matches!(resp, Response::Ok) {
+                    self.emit_tree_event(&tree_id, "prune", Some(&node_id), None);
+                }
+                resp
             }
             Request::TreeAutoEvict { tree_id } => {
-                self.with_tree(&tree_id, |t| match t.auto_evict() {
+                let resp = self.with_tree(&tree_id, |t| match t.auto_evict() {
                     Ok(evicted) => Response::TreeEvicted { evicted },
                     Err(message) => Response::Error { message },
-                })
+                });
+                if let Response::TreeEvicted { ref evicted } = resp {
+                    for id in evicted {
+                        self.emit_tree_event(&tree_id, "evict", Some(id), None);
+                    }
+                }
+                resp
             }
-            Request::TreeNodes { tree_id } => {
-                self.with_tree(&tree_id, |t| Response::TreeNodeList {
-                    nodes: t.list_nodes(),
-                })
-            }
+            Request::TreeNodes { tree_id } => self.with_tree(&tree_id, |t| t.node_list_response()),
             Request::TreeList => self.tree_list(),
+            Request::TreeWatch { tree_id } => self.watch_snapshot(tree_id.as_deref()),
             Request::TreeDrop { tree_id } => self.tree_drop(&tree_id),
             Request::PoolStatus => self.pool_status(),
         }
@@ -1363,14 +1720,17 @@ impl Daemon {
     /// path so concurrent `list_vms` / `stop_vm` calls don't stall.
     #[allow(clippy::too_many_lines)]
     fn build_and_start(&self, config: VmConfig) -> Result<CreatedVm, String> {
-        let (kernel, initrd) = Self::resolve_guest_paths(&config)?;
+        let artifacts = Self::resolve_vm_guest(&config)?;
+        let kernel = artifacts.kernel;
         // Name the guest in the log. "Which kernel did this pod boot?"
         // is otherwise unanswerable after the fact, and the answer is
         // what turns a guest that misbehaves in one corner (nf_tables
         // with no address families, an agent older than the call it is
         // waiting for) into a one-line diagnosis. See CHALLENGES #72.
         log::info!(
-            "guest artifacts: kernel={kernel} initrd={initrd} (from {})",
+            "guest artifacts: kernel={kernel} initrd={} cmdline={} (from {})",
+            artifacts.initrd.as_deref().unwrap_or("(none)"),
+            config.cmdline.as_deref().unwrap_or("(builder default)"),
             if config.kernel.is_some() {
                 "the client's request"
             } else {
@@ -1384,10 +1744,21 @@ impl Daemon {
         // counts loudly at build time).
         let mut builder = Vm::builder()
             .kernel(&kernel)
-            .initrd(&initrd)
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .vsock(config.vsock);
+        if let Some(ref initrd) = artifacts.initrd {
+            builder = builder.initrd(initrd);
+        }
+        if let Some(ref cmdline) = config.cmdline {
+            if cmdline.trim().is_empty() {
+                return Err(
+                    "config.cmdline is empty; omit the field to keep the builder default"
+                        .to_string(),
+                );
+            }
+            builder = builder.cmdline(cmdline);
+        }
         for share in &config.virtiofs {
             builder = builder.virtiofs_share(&share.host_dir, &share.guest_mount, share.readonly);
         }
@@ -1433,6 +1804,30 @@ impl Daemon {
                         format!("provision scratch disk for container {}: {e}", cs.name)
                     })?;
             builder = builder.container_scratch_disk(&cs.name, disk);
+        }
+
+        // Named persistent disks. Same "declared last" rule, opposite
+        // lifetime: these images are reused by the next VM that claims
+        // the same id, and teardown leaves them alone.
+        for (i, dd) in config.data_disks.iter().enumerate() {
+            if config.data_disks[..i].iter().any(|prev| prev.id == dd.id) {
+                return Err(format!("data_disks names disk {:?} twice", dd.id));
+            }
+            if config.data_disks[..i]
+                .iter()
+                .any(|prev| prev.guest_mount == dd.guest_mount)
+            {
+                // Two devices at one mount point: the second shadows the
+                // first, and a node would be writing its replicas to an
+                // image nobody reads back.
+                return Err(format!(
+                    "data_disks mounts two disks at {:?}",
+                    dd.guest_mount
+                ));
+            }
+            let disk = crate::disks::DataDisk::attach(&dd.id, dd.size_bytes, &dd.guest_mount)
+                .map_err(|e| format!("attach data disk {}: {e}", dd.id))?;
+            builder = builder.data_disk(disk);
         }
 
         let attachment = match config.network {
@@ -1834,9 +2229,16 @@ impl Daemon {
         Response::Ok
     }
 
-    /// Resolve kernel/initrd from `config` or the environment — loudly.
-    fn resolve_guest_paths(config: &VmConfig) -> Result<(String, String), String> {
-        crate::config::resolve_guest_paths(config.kernel.as_deref(), config.initrd.as_deref())
+    /// Resolve kernel + optional initrd for a `CreateVm` / tree member.
+    /// Ubuntu `root=` disk boots omit the initrd and must not pick up
+    /// `K7D_INITRD` (CHALLENGES #72).
+    fn resolve_vm_guest(config: &VmConfig) -> Result<crate::config::GuestArtifacts, String> {
+        crate::config::resolve_vm_guest(
+            config.kernel.as_deref(),
+            config.initrd.as_deref(),
+            config.cmdline.as_deref(),
+            config.block_devices.len(),
+        )
     }
 
     /// Boot one VM for a tree payload and wait for its guest agent —
@@ -1868,13 +2270,37 @@ impl Daemon {
                 .to_string(),
             );
         }
-        let (kernel, initrd) = Self::resolve_guest_paths(config)?;
+        if !config.data_disks.is_empty() {
+            // Same refusal, sharper reason: a tree payload is forked
+            // repeatedly, and every branch would want *its own* copy of a
+            // disk whose whole identity is that it is shared across VMs.
+            // A node that wants persistent storage gets it from the
+            // sandbox VMs the tree adopts.
+            return Err(
+                "data_disks are not supported for tree payload VMs — a tree node is forked \
+                 repeatedly and a persistent disk has one identity; attach it to the sandbox \
+                 VMs the tree adopts instead"
+                    .to_string(),
+            );
+        }
+        let artifacts = Self::resolve_vm_guest(config)?;
         let mut builder = Vm::builder()
-            .kernel(&kernel)
-            .initrd(&initrd)
+            .kernel(&artifacts.kernel)
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .vsock(config.vsock);
+        if let Some(ref initrd) = artifacts.initrd {
+            builder = builder.initrd(initrd);
+        }
+        if let Some(ref cmdline) = config.cmdline {
+            if cmdline.trim().is_empty() {
+                return Err(
+                    "config.cmdline is empty; omit the field to keep the builder default"
+                        .to_string(),
+                );
+            }
+            builder = builder.cmdline(cmdline);
+        }
         for share in &config.virtiofs {
             builder = builder.virtiofs_share(&share.host_dir, &share.guest_mount, share.readonly);
         }
@@ -2373,10 +2799,78 @@ impl Daemon {
                 tree_id: id.clone(),
                 kind: t.kind().to_string(),
                 nodes: t.list_nodes().len(),
+                usage: t.usage().into(),
+                budget: t.budget(),
             })
             .collect();
         list.sort_by(|a, b| a.tree_id.cmp(&b.tree_id));
         Response::TreeList { trees: list }
+    }
+
+    /// Initial `tree_watch` snapshot. Unknown `tree_id` is loud.
+    fn watch_snapshot(&self, tree_id: Option<&str>) -> Response {
+        let trees = self.trees.lock().unwrap();
+        if let Some(id) = tree_id {
+            return match trees.get(id) {
+                Some(t) => Response::TreeWatching {
+                    trees: vec![t.watch_snapshot(id.to_string())],
+                },
+                None => Response::Error {
+                    message: format!("no such tree: {id}"),
+                },
+            };
+        }
+        let mut snaps: Vec<TreeWatchSnapshot> = trees
+            .iter()
+            .map(|(id, t)| t.watch_snapshot(id.clone()))
+            .collect();
+        snaps.sort_by(|a, b| a.tree_id.cmp(&b.tree_id));
+        Response::TreeWatching { trees: snaps }
+    }
+
+    fn watch_subscribe(&self, tree_id: Option<String>) -> std::sync::mpsc::Receiver<TreeEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.watchers.lock().unwrap().push(WatchSub { tree_id, tx });
+        rx
+    }
+
+    fn emit_tree_event(
+        &self,
+        tree_id: &str,
+        op: &str,
+        node_id: Option<&str>,
+        latency_ns: Option<u64>,
+    ) {
+        let ev = TreeEvent {
+            tree_id: tree_id.to_string(),
+            op: op.to_string(),
+            node_id: node_id.map(str::to_string),
+            latency_ns,
+        };
+        let mut subs = self.watchers.lock().unwrap();
+        subs.retain(|s| {
+            if s.tree_id.as_deref().is_none_or(|id| id == tree_id) {
+                s.tx.send(ev.clone()).is_ok()
+            } else {
+                true
+            }
+        });
+    }
+
+    fn emit_from_response(&self, tree_id: &str, resp: &Response) {
+        match resp {
+            Response::TreeForked {
+                node_id,
+                latency_ns,
+                ..
+            } => self.emit_tree_event(tree_id, "fork", Some(node_id), Some(*latency_ns)),
+            Response::TreeForkBatch { forks, latency_ns } => {
+                for f in forks {
+                    self.emit_tree_event(tree_id, "fork", Some(&f.node_id), Some(*latency_ns));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Forget a tree. Dropping the payload outside the lock tears down
@@ -2388,6 +2882,7 @@ impl Daemon {
             Some(payload) => {
                 drop(payload);
                 log::info!("dropped tree {tree_id}");
+                self.emit_tree_event(tree_id, "drop", None, None);
                 Response::Ok
             }
             None => Response::Error {
@@ -2500,26 +2995,55 @@ impl Daemon {
     fn dump_serial(&self, vm_id: Option<&str>, guest_cid: Option<u64>) -> Response {
         {
             let vms = self.vms.lock().unwrap();
-            let hit = match (vm_id, guest_cid) {
-                (Some(id), _) => vms.get_key_value(id),
-                (None, Some(cid)) => vms.iter().find(|(_, e)| e.guest_cid == cid),
-                (None, None) => None,
-            };
-            if let Some((id, entry)) = hit {
-                return Response::SerialDump {
-                    vm_id: id.clone(),
-                    console: entry.vm.serial_output(Duration::ZERO),
-                };
+            if let Some(id) = vm_id {
+                if let Some(entry) = vms.get(id) {
+                    return Response::SerialDump {
+                        vm_id: id.to_string(),
+                        guest_cid: entry.vm.guest_cid(),
+                        console: entry.vm.serial_output(Duration::ZERO),
+                    };
+                }
+            }
+            if let Some(cid) = guest_cid {
+                if let Some((id, entry)) = vms
+                    .iter()
+                    .find(|(_, e)| e.guest_cid == cid || e.vm.guest_cid() == cid)
+                {
+                    return Response::SerialDump {
+                        vm_id: id.clone(),
+                        guest_cid: entry.vm.guest_cid(),
+                        console: entry.vm.serial_output(Duration::ZERO),
+                    };
+                }
+            }
+        }
+
+        let trees = self.trees.lock().unwrap();
+        // Composite id `{tree_id}/{node_id}` is what we echo for tree
+        // members — looking it back up must work without a CID.
+        if let Some(id) = vm_id {
+            if let Some((tree_id, node_id)) = id.split_once('/') {
+                if let Some(tree) = trees.get(tree_id) {
+                    if let Some(cid) = guest_cid {
+                        if let Some((nid, vm)) = tree.find_live_vm_by_cid(cid) {
+                            if nid == node_id {
+                                return serial_dump_tree(tree_id, nid, vm);
+                            }
+                        }
+                    }
+                    let key = node_id.to_string();
+                    if let Some(&cid) = tree.node_cids(&key).first() {
+                        if let Some((nid, vm)) = tree.find_live_vm_by_cid(cid) {
+                            return serial_dump_tree(tree_id, nid, vm);
+                        }
+                    }
+                }
             }
         }
         if let Some(cid) = guest_cid {
-            let trees = self.trees.lock().unwrap();
             for (tree_id, tree) in trees.iter() {
                 if let Some((node_id, vm)) = tree.find_live_vm_by_cid(cid) {
-                    return Response::SerialDump {
-                        vm_id: format!("{tree_id}/{node_id}"),
-                        console: vm.serial_output(Duration::ZERO),
-                    };
+                    return serial_dump_tree(tree_id, node_id, vm);
                 }
             }
         }
@@ -2556,6 +3080,43 @@ impl Daemon {
             }
             None => Response::Error {
                 message: format!("no such VM: {vm_id}"),
+            },
+        }
+    }
+
+    /// Delete a persistent data disk's image, refusing while a VM the
+    /// daemon owns still has it attached.
+    ///
+    /// Retention with no way to delete is a disk leak, and deletion that
+    /// ignores the live attachment is CHALLENGES #63 again — the check
+    /// is against the daemon's own registry, which is the only set of
+    /// VMs that could have been given the disk through `create_vm`.
+    fn delete_data_disk(&self, id: &str) -> Response {
+        if let Err(e) = crate::disks::DataDisk::validate_id(id) {
+            return Response::Error {
+                message: e.to_string(),
+            };
+        }
+        let holder = self.vms.lock().unwrap().iter().find_map(|(vm_id, entry)| {
+            entry
+                .vm
+                .data_disks()
+                .iter()
+                .any(|d| d.id() == id)
+                .then(|| vm_id.clone())
+        });
+        if let Some(vm_id) = holder {
+            return Response::Error {
+                message: format!(
+                    "data disk {id} is attached to live VM {vm_id} — stop it before deleting \
+                     the disk"
+                ),
+            };
+        }
+        match crate::disks::DataDisk::delete(id) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error {
+                message: format!("delete data disk {id}: {e}"),
             },
         }
     }
@@ -2694,6 +3255,14 @@ fn remove_sandbox_record(sandbox_id: &str) {
     }
 }
 
+fn serial_dump_tree(tree_id: &str, node_id: &str, vm: &Vm) -> Response {
+    Response::SerialDump {
+        vm_id: format!("{tree_id}/{node_id}"),
+        guest_cid: vm.guest_cid(),
+        console: vm.serial_output(Duration::ZERO),
+    }
+}
+
 /// Synchronous control-plane client (one Unix connection, JSON-lines).
 ///
 /// Used by the containerd shim and by tests. Each [`Client::call`]
@@ -2806,7 +3375,8 @@ pub fn serve(
 }
 
 /// Handle one client connection: read request lines, dispatch, write
-/// response lines, until EOF.
+/// response lines, until EOF. `tree_watch` takes over the connection
+/// (snapshot, then events) until the client hangs up.
 fn handle_connection(stream: &UnixStream, daemon: &Daemon) {
     let reader = BufReader::new(stream);
     let mut writer = stream;
@@ -2821,25 +3391,64 @@ fn handle_connection(stream: &UnixStream, daemon: &Daemon) {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => daemon.handle(req),
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
-        };
-        let mut buf = match serde_json::to_string(&response) {
-            Ok(s) => s,
+        let req = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => req,
             Err(e) => {
-                log::error!("serialize response: {e}");
-                return;
+                if !write_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!("bad request: {e}"),
+                    },
+                ) {
+                    return;
+                }
+                continue;
             }
         };
-        buf.push('\n');
-        if let Err(e) = writer
-            .write_all(buf.as_bytes())
-            .and_then(|()| writer.flush())
-        {
-            log::warn!("control write error: {e}");
+        if let Request::TreeWatch { tree_id } = req {
+            serve_tree_watch(&mut writer, daemon, tree_id.as_deref());
+            return;
+        }
+        if !write_response(&mut writer, &daemon.handle(req)) {
+            return;
+        }
+    }
+}
+
+fn write_response(writer: &mut &UnixStream, response: &Response) -> bool {
+    let mut buf = match serde_json::to_string(response) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("serialize response: {e}");
+            return false;
+        }
+    };
+    buf.push('\n');
+    if let Err(e) = writer
+        .write_all(buf.as_bytes())
+        .and_then(|()| writer.flush())
+    {
+        log::warn!("control write error: {e}");
+        return false;
+    }
+    true
+}
+
+fn serve_tree_watch(writer: &mut &UnixStream, daemon: &Daemon, tree_id: Option<&str>) {
+    let rx = daemon.watch_subscribe(tree_id.map(str::to_string));
+    let snap = daemon.watch_snapshot(tree_id);
+    let failed = matches!(snap, Response::Error { .. });
+    if !write_response(writer, &snap) || failed {
+        return;
+    }
+    while let Ok(ev) = rx.recv() {
+        let resp = Response::TreeEvent {
+            tree_id: ev.tree_id,
+            op: ev.op,
+            node_id: ev.node_id,
+            latency_ns: ev.latency_ns,
+        };
+        if !write_response(writer, &resp) {
             return;
         }
     }

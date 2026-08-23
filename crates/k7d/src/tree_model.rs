@@ -30,8 +30,10 @@
 //! - Pure DAG operations: [`add_child`], [`touch`], [`set_state`],
 //!   [`set_protected`].
 //! - Pure budget / usage predicates: [`usage`], [`over_ram`],
-//!   [`over_count`], [`over_disk`], [`TreeBudget::ram_soft_limit`].
-//! - Pure eviction policy: [`ancestor_ids`], [`implicitly_protected`],
+//!   [`over_count`], [`over_disk`], [`over_disk_incoming`],
+//!   [`TreeBudget::ram_soft_limit`].
+//! - Pure eviction policy: [`ancestor_ids`], [`restore_chain_depth`],
+//!   [`implicitly_protected`],
 //!   [`lru_live_victim`], [`subtree_isolated`],
 //!   [`lru_evictable_leaf_subtree`], [`auto_evict_ram`].
 //! - The pure half of the K7DL delta codec: [`k7dl_header_bytes`],
@@ -107,7 +109,12 @@ pub struct TreeBudget {
     pub max_live_ram_bytes: u64,
     /// Max disk usage for `base.mem` + `delta.pack` across all nodes, in bytes.
     pub max_disk_bytes: u64,
-    /// Max parent chain depth before consolidation. Recommended: 1.
+    /// Max *restore-chain* depth (non-checkpoint hops to the nearest
+    /// `has_base_snapshot` ancestor) before consolidation. Recommended: 1.
+    /// Not tree-graph / search depth — a graph of root→child→grandchild
+    /// is legal while this stays 1. The quantity capped is
+    /// [`restore_chain_depth`]; the orchestrators enforce it on `resume`
+    /// .
     pub max_chain_depth: usize,
 }
 
@@ -450,6 +457,19 @@ pub fn over_disk(t: &TreeModel) -> bool {
     usage(t).disk_bytes > t.budget.max_disk_bytes
 }
 
+/// Whether the on-disk footprint plus `incoming` bytes about to be
+/// written (a projected new base snapshot — the referenced work) exceeds
+/// `max_disk_bytes`. `over_disk_incoming(t, 0)` coincides with
+/// [`over_disk`].
+///
+/// Verified: `over_disk_incoming_zero_rust` in
+/// `verif/Verif/Equiv/Transfer.lean` (on the Aeneas translation of
+/// this function).
+#[must_use]
+pub fn over_disk_incoming(t: &TreeModel, incoming: u64) -> bool {
+    usage(t).disk_bytes.saturating_add(incoming) > t.budget.max_disk_bytes
+}
+
 // --- Pure eviction policy ---
 
 /// Ancestor chain of `id`, inclusive (`[id, parent, grandparent, …, root]`).
@@ -480,6 +500,52 @@ pub fn ancestor_ids(t: &TreeModel, id: u64) -> Vec<u64> {
         fuel -= 1;
     }
     out
+}
+
+/// Restore-chain depth of `id` : the number of
+/// non-checkpoint nodes from `id` (inclusive) up to — but not counting —
+/// its nearest `has_base_snapshot` ancestor, i.e. how many `delta.pack`s
+/// a resume would have to apply on top of that ancestor's `memory.bin`.
+/// `Some(0)` for a checkpoint node. `None` when the walk finds no
+/// checkpoint: a missing node, a root path with no base snapshot, or
+/// fuel exhaustion on a malformed (cyclic) input. The fuel bound is
+/// `max_id(t) + 2`, same as [`ancestor_ids`]; on a well-formed tree it
+/// never truncates a real chain.
+///
+/// This is the quantity [`TreeBudget::max_chain_depth`] caps. It is NOT
+/// tree-graph depth: `root → child → grandchild` is graph depth 2 while
+/// this stays ≤ 1 as long as every fork source was prepared
+/// (`prepare_fork_source` sets `has_base_snapshot`).
+///
+/// Verified: `restore_chain_depth_checkpoint_rust` /
+/// `restore_chain_depth_hop_rust` in `verif/Verif/Equiv/Transfer.lean`
+/// (on the Aeneas translation of this function).
+#[must_use]
+pub fn restore_chain_depth(t: &TreeModel, id: u64) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut cur: Option<u64> = Some(id);
+    let mut fuel = max_id(t).saturating_add(2);
+    while fuel > 0 {
+        match cur {
+            None => return None,
+            Some(c) => match find_index(t, c) {
+                None => return None,
+                Some(i) => {
+                    // Scalar copies — no `&NodeInfo` borrow across the
+                    // branch (Aeneas context join; see `usage`).
+                    let has_base = t.nodes[i].has_base_snapshot;
+                    let parent = t.nodes[i].parent;
+                    if has_base {
+                        return Some(depth);
+                    }
+                    depth = depth.saturating_add(1);
+                    cur = parent;
+                }
+            },
+        }
+        fuel -= 1;
+    }
+    None
 }
 
 /// The ids that should NOT be auto-evicted: every explicitly-protected
@@ -977,6 +1043,36 @@ mod tests {
         let t = test_tree();
         assert_eq!(ancestor_ids(&t, 2), vec![2, 1, 0]);
         assert_eq!(ancestor_ids(&t, 0), vec![0]);
+    }
+
+    #[test]
+    fn restore_chain_depth_is_not_graph_depth() {
+        // Root is a checkpoint; node 1 is a prepared fork source. Graph
+        // depth of node 2 is 2, but its restore chain is 1 hop to its
+        // prepared parent — the the referenced work distinction.
+        let mut t = test_tree(); // chain 0 → 1 → 2, sibling 3
+        t.nodes[0].has_base_snapshot = true;
+        t.nodes[1].has_base_snapshot = true;
+        assert_eq!(restore_chain_depth(&t, 2), Some(1));
+        assert_eq!(restore_chain_depth(&t, 1), Some(0)); // checkpoint itself
+        assert_eq!(restore_chain_depth(&t, 3), Some(1)); // 1 hop to root
+    }
+
+    #[test]
+    fn restore_chain_depth_no_checkpoint_is_none() {
+        let t = test_tree(); // no has_base_snapshot anywhere
+        assert_eq!(restore_chain_depth(&t, 2), None);
+        assert_eq!(restore_chain_depth(&t, 77), None); // missing node
+    }
+
+    #[test]
+    fn over_disk_incoming_projects_headroom() {
+        let mut t = test_tree(); // max_disk_bytes: 10_000
+        t.nodes[0].disk_bytes = 9_000;
+        assert!(!over_disk(&t));
+        assert!(!over_disk_incoming(&t, 1_000));
+        assert!(over_disk_incoming(&t, 1_001));
+        assert!(over_disk_incoming(&t, u64::MAX)); // saturating, no overflow
     }
 
     #[test]

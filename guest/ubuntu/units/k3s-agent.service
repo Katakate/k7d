@@ -1,0 +1,28 @@
+[Unit]
+Description=Lightweight Kubernetes (k3s agent)
+Documentation=https://k3s.io
+# Do not wait for network-online.target: systemd-networkd-wait-online is
+# masked in this image (k7d-net.service owns eth0), and that target
+# would otherwise hang k3s at start.
+After=k7d-net.service
+Wants=k7d-net.service
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=notify
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+ExecStartPre=-/sbin/modprobe overlay
+ExecStartPre=-/sbin/modprobe br_netfilter
+ExecStart=/usr/local/bin/k3s agent
+StandardOutput=journal+console
+StandardError=journal+console

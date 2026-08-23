@@ -1,5 +1,6 @@
 .PHONY: build build-agent build-guest-kernel build-guest-rootfs \
-       test test-integration lint fmt-check deny bench check \
+       test test-integration lint fmt-check deny bench check gym-test \
+       k7d-mcp-deps k7d-mcp-test k7view-test \
        miri fuzz kani kani-harness verif-gen verif-build \
        rsync remote-check remote-build remote-test-integration remote-bench \
        remote-install-rust remote-miri remote-fuzz remote-kani \
@@ -86,7 +87,34 @@ test-integration:
 bench:
 	cargo bench
 
-check: lint test
+# Pure-Python gym unit tests (no KVM). The Rust integration test in
+# crates/k7d/tests/test_gym.rs covers the HTTP+k7d path and does not
+# duplicate these.
+#
+# k7d-mcp-test is the 27a-inc1 Python path: stub MCP round-trip (no
+# KVM) plus one Ubuntu Cilium+Tetragon smoke (needs the live daemon).
+# PEP 668: Ubuntu 24.04 refuses system-site pip. Keep the venv off
+# the rsync tree so --delete cannot wipe the wheels.
+K7D_MCP_VENV := /var/lib/k7d/mcp-venv
+k7d-mcp-deps:
+	@if [ ! -x "$(K7D_MCP_VENV)/bin/python" ]; then \
+	  python3 -m venv "$(K7D_MCP_VENV)" 2>/dev/null \
+	    || { apt-get install -y python3-venv python3-pip && python3 -m venv "$(K7D_MCP_VENV)"; }; \
+	fi
+	$(K7D_MCP_VENV)/bin/pip install -q -r examples/k7d-mcp/requirements.txt
+
+k7d-mcp-test: k7d-mcp-deps
+	cd examples/k7d-mcp && $(K7D_MCP_VENV)/bin/python -m unittest discover -s tests -v
+
+gym-test: k7d-mcp-test k7view-test
+	cd gym && python3 -m unittest discover -s tests -v
+
+# k7view observer unit tests (pure Python, no KVM; the referenced work)
+k7view-test:
+	python3 examples/k7view/test_store.py
+	python3 examples/k7view/test_probe.py
+
+check: lint gym-test test
 
 miri:
 	# Miri runs on pure unit tests only — integration tests touch KVM, the

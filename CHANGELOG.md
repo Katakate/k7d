@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-23
+
+Ubuntu 24.04 is now a first-class guest: a three-node k3s cluster boots
+on bare VMs, takes Cilium, Tetragon, and Longhorn, and still warm-forks.
+A gym leases those nodes, a tree jailer contains them, and an MCP demo
+plus live viewer show a cluster-fork incident end to end.
+
+### Added
+
+- Ubuntu 24.04 guests on `create_vm`, then k3s on those nodes and a warm
+  fork of the running cluster.
+- Cilium 1.16.10 and Tetragon 1.7.0 on the Ubuntu cluster, with
+  fork-and-diff of Tetragon events.
+- Longhorn on Ubuntu nodes, plus persistent data disks that survive a
+  warm fork as reflink-CoW copies.
+- Single-node gym: lease, act, score, TTL reap; a v0 fault catalog
+  (inject / contain / restore); a gym router with sticky groups and
+  drain; Tetragon scoreboard and reset arm.
+- k7d MCP server and an incident demo (fork, inspect, remediate), with
+  k7view as a live observer for cluster-fork trees.
+- Tree jailer: virtiofsd sandbox, nft net jail, per-tree cgroup, and
+  daemon seccomp (enforce by default).
+- Checkpoint policy: restore-chain cap, incoming eviction, disk guard.
+- Fork-under-load correctness checks and dirty-page divergence plots.
+
+### Fixed
+
+- Guest NAT egress collapsing to ~50 KB/s.
+- vhost-vsock ring pages were missing from the warm-fork dirty set, so
+  a child could boot from a stale `used.idx`.
+
+### Changed
+
+- Ubuntu bare-VM is the exclusive gym / GRPO substrate. The tiny
+  busybox guest and nested-runc inner-k3s stay in CI.
+
 ## [0.2.2] — 2026-08-19
 
 Inner-cluster fidelity and guest-kernel work. Add-ons survive a warm fork,

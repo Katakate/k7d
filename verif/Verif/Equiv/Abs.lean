@@ -32,15 +32,16 @@ def absState : tree_model.NodeState → Tree.NodeState
   | .Suspended => .suspended
   | .Evicted => .evicted
 
-/-- Abstraction: generated `NodeInfo` → mirror `NodeInfo` (drops `kind`,
-`dirty_pages`, `has_base_snapshot` — the verified functions never read
-them; scalars via `.val`). -/
+/-- Abstraction: generated `NodeInfo` → mirror `NodeInfo` (drops `kind`
+and `dirty_pages` — the verified functions never read them; scalars via
+`.val`). -/
 def absNode (n : tree_model.NodeInfo) : Tree.NodeInfo :=
   { id := n.id.val
     parent := n.parent.map (·.val)
     children := n.children.val.map (·.val)
     state := absState n.state
     vmCount := n.vm_count.val
+    hasBase := n.has_base_snapshot
     lastActive := n.last_active.val
     prot := n.«protected»
     estRamBytes := n.est_ram_bytes.val
@@ -89,6 +90,9 @@ def absBytes {n : Std.Usize} (a : Array Std.U8 n) : List (BitVec 8) :=
 
 @[simp] theorem absNode_vmCount (n : tree_model.NodeInfo) :
     (absNode n).vmCount = n.vm_count.val := rfl
+
+@[simp] theorem absNode_hasBase (n : tree_model.NodeInfo) :
+    (absNode n).hasBase = n.has_base_snapshot := rfl
 
 @[simp] theorem absNode_lastActive (n : tree_model.NodeInfo) :
     (absNode n).lastActive = n.last_active.val := rfl

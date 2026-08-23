@@ -104,6 +104,91 @@ fn test_tree_fork_and_rollback() {
     assert!(tree.get_node(&b).is_none());
 }
 
+/// A child is not a fork source until prepared. `fork_batch` must
+/// checkpoint it so a grandchild's parent is the child, not root.
+#[test]
+fn test_tree_fork_from_child() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut vm = create_test_vm();
+    vm.start().unwrap();
+    vm.connect_agent(Duration::from_secs(90)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tree, root_id) =
+        SnapshotTree::new(vm, dir.path().to_path_buf(), default_budget()).unwrap();
+
+    let child = tree.fork(&root_id, "child").unwrap();
+    assert_eq!(
+        tree.get_node(&child).unwrap().parent.as_deref(),
+        Some("root")
+    );
+    assert!(!tree.get_node(&child).unwrap().has_base_snapshot);
+
+    // Graph depth 2 under `max_chain_depth: 1` must succeed —
+    // `max_chain_depth` caps the restore chain (delta hops to the nearest
+    // checkpoint), NOT tree-graph depth (the referenced work regression guard:
+    // a naive graph-depth check would fail this fork).
+    assert_eq!(default_budget().max_chain_depth, 1);
+    let grand = tree.fork(&child, "grand").unwrap();
+    assert_eq!(
+        tree.get_node(&grand).unwrap().parent.as_deref(),
+        Some(child.as_str())
+    );
+    assert!(tree.get_node(&child).unwrap().has_base_snapshot);
+    assert!(tree
+        .get_vm(&child)
+        .unwrap()
+        .fork_source_base_path()
+        .is_some());
+
+    // The grandchild's restore chain is 1 hop (its delta on the child's
+    // memory.bin), so suspend/resume must pass the max_chain_depth guard.
+    tree.suspend(&grand).unwrap();
+    tree.resume(&grand).unwrap();
+    assert_eq!(tree.get_node(&grand).unwrap().state, NodeState::Live);
+
+    tree.prune(&root_id).unwrap();
+}
+
+/// the referenced work: `prepare_fork_source` must check the disk budget BEFORE
+/// writing a new `memory.bin`, failing loud (`BudgetExhausted`) when there
+/// is no headroom and nothing evictable — not silently blowing
+/// `max_disk_bytes` until the next auto_evict.
+#[test]
+fn test_tree_prepare_disk_budget_loud() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Room for the root's 256 MiB base only; a child prepare would need
+    // another 256 MiB and nothing is evictable (no suspended subtrees).
+    let budget = TreeBudget {
+        max_live_vms: 10,
+        max_live_ram_bytes: u64::MAX,
+        max_disk_bytes: 320 * 1024 * 1024,
+        max_chain_depth: 1,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut vm = create_test_vm();
+    vm.start().unwrap();
+    vm.connect_agent(Duration::from_secs(90)).unwrap();
+
+    let (mut tree, root) = SnapshotTree::new(vm, dir.path().to_path_buf(), budget).unwrap();
+    let a = tree.fork(&root, "a").unwrap(); // root already prepared: no new base
+
+    let err = tree
+        .fork(&a, "grand")
+        .expect_err("fork from unprepared child must refuse to blow the disk budget");
+    assert!(
+        matches!(err, k7d::tree::TreeError::BudgetExhausted { .. }),
+        "expected BudgetExhausted, got: {err}"
+    );
+    // The failed prepare must not have half-written a base or broken the tree.
+    assert!(!tree.get_node(&a).unwrap().has_base_snapshot);
+    assert_eq!(tree.get_node(&a).unwrap().state, NodeState::Live);
+
+    tree.prune(&root).unwrap();
+}
+
 #[test]
 fn test_tree_auto_evict_lru() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -200,7 +285,7 @@ fn test_tree_protection() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let budget = TreeBudget {
-        max_live_vms: 1,
+        max_live_vms: 2,
         max_live_ram_bytes: u64::MAX,
         max_disk_bytes: u64::MAX,
         max_chain_depth: 1,
@@ -216,33 +301,28 @@ fn test_tree_protection() {
         vm_root.connect_agent(Duration::from_secs(30)).unwrap();
     }
 
-    let a = tree.fork(&root, "a").unwrap();
+    let a = tree.fork(&root, "a").unwrap(); // budget now full: root + a
     tree.protect(&a);
 
-    // Forking b triggers auto-evict (budget=1 live VM). "a" is protected and
-    // "root" is its ancestor so implicitly protected. Only candidate to evict
-    // would be root, but it's protected → auto_evict suspends something else,
-    // or returns the error. Since root is implicitly protected as ancestor of
-    // "a", and "a" is protected, auto_evict must pick root-or-a but both are
-    // protected → it should return BudgetExhausted OR evict nothing.
-    //
-    // In practice auto_evict runs BEFORE the fork in fork_batch, and at that
-    // point live = {root, a}. So we must suspend one of those. Both are
-    // implicitly protected → auto_evict returns Err.
-    let b_result = tree.fork(&root, "b");
+    // Forking b needs headroom for 1 incoming VM : fork_batch
+    // evicts BEFORE forking, exempting the source (root). The only candidate
+    // is "a", which is protected → deterministic loud BudgetExhausted; the
+    // fork must NOT silently overshoot max_live_vms.
+    let err = tree
+        .fork(&root, "b")
+        .expect_err("fork with only protected eviction candidates must fail loud");
+    assert!(
+        matches!(err, k7d::tree::TreeError::BudgetExhausted { .. }),
+        "expected BudgetExhausted, got: {err}"
+    );
 
-    // Either: the fork succeeded (e.g. budget_exhausted not yet triggered), or
-    // it failed with BudgetExhausted. In both cases "a" must still be live.
+    // The protected node was never suspended to make room.
     assert_eq!(
         tree.get_node(&a).unwrap().state,
         NodeState::Live,
         "protected node should never be auto-evicted"
     );
-
-    // If fork succeeded, clean up b.
-    if let Ok(b) = b_result {
-        assert_eq!(tree.get_node(&b).unwrap().state, NodeState::Live);
-    }
+    assert_eq!(tree.get_node(&root).unwrap().state, NodeState::Live);
 }
 
 /// Checkpoint → fork → rollback a 2-vCPU VM through the
@@ -348,4 +428,89 @@ fn test_tree_delta_format_roundtrip() {
     assert!(dst[4096..8192].iter().all(|&b| b == 0));
     assert_eq!(&dst[8192..12288], &src[8192..12288]);
     assert!(dst[12288..].iter().all(|&b| b == 0));
+}
+
+/// Regression for CHALLENGES.md #130 on the single-VM tree: fork-of-fork
+/// and suspend/resume of a fork child with a **read-write block device**.
+///
+/// A forked VM runs on a reflinked RW image it owns (`fork_state_dir`,
+/// removed on Drop). Pre-fix, preparing a fork child as a fork source
+/// dropped the husk that owned the child's image (the next FICLONE hit
+/// ENOENT), and suspending a fork child deleted its image outright, so
+/// resume's reflink hit the same ENOENT.
+#[test]
+fn test_tree_fork_of_fork_with_rw_disk() {
+    use std::path::Path;
+
+    use k7d::disks::{ensure_loopback_xfs, DISKS_DIR, DISKS_IMAGE, DISKS_IMAGE_SIZE};
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    ensure_loopback_xfs(
+        Path::new(DISKS_IMAGE),
+        Path::new(DISKS_DIR),
+        DISKS_IMAGE_SIZE,
+    )
+    .expect("reflink XFS at /var/lib/k7d/disks");
+
+    let img = Path::new(DISKS_DIR).join(format!("tree-fof-{}.img", std::process::id()));
+    std::fs::write(&img, vec![0u8; 4 * 1024 * 1024]).expect("write RW image");
+
+    let mut vm = Vm::builder()
+        .kernel_and_initrd()
+        .memory_mb(256)
+        .vsock(true)
+        .block_device(&img, false)
+        .build()
+        .expect("VM should build");
+    vm.start().unwrap();
+    let _ = vm.connect_agent(Duration::from_secs(90)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let budget = TreeBudget {
+        max_live_vms: 10,
+        max_live_ram_bytes: 4 * 1024 * 1024 * 1024,
+        max_disk_bytes: 10 * 1024 * 1024 * 1024,
+        max_chain_depth: 8,
+    };
+    let (mut tree, root_id) = SnapshotTree::new(vm, dir.path().to_path_buf(), budget).unwrap();
+
+    let disk_of = |tree: &SnapshotTree, id: &String| {
+        let vm = tree.get_vm(id).expect("live vm");
+        vm.block_devices()
+            .first()
+            .expect("has a block device")
+            .host_path
+            .clone()
+    };
+
+    let child = tree.fork(&root_id, "child").expect("fork from root");
+    assert!(disk_of(&tree, &child).exists(), "child image deleted");
+    let grand = tree
+        .fork(&child, "grand")
+        .expect("fork-of-fork with a RW disk (CHALLENGES #130)");
+    assert!(disk_of(&tree, &child).exists(), "child image deleted");
+    assert!(disk_of(&tree, &grand).exists(), "grand image deleted");
+
+    // Suspend/resume of the fork child: image parked, reflinked, reaped.
+    tree.suspend(&grand).expect("suspend fork child");
+    let parked = tree.get_node(&grand).unwrap().parked_disk_dirs.clone();
+    assert!(
+        !parked.is_empty(),
+        "suspended fork child must park its RW disk-clone dir"
+    );
+    assert!(parked.iter().all(|d| d.exists()));
+    tree.resume(&grand).expect("resume fork child with RW disk");
+    assert!(tree.get_node(&grand).unwrap().parked_disk_dirs.is_empty());
+    assert!(parked.iter().all(|d| !d.exists()), "resume must reap");
+    assert!(disk_of(&tree, &grand).exists(), "resumed image missing");
+
+    // Prune of a suspended fork child reaps the parked image.
+    tree.suspend(&grand).expect("suspend for prune");
+    let parked2 = tree.get_node(&grand).unwrap().parked_disk_dirs.clone();
+    assert!(!parked2.is_empty());
+    tree.prune(&grand).expect("prune suspended child");
+    assert!(parked2.iter().all(|d| !d.exists()), "prune must reap");
+
+    tree.prune(&root_id).expect("prune");
+    let _ = std::fs::remove_file(&img);
 }

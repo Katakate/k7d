@@ -38,6 +38,33 @@ const VHOST_USER_F_PROTOCOL_FEATURES: u64 = 1 << 30;
 
 const VIRTIOFSD_PATH: &str = "/usr/libexec/virtiofsd";
 
+/// Sandbox mode virtiofsd is spawned with when `K7D_VIRTIOFSD_SANDBOX`
+/// is unset .
+///
+/// `chroot`, not virtiofsd's own `namespace` default: the namespace
+/// sandbox unshares a mount namespace, and k7d bind-mounts per-volume
+/// directories into the shared tree *after* virtiofsd is running
+/// (`volumes.rs`). Those mounts do not propagate into a private mount
+/// namespace, so the guest would see empty volume dirs. A chroot gives
+/// the same "cannot name a path outside the share" property while
+/// staying in the host mount namespace.
+const DEFAULT_SANDBOX: &str = "chroot";
+
+/// Resolve the virtiofsd sandbox mode. An unrecognised value is a loud
+/// error: silently falling back to `none` would unjail every share.
+fn sandbox_mode() -> Result<String, String> {
+    let mode = match std::env::var("K7D_VIRTIOFSD_SANDBOX") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_SANDBOX.to_string(),
+    };
+    match mode.as_str() {
+        "chroot" | "namespace" | "none" => Ok(mode),
+        other => Err(format!(
+            "K7D_VIRTIOFSD_SANDBOX={other:?} is not one of chroot|namespace|none"
+        )),
+    }
+}
+
 /// Manages a virtiofsd child process.
 pub struct VirtiofsdProcess {
     child: Child,
@@ -84,8 +111,15 @@ impl VirtiofsdProcess {
             .arg(tag)
             .arg("--cache")
             .arg("never")
+            // the referenced work layer 1: the share is parsed by guest-controlled
+            // FUSE traffic, so the daemon that serves it is jailed. The
+            // seccomp action is spelled out next to the sandbox mode —
+            // they are one decision, and a future virtiofsd default
+            // change must not silently unjail us.
             .arg("--sandbox")
-            .arg("none")
+            .arg(sandbox_mode()?)
+            .arg("--seccomp")
+            .arg("kill")
             // virtiofsd >= 1.13 defaults to --announce-submounts, which
             // makes every host mount point inside the share (e.g. the
             // per-volume bind mounts in the volumes-rw scratch
@@ -129,6 +163,13 @@ impl VirtiofsdProcess {
             socket_path: socket_path.to_path_buf(),
         })
     }
+
+    /// PID of the virtiofsd child, so a tree can put its helpers in the
+    /// tree's cgroup jail .
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for VirtiofsdProcess {
@@ -142,6 +183,39 @@ impl Drop for VirtiofsdProcess {
         if let Some(dir) = self.socket_path.parent() {
             let _ = std::fs::remove_dir(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_mode_tests {
+    use super::{sandbox_mode, DEFAULT_SANDBOX};
+
+    fn with_env<T>(val: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let key = "K7D_VIRTIOFSD_SANDBOX";
+        let prev = std::env::var(key).ok();
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        out
+    }
+
+    #[test]
+    fn defaults_to_chroot_and_rejects_unknown_modes() {
+        with_env(None, || {
+            assert_eq!(sandbox_mode().unwrap(), DEFAULT_SANDBOX);
+        });
+        with_env(Some("none"), || {
+            assert_eq!(sandbox_mode().unwrap(), "none");
+        });
+        with_env(Some("wide-open"), || {
+            assert!(sandbox_mode().is_err(), "unknown mode must fail loudly");
+        });
     }
 }
 

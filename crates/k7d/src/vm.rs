@@ -14,7 +14,8 @@ use kvm_bindings::{
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use linux_loader::configurator::linux::LinuxBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
-use linux_loader::loader::bootparam::boot_params;
+use linux_loader::loader::bootparam::{boot_params, setup_header};
+use linux_loader::loader::bzimage::BzImage as BzImageLoader;
 use linux_loader::loader::elf::Elf as ElfLoader;
 use linux_loader::loader::{load_cmdline, Cmdline, KernelLoader};
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -59,6 +60,18 @@ pub enum VmError {
     SetCpuid(kvm_ioctls::Error),
     #[error("failed to open kernel file: {0}")]
     KernelFile(std::io::Error),
+    #[error(
+        "{path} is neither an ELF vmlinux (no \\x7fELF at 0) nor a bzImage \
+         (no 'HdrS' at 0x202): first bytes {head:02x?}"
+    )]
+    KernelFormat {
+        /// The rejected kernel image.
+        path: PathBuf,
+        /// The first bytes read from it, for the error message.
+        head: Vec<u8>,
+    },
+    #[error("bzImage loader returned no setup header for {0} — cannot build the zero page")]
+    BzImageNoSetupHeader(PathBuf),
     #[error("failed to load kernel: {0}")]
     KernelLoad(linux_loader::loader::Error),
     #[error("failed to load command line: {0}")]
@@ -115,6 +128,17 @@ const EFER_LME: u64 = 0x100;
 const X86_CR0_PE: u64 = 0x1;
 const X86_CR0_PG: u64 = 0x8000_0000;
 const X86_CR4_PAE: u64 = 0x20;
+
+// bzImage boot constants
+/// Offset of the `HdrS` magic inside a bzImage's real-mode setup header.
+const BZIMAGE_MAGIC_OFFSET: usize = 0x202;
+/// Offset of the 64-bit entry point into a bzImage's *loaded*
+/// protected-mode kernel. `BzImage::load` copies the compressed kernel
+/// to `kernel_load` and the 64-bit boot protocol says the loader jumps
+/// to `kernel_load + 0x200` (`startup_64`) with the CPU already in long
+/// mode — the ELF path's "entry point is what the header says" does not
+/// apply here.
+const BZIMAGE_64BIT_ENTRY_OFFSET: u64 = 0x200;
 
 // Boot params header constants
 const KERNEL_LOADER_OTHER: u8 = 0xff;
@@ -272,6 +296,10 @@ pub struct VmBuilder {
     scratch_disk: Option<crate::disks::ScratchDisk>,
     /// Per-container writable images, same ownership rules.
     container_scratch_disks: Vec<crate::disks::ScratchDisk>,
+    /// Named persistent data disks . Attached as
+    /// read-write virtio-blk devices like the scratch images, but
+    /// **retained**: the built `Vm` never unlinks them.
+    data_disks: Vec<crate::disks::DataDisk>,
 }
 
 impl Default for VmBuilder {
@@ -459,6 +487,7 @@ impl VmBuilder {
             network: None,
             scratch_disk: None,
             container_scratch_disks: Vec::new(),
+            data_disks: Vec::new(),
         }
     }
 
@@ -483,6 +512,26 @@ impl VmBuilder {
     pub fn kernel_and_initrd(self) -> Self {
         let (kernel, initrd) = default_guest_paths();
         self.kernel(kernel).initrd(initrd)
+    }
+
+    /// Replace the whole kernel command line.
+    ///
+    /// The default is the minimal guest's line (initramfs `rdinit`,
+    /// haltpoll tuning, `noapic`, …) and every device parameter the
+    /// builder derives — `virtio_mmio.device=`, `k7d.blk=`,
+    /// `k7d.virtiofs=`, `k7d.mkdir=` — is still appended at
+    /// [`Self::build`] time, whatever base is set here.
+    ///
+    /// A guest with a different init contract needs a different base
+    /// line: an Ubuntu node image  boots `root=/dev/vda` into
+    /// systemd and must not carry `rdinit=/init`. Overriding is
+    /// deliberate and total — there is no merge, so a caller that drops
+    /// `console=ttyS0` gets a VM whose agent marker never reaches the
+    /// host and whose [`Vm::connect_agent`] therefore times out.
+    #[must_use]
+    pub fn cmdline(mut self, cmdline: &str) -> Self {
+        self.cmdline = cmdline.to_string();
+        self
     }
 
     /// Set guest memory size in megabytes.
@@ -698,6 +747,26 @@ impl VmBuilder {
         builder
     }
 
+    /// Attach a **named persistent** data disk : one
+    /// more read-write virtio-blk image, agent-mounted at the disk's
+    /// [`crate::disks::DataDisk::guest_mount`] as ext4, whose lifetime is
+    /// *not* the VM's.
+    ///
+    /// The built [`Vm`] holds the handle for reporting only — unlike
+    /// [`Self::scratch_disk`], nothing unlinks the image when the VM goes
+    /// away. That is the point: an inner node's `/var/lib/longhorn` has
+    /// to still be there for the next VM that claims the same `id`.
+    ///
+    /// A warm fork clones it into the child's own file like every other
+    /// read-write block device, so two live VMs never mount one ext4.
+    #[must_use]
+    pub fn data_disk(self, disk: crate::disks::DataDisk) -> Self {
+        let mount = disk.guest_mount().to_string();
+        let mut builder = self.block_device_mounted(disk.path(), false, &mount, "ext4");
+        builder.data_disks.push(disk);
+        builder
+    }
+
     /// Build and return a configured (but not started) VM.
     #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<Vm, VmError> {
@@ -792,19 +861,10 @@ impl VmBuilder {
             }
         }
 
-        // Load kernel
-        let mut kernel_file = File::open(&kernel_path).map_err(VmError::KernelFile)?;
-        let entry_addr = ElfLoader::load(
-            &guest_memory,
-            None,
-            &mut kernel_file,
-            Some(GuestAddress(HIMEM_START)),
-        )
-        .map_err(VmError::KernelLoad)?;
-        log::info!(
-            "kernel loaded: entry={:#x}",
-            entry_addr.kernel_load.raw_value()
-        );
+        // Load the kernel — ELF `vmlinux` or bzImage `vmlinuz`, decided
+        // by magic bytes. A bzImage hands back its own setup header,
+        // which the zero page must carry verbatim.
+        let (kernel_entry, setup_hdr) = load_kernel_image(&guest_memory, &kernel_path)?;
 
         // Set up virtio-MMIO devices and build cmdline with device params.
         //
@@ -1124,6 +1184,7 @@ impl VmBuilder {
             layout,
             initrd_config,
             mptable_reservation,
+            setup_hdr,
         )?;
 
         // Create the vCPUs. Every vCPU gets CPUID + FPU setup; only
@@ -1156,7 +1217,7 @@ impl VmBuilder {
             }
             if cpu_index == 0 {
                 // Setup CPU registers for 64-bit Linux boot (BSP only).
-                setup_regs(&vcpu_fd, entry_addr.kernel_load)?;
+                setup_regs(&vcpu_fd, kernel_entry)?;
                 setup_sregs(&guest_memory, &vcpu_fd)?;
             }
             setup_fpu(&vcpu_fd)?;
@@ -1203,7 +1264,7 @@ impl VmBuilder {
             } else {
                 0
             },
-            _virtiofsds: virtiofsd_processes,
+            virtiofsds: virtiofsd_processes,
             tap: tap_device,
             guest_ip,
             virtiofs_shares: self.virtiofs_shares,
@@ -1224,6 +1285,7 @@ impl VmBuilder {
             slow_fork_allowed: false,
             scratch_disk: self.scratch_disk,
             container_scratch_disks: self.container_scratch_disks,
+            data_disks: self.data_disks,
         })
     }
 }
@@ -1250,7 +1312,7 @@ pub struct Vm {
     /// the backing memfd is unmapped. Empty for restored VMs (which
     /// never re-spawn virtiofsd) and for VMs with no virtiofs shares
     /// configured.
-    _virtiofsds: Vec<VirtiofsdProcess>,
+    virtiofsds: Vec<VirtiofsdProcess>,
     tap: Option<TapDevice>,
     guest_cid: u64,
     /// Guest memory size in bytes.
@@ -1328,6 +1390,16 @@ pub struct Vm {
     /// asked for its own writable-space limit. Same ownership and fork
     /// rules as `scratch_disk`.
     container_scratch_disks: Vec<crate::disks::ScratchDisk>,
+    /// Named persistent data disks . Held for reporting;
+    /// deliberately **not** cleaned up on drop — `delete_vm` leaves a
+    /// data disk's image alone, and only an explicit
+    /// [`crate::disks::DataDisk::delete`] (or the age-gated sweep)
+    /// removes it.
+    ///
+    /// A fork does not inherit these handles: like every read-write
+    /// image, the child's copy is a reflink in the fork's own directory,
+    /// and so — after `prepare_fork_source` — is the source's.
+    data_disks: Vec<crate::disks::DataDisk>,
 }
 
 impl Vm {
@@ -1389,7 +1461,7 @@ impl Vm {
             agent_serial,
             mmio_registry,
             guest_cid,
-            _virtiofsds: virtiofsds,
+            virtiofsds,
             tap,
             guest_ip,
             virtiofs_shares,
@@ -1413,6 +1485,7 @@ impl Vm {
             // fork owning reflinked copies via `fork_state_dir`.
             scratch_disk: None,
             container_scratch_disks: Vec::new(),
+            data_disks: Vec::new(),
         }
     }
 
@@ -1432,6 +1505,12 @@ impl Vm {
             .iter()
             .map(crate::disks::ScratchDisk::path)
             .collect()
+    }
+
+    /// This VM's named persistent data disks, in declaration order.
+    #[must_use]
+    pub fn data_disks(&self) -> &[crate::disks::DataDisk] {
+        &self.data_disks
     }
 
     /// Attach the memfd backing a virtiofs-capable fork's memory (see
@@ -1763,6 +1842,14 @@ impl Vm {
         }
     }
 
+    /// PIDs of this VM's virtiofsd helper processes, so a tree can pull
+    /// them into its cgroup jail . Empty for a VM
+    /// with no virtiofs share.
+    #[must_use]
+    pub fn virtiofsd_pids(&self) -> Vec<u32> {
+        self.virtiofsds.iter().map(VirtiofsdProcess::pid).collect()
+    }
+
     /// Send `SIGRTMIN` to every vCPU thread that has published its
     /// pthread id, breaking them out of a blocking `KVM_RUN`.
     fn signal_vcpu_threads(&self) {
@@ -1989,9 +2076,23 @@ impl Vm {
         // husk's handle would unlink it out from under the live guest
         // (and out from under every later fork's FICLONE).
         restored.scratch_disk = self.scratch_disk.take();
+        // Same for the reflinked RW images a *forked* VM was built with:
+        // the husk owns their directory (`fork_state_dir`, removed on
+        // Drop) but the restored copy's block backends reopened those
+        // exact files. Without this transfer the husk's Drop deletes the
+        // live guest's disk (silently — the open fd keeps working) and
+        // every later fork's FICLONE fails ENOENT, which broke
+        // fork-of-fork for any VM with a RW block device
+        // (CHALLENGES.md #130).
+        restored.fork_state_dir = self.fork_state_dir.take();
         // The per-container images are the same class of
         // resource — the live guest is reading and writing them too.
         restored.container_scratch_disks = std::mem::take(&mut self.container_scratch_disks);
+        // Data-disk handles move across too, but for a different reason:
+        // they own no cleanup, and the restored copy is now the live
+        // source, so it is the VM that must be able to report which
+        // persistent disks it was created with.
+        restored.data_disks = std::mem::take(&mut self.data_disks);
 
         // The old source was already shut down above (CID release);
         // dropping the swapped-out husk just unmaps its memory.
@@ -2131,6 +2232,8 @@ impl Vm {
             per_slot.push((gpa, bitmap));
         }
 
+        let mem_host_addr = self.mem_host_addr();
+        let mem_span = self.mem_span();
         let acc = self.accumulated_dirty.as_mut().expect("bitmap allocated");
         let acc_words = acc.len();
         for (gpa, bitmap) in per_slot {
@@ -2156,10 +2259,12 @@ impl Vm {
         // through k7d's own mapping report their pages here. Without this,
         // warm forks on the base.mem + dirty-delta path would silently miss
         // read completions and used-ring updates (host-side #27 class).
+        // vhost-vsock has no userspace worker to report anything, so its
+        // virtqueue rings and buffers are marked from the queue state.
         self.mmio_registry
             .lock()
             .unwrap()
-            .merge_dirty_pages_all(acc);
+            .merge_dirty_pages_all(acc, mem_host_addr, mem_span);
 
         // Re-arm write protection. With MANUAL_DIRTY_LOG_PROTECT2, KVM_GET_DIRTY_LOG
         // no longer clears the bitmap — we must do it explicitly via KVM_CLEAR_DIRTY_LOG
@@ -2269,6 +2374,14 @@ impl Vm {
     /// Set the fork state directory path (used internally after fork).
     pub(crate) fn set_fork_state_dir(&mut self, path: PathBuf) {
         self.fork_state_dir = Some(path);
+    }
+
+    /// Take ownership of the fork state directory away from this VM, so
+    /// Drop no longer removes it. Used by tree suspend: the reflinked RW
+    /// images inside it ARE the node's disk state and must outlive the
+    /// `Vm` — resume reflinks fresh copies from them (CHALLENGES.md #130).
+    pub(crate) fn take_fork_state_dir(&mut self) -> Option<PathBuf> {
+        self.fork_state_dir.take()
     }
 
     /// Take a snapshot of the VM to the given directory.
@@ -2541,6 +2654,117 @@ fn install_vcpu_signal_handler() {
 /// written to guest memory (`vcpus > 1` only) — the region is
 /// reported as E820-reserved so the guest never allocates over it.
 /// `None` keeps the E820 map byte-identical to the original layout.
+/// Which of the two kernel image formats a file holds.
+///
+/// k7d's own guest is an uncompressed ELF `vmlinux`; a distro kernel
+/// (`/boot/vmlinuz-*`, the referenced work) is a bzImage. Both boot on this VMM,
+/// but they differ in where the entry point is and in whether the zero
+/// page must carry the image's own setup header — so the format is
+/// decided once, by magic bytes, instead of being guessed by trying
+/// loaders until one stops erroring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelFormat {
+    /// Uncompressed ELF `vmlinux` (`\x7fELF` at offset 0).
+    Elf,
+    /// Compressed bzImage (`HdrS` at offset 0x202).
+    BzImage,
+}
+
+impl KernelFormat {
+    /// Classify a kernel image from its first bytes (at least
+    /// `0x206` of them). `None` means neither magic matched, which is
+    /// always a loud error at the call site — never a "try anyway".
+    #[must_use]
+    pub fn detect(head: &[u8]) -> Option<Self> {
+        if head.starts_with(&[0x7f, b'E', b'L', b'F']) {
+            return Some(Self::Elf);
+        }
+        if head.len() >= BZIMAGE_MAGIC_OFFSET + 4
+            && &head[BZIMAGE_MAGIC_OFFSET..BZIMAGE_MAGIC_OFFSET + 4] == b"HdrS"
+        {
+            return Some(Self::BzImage);
+        }
+        None
+    }
+}
+
+/// Load `kernel_path` into `guest_memory` and return the address the BSP
+/// must start at, plus the image's setup header when it brought one.
+///
+/// The returned setup header belongs in the zero page verbatim (see
+/// [`configure_boot_params`]): a bzImage's decompressor reads
+/// `setup_sects`, `init_size`, `relocatable_kernel`, `pref_address` and
+/// `loadflags` back out of it, and a hand-built header like the ELF path
+/// uses would send it decompressing into the wrong place.
+fn load_kernel_image(
+    guest_memory: &GuestMemoryMmap,
+    kernel_path: &Path,
+) -> Result<(GuestAddress, Option<setup_header>), VmError> {
+    use std::io::Read;
+
+    let mut kernel_file = File::open(kernel_path).map_err(VmError::KernelFile)?;
+    let mut head = vec![0u8; BZIMAGE_MAGIC_OFFSET + 4];
+    // A kernel shorter than the magic window is simply not a kernel;
+    // `read` filling less than the buffer leaves zeros, which matches
+    // neither magic and therefore fails loudly below.
+    let read = kernel_file.read(&mut head).map_err(VmError::KernelFile)?;
+    head.truncate(read);
+
+    match KernelFormat::detect(&head) {
+        Some(KernelFormat::Elf) => {
+            let loaded = ElfLoader::load(
+                guest_memory,
+                None,
+                &mut kernel_file,
+                Some(GuestAddress(HIMEM_START)),
+            )
+            .map_err(VmError::KernelLoad)?;
+            log::info!(
+                "kernel loaded (ELF): entry={:#x}",
+                loaded.kernel_load.raw_value()
+            );
+            Ok((loaded.kernel_load, None))
+        }
+        Some(KernelFormat::BzImage) => {
+            let loaded = BzImageLoader::load(
+                guest_memory,
+                None,
+                &mut kernel_file,
+                Some(GuestAddress(HIMEM_START)),
+            )
+            .map_err(VmError::KernelLoad)?;
+            let hdr = loaded
+                .setup_header
+                .ok_or_else(|| VmError::BzImageNoSetupHeader(kernel_path.to_path_buf()))?;
+            let entry = loaded
+                .kernel_load
+                .raw_value()
+                .checked_add(BZIMAGE_64BIT_ENTRY_OFFSET)
+                .ok_or_else(|| {
+                    VmError::Pipe(std::io::Error::other(
+                        "bzImage load address plus the 64-bit entry offset overflows",
+                    ))
+                })?;
+            // `setup_header` is `#[repr(packed)]`, so these are read out
+            // by value: a reference to a packed field (which `log!`'s
+            // format args would take) is undefined behaviour.
+            let (setup_sects, init_size, relocatable) =
+                (hdr.setup_sects, hdr.init_size, hdr.relocatable_kernel);
+            log::info!(
+                "kernel loaded (bzImage): load={:#x} entry={entry:#x} \
+                 setup_sects={setup_sects} init_size={init_size:#x} \
+                 relocatable={relocatable}",
+                loaded.kernel_load.raw_value(),
+            );
+            Ok((GuestAddress(entry), Some(hdr)))
+        }
+        None => Err(VmError::KernelFormat {
+            path: kernel_path.to_path_buf(),
+            head: head.into_iter().take(8).collect(),
+        }),
+    }
+}
+
 fn configure_boot_params(
     guest_memory: &GuestMemoryMmap,
     cmdline_addr: GuestAddress,
@@ -2548,17 +2772,32 @@ fn configure_boot_params(
     layout: MemLayout,
     initrd_config: Option<(GuestAddress, usize)>,
     mptable_reservation: Option<(u64, u64)>,
+    setup_hdr: Option<setup_header>,
 ) -> Result<(), VmError> {
     let mut params = boot_params::default();
 
+    if let Some(hdr) = setup_hdr {
+        // A bzImage's own header, with `code32_start` already pointing
+        // at where the loader put the kernel. Everything the
+        // decompressor needs (`init_size`, `pref_address`,
+        // `relocatable_kernel`, `setup_sects`, `version`, and the
+        // LOADED_HIGH bit in `loadflags`) is in these bytes, so it is
+        // copied rather than rebuilt. `loadflags`' CAN_USE_HEAP bit is
+        // deliberately left as the image shipped it (clear): it grants
+        // the *real-mode* setup code a heap at `heap_end_ptr`, and this
+        // VMM never runs that code — it enters at the 64-bit entry
+        // point with the CPU already in long mode.
+        params.hdr = hdr;
+    } else {
+        params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
+        params.hdr.header = KERNEL_HDR_MAGIC;
+        params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
+        // Protocol version 2.14+ supports initrd and other features
+        params.hdr.version = 0x020e;
+    }
     params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
-    params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
-    params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = cmdline_addr.raw_value() as u32;
     params.hdr.cmdline_size = cmdline_size as u32;
-    params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
-    // Protocol version 2.14+ supports initrd and other features
-    params.hdr.version = 0x020e;
 
     if let Some((initrd_addr, initrd_size)) = initrd_config {
         let rd_img = initrd_addr.raw_value() as u32;
@@ -2903,7 +3142,11 @@ mod verification {
         let layout = MemLayout::from_ram(mem_mb * 1024 * 1024);
 
         let initrd_size: u64 = kani::any();
-        kani::assume(initrd_size > 0 && initrd_size + HIMEM_START < layout.low_size);
+        // Bound the size *before* using it in arithmetic: `kani::any()`
+        // spans all of `u64`, and the addition in the second assume is
+        // itself checked for overflow.
+        kani::assume(initrd_size > 0 && initrd_size < layout.low_size);
+        kani::assume(initrd_size + HIMEM_START < layout.low_size);
 
         let initrd_addr_raw = (layout.low_size - initrd_size) & !0xFFF;
 
@@ -3007,6 +3250,111 @@ mod verification {
 mod tests {
     use super::*;
     use kvm_ioctls::VcpuExit;
+
+    /// The two kernel formats are told apart by magic, and anything
+    /// else is refused rather than fed to a loader "to see".
+    #[test]
+    fn kernel_format_detects_elf_and_bzimage_and_refuses_the_rest() {
+        let mut elf = vec![0u8; 0x400];
+        elf[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        assert_eq!(KernelFormat::detect(&elf), Some(KernelFormat::Elf));
+
+        let mut bz = vec![0u8; 0x400];
+        bz[BZIMAGE_MAGIC_OFFSET..BZIMAGE_MAGIC_OFFSET + 4].copy_from_slice(b"HdrS");
+        // A bzImage's first bytes are the real-mode boot sector, which
+        // starts with the `MZ`-ish jump — never the ELF magic.
+        bz[..2].copy_from_slice(b"MZ");
+        assert_eq!(KernelFormat::detect(&bz), Some(KernelFormat::BzImage));
+
+        assert_eq!(KernelFormat::detect(&[0u8; 0x400]), None);
+        assert_eq!(
+            KernelFormat::detect(b"HdrS"),
+            None,
+            "magic must be at 0x202"
+        );
+        assert_eq!(KernelFormat::detect(&[]), None);
+    }
+
+    /// A file that is neither format fails at `build` with the loud
+    /// format error, naming the path — not with a loader's "invalid ELF
+    /// magic number", which reads as a broken kernel rather than a
+    /// wrong file.
+    #[test]
+    fn build_refuses_a_kernel_that_is_neither_elf_nor_bzimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not-a-kernel");
+        std::fs::write(&bogus, b"#!/bin/sh\necho hello\n").unwrap();
+        match VmBuilder::new().kernel(&bogus).build() {
+            Err(VmError::KernelFormat { path, .. }) => assert_eq!(path, bogus),
+            Err(other) => panic!("expected KernelFormat, got {other}"),
+            Ok(_) => panic!("a shell script must not boot as a kernel"),
+        }
+    }
+
+    /// The bzImage zero page carries the image's *own* setup header, and
+    /// the ELF one carries the hand-built header. Asserted on the bytes
+    /// written to guest memory, because getting this backwards is a
+    /// silent decompressor crash rather than an error.
+    #[test]
+    fn boot_params_carry_the_bzimage_setup_header_verbatim() {
+        let mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 16 * 1024 * 1024)]).unwrap();
+        let layout = MemLayout::from_ram(16 * 1024 * 1024);
+
+        let hdr = setup_header {
+            setup_sects: 0x1d,
+            header: KERNEL_HDR_MAGIC,
+            version: 0x020f,
+            loadflags: 0x1,
+            relocatable_kernel: 1,
+            init_size: 0x0123_4000,
+            ..Default::default()
+        };
+        configure_boot_params(
+            &mem,
+            GuestAddress(CMDLINE_START),
+            7,
+            layout,
+            None,
+            None,
+            Some(hdr),
+        )
+        .unwrap();
+        // Fields are copied out by value: `setup_header` is packed, so a
+        // reference to one of its fields is UB (and `assert_eq!` takes
+        // references).
+        let written: boot_params = mem.read_obj(GuestAddress(ZERO_PAGE_START)).unwrap();
+        let w = written.hdr;
+        assert_eq!({ w.init_size }, 0x0123_4000);
+        assert_eq!({ w.relocatable_kernel }, 1);
+        assert_eq!({ w.version }, 0x020f);
+        assert_eq!({ w.setup_sects }, 0x1d);
+        assert_eq!({ w.type_of_loader }, KERNEL_LOADER_OTHER);
+        assert_eq!({ w.cmd_line_ptr }, CMDLINE_START as u32);
+        assert_eq!(
+            { w.loadflags } & 0x80,
+            0,
+            "CAN_USE_HEAP must stay clear: no real-mode setup code runs"
+        );
+
+        // The ELF path is unchanged: no image header, so the
+        // hand-built 2.14 one.
+        configure_boot_params(
+            &mem,
+            GuestAddress(CMDLINE_START),
+            7,
+            layout,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let written: boot_params = mem.read_obj(GuestAddress(ZERO_PAGE_START)).unwrap();
+        let w = written.hdr;
+        assert_eq!({ w.version }, 0x020e);
+        assert_eq!({ w.boot_flag }, KERNEL_BOOT_FLAG_MAGIC);
+        assert_eq!({ w.init_size }, 0, "no bzImage fields leak in");
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)]

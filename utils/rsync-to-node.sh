@@ -59,3 +59,9 @@ if [[ -n "$FILES" ]]; then
         ssh "${SSH_OPTS[@]}" "$NODE" \
             "cd '$REMOTE_DIR' && xargs -0 -r touch -h --"
 fi
+# Cloud-agent git snapshots often ship epoch mtimes. rsync -a keeps them,
+# so a file we did not re-transfer stays dated 1970 and cargo treats the
+# newer artifact as fresh (CHALLENGES #64). Bump anything still in 1970.
+ssh "${SSH_OPTS[@]}" "$NODE" \
+    "find '$REMOTE_DIR/crates' '$REMOTE_DIR/gym' '$REMOTE_DIR/examples' \
+     -type f ! -newermt '1980-01-01' -exec touch -- {} +"

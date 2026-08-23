@@ -146,6 +146,21 @@ const ANN_SCRATCH_SIZE: &str = "k7d.katakate.org/scratch-size";
 /// unlisted containers still get, and it is reported as such
 /// (`dedicated: false`) rather than dressed up as a limit.
 const ANN_CONTAINER_SCRATCH_SIZE: &str = "k7d.katakate.org/container-scratch-size";
+
+/// Pod annotation asking for **named persistent** data disks
+/// : disks whose lifetime is not the pod's, so an inner
+/// node's `/var/lib/longhorn` is still there for the next VM that claims
+/// the same id.
+///
+/// Value is a comma-separated `id:size:guest-mount` list, e.g.
+/// `longhorn:8Gi:/var/lib/longhorn`. Sizes take the same suffixes as
+/// [`ANN_SCRATCH_SIZE`]. Absent (the default) reproduces today's
+/// all-ephemeral behaviour exactly.
+///
+/// Each disk costs one virtio-blk device out of [`MMIO_DEVICE_BUDGET`],
+/// like a per-container scratch image — which is why this is a pod-level
+/// opt-in and not something every sandbox gets.
+const ANN_DATA_DISKS: &str = "k7d.katakate.org/data-disks";
 /// Default spare image-slot count (each costs one MMIO slot + IOAPIC pin).
 const DEFAULT_IMAGE_SLOTS: u32 = 4;
 /// Default slot capacity: 2 GiB, sparse (blocks allocate on fill).
@@ -255,6 +270,10 @@ pub struct ShimAnnotations {
     /// image; parsed loudly at sandbox Create
     /// ([`container_scratch_from_annotations`]).
     pub container_scratch_size: Option<String>,
+    /// `k7d.katakate.org/data-disks` — raw
+    /// `id:size:guest-mount,...` list of named persistent disks; parsed
+    /// loudly at sandbox Create ([`data_disks_from_annotations`]).
+    pub data_disks: Option<String>,
 }
 
 impl ShimAnnotations {
@@ -443,6 +462,7 @@ fn annotations_from_spec(bundle: &str) -> ShimAnnotations {
         scratch_size: ShimAnnotations::lookup(annotations, ANN_SCRATCH_SIZE).map(str::to_string),
         container_scratch_size: ShimAnnotations::lookup(annotations, ANN_CONTAINER_SCRATCH_SIZE)
             .map(str::to_string),
+        data_disks: ShimAnnotations::lookup(annotations, ANN_DATA_DISKS).map(str::to_string),
     }
 }
 
@@ -549,6 +569,65 @@ fn container_scratch_from_annotations(
         return Err(format!(
             "{ANN_CONTAINER_SCRATCH_SIZE}={raw:?} names no containers"
         ));
+    }
+    Ok(out)
+}
+
+/// Named persistent data disks, from the `k7d.katakate.org/data-disks`
+/// annotation .
+///
+/// Loud on every malformed entry: a pod that asked for a persistent disk
+/// and silently did not get one would write its replicas to the
+/// ephemeral scratch and lose them with the VM, which is the failure the
+/// annotation exists to prevent.
+fn data_disks_from_annotations(
+    ann: &ShimAnnotations,
+) -> Result<Vec<k7d::control::DataDiskConfig>, String> {
+    let Some(raw) = ann.data_disks.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<k7d::control::DataDiskConfig> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let parts: Vec<&str> = entry.split(':').map(str::trim).collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "invalid {ANN_DATA_DISKS} entry {entry:?} — expected \
+                 <id>:<size>:<guest-mount>, e.g. longhorn:8Gi:/var/lib/longhorn"
+            ));
+        }
+        let (id, size, guest_mount) = (parts[0], parts[1], parts[2]);
+        k7d::disks::DataDisk::validate_id(id)
+            .map_err(|e| format!("invalid {ANN_DATA_DISKS} id: {e}"))?;
+        if out.iter().any(|d| d.id == id) {
+            return Err(format!("{ANN_DATA_DISKS} names disk {id:?} twice"));
+        }
+        if !guest_mount.starts_with('/') {
+            return Err(format!(
+                "{ANN_DATA_DISKS} mount {guest_mount:?} for {id:?} must be an absolute path"
+            ));
+        }
+        if out.iter().any(|d| d.guest_mount == guest_mount) {
+            return Err(format!(
+                "{ANN_DATA_DISKS} mounts two disks at {guest_mount:?}"
+            ));
+        }
+        let size_bytes = parse_size_quantity(size)
+            .map_err(|e| format!("invalid {ANN_DATA_DISKS} size for {id:?}: {e}"))?;
+        if size_bytes < k7d::disks::MIN_DATA_DISK_SIZE {
+            return Err(format!(
+                "{ANN_DATA_DISKS} gives {id:?} {size_bytes} bytes, below the \
+                 {}-byte minimum for a usable ext4 filesystem",
+                k7d::disks::MIN_DATA_DISK_SIZE
+            ));
+        }
+        out.push(k7d::control::DataDiskConfig {
+            id: id.to_string(),
+            size_bytes,
+            guest_mount: guest_mount.to_string(),
+        });
+    }
+    if out.is_empty() {
+        return Err(format!("{ANN_DATA_DISKS}={raw:?} names no disks"));
     }
     Ok(out)
 }
@@ -833,6 +912,7 @@ fn annotation_fork_tree(
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         } => {
             debug_log_cni(&format!(
                 "tree annotations: forked node {node_id} (cids {guest_cids:?}, \
@@ -1563,9 +1643,17 @@ impl Task for K7Service {
                     ));
                     containerd_shim::Error::Other(e)
                 })?;
+                // Named persistent disks this pod asked for. Same
+                // fail-loud rule: a pod that thinks it has a disk that
+                // outlives it, and does not, loses data at teardown.
+                let data_disks = data_disks_from_annotations(&ann).map_err(|e| {
+                    debug_log_cni(&format!("Create: data disks for {} failed: {e}", req.id));
+                    containerd_shim::Error::Other(e)
+                })?;
                 let mut config = k7d::control::VmConfig {
                     kernel: None,
                     initrd: None,
+                    cmdline: None,
                     memory_mb: sizing.memory_mb,
                     vcpus: sizing.vcpus,
                     cpu_quota: sizing.cpu_quota,
@@ -1576,6 +1664,7 @@ impl Task for K7Service {
                     guest_dirs: block_volumes.emptydir_guest_dirs.clone(),
                     scratch_size_bytes: Some(scratch_size_bytes),
                     container_scratch,
+                    data_disks,
                     sandbox_id: Some(req.id.clone()),
                     network: Some(k7d::control::NetConfig {
                         cluster_id: cluster_id.clone(),
@@ -3247,7 +3336,9 @@ fn declare_image_slots(
         // and every per-container one after the devices declared here,
         // so they spend pins too.
         + usize::from(config.scratch_size_bytes.is_some())
-        + config.container_scratch.len();
+        + config.container_scratch.len()
+        // Named persistent disks are appended by the daemon too.
+        + config.data_disks.len();
     if declared + count as usize > MMIO_DEVICE_BUDGET {
         return Err(format!(
             "{ANN_IMAGE_SLOTS}={count} exceeds the MMIO/IOAPIC pin budget: {declared} \
@@ -3999,6 +4090,95 @@ mod tests {
                 "error for {bad:?} must name the annotation, got: {err}"
             );
         }
+    }
+
+    fn data_disk_ann(raw: Option<&str>) -> ShimAnnotations {
+        ShimAnnotations {
+            data_disks: raw.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The data-disk annotation parses to exactly what it says, and its
+    /// absence is today's all-ephemeral behaviour.
+    #[test]
+    fn data_disks_annotation_parses() {
+        assert!(
+            data_disks_from_annotations(&data_disk_ann(None))
+                .unwrap()
+                .is_empty(),
+            "no annotation must reproduce today's behaviour: no persistent disks"
+        );
+        let parsed = data_disks_from_annotations(&data_disk_ann(Some(
+            " longhorn:8Gi:/var/lib/longhorn , etcd:512Mi:/var/lib/etcd ",
+        )))
+        .expect("valid list");
+        assert_eq!(
+            parsed,
+            vec![
+                k7d::control::DataDiskConfig {
+                    id: "longhorn".into(),
+                    size_bytes: 8 * 1024 * 1024 * 1024,
+                    guest_mount: "/var/lib/longhorn".into(),
+                },
+                k7d::control::DataDiskConfig {
+                    id: "etcd".into(),
+                    size_bytes: 512 * 1024 * 1024,
+                    guest_mount: "/var/lib/etcd".into(),
+                },
+            ]
+        );
+    }
+
+    /// Every rejection names the annotation: a pod that asked for a disk
+    /// that outlives it must never reach Running without one.
+    #[test]
+    fn data_disks_annotation_rejections_are_loud() {
+        for bad in [
+            "longhorn:8Gi",                       // no mount
+            "longhorn:8Gi:/var/lib:extra",        // too many fields
+            ":8Gi:/var/lib/longhorn",             // no id
+            "long/horn:8Gi:/var/lib/longhorn",    // not a filename component
+            "..:8Gi:/var/lib/longhorn",           // path escape
+            "longhorn:8Zi:/var/lib/longhorn",     // unknown suffix
+            "longhorn:1Mi:/var/lib/longhorn",     // below the ext4 floor
+            "longhorn:8Gi:var/lib/longhorn",      // relative mount
+            "a:1Gi:/one,a:1Gi:/two",              // same id twice
+            "a:1Gi:/same,b:1Gi:/same",            // two disks, one mount
+            ",",                                  // names nothing
+            "longhorn:8Gi:/var/lib/longhorn,bad", // one good entry excuses nothing
+        ] {
+            let err = data_disks_from_annotations(&data_disk_ann(Some(bad)))
+                .expect_err("annotation value must be rejected");
+            assert!(
+                err.contains(ANN_DATA_DISKS),
+                "error for {bad:?} must name the annotation, got: {err}"
+            );
+        }
+    }
+
+    /// Each persistent disk is one more virtio-blk device, so it spends
+    /// an MMIO pin the image-slot budget check has to see.
+    #[test]
+    fn data_disks_count_against_the_pin_budget() {
+        let dir = std::env::temp_dir().join(format!("k7d-datadisk-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = k7d::control::VmConfig {
+            vsock: true,
+            data_disks: (0..MMIO_DEVICE_BUDGET - 4)
+                .map(|i| k7d::control::DataDiskConfig {
+                    id: format!("d{i}"),
+                    size_bytes: k7d::disks::MIN_DATA_DISK_SIZE,
+                    guest_mount: format!("/var/lib/d{i}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = declare_image_slots(&mut config, &slot_ann(Some("4"), None), &dir)
+            .expect_err("persistent disks must count against the budget");
+        assert!(err.contains(ANN_IMAGE_SLOTS), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Each per-container image is one more virtio-blk device, so it

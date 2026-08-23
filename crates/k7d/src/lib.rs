@@ -43,11 +43,15 @@ pub mod mem_layout;
 #[cfg(not(feature = "verif"))]
 pub mod mptable;
 #[cfg(not(feature = "verif"))]
+pub mod netjail;
+#[cfg(not(feature = "verif"))]
 pub mod netns;
 #[cfg(not(feature = "verif"))]
 pub mod network;
 #[cfg(not(feature = "verif"))]
 pub mod pool;
+#[cfg(not(feature = "verif"))]
+pub mod seccomp;
 #[cfg(not(feature = "verif"))]
 pub mod snapshot;
 #[cfg(not(feature = "verif"))]

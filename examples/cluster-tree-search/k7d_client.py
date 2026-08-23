@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Minimal JSON-lines client for the k7d control socket.
 
-Not a product SDK — just enough for the cluster-tree-search demo.
-Talks to `/run/k7d/k7d.sock` (override with `K7D_SOCKET`).
-Failures are loud: non-`ok` / unexpected status raise RuntimeError.
+Not a product SDK — just enough for the cluster-tree-search demo
+and the gym. `gym/server.py` imports this module (dependency points
+gym → examples/; the demo does not import gym). Talks to `/run/k7d/k7d.sock`
+(override with `K7D_SOCKET`). Failures are loud: non-`ok` /
+unexpected status raise RuntimeError.
 """
 
 from __future__ import annotations
@@ -19,13 +21,18 @@ DEFAULT_SOCKET = os.environ.get("K7D_SOCKET", "/run/k7d/k7d.sock")
 
 
 class K7dClient:
-    def __init__(self, path: str | Path = DEFAULT_SOCKET) -> None:
+    def __init__(
+        self, path: str | Path = DEFAULT_SOCKET, timeout: float = 600
+    ) -> None:
         self.path = str(path)
+        self.timeout = timeout
 
-    def call(self, req: dict[str, Any]) -> dict[str, Any]:
+    def call(
+        self, req: dict[str, Any], timeout: float | None = None
+    ) -> dict[str, Any]:
         payload = (json.dumps(req, separators=(",", ":")) + "\n").encode()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(600)
+            sock.settimeout(self.timeout if timeout is None else timeout)
             sock.connect(self.path)
             sock.sendall(payload)
             # One JSON object per response line.
@@ -47,6 +54,29 @@ class K7dClient:
     def ping(self) -> dict[str, Any]:
         return self.call({"op": "ping"})
 
+    def create_vm(
+        self, config: dict[str, Any], *, timeout: float | None = 180
+    ) -> dict[str, Any]:
+        return self.call({"op": "create_vm", "config": config}, timeout=timeout)
+
+    def stop_vm(self, vm_id: str) -> dict[str, Any]:
+        return self.call({"op": "stop_vm", "vm_id": vm_id})
+
+    def tree_create(
+        self,
+        config: dict[str, Any],
+        *,
+        tree_id: str | None = None,
+        budget: dict[str, Any] | None = None,
+        timeout: float | None = 300,
+    ) -> dict[str, Any]:
+        req: dict[str, Any] = {"op": "tree_create", "config": config}
+        if tree_id is not None:
+            req["tree_id"] = tree_id
+        if budget is not None:
+            req["budget"] = budget
+        return self.call(req, timeout=timeout)
+
     def tree_create_cluster(
         self,
         vm_count: int,
@@ -54,6 +84,7 @@ class K7dClient:
         *,
         tree_id: str | None = None,
         budget: dict[str, Any] | None = None,
+        timeout: float | None = 300,
     ) -> dict[str, Any]:
         req: dict[str, Any] = {
             "op": "tree_create_cluster",
@@ -64,7 +95,7 @@ class K7dClient:
             req["tree_id"] = tree_id
         if budget is not None:
             req["budget"] = budget
-        return self.call(req)
+        return self.call(req, timeout=timeout)
 
     def tree_adopt_cluster(
         self,
@@ -81,7 +112,11 @@ class K7dClient:
         return self.call(req)
 
     def tree_fork_batch(
-        self, tree_id: str, source_id: str, labels: list[str]
+        self,
+        tree_id: str,
+        source_id: str,
+        labels: list[str],
+        timeout: float | None = 180,
     ) -> dict[str, Any]:
         return self.call(
             {
@@ -89,7 +124,23 @@ class K7dClient:
                 "tree_id": tree_id,
                 "source_id": source_id,
                 "labels": labels,
-            }
+            },
+            timeout=timeout,
+        )
+
+    def tree_prepare_fork_source(
+        self,
+        tree_id: str,
+        node_id: str,
+        timeout: float | None = 300,
+    ) -> dict[str, Any]:
+        return self.call(
+            {
+                "op": "tree_prepare_fork_source",
+                "tree_id": tree_id,
+                "node_id": node_id,
+            },
+            timeout=timeout,
         )
 
     def tree_rollback(self, tree_id: str, node_id: str, label: str) -> dict[str, Any]:
@@ -122,6 +173,28 @@ class K7dClient:
 
     def tree_nodes(self, tree_id: str) -> dict[str, Any]:
         return self.call({"op": "tree_nodes", "tree_id": tree_id})
+
+    def tree_list(self) -> dict[str, Any]:
+        return self.call({"op": "tree_list"})
+
+    def tree_auto_evict(self, tree_id: str) -> dict[str, Any]:
+        return self.call({"op": "tree_auto_evict", "tree_id": tree_id})
+
+    def tree_suspend(self, tree_id: str, node_id: str) -> dict[str, Any]:
+        return self.call({"op": "tree_suspend", "tree_id": tree_id, "node_id": node_id})
+
+    def tree_resume(self, tree_id: str, node_id: str) -> dict[str, Any]:
+        return self.call({"op": "tree_resume", "tree_id": tree_id, "node_id": node_id})
+
+    def dump_serial(
+        self, *, vm_id: str | None = None, guest_cid: int | None = None
+    ) -> dict[str, Any]:
+        req: dict[str, Any] = {"op": "dump_serial"}
+        if vm_id is not None:
+            req["vm_id"] = vm_id
+        if guest_cid is not None:
+            req["guest_cid"] = guest_cid
+        return self.call(req)
 
     def list_vms(self) -> dict[str, Any]:
         return self.call({"op": "list_vms"})

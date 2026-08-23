@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>k7d-view</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="mark"></span>
+      <span class="wordmark">k7d<em>-view</em></span>
+      <nav class="tree-tabs" id="trees"></nav>
+    </div>
+    <div class="goal" id="goal">waiting for a tree</div>
+    <div class="status">
+      <span class="pill" id="arm" hidden></span>
+      <span class="pill" id="phase">idle</span>
+      <span class="pill" id="conn">connecting</span>
+      <span class="clock" id="clock">T+00:00</span>
+    </div>
+  </header>
+
+  <nav class="timeline" id="timeline">
+    <span class="timeline-empty">incident timeline — waiting for a run</span>
+  </nav>
+
+  <main>
+    <section class="hero" id="hero">
+      <svg id="graph" xmlns="http://www.w3.org/2000/svg">
+        <g id="layer-edges"></g>
+        <g id="layer-chips"></g>
+        <g id="layer-ghosts"></g>
+        <g id="layer-nodes"></g>
+      </svg>
+      <div class="toast" id="toast" hidden></div>
+      <div class="hero-hint" id="hero-hint">waiting for k7d snapshot tree</div>
+    </section>
+
+    <aside class="rail">
+      <section class="panel">
+        <h2>tree budget</h2>
+        <div class="gauge" id="g-vms">
+          <div class="gauge-head"><span class="gauge-label">live vms</span><span class="gauge-num" id="vms-num">—</span></div>
+          <div class="gauge-bar"><i id="vms-fill"></i><em class="soft" style="left:85%"></em></div>
+        </div>
+        <div class="gauge" id="g-ram">
+          <div class="gauge-head"><span class="gauge-label">live ram</span><span class="gauge-num" id="ram-num">—</span></div>
+          <div class="gauge-bar"><i id="ram-fill"></i><em class="soft" style="left:85%"></em></div>
+        </div>
+        <div class="gauge small" id="g-disk">
+          <div class="gauge-head"><span class="gauge-label">disk (dirty)</span><span class="gauge-num" id="disk-num">—</span></div>
+          <div class="gauge-bar"><i id="disk-fill"></i></div>
+        </div>
+        <div class="headroom" id="headroom"></div>
+        <canvas id="chart" height="132"></canvas>
+        <div class="chart-legend">
+          <span><i class="sw vms"></i>live vms</span>
+          <span><i class="sw ram"></i>ram</span>
+          <span><i class="sw cap"></i>budget</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>controller</h2>
+        <div class="feed" id="meta-feed"><span class="empty">waiting for decisions</span></div>
+      </section>
+
+      <section class="panel grow">
+        <h2>events</h2>
+        <div class="feed events" id="events"><span class="empty">waiting for events</span></div>
+      </section>
+    </aside>
+
+    <aside class="drawer" id="drawer" hidden>
+      <header>
+        <h2 id="drawer-title">node</h2>
+        <button class="close" id="drawer-close" title="close (esc)">×</button>
+      </header>
+      <div class="drawer-body">
+        <div class="kv" id="drawer-kv"></div>
+        <p class="note" id="drawer-note" hidden></p>
+        <p class="note err" id="drawer-err" hidden></p>
+        <div class="actions" id="actions">
+          <button data-act="protect">protect</button>
+          <button data-act="unprotect">unprotect</button>
+          <button data-act="suspend">suspend</button>
+          <button data-act="resume">resume</button>
+          <button data-act="prune">prune</button>
+          <button data-act="auto_evict">auto-evict</button>
+        </div>
+        <h3>trace</h3>
+        <div class="feed" id="drawer-trace"></div>
+        <h3>cluster vms</h3>
+        <div class="vms" id="drawer-vms"></div>
+        <h3>member activity <span class="hint" id="execs-hint"></span></h3>
+        <div class="execs" id="drawer-execs"></div>
+        <h3>serial <span class="hint" id="serial-cid"></span></h3>
+        <pre class="serial" id="serial">select a vm</pre>
+      </div>
+    </aside>
+  </main>
+
+  <section class="tiles" id="tiles"></section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

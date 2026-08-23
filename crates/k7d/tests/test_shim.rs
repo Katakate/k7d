@@ -2737,7 +2737,7 @@ spec:
     match daemon.call(&k7d::control::Request::TreeNodes {
         tree_id: tree_id.clone(),
     }) {
-        Ok(k7d::control::Response::TreeNodeList { nodes }) => {
+        Ok(k7d::control::Response::TreeNodeList { nodes, .. }) => {
             assert!(
                 nodes.iter().any(|n| n.label == "warm"),
                 "annotation fork node labeled 'warm' must exist: {nodes:?}"

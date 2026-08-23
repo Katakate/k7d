@@ -2722,6 +2722,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(guest_cids.len(), 3, "fork must clone every member");
             // Share-less cluster members must ride the
@@ -3664,6 +3665,7 @@ fn test_inner_k3s_coredns_dns_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -4886,6 +4888,7 @@ fn test_inner_k3s_ingress_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -5633,6 +5636,7 @@ fn test_inner_k3s_local_path_pvc_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -5896,6 +5900,7 @@ fn test_inner_k3s_metrics_server_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -6479,6 +6484,7 @@ fn test_inner_k3s_network_policy_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -6956,6 +6962,7 @@ fn test_inner_k3s_hpa_scale_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -7347,6 +7354,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -8554,6 +8562,7 @@ fn test_inner_k3s_argocd_gitops_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -10020,6 +10029,7 @@ fn test_inner_k3s_cilium_datapath_fork() {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),

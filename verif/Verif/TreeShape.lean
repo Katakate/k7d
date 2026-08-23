@@ -23,8 +23,10 @@
 --      times as `Nat` — the Rust `u64` ops used here are comparisons
 --      and list pushes only, no wrapping arithmetic). Fields the
 --      verified functions never read (`kind`, `dirty_pages`,
---      `has_base_snapshot`, `max_chain_depth`) are dropped from the
---      mirror. Change the Rust, update the mirror.
+--      `max_chain_depth`) are dropped from the mirror
+--      (`has_base_snapshot` used to be dropped too, until
+--      `restore_chain_depth` started reading it — the referenced work).
+--      Change the Rust, update the mirror.
 --   2. The theorems are proven on the mirror.
 --
 -- Equivalence with the Rust source is machine-checked:
@@ -53,6 +55,7 @@ structure NodeInfo where
   children : List Nat
   state : NodeState
   vmCount : Nat
+  hasBase : Bool
   lastActive : Nat
   prot : Bool
   estRamBytes : Nat
@@ -92,8 +95,8 @@ def bumpParent (parent newId now : Nat) (n : NodeInfo) : NodeInfo :=
 /-- The freshly-created `Live` child `add_child` appends. -/
 def newChild (parent newId now : Nat) : NodeInfo :=
   { id := newId, parent := some parent, children := [], state := .live,
-    vmCount := 1, lastActive := now, prot := false, estRamBytes := 0,
-    diskBytes := 0 }
+    vmCount := 1, hasBase := false, lastActive := now, prot := false,
+    estRamBytes := 0, diskBytes := 0 }
 
 /-- Mirror of `tree_model::add_child`. -/
 def addChild (t : TreeModel) (parent newId now : Nat) : TreeModel :=

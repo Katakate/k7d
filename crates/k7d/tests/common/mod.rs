@@ -14,6 +14,10 @@
 //! best-effort style into product code.
 #![allow(dead_code)]
 
+pub mod ubuntu;
+pub mod ubuntu_helm;
+pub mod ubuntu_k3s;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -317,6 +321,12 @@ fn install_workspace_guest() -> bool {
 /// from the host netns to the pod IP, i.e. exactly the path that
 /// breaks during convergence.
 pub fn wait_for_k3s_ready() {
+    // Older cilium tests used `ip route replace 10.42.0.0/24 via
+    // 10.200…` in the main table. When the k7 bridge dropped, host
+    // cni0's connected route was gone and CoreDNS probes timed out.
+    k7d::network::purge_main_table_guest_via_routes();
+    k7d::network::restore_host_cni_connected_route()
+        .unwrap_or_else(|e| panic!("restore host cni0 before k3s ready wait: {e}"));
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         let api_ok = Command::new("kubectl")
@@ -904,6 +914,49 @@ fn sweep_disks(report: &mut Vec<String>) {
         }
         match std::fs::remove_file(&path) {
             Ok(()) => reap(report, "disk", &path.display().to_string()),
+            Err(e) => eprintln!("sweep: failed to remove {}: {e}", path.display()),
+        }
+    }
+    sweep_data_disks(&live, report);
+}
+
+/// Reap **named persistent** data disks  left behind by
+/// a run that died.
+///
+/// Deliberately not the same rule as the loop above: a data disk's whole
+/// contract is that it outlives the VM, so "no live VM holds it open" is
+/// exactly the state a correctly retained disk is in between two VMs.
+/// The gate is therefore age, like the labeled-resource reap — nothing
+/// younger than [`STALE_AGE`] is touched, which is safe against a
+/// concurrent run and still cleans up after a crashed one.
+fn sweep_data_disks(live: &HashSet<PathBuf>, report: &mut Vec<String>) {
+    let dir = k7d::disks::data_disks_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("img") || live.contains(&path) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok());
+        match age {
+            Some(age) if age >= STALE_AGE => {}
+            Some(_) => continue,
+            // An unreadable or future mtime is not evidence of an
+            // orphan; deleting on "don't know" would eat a live run's
+            // data disk.
+            None => {
+                eprintln!("sweep: cannot age {} — leaving it alone", path.display());
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => reap(report, "data-disk", &path.display().to_string()),
             Err(e) => eprintln!("sweep: failed to remove {}: {e}", path.display()),
         }
     }

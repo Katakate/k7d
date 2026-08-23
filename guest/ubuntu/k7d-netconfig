@@ -1,0 +1,50 @@
+#!/bin/sh
+# Configure this VM's network from the kernel command line .
+#
+#   k7d.ip=<addr>/<prefix>,<gateway>[,<iface>]
+#
+# No DHCP, no netplan, no cloud-init: the k7d daemon assigns every TAP a
+# deterministic guest IP, so the address is known before the VM boots and
+# the guest's job is only to apply it. `iface` defaults to eth0, which
+# the VM's command line pins with `net.ifnames=0`.
+#
+# Loud on every failure: a malformed or unapplicable k7d.ip= exits
+# non-zero so the unit is *failed* and the test that asserts zero failed
+# units says so, instead of the VM coming up silently unreachable.
+set -eu
+
+log() { echo "k7d-netconfig: $*"; }
+die() { log "$*" >&2; exit 1; }
+
+ip link set lo up
+
+SPEC=""
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+        k7d.ip=*) SPEC="${tok#k7d.ip=}" ;;
+    esac
+done
+
+if [ -z "$SPEC" ]; then
+    # A VM with no NIC (most k7d VMs) legitimately has no k7d.ip=.
+    log "no k7d.ip= on the command line; nothing to configure"
+    exit 0
+fi
+
+CIDR=$(echo "$SPEC" | cut -d, -f1)
+GW=$(echo "$SPEC" | cut -d, -f2)
+IFACE=$(echo "$SPEC" | cut -d, -f3)
+[ -n "$IFACE" ] || IFACE=eth0
+
+case "$CIDR" in
+    */*) : ;;
+    *) die "k7d.ip=$SPEC: address must be <addr>/<prefix>" ;;
+esac
+[ -n "$GW" ] || die "k7d.ip=$SPEC: missing gateway"
+[ -e "/sys/class/net/$IFACE" ] || die "interface $IFACE does not exist (k7d.ip=$SPEC)"
+
+ip address flush dev "$IFACE"
+ip address add "$CIDR" dev "$IFACE"
+ip link set "$IFACE" up
+ip route replace default via "$GW" dev "$IFACE"
+log "$IFACE = $CIDR via $GW"

@@ -1,6 +1,7 @@
 -- Equivalence for the accounting
 -- group: `usage`, `ram_soft_limit`, `over_ram`, `over_count`,
--- `over_disk`. The `usage` loop threads four accumulators; the invariant
+-- `over_disk`, `over_disk_incoming`. The `usage` loop threads four
+-- accumulators; the invariant
 -- says the mirror `usageAux` on the *remaining* suffix, seeded with the
 -- current accumulator values, equals the final accumulator values. All
 -- saturating arithmetic is unconditional (mirrors are saturation-exact);
@@ -215,6 +216,25 @@ theorem over_disk_equiv (t : tree_model.TreeModel) :
     rw [← huPost]; rfl
   have h2 : (absTree t).budget.maxDiskBytes = t.budget.max_disk_bytes.val := rfl
   simp only [Tree.overDisk, h2, ← h1, decide_eq_decide]
+  scalar_tac
+
+/-- Equivalence: `tree_model::over_disk_incoming` decides the mirror
+`Tree.overDiskIncoming` (and never panics) — the `u64::saturating_add`
+on the projected write is bridged by `u64_saturating_add_val`. -/
+theorem over_disk_incoming_equiv (t : tree_model.TreeModel)
+    (incoming : Std.U64) :
+    tree_model.over_disk_incoming t incoming
+      ⦃ b => b
+        = decide (Tree.overDiskIncoming (absTree t) incoming.val) ⦄ := by
+  unfold tree_model.over_disk_incoming
+  obtain ⟨u, hu, huPost⟩ := spec_imp_exists (usage_equiv t)
+  rw [hu]
+  simp only [bind_tc_ok]
+  step as ⟨sum, hsum⟩
+  have h1 : u.disk_bytes.val = (Tree.usage (absTree t)).diskBytes := by
+    rw [← huPost]; rfl
+  have h2 : (absTree t).budget.maxDiskBytes = t.budget.max_disk_bytes.val := rfl
+  simp only [Tree.overDiskIncoming, h2, decide_eq_decide, ← h1, ← hsum]
   scalar_tac
 
 end Verif.Equiv

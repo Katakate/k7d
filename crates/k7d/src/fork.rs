@@ -16,7 +16,7 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::devices::{create_serial_device_with_trigger, PipeSerialDevice, SerialTrigger};
 use crate::network::{ClusterNetwork, TapDevice, TapNetBackend};
 use crate::snapshot::{CpuState, KvmClockState, SnapshotError, VmState};
-use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, VirtioBackend};
+use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, VirtioBackend, VIRTIO_ID_VSOCK};
 use crate::vm::{Vm, VmError};
 use crate::vsock::VhostVsockBackend;
 
@@ -25,8 +25,6 @@ const VIRTIO_ID_NET: u32 = 1;
 /// Virtio device-type ID for `virtio-blk` (matches `crate::block::VIRTIO_ID_BLOCK`).
 const VIRTIO_ID_BLOCK: u32 = 2;
 const VIRTIO_ID_FS: u32 = 26;
-/// Virtio device-type ID for vsock.
-const VIRTIO_ID_VSOCK: u32 = 19;
 
 /// Errors specific to restore/fork operations.
 #[derive(Debug, thiserror::Error)]
@@ -2021,12 +2019,31 @@ fn build_vm_from_state_and_mem_inner(
                     } else {
                         static FORK_BLK_SEQ: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
-                        let parent = cfg.host_path.parent().ok_or_else(|| {
+                        let mut parent = cfg.host_path.parent().ok_or_else(|| {
                             ForkError::Reflink(format!(
                                 "RW block image {} has no parent directory",
                                 cfg.host_path.display()
                             ))
                         })?;
+                        // A fork-of-fork's source image already lives in
+                        // a `.k7d-blk-fork-*` dir owned by another VM (or
+                        // parked by a suspended node). Never nest inside
+                        // it — removing that dir would recursively delete
+                        // THIS fork's images (CHALLENGES.md #130). Walk
+                        // up to the stable disks dir; it is the same
+                        // filesystem, so FICLONE still works.
+                        while parent
+                            .file_name()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .is_some_and(|n| n.starts_with(".k7d-blk-fork-"))
+                        {
+                            parent = parent.parent().ok_or_else(|| {
+                                ForkError::Reflink(format!(
+                                    "fork dir {} has no parent directory",
+                                    cfg.host_path.display()
+                                ))
+                            })?;
+                        }
                         let d = parent.join(format!(
                             ".k7d-blk-fork-{}-{}",
                             std::process::id(),

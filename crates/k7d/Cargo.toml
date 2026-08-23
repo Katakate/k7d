@@ -19,6 +19,7 @@ vm-memory = { workspace = true, features = ["backend-mmap"] }
 linux-loader = { workspace = true, features = ["elf", "bzimage"] }
 vm-superio.workspace = true
 vmm-sys-util.workspace = true
+seccompiler.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

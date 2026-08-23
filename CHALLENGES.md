@@ -937,6 +937,13 @@ requiring `prepare_fork_source` first).
 
 **Time lost:** ~20 minutes.
 
+**Follow-up:** `SnapshotTree::fork_batch` / `ClusterSnapshotTree::fork_batch`
+now call `prepare_fork_source` on the source when members have no
+`fork_source_base_path` (same policy as daemon `fork_vm`). Control op
+`tree_prepare_fork_source` exposes that checkpoint as its own step.
+Parent ids stay k7d's — a child fork is a real depth-2 node, not a
+flattened retry from root.
+
 ---
 
 ## 60. Fork-source pods can never terminate — Kill blocks on the dead pre-swap agent connection while holding the state lock 
@@ -2803,6 +2810,1839 @@ when a CNI DaemonSet crashloops on a k7d guest, read the agent's
 **last fatal log line** before reading the eBPF config — twice in a row
 the answer was a `/proc` or netlink surface the guest simply lacked, and
 neither would ever have been found by re-reading the datapath options.
+
+---
+
+## 101. vhost-vsock's kernel DMA was the one device write nobody reported to the warm-fork dirty delta (PR 118 salvage)
+
+**Symptom:** none observed — this is the hazard #56 left open, closed
+deliberately rather than after a failure. It was found while reviewing an
+abandoned branch (PR 118) that had been written against the same the referenced work
+symptom #78/#79 turned out to explain.
+
+**Root cause:** a warm fork copies `base.mem` plus the pages
+`KVM_GET_DIRTY_LOG` reports, and that log only sees vCPU writes. #79 gave
+the userspace virtio-net and virtio-blk workers their own device-DMA
+bitmaps for exactly this reason, but vhost-vsock has no userspace worker to
+carry one: the kernel module DMA-writes the used ring and RX payloads
+directly. `VirtioBackend::merge_dirty_pages` defaulted to a no-op and its
+doc comment claimed vhost devices take the full-memfd fork path — vsock-only
+VMs do not (`test_emptydir_tmpfs_shared_and_survives_fork` asserts the CoW
+path). A fork whose vsock rings moved after `prepare_fork_source` therefore
+inherited them as of `base.mem`, and `activate_with_bases` programmed
+`VHOST_SET_VRING_BASE` from that stale `used.idx`. The `.cursor` rule
+saying vsock "side-steps the worker-counter bug kernel-side via
+`VHOST_SET_VRING_BASE`" holds only if the ring pages themselves are fresh.
+
+Why it never showed up as a failure: an idle guest's rings do not move in
+the fork window, and a vCPU write sharing the ring page copies the right
+bytes by accident. The Ubuntu bare-VM guests of the referenced work are busier, which
+is what made closing it now worth the churn.
+
+**Fix:** `MmioDevice::merge_dirty_pages` marks every ready vsock virtqueue's
+descriptor table, avail ring, and used ring, and walks the descriptors to
+mark the buffers they point at (RX payloads vhost writes). Bounded to vsock
+on purpose: its queues are 256 descriptors of at most a page, while a net or
+blk `len` is legitimately megabytes — PR 118 walked every device first and
+pushed `test_inner_k3s_cluster_warm_fork_no_restart` over its 1 s `TreeFork`
+budget (1.031 s), which it then proposed to widen to 2 s. Indirect
+descriptors and any buffer outside `mem_span` are skipped.
+
+**Deliberately not taken from PR 118:** freezing the kernel worker
+(`SET_RUNNING` 0 + `GET_VRING_BASE`) around the multi-second `memory.bin`
+dump and persisting those bases in `devices.json`. That is the remedy #56
+prescribes for dump-window tearing, it is a real remaining gap, and it is
+also the ioctl pair #56 already reverted once for breaking live sources —
+so it wants the repro loop and its own increment, not a drive-by. Spec
+26a-inc1 carries it.
+
+**Reference:** CHALLENGES #27, #56, #79; Linux `drivers/vhost/vsock.c`
+(used-ring updates outside KVM's view); PR 118 (closed unmerged).
+
+**Time lost:** none on the bug; the cost was reviewing a stale 16-commit
+branch against a `main` that had already fixed the symptom differently.
+
+---
+
+## 102. Leftover Cilium dataplane kills standalone k3s, then SSH 
+
+**Symptom:** `make remote-check` died in `test_cni` because `systemctl
+restart k3s` had no `k3s.service` — the node was a `k3s-agent` joined to
+another cluster. After uninstalling the agent and installing a
+standalone k3s server, flannel immediately exited:
+
+```
+failed to set interface flannel.1 to UP state: address already in use
+```
+
+UDP 8472 was held by leftover `cilium_vxlan`. After deleting
+`cilium_vxlan` / `cilium_host` / `cilium_net` *and* the maps under
+`/sys/fs/bpf/tc/globals/cilium*`, SSH still accepted TCP/22 but reset
+during kex (`kex_exchange_identification: Connection reset by peer`).
+The node was not wiped — just unreachable.
+
+**Root cause:** a k3s-agent + Cilium join leaves a host dataplane
+(vxlan on 8472, `05-cilium.conflist`, tc/BPF on the physical NIC) that
+survives `k3s-agent-uninstall.sh`. Flannel and Cilium cannot share 8472.
+Deleting the BPF maps while programs are still attached to `enp9s0`
+breaks the host path SSH needs after the TCP handshake. A hw reset
+clears the attached programs; the on-disk CNI conflist does not.
+
+**Fix:** provider hardware reset of *this node only* (`K7_SERVERS=3040440` /
+`<node-ip>`). Then `rm` leftover `/etc/cni/net.d/05-cilium.conflist`,
+seed `/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl`
+with the k7 runtime (fresh k3s only writes `config.toml`), apply
+RuntimeClass `k7`. Do not delete Cilium BPF maps as a first cleanup
+step — take the vxlan iface and the conflist, or reboot.
+
+**Reference:** none (host leftover from a previous agent join).
+
+**Time lost:** ~45 minutes, most of it waiting on a node whose SSH was
+half-dead after the BPF-map delete.
+
+A second trap on the same node: after the hw reset, the share-dir
+guest (`/usr/local/share/k7d/vmlinux`, 20 MiB, no `CONFIG_MODULES`)
+was copied into the rsync-excluded `guest/kernel/vmlinux` so the
+workspace had *a* kernel. `make check` then ran `test_inner_k3s`
+against that pre-#100 image — Cilium CrashLoopBackOff on
+`/proc/modules` missing, and NetworkPolicy `ipset` EINVAL. Rebuild
+from `config-minimal` (needs `dwarves`/`pahole`, `flex`, `bison`,
+`libelf-dev` — this node did not have them) and install the 25 MiB
+result into the share dir before re-running the suite. The same reset
+also left `tgt` / `nfs-kernel-server` uninstalled, so
+`test_iscsi_nfs` failed loud (as designed) until
+`setup-node-after-reset.sh`'s package list was applied.
+
+---
+
+## 103. `linux-image-virtual` has no haltpoll module, and a missing cpuidle driver looks like a config gap 
+
+**Symptom:** the Ubuntu node booted, systemd came up clean, the clock was
+exact — and the 19g idle probe failed on the first thing it reads:
+
+```
+assertion `left == right` failed: boot: cpuidle driver is "none", not haltpoll
+```
+
+Everything the minimal guest needs for haltpoll was in place:
+`cpuidle_haltpoll.force=1` on the cmdline,
+`haltpoll.guest_halt_poll_ns=200000`, `cpuidle_haltpoll` listed in
+`/etc/modules-load.d`, and `CONFIG_ACPI_PROCESSOR_IDLE`/`CONFIG_HALTPOLL_CPUIDLE=m`
+in the flavour's `/boot/config-6.8.0-138-generic`. The config said the
+driver existed and the driver was not there.
+
+**Root cause:** `cpuidle-haltpoll.ko` ships in `linux-modules-extra-*`,
+not in the `linux-modules-*` set that `linux-image-virtual` pulls in.
+`systemd-modules-load.service` therefore failed to load a module that
+was never on the disk, and the kernel fell back to no cpuidle driver at
+all. The config check could not catch this: a distro `=m` means "this
+module was built", not "this module is in the package you installed" —
+two different questions that look identical in `config-*`.
+
+**Fix:** add `linux-image-extra-virtual` to the image's package list.
+The test's flavour check now asserts, for every `=m` option it accepts,
+that the matching `.ko` is actually present under `/lib/modules` — so
+the next instance of this fails on the specific missing module instead
+of on a downstream functional probe. The diagnosis came from making the
+failure talk: the probe now dumps `/proc/cmdline`, `lsmod`, an explicit
+`modprobe -v cpuidle_haltpoll`, the `dmesg` cpuidle/kvm lines and
+`systemctl status systemd-modules-load` before it panics, and
+`modprobe -v`'s "module not found" was the whole answer.
+
+**Reference:** Ubuntu kernel packaging — `linux-image-virtual` →
+`linux-modules-<ver>-virtual` (the trimmed VM set),
+`linux-image-extra-virtual` → `linux-modules-extra-<ver>-generic`.
+This is the same shape as the Cilium/Longhorn module question in
+inc3-inc5, which is why the extra set is installed rather than
+`modprobe`-ing one module by hand.
+
+**Time lost:** ~25 minutes, most of it spent re-reading the kernel
+config on the assumption that a `-virtual` flavour had dropped
+haltpoll. On a distro guest, "is the option set" and "is the module
+installed" are separate checks; ask the second one first.
+
+---
+
+## 104. `du` over a chroot that still has `/proc` bind-mounted 
+
+**Symptom:** the Ubuntu image builder failed at the very end, after the
+expensive `apt` work had already succeeded, with a burst of:
+
+```
+du: cannot read directory '/tmp/tmp.MzvpNNwvsy/proc/1234/task/...': No such file or directory
+```
+
+**Root cause:** the builder measures the finished rootfs with
+`du -sk "$MNT"` for the manifest, and at that point `/proc`, `/sys`,
+`/dev` and `/dev/pts` were still bind-mounted into the chroot from the
+host. So `du` was not walking the image — it was walking the host's live
+process tree, and racing every process that exited mid-walk. The failure
+is timing-dependent, which is worse than deterministic: the same builder
+can pass on a quiet host and fail on a busy one.
+
+**Fix:** unmount the four pseudo-filesystems *before* measuring anything,
+and pass `--one-file-system` to `du` so a future bind mount cannot
+silently inflate `rootfs_used_kb` either. Same reasoning for the module
+count, which globs `/lib/modules` in the image.
+
+**Reference:** none — generic chroot hygiene.
+
+**Time lost:** ~10 minutes. Worth writing down only because of where it
+struck: a manifest-measuring step at the end of a multi-minute build,
+which is exactly where a cheap ordering bug is most expensive to hit.
+
+---
+
+## 105. A bzImage needs its own setup header and a different entry point than the ELF path 
+
+**Symptom / trap:** the ELF path builds a `boot_params` zero page from a
+hand-written `setup_header` (boot protocol version, magic, cmdline
+pointer, E820 map) and starts the BSP at the address the loader
+reports. Reusing either of those for a bzImage produces no error and no
+serial output — the decompressor either jumps somewhere unmapped or
+decompresses over itself, and the VM sits there until the test's boot
+ceiling expires.
+
+**Root cause:** two differences the ELF path gets away with not knowing.
+First, a bzImage's decompressor reads `setup_sects`, `init_size`,
+`pref_address`, `relocatable_kernel` and the `LOADED_HIGH` bit in
+`loadflags` back out of the zero page — values that describe *that
+image*, so `linux-loader`'s `BzImage::load` hands its parsed
+`setup_header` back and the zero page must carry it verbatim rather than
+carrying a hand-built one. Second, the 64-bit entry point is
+`kernel_load + 0x200` (`startup_64`, with the CPU already in long mode),
+not the entry the header advertises, which is the 32-bit/real-mode one.
+
+Also, `setup_header` is `#[repr(packed)]`, so any expression that takes
+a *reference* to one of its fields is UB. `log::info!` format args and
+`assert_eq!` both take references, so the natural way to log or assert
+on these fields does not compile (`error[E0793]: reference to packed
+field is unaligned`) — a real error worth keeping rather than papering
+over with `addr_of!`: the fields are copied out by value into locals
+first.
+
+**Fix:** `load_kernel_image` selects the loader by magic bytes
+(`\x7fELF` at 0, `HdrS` at 0x202) and returns `(entry, Option<setup_header>)`;
+`configure_boot_params` overlays the image's header when it got one and
+keeps the hand-built header otherwise. Neither is trusted to be right by
+inspection: a unit test asserts on the bytes actually written to guest
+memory that the bzImage zero page carries the image's header and that no
+bzImage-only field (`init_size`) leaks into the ELF one, and a third
+test asserts an unrecognised file (a shell script) fails loudly instead
+of being handed to a loader on spec.
+
+**Reference:** the x86 [boot protocol](https://www.kernel.org/doc/html/latest/arch/x86/boot.html)
+(`init_size`, `pref_address`, `LOADED_HIGH`, the 64-bit entry at
+`+0x200`); `linux-loader`'s `loader::bzimage`; cloud-hypervisor's
+`vmm/src/vm.rs` bzImage path in `reference/`.
+
+**Time lost:** ~15 minutes, all of it reading the boot protocol before
+writing the code rather than debugging a silent hang after. Recorded
+because the failure mode carries no diagnostic at all: get either half
+wrong and the guest is simply mute.
+
+---
+
+## 106. The suite's own hygiene sweep eats a multi-minute cached artifact 
+
+**Symptom:** the Ubuntu base image kept disappearing from
+`/var/lib/k7d/disks` between test binaries, leaving its manifest,
+kernel and initrd behind. Every suite run then rebuilt a several-minute
+image that was supposed to be content-cached and built once per node.
+Nothing failed, which is why it was easy to miss — the cost showed up
+only as a suite that had quietly got slower.
+
+**Root cause:** `sweep_disks` in `tests/common` deletes every `*.img`
+directly under `/var/lib/k7d/disks` that no live VM holds open, and
+`maybe_hygiene_once()` runs it at the start of each test binary. That is
+the correct contract for the directory: per-VM images there are garbage
+the moment their VM is gone, and a test that dies mid-run must not strand
+one. A cached *base* image is the one thing in that directory that is
+not per-VM state, and it looked exactly like a stranded image.
+
+**Fix:** build the base image into a `base-images/` subdirectory of the
+same reflink XFS. `FICLONE` needs the same filesystem, not the same
+directory, so per-VM clones still reflink, and `sweep_disks` does not
+recurse. The alternative — teaching the sweep to recognise base images —
+was rejected: "anything unrecognised directly under the disks dir is
+garbage" is a stronger invariant than a list of exceptions.
+
+Worth noting the near miss: the builder's cache check requires the image
+file itself and not just the manifest it writes last, so a swept image
+rebuilt instead of handing a test a path to a file that no longer
+existed. Had the check trusted the manifest alone, this would have
+surfaced as a reflink failure in an unrelated test.
+
+**Reference:** none — the interaction is between this repo's own
+`cached_erofs_image` caching pattern and its spec-22d sweep.
+
+**Time lost:** ~15 minutes, all of it after noticing that a manifest
+pointed at a nonexistent `.img`. Two correct local decisions (cache the
+artifact on the reflink filesystem; reap unknown images there) composed
+into a wrong global one.
+
+---
+
+## 107. The node's workspace lock does not stop an interactive session, and the damage looks like a flaky budget 
+
+**Symptom:** `test_inner_k3s_argocd_gitops_fork` failed inside an
+otherwise green `make remote-check`, on a test whose budget
+(`FORK_INNER_K3S_CLUSTER_3VM_ARGOCD`, 2 s) had been comfortable for days.
+The obvious readings — a real regression from the branch, or CHALLENGES
+#97's known fork flake — were both wrong.
+
+**Root cause:** another agent was on the same bare-metal node, running
+`examples/k7view/run_scenario.py --keep --branches 4` in a detached tmux
+session, in the *same* `/root/k7d` workspace, at the same moment. It
+created a 3-VM cluster and forked four branches on the same KVM host
+while the suite was measuring a cluster fork.
+
+`utils/remote-run.sh` takes an `flock` on
+`/run/k7d-remote/workspace.lock` precisely to stop this (CHALLENGES #64's
+neighbour), and it worked as designed: it serialises *remote-run
+invocations*. A human or agent typing `python3 …` into a tmux session on
+the node never touches that lock. The interlock is not a mutex on the
+node, only on one way of using it.
+
+**Fix (operational, not code):** confirm exclusivity before trusting a
+timing failure. `tmux ls`, `who`, `ps` for foreign `cargo`/`python`, and
+`ls /run/k7d-remote/*/pid` for live runs answer it in one round trip; the
+scenario's own leftovers (`--keep` leaves `k7v-*` trees in
+`/var/lib/k7d/trees`) are the fingerprint afterwards. The failing test
+was then re-run on a quiet node and passed.
+
+Recording it because the diagnosis order matters: when a *budget* test
+fails and the code under it did not change, ask "was the machine mine?"
+before reading the fork path. Kept measurements are only as good as the
+host's exclusivity — the numbers in `LATENCY_BUDGETS.md` are all 2x
+ceilings for exactly this reason.
+
+**Reference:** none — this repo's `utils/remote-run.sh` lock and the
+ops-side node lease, which is advisory: a launched agent still reads
+`K7_NODE_IP` from its own environment.
+
+**Time lost:** ~20 minutes, most of it spent about to re-run a suite on
+the assumption the failure was mine.
+
+---
+
+## 108. k3s `After=network-online.target` hangs forever when wait-online is masked 
+
+**Symptom:** a Ubuntu node with `k7d.k3s=server,…` on the cmdline
+reaches the vsock agent and `k7d-net.service` is active, but
+`k3s.service` never leaves `activating` and `/readyz` is never
+reachable. `systemctl start k3s` from the oneshot times out at 180 s.
+`journalctl -u k3s` is empty — the binary has not run.
+
+**Root cause:** the stock k3s unit (and every copy of it online) has
+`After=network-online.target` / `Wants=network-online.target`. inc1's
+image masks `systemd-networkd-wait-online.service` because
+`k7d-net.service` already configured eth0 from `k7d.ip=`, and a
+wait-online that never sees a DHCP lease is a boot hang. Masking the
+waiter does not satisfy `network-online.target`; it leaves the target
+unreached. systemd then holds every unit that `After=`s it, including
+k3s, for the start timeout — which with `TimeoutStartSec=0` is
+forever.
+
+This is the same class of trap as inc1's masked-unit list: a target
+that is correct on a cloud VM is a silent deadlock on a k7d node
+that does its own net config.
+
+**Fix:** ship `k3s.service` / `k3s-agent.service` with
+`After=k7d-net.service` / `Wants=k7d-net.service` and no mention of
+`network-online.target`. `k7d-net.service` is the unit that actually
+makes eth0 usable; waiting on it is both sufficient and terminating.
+Named in `guest/ubuntu/units/k3s.service` so a future refresh of the
+upstream unit file cannot silently put the After= back.
+
+**Reference:** systemd `network-online.target` +
+`systemd-networkd-wait-online.service`; k3s packaging
+(`k3s.service` in the k3s-io/k3s install script). inc1's masked-unit
+list in `guest/ubuntu/build-node-image.sh`.
+
+**Time lost:** ~15 minutes (caught in the unit file before the first
+cluster bring-up, from reading the masked-unit list against the
+upstream k3s unit — a future reader who copies the stock unit will
+lose a boot-to-Ready hang cycle).
+
+---
+
+## 109. Gym lease 404 ≠ residue gone 
+
+**Symptom:** `test_gym` TTL path saw `GET /lease/{id}` return 404 while
+`tree_nodes` still listed a branch and a `k7-br-*` + its TAP slaves
+were still up. Explicit `/release` was clean because the HTTP call
+blocked on prune.
+
+**Root cause:** `mark_released` popped the in-memory row *before*
+`tree_prune`. The reaper logged the reap, the test treated 404 as
+"done", and asserted the pre-lease snapshot against a half-torn-down
+group. A second flake: a global `k7-br-*` diff also fired on
+`k7-br-3vm-*` bridges minted by other work on the shared node — those
+are not this lease.
+
+**Fix:** `begin_release` keeps the row visible until prune returns, then
+`mark_released`. Residue assertions are scoped to the lease's own
+`branch_node_id`s / `bridge`s / TAP slaves, not every `k7-br-*` on the
+box. `GET` staying 200 through teardown is load-bearing for a trainer
+that polls.
+
+**Reference:** none (gym-side lifecycle, not a k7d bug).
+
+**Time lost:** ~25 minutes (two red `test_gym` runs).
+
+---
+
+## 110. Busybox gym is a frozen contract, not the trainer substrate (2026-08-19)
+
+**Symptom:** After 26a-inc0 (and the inc1 catalog) it was still
+reasonable to write the next gym spec against create-mode busybox
+or `K7_KEEP_INNER3` — the 26a substrate note explicitly allowed
+that "while 25a climbs". Gym-router as inc2 would have encoded
+tiny-guest RAM (~23 MiB k7d VmRSS/fork, 256 MiB guests) into fleet
+admission. Fault injectors on that guest also fight PID 1 =
+`k7-agent`, ash hex arithmetic, and `eth0` starting DOWN.
+
+**Root cause:** The 2026-08-18 25a decision parked nested-runc and
+`config-minimal` feature work but left a gym exception so the HTTP
+contract could freeze first. "Park" was also easy to read as
+"delete the tiny kernel" or "keep using it until Ubuntu is
+perfect". Neither is the intent. GRPO on realistic k3s +
+Cilium/Tetragon needs systemd + a distro kernel, not another
+busybox workaround.
+
+**Fix:** Exclusive policy in `internal notes` and
+`internal notes`. Next gym increment is
+`internal notes`. Gym-router moved to parked
+`internal notes`. Always-apply rule
+`editor-config/rules/ubuntu-substrate.mdc`. Minimal guest +
+`test_inner_k3s.rs` stay green CI — not deleted.
+
+**Reference:** `internal notes` (decision
+record).
+
+**Time lost:** none this change (policy lock). The cost avoided is
+another busybox gym increment.
+
+---
+
+## 111. Gym fault catalog: PID 1, zombies, ash hex, and eth0 never up 
+
+**Symptom:** `kill-member-0` inject "did not take"; the scripted restore
+hung `POST /act` for 15 s; `partition-member-0` scored `contained=0`
+with `source_intact=1`.
+
+**Root cause:** four independent create-mode traps, all on the busybox
+guest (`guest/rootfs/init.sh` `exec`s `k7-agent` as PID 1):
+
+1. `kill -9 1` kills the vsock agent. There is no scripted restore.
+2. After SIGKILL of a canary, `kill -0 $pid` stays true on the zombie
+   until PID 1 reaps, so a "process is gone" verifier fails.
+3. A good-fix of `sleep 86400 &` never returns: busybox ash waits on
+   the leftover job and `Command::output()` (the agent exec path)
+   blocks until `timeout_s`.
+4. Create-mode guests only `ip link set lo up`. `eth0` exists and is
+   DOWN on the source and every fork. Taking it down on one sibling
+   is indistinguishable from the rest, so `contained` is 0. A first
+   attempt to read `/sys/class/net/eth0/flags` as hex made it worse:
+   busybox ash evaluates `$((0x1003 & 1))` as 0 (stops at `x`), so
+   every NIC looked DOWN.
+
+**Fix:** `kill-member-0` SIGKILLs a planted canary and scores on
+`/tmp/k7-fault-kill` / `/tmp/k7-fault-restored` (the good fix is a
+marker write, not a background sleep). `partition-member-0` matches
+`,UP`/`<UP` on `ip link show eth0`. The gym brings `eth0` up on the
+source after create so forks inherit a live link. Unknown `fault_id`
+stays 400 with the allowlist; a failed inject still tears the lease
+down.
+
+**Reference:** none (guest userspace + ash, not a k7d/KVM bug).
+
+**Time lost:** ~40 minutes (four red `test_gym` inject/score runs).
+
+---
+
+## 112. Cilium's conflist is not always under k3s' CNI dir 
+
+**Symptom:** `test_ubuntu_cilium_datapath_fork` brought Cilium 1.16.10
+to DaemonSet 3/3 + operator Available, every node had `cilium_host` /
+`cilium_net`, and the three nodes were Ready — then panicked:
+
+```
+server: Cilium never wrote its conflist:
+---
+ls: cannot access '/run/flannel': No such file or directory
+```
+
+A first reading treated this as "Cilium did not install its CNI
+config". The datapath was already programmed.
+
+**Root cause:** the assertion was copied from inner-k3s
+(`test_inner_k3s.rs`), which lists only
+`/var/lib/rancher/k3s/agent/etc/cni/net.d` for a file named
+`05-cilium.conflist`. Cilium's Helm chart default is `/etc/cni/net.d`,
+and the filename is any `*cilium*.conflist`. The first `ls` printed
+nothing (empty or missing k3s dir; stderr discarded); the second
+`ls /run/flannel` error was concatenated into the same string. A
+follow-on `contains("flannel")` check would also have failed on that
+error text even after the conflist was found.
+
+**Fix:** `find` both the k3s CNI dir and `/etc/cni/net.d` for
+`*cilium*.conflist`; look for `*flannel*` files in those dirs
+separately; assert `/run/flannel` is absent without grepping its
+`ls` error. Do not require the inner-k3s filename or path.
+
+**Reference:** Cilium Helm `cni.confPath` default (`/etc/cni/net.d`);
+k3s kubelet `--cni-conf-dir=/var/lib/rancher/k3s/agent/etc/cni/net.d`.
+
+**Time lost:** one full Ubuntu Cilium bring-up (~6 min) plus resuming
+the sequential suite around it.
+
+---
+
+## 113. Cluster-tree fork bridges were named `ctree-{pid}`, so gym kubectl bound the wrong `k7-br-*` 
+
+**Symptom:** Ubuntu gym source bring-up succeeded (~113 s, 3 Ready).
+`POST /lease` n=1 `none` forked in ~626 ms. `act` `kubectl get nodes`
+then returned HTTP 200 with `ok: false`:
+
+```
+curl: (45) Couldn't bind to 'k7-br-gym-8fa62'
+```
+
+`obs` also 200 — it swallows the same bind failure into
+`nodes_error` / `readyz=false`.
+
+**Root cause:** `ClusterSnapshotTree::new_cluster` invented
+`tree_id = format!("ctree-{}", pid)` and `fork_batch` named the new
+bridge from `{that}-{node_id}`. The gym recomputes
+`k7_bridge_name(f"{registry_tree_id}-{node_id}")` from the id
+`tree_adopt_cluster` returned (`gym-src-test-ubuntu-…`). Those
+hashes diverge. Busybox gym never hit this: create-mode used vsock
+`exec`, adopt used the short `k7-br-inner3`. First hashed long
+tree id + `--interface` path.
+
+**Fix:** `new_cluster` takes the last component of `root_dir` as
+`tree_id` (callers already do `tree_root_dir().join(&tree_id)`).
+Gym fails loud if the computed fork bridge is not on the host.
+
+**Reference:** none (k7d `ClusterNetwork::create` / `bridge_short_tag`).
+
+**Time lost:** one full Ubuntu source bring-up plus diagnosing curl 45
+as a name mismatch rather than a down interface.
+
+---
+
+## 114. A foreign rsync can replace `/root/k7d` on an "exclusive" node 
+
+**Symptom:** After a green `test_gym_ubuntu` on <node-ip>, a
+`--nocapture` re-run hung in the 600 s healthz wait. The gym log was
+one line: `GYM_SOURCE_MODE must be create|adopt, got 'ubuntu'`.
+
+**Root cause:** `/root/k7d/gym/server.py` on the node was an older
+tree (no `ubuntu` mode). `utils/rsync-to-node.sh` / `remote-run.sh`
+use `K7_NODE_IP` (or the first of `K7_NODE_IPS`). The cloud env
+still lists all three nodes in `K7_NODE_IPS`. Another agent that
+does not `unset K7_NODE_IPS` can rsync *its* workspace onto this
+node even when the increment said "TOUCH ONLY 135". Same class as
+CHALLENGES #107 (workspace lock is not a node mutex).
+
+**Fix (operational):** `export K7_NODE_IP=…; unset K7_NODE_IPS`
+before every `make rsync` / `remote-check`. If gym/daemon sources
+on the node do not match the branch, re-rsync before believing a
+hang. Do not provider-reset.
+
+**Reference:** none.
+
+**Time lost:** one 600 s healthz wait plus diagnosing a "missing
+mode" as a hung Ready.
+
+---
+
+## 115. Cluster `fork_batch` does not evict for *incoming* VMs (k7view max-load)
+
+**Symptom:** `run_scenario.py --profile max` created a 3-VM root, forked
+8 cluster branches (27 live VMs, budget 30), then hung for ~180 s on
+the second wave and died. The tree never grew past wave 0. k7d logged
+nothing after the first `fork_cluster_warm_batch: 8 clusters / 24 VMs`.
+
+**Root cause:** `ClusterSnapshotTree::fork_batch` calls
+`auto_evict_if_over(source)` which is `evict_for_incoming_inner(source, 0)`.
+It only suspends when the tree is *already* over budget, not when the
+batch about to start would push `live_vm_count + incoming` over
+`max_live_vms`. Wave 1 wanted 12 more VMs at 27/30. The client sat on
+the control socket until `tree_fork_batch`'s 180 s timeout.
+
+Single-VM `SnapshotTree` has the same `incoming=0` helper for
+`fork_batch`; the cluster path is the one the video demo hits because
+each node is 3 VMs.
+
+**Fix (demo-side, not a daemon change):** park unprotected losers
+*before* the next wave so there is real headroom, and use a 300 s
+timeout on the max profile. Do not retry a failed child fork from
+root — that flattens the tree to depth 1. A daemon fix would pass
+`incoming = labels.len() * vm_count` into `evict_for_incoming_inner`
+— that is a separate increment.
+
+**Reference:** none — `crates/k7d/src/cluster_tree.rs` `fork_batch` /
+`auto_evict_if_over`.
+
+**Time lost:** ~15 minutes (one hung wave, then the headroom-before-wave
+retry).
+
+**Resolution :** both `fork_batch` paths now call
+`evict_for_incoming(source, labels.len() × vm_count)` and fail loud with
+`BudgetExhausted` when everything else is protected. Note the semantic
+shift: a fork that previously *overshot* `max_live_vms` silently (source
+and forks exempt from `evict_post_fork`, warning only) now refuses
+up-front — `test_tree_protection` relied on the overshoot with
+`max_live_vms: 1` and had to move to a budget of 2 where its intent
+(protected nodes are never suspended) is expressible without overshoot.
+
+---
+
+## 116. `remote-run.sh` reattach dies on a fresh checkout (`.remote-runs/<run>.log` missing)
+
+**Symptom:** `make remote-check` from a fresh clone, while a previous
+agent's run of the same name was still in flight on the node, printed
+`line 92: /workspace/.remote-runs/check.log: No such file or directory`
+and exited 1 — looking like a failed check when the node-side run was
+fine.
+
+**Root cause:** the reattach path never creates the local log — only
+`start_run` truncates it (`: >"$LOCAL_LOG"`). `local_log_size` reads the
+file via input redirection (`wc -c <"$LOCAL_LOG"`); with `set -e` the
+failed redirect aborts the script before the viewer even attaches. Any
+fresh checkout reattaching to an in-flight run hits it (cloud agents
+always start from fresh clones).
+
+**Fix:** create the file if missing right after the `mkdir -p` — resume
+offset 0 is exactly right for a viewer that has no local copy yet.
+
+**Reference:** none — `utils/remote-run.sh`, builds on #64.
+
+**Time lost:** ~10 minutes (plus one 45-minute lock wait behind another
+agent's suite that the failure obscured).
+
+---
+
+## 117. `test_ubuntu_cilium_datapath_fork` fails: guest pulls from quay.io at ~50 KB/s (pre-existing, node-side)
+
+**Symptom:** during the 9g-inc1 `make remote-check`,
+`test_ubuntu_cilium_datapath_fork` timed out with `Cilium never Ready
+in 600s (agents=0/3 operator=1)`. Reproduced identically in isolation.
+An *independent* agent's suite on different sources failed on the same
+test earlier the same day — this is not a regression of the branch
+under test (which touches only tree eviction/checkpoint policy).
+
+**Root cause:** userspace virtio-net advertised TSO and enabled TAP
+`TUNSETOFFLOAD CSUM+TSO`, so the kernel delivered 16–64 KiB GRO
+aggregates on RX — but the RX path always stamped `num_buffers=1` and
+wrote into a single descriptor chain, silently truncating the rest.
+Guest TCP saw chopped segments and collapsed to ~50 KB/s. The kubelet
+event log had the number: `Successfully pulled image
+"quay.io/cilium/operator-generic:v1.16.10@…" in 9m15.047s … Image
+size: 29153610 bytes` — 29 MB in 9¼ minutes. At that rate the ~200 MB
+`cilium` and ~150 MB `cilium-envoy` images cannot finish inside the
+test's 600 s ceiling.
+
+Not quay throttling the node IP: a `k3s crictl pull` of the same repo
+**on the host** is full speed. Single-guest `curl -o /dev/null -w
+'%{speed_download}'` of that quay blob vs GitHub `runc.amd64`: host
+~15–35 MB/s quay / ~19–26 MB/s GitHub; guest with the truncate bug
+matches the 50 KB/s kubelet number; guest after the MRG_RXBUF split
+is line-rate on both URLs. Conntrack was 1399/393216. No IFB, no
+leftover `tbf`/`htb`/`netem`/`ingress` on the WAN. `speed.hetzner.de`
+does not resolve here.
+
+Bisect traps (each tried, each loud):
+- `TUNSETOFFLOAD CSUM+TSO` + `ethtool -K gro off` on the TAP
+  reproduced 29 MB in 9m22s exactly.
+- TAP CSUM-only (TSO off) made NAT egress fast — kernel no longer
+  GRO'd into userspace — but the guest still TSO'd. `write(2)` of a
+  GSO frame to a CSUM-only TAP returns `EINVAL` (ignored), so
+  guest-to-guest Cilium native-routing hung (`cil-allow` wget).
+- Advertising TSO to the guest while the TAP was CSUM-only is the
+  same mismatch. TCPMSS on the bridge FORWARD path was not the
+  cause (still hung after it was scoped to WAN, then removed).
+
+**Fix:** two stacked bugs.
+
+1. NAT collapse: TAP `TUNSETOFFLOAD CSUM+TSO` plus RX `num_buffers=1`
+   silently truncated GRO aggregates. TAP is CSUM-only (fail loud);
+   RX splits across MRG_RXBUF and publishes `used.idx` once. Single-guest
+   curl on <node-ip>: host quay ~22–35 MB/s / github ~26–28 MB/s;
+   guest quay ~26–38 MB/s / github ~41–45 MB/s. Conntrack 1.5k/393216;
+   no IFB; WAN qdisc is fq_codel. `speed.hetzner.de` does not resolve.
+   `ClusterNetwork::create` fails on leftover IFB/tc shaping.
+2. Cross-node pod SYN-ACK dest MAC is the **k7 bridge / default-gateway
+   MAC**, not the peer node. Cilium native routing sends that frame to
+   `10.200.0.1`; the host had no `10.42.0.0/16` route and dropped it.
+   Host-ns replies stay on-link (node MAC → node MAC) and never hit
+   this hop. `ensure_host_pod_routes` installs each node's `podCIDR`
+   via its InternalIP on the k7 bridge (and `10.43.0.0/16` via the
+   first node so a ClusterIP that misses kube-proxy replacement is
+   not dropped on the gateway). Unlabelled `cil-preadmit` then
+   finishes in ~4–6 s. Do not log/rewrite every gateway-dest frame
+   — that stalls the virtio thread (Cilium Ready 0/3).
+3. After NetworkPolicy, labeled `cil-allow` got `Connection refused`
+   for minutes while Cilium ipcache/identity were correct and the
+   BPF allow map stayed at 0 packets. k3s's embedded kube-router
+   netpol controller installs `KUBE-POD-FW-*` `REJECT … icmp-port-unreachable`
+   unless mark `0x10000`. Cilium never sees the skb. `k7d.cni=none`
+   now writes `disable-network-policy: true` (same requirement as
+   the inner-k3s Cilium profile).
+4. Even with kube-router off, labeled wget timed out: server TAP
+   saw `10.200.0.1 → pod:8080` and Cilium logged `identity world`
+   deny. Host `bridge-nf-call-iptables=1` (required for host
+   kube-proxy) plus host flannel `MASQUERADE 10.42.0.0/16` SNATed
+   *bridged* guest SYNs to the k7 gateway. Per-bridge
+   `nf_call_iptables=0` does **not** override the global hook.
+   `ClusterNetwork::create` INSERTs
+   `nat POSTROUTING -s 10.42/16 -d 10.42/16 -m physdev --physdev-is-bridged -j RETURN`
+   so those frames skip host flannel MASQ. Live proof: TAP SYNs
+   kept the pod IP and HTTP 200 followed immediately.
+5. `ensure_host_pod_routes` originally did `ip route replace
+   10.42.{n}.0/24 via 10.200.0.{n+2}` **in the main table**. Guest
+   node 0's podCIDR is the same prefix as host k3s `cni0`
+   (`10.42.0.0/24`). The replace stole kubelet's connected route;
+   `ClusterNetwork::Drop` then deleted the bridge and the via-route
+   vanished with it — main had **no** `10.42.0.0/24`. Host CoreDNS
+   readiness probes (`http://10.42.0.11:8181/ready`) timed out and
+   `test_cni_pod_traffic_flows` failed with `k3s did not converge
+   within 180s (coredns ready=false)`. Overlay routes now live in
+   table 200, selected only by `iif k7-br-* to 10.42/16|10.43/16`.
+   `destroy` / `cleanup_stale_k7_bridges` / `wait_for_k3s_ready`
+   restore `cni0`'s connected route if it is missing. Tetragon's
+   operator is a regular pod on a worker (`10.42.1.x`); without
+   these overlay routes it never reaches the API, never binds
+   `:8081`, and dies on liveness. `test_ubuntu_tetragon` now
+   installs the same table-200 routes as the Cilium datapath test.
+
+`test_ubuntu_guest_egress_throughput` floors guest downloads at 1 MB/s;
+`test_ubuntu_guest_bridge_tcp` covers L2.
+
+**Reference:** `crates/k7d/src/network.rs` (`rx_deliver_merged`,
+`TUNSETOFFLOAD`); `crates/k7d/tests/test_ubuntu_guest.rs`; spec
+25a-inc3b.
+
+**Time lost:** ~1 hour on the original report, plus a day of TAP
+offload / GRO / TCPMSS bisect before the truncate was named.
+
+---
+
+## 118. `cases` on an `Option` loop argument fails dependent elimination inside a WP spec goal (Aeneas Equiv proofs)
+
+**Symptom:** the new `Verif/Equiv/Chain.lean` loop-equivalence proof
+for `restore_chain_depth` — written by copying `Anc.lean`'s
+`ancestor_ids_loop_equiv` skeleton — died on its `cases cur with`
+step with `Dependent elimination failed: Failed to solve equation
+cur = none`, even though the goal state (dumped with `trace_state`)
+was exactly the expected `⦃…⦄`-wrapped `match cur with …` and no
+hypothesis mentioned `cur`. The same `cases cur with` idiom compiles
+fine in `Anc.lean` against the same Aeneas/Lean toolchain.
+
+**Root cause:** not fully diagnosed (the generated
+`restore_chain_depth_loop` differs from `ancestor_ids_loop` only in
+arm shapes — scalar accumulator and early `ok none` returns instead of
+a `Vec` push), but the failure is in `cases`' structured-`with` mode
+building the dependent motive over the spec-triple goal.
+
+**Fix:** use `rcases cur with _ | c` instead of
+`cases cur with | none => … | some c => …`. `rcases` clears the
+elimination without any other change; the rest of the `Anc.lean`
+skeleton (fuel recursion, `find_index_equiv`, `step as`,
+`termination_by fuel.val`) transfers as-is. Also handy from the same
+session: after `step as ⟨ni, hni⟩` on the `Vec.index` read,
+`rw [hwalk, hlook, ← hni]` rewrites the *mirror* side's indexed
+element into `ni` so both sides of the goal speak the same node — no
+per-field `have`s needed.
+
+**Reference:** `verif/Verif/Equiv/Chain.lean` vs
+`verif/Verif/Equiv/Anc.lean`; Lean 4 `cases` dependent-elimination
+notes.
+
+**Time lost:** ~30 minutes (one failed lake build, one `trace_state`
+round-trip, one variant experiment).
+
+---
+
+## 116. Child Tetragon inject stays Pending unless it lands on the node that already pulled busybox 
+
+**Symptom:** `test_ubuntu_tetragon_fork_event_diff` installed Tetragon
+1.7.0 via Helm, fired kprobe + BPF-LSM on the source (`touch
+/tmp/k7d-tetra-src-*` in ~3 s), warm-forked three 2 GB nodes in 453 ms
+with zero restarts — then panicked:
+
+```
+default/tetra-child-inject: never Succeeded via k7-br-ubtetf after 180s
+```
+
+The child's API was fine (`/readyz`, node Ready, pod snapshot via
+`curl --interface`). The POST created the pod. It never left Pending.
+
+**Root cause:** the source inject had no `nodeName`, so busybox landed
+on whichever node the scheduler picked. The child inject was also
+unpinned. After the fork it scheduled onto a node whose containerd
+had never pulled `docker.io/library/busybox:1.36.1`. A post-fork
+image pull through that node's bridge did not finish in 180 s (and
+looked like a Tetragon / fork bug). The child's kubelet was not
+wedged: pinning both injects to agent-1 — the containerd that already
+had the image — made the child Succeed in 16 s, and the event-stream
+diff landed 455 ms later.
+
+**Fix:** pin `tetra-src-probe` and `tetra-child-inject` to
+`k7d-10-200-0-3`. Keep `imagePullPolicy: IfNotPresent`. Dump phase
+and default-namespace events if a later inject still sticks.
+
+**Reference:** none (test fixture, not a Tetragon or VMM bug).
+
+**Time lost:** one full Ubuntu Tetragon bring-up (~8 min) plus the
+pinned re-run.
+
+---
+
+## 117. k3s `helm-install-traefik` Jobs are not long-lived pods 
+
+**Symptom:** A full `make remote-check` that had already passed
+`test_ubuntu_k3s` on the previous exclusive run panicked later in the
+same PR:
+
+```
+source: kube-system/helm-install-traefik-76vbs/helm restartCount 0 → 1
+(must stay zero-delta across the convergence wait, not merely at the end)
+```
+
+Fork latency was 870 ms (under the 1 s ceiling, high vs the 488 ms
+typical). Nodes were Ready; no other pod restarted.
+
+**Root cause:** `snapshot_pods_json` is documented as tracking
+*long-lived* pods, but it still indexed k3s' `helm-install-traefik*`
+Job pods. Those Jobs retry by design. A retry during the converge
+wait is not a cluster restart and is not a regression of the 13a/22a
+zero-restart matrix.
+
+**Fix:** skip `helm-install-*` in the snapshot the same way the
+fixture already skips `churn-pause-` / `cil-allow-` / `tetra-`.
+
+**Reference:** none (test fixture).
+
+**Time lost:** one 70-minute remote-check that died on the last Ubuntu
+binaries.
+
+---
+
+## 118. Deleting leftover cluster trees evicts the Ubuntu image from page cache 
+
+**Symptom:** After a green Tetragon isolated run (453–551 ms cluster
+fork) and a first `make remote-check` that died on `test_inner_k3s`
+TreeFork budgets (1.033 s / 1.118 s), leftover `i3*` trees totaled
+~82 GiB. Soft-cleaning those trees on an exclusive node
+(`tmux`/`who`/live `/run/k7d-remote/*/pid` all empty, load 0.2)
+dropped `buff/cache` 54 GiB → 31 GiB. The next exclusive
+`test_ubuntu_k3s_cluster_warm_fork_no_restart` then missed
+`FORK_UBUNTU_K3S_CLUSTER_3VM` at **1.613 s** and **1.999 s**. The
+code under the test had not changed; `FORK_UBUNTU_NODE_1VM` was
+untouched.
+
+**Root cause:** the 6 GiB Ubuntu node image lives on the loopback XFS
+at `/var/lib/k7d/disks/base-images/`. A bulk `rm -rf` of tens of
+gigabytes of dead trees evicts that image (and the live guest RAM
+backing) from the host page cache. The 1 s Ubuntu cluster ceiling
+is a 2× of a *hot* measurement (~416–551 ms). A cold-cache fork
+looks like a regression. CHALLENGES #107's exclusivity check is
+necessary but not sufficient — the machine can be yours and still
+cold.
+
+The same suite's `test_inner_k3s_etcd_datastore_fork` passed on the
+exclusive re-run; `test_inner_k3s_ingress_fork` missed again
+(2.52 s, warm-0 materialise 2.16 s) with those 13 GiB leftover
+trees still on disk. That test was not edited.
+
+**Fix (operational, not a widened budget):** confirm exclusivity
+(#107), then check whether the 6 GiB image is still in cache
+(`free`, or a `dd` of the current `ubuntu-24.04-*.img` into
+`/dev/null`). Re-run the Ubuntu budget tests after a cache warm —
+do **not** raise `FORK_UBUNTU_K3S_CLUSTER_3VM`. After warming,
+`test_ubuntu_k3s` (176 s) and `test_ubuntu_tetragon_fork_event_diff`
+(359 s) passed on `<node-ip>`.
+
+**Reference:** CHALLENGES #107 (exclusivity), #106 (do not put the
+cached artifact where the sweep deletes `*.img`).
+
+**Time lost:** two exclusive Ubuntu re-runs (~6 min) plus diagnosing
+a "real" 2 s miss that was a cold cache.
+
+**Seen again, and now easier to hit :** a full
+`make remote-check` that spends two hours in `test_shim` /
+`test_inner_k3s` before it reaches `test_ubuntu_k3s` leaves the same
+cold cache behind, and
+`test_ubuntu_k3s_cluster_warm_fork_no_restart` missed at **1.200 s**.
+`dd`-ing the current base image to `/dev/null` on the idle node and
+re-running gave **462 ms** — with `test_ubuntu_tetragon` at 423 ms and
+`test_ubuntu_longhorn` at 538 ms in the same pass. inc5 doubled the
+node root to 16 GiB, so there is more image to fall out of cache;
+warm before trusting a miss at the tail of a full suite.
+
+**Seen again :** back-to-back full
+`make remote-check` runs plus **65 GiB** of leftover `gym-src-test-*`
+trees produced inner-k3s TreeFork misses at 1.17–1.42 s (three
+different profiles across two runs — never the same test twice, a
+flake signature, and the daemon-side materialise was 17–50 ms every
+time) and `test_ubuntu_longhorn_fork_volumes` at 2.09 s in-suite and
+2.72 s isolated. A `dd` of the base image alone was **not** enough for
+Longhorn — that fork's cost is dominated by the *guests'* dirty memory
+under churn, which only warms by actually running the cluster. After
+soft-cleaning the leftover trees and one warm-up cluster run, inner-k3s
+went green and the Longhorn fork measured **802 ms** on the same code.
+Note `main` cannot cross-check this node: without this branch's
+virtio-net fixes (#117) Cilium agents never come up there, so
+attribution has to come from the materialise-time breakdown, not an
+A/B run.
+
+---
+
+## 119. The guest cluster reused the host cluster's pod CIDR, so the host masqueraded guest pod-to-pod traffic 
+
+**Symptom:** Longhorn 1.12.1 installed cleanly on the Ubuntu 3-node
+Cilium cluster and then never became Ready inside 900 s. What varied
+run to run was *which* component looked broken: `longhorn-manager` on
+the k3s server node exited 1 in a crash loop after two minutes of
+`Failed to check endpoint
+https://longhorn-admission-webhook.longhorn-system.svc:9502/v1/healthz:
+context deadline exceeded`, occasionally with `lookup ... on
+10.43.0.10:53: i/o timeout`; `longhorn-driver-deployer` sat at
+`Init:0/1`; `longhorn-csi-plugin` hung at 2/3; readiness probes
+flapped 3/3 → 2/3 → 3/3. When a volume did get far enough to attach,
+CSI reported only `DeadlineExceeded` and the instance-manager log said
+`iscsiadm: cannot make connection to <pod ip>: Connection timed out`.
+Cilium itself reported `Cluster health: 3/3 reachable`, no policy
+drops in `cilium-dbg monitor --type drop`, correct
+`autoDirectNodeRoutes` routes on every node, and matching podCIDRs in
+both `nodes` and `ciliumnodes`.
+
+**Root cause:** the guest k3s cluster ran on k3s' default
+`10.42.0.0/16` pod CIDR and `10.43.0.0/16` service CIDR — and the
+bare-metal host these VMs run on is *itself* a k3s node whose cluster
+uses exactly those ranges (`k7-node-01` = `10.42.0.0/24`,
+`k7-node-03` = `10.42.1.0/24`, `k7-node-02` = `10.42.2.0/24`, kube-dns
+`10.43.0.10`). The host has `net.bridge.bridge-nf-call-iptables=1`, so
+guest frames crossing `k7-br-*` traverse the host's `nat` table, where
+the host's own Cilium has:
+
+```
+-A CILIUM_POST_nat -s 10.42.0.0/24 ! -d 10.42.0.0/24 ! -o cilium_+ -j MASQUERADE
+```
+
+A guest pod on the server node (`10.42.0.x`) talking to a pod on
+another guest node (`10.42.1.x`) matches that rule exactly, so the
+*host* SNATs it. The asymmetry this produces is what made every
+component look individually broken: same-node pod-to-pod worked
+(never leaves the VM), `10.42.1.x → 10.42.0.x` worked (wrong `-s`),
+and everything a `10.42.0.x` pod sent off-node — cluster DNS, its own
+`ClusterIP` webhook, another node's pod, even a node IP — was lost.
+Zeroing the chain and re-probing from a guest pod showed 11 packets on
+that MASQUERADE rule; that is the whole diagnosis.
+
+**Fix:** move the guest cluster off the host's ranges in
+`guest/ubuntu/k7d-k3sconfig` — `cluster-cidr: 10.244.0.0/16`,
+`service-cidr: 10.245.0.0/16`, `cluster-dns: 10.245.0.10` — with
+`POD_CIDR` / `SERVICE_CIDR` in `common/ubuntu_k3s.rs` as the single
+place the fixtures and Cilium's `ipv4NativeRoutingCIDR` read them
+from. k7d's guest subnet (10.200.0.0/24) already dodged this
+collision for node IPs; the cluster's own CIDRs had never been moved
+because nothing before Longhorn needed cross-node pod-to-pod or
+in-cluster DNS. Longhorn Ready went from "never" to 364 s on the
+first try.
+
+**A measurement trap met along the way:** `curl -m 5
+telnet://<ip>:3260` exits 28 both when the SYN is dropped and when the
+connection is fine but `tgtd` says nothing until an initiator speaks
+iSCSI. An "unreachable" verdict built on that timeout string is
+measuring nothing; only `curl -v`'s `Connected to <ip>` line
+distinguishes the two. #121 is a *second*, independent cause that this
+same probe found once it could tell them apart.
+
+**Reference:** none upstream — this is a host/guest CIDR collision
+specific to running guest clusters on a machine that is itself a k3s
+node. Cilium's masquerade rule is doing exactly what it is supposed
+to.
+
+**Time lost:** ~5 twenty-minute cluster runs chasing NetworkPolicies,
+node memory, and vCPU count before probing the host's nat counters.
+
+---
+
+## 120. Longhorn needs a bigger node root, a bigger reflink XFS, and more than 2 GB 
+
+**Symptom:** Longhorn pods were evicted with `DiskPressure`, managers
+and CSI sidecars were `OOMKilled`, and `ensure_loopback_xfs` ran out
+of space at 25 GiB used of 32 GiB while three clusters' base-image
+copies were live.
+
+**Root cause:** three separate ceilings sized for k3s alone. inc2's
+6 GiB node root cannot hold Ubuntu + the k3s airgap images + Cilium +
+ten Longhorn images (~1.1 GiB of layers before unpacking), so the
+kubelet crosses its `nodefs` eviction threshold. inc2's 2 GB per node
+is under Longhorn's documented 4 GB floor. And `DISKS_IMAGE_SIZE`
+(32 GiB) is the sum of every base image and every live clone, so a
+bigger root multiplies through it.
+
+**Fix:** node image 6 GiB → 16 GiB, `DISKS_IMAGE_SIZE` 32 GiB →
+96 GiB with `ensure_loopback_xfs` growing an existing image in place
+(`truncate` + `losetup -c` + `xfs_growfs`) rather than demanding a
+wiped node, and a `NodeSize` the cluster fixture takes so Longhorn
+asks for 4 vCPU / 4 GB while every other Ubuntu test keeps inc2's
+2 vCPU / 2 GB and its budgets. Sizing was the fix for these three;
+it was *not* the fix for the connectivity failure in #119, which
+survived every one of them.
+
+**Reference:** Longhorn's documented node requirements.
+
+**Time lost:** ~2 runs, plus a manual sweep of stale images.
+
+---
+
+## 121. Longhorn's own NetworkPolicies deny its loopback iSCSI attach under Cilium, because the initiator is `world` 
+
+**Symptom:** with the CIDR collision in #119 fixed, Longhorn reached
+Ready in 293 s and then the first RWO attach still failed: the pod sat
+in `ContainerCreating` behind `AttachVolume.Attach failed … rpc error:
+code = DeadlineExceeded`, and the node's host namespace could not open
+TCP to its *own* instance-manager pod on 3260 — while a plain busybox
+pod on that same node, on that same port, answered fine.
+
+**Root cause:** Longhorn 1.12's chart ships ingress-only
+NetworkPolicies for its own components, and
+`networkPolicies.restrictInternalTraffic` defaults to **true** even
+when `networkPolicies.enabled` is false. Every `from:` in the
+`instance-manager` policy is a `podSelector`. But Longhorn's V1 attach
+is a host-to-pod loopback iSCSI session: the engine creates a tgt
+target inside the instance-manager pod's namespace and then runs
+`iscsiadm` in the *host* namespace against that pod's own IP. Under
+Cilium that connection arrives sourced from the node's `cilium_host`
+router IP and is classified as identity `world` — not `host`, so
+`allow-localhost` does not cover it — and the policy denies it:
+
+```
+xx drop (Policy denied) to endpoint 1036, file bpf_lxc.c:2067,
+   identity world->40615: 10.244.1.132:38992 -> 10.244.1.226:3260 tcp SYN
+```
+
+**Fix:** `--set networkPolicies.restrictInternalTraffic=false` on the
+Helm install — the chart's own switch for managing that traffic
+yourself. `test_ubuntu_longhorn_fork_volumes` asserts the loopback
+connect against the real instance-manager (not just a plain pod)
+before it creates a PVC, so this failure names itself in seconds
+instead of arriving seven minutes later as a CSI deadline.
+
+**Reference:** Longhorn chart `networkPolicies.restrictInternalTraffic`;
+Cilium identity `world` vs `host` for `cilium_host`-sourced traffic.
+
+**Time lost:** one 9-minute run to confirm the flag is load-bearing
+after #119 was fixed (the two causes were entangled: with #119 in
+place, this one could not be seen).
+
+---
+
+## 122. Longhorn's share-manager pod legitimately disappears across the fork's no-restart check 
+
+**Symptom:** a full `make remote-check` that had already survived the
+fork budget died in `test_ubuntu_longhorn_fork_volumes` at
+`assert_no_restarts`: `source-longhorn: pod
+longhorn-system/share-manager-pvc-… disappeared after the fork`. The
+same test had passed twice on identical code.
+
+**Root cause:** `share-manager-*` is Longhorn's RWX NFS server pod.
+It exists only while a workload has the RWX volume attached; once the
+test's `lh-rwx-write`/`lh-rwx-read` probe pods reach `Succeeded`,
+Longhorn detaches the volume and deletes the share-manager
+*asynchronously*. Whether that deletion lands before the pre-fork
+snapshot or between snapshot and post-fork check is a race the test
+does not control — the pod's disappearance is volume lifecycle, not a
+restart.
+
+**Fix:** add `share-manager-` to the ephemeral-pod skip list in
+`snapshot_pods_json` (`tests/common/ubuntu_k3s.rs`), next to
+`churn-pause-` / `helm-install-` which exist for the same reason.
+
+**Reference:** Longhorn share-manager lifecycle (created on RWX
+attach, deleted on detach).
+
+**Time lost:** one ~60-minute remote-check that failed at the last
+binary.
+
+---
+
+## 123. `k7d.cni=none` nodes stay NotReady until Cilium — do not wait Ready first 
+
+**Symptom:** the MCP Ubuntu smoke hung 600 s in `wait_nodes_ready` after
+CreateVm × 3 with `k7d.cni=none`. kubectl showed all three nodes
+registered as `NotReady` for the whole ceiling.
+
+**Root cause:** once flannel and kube-proxy are off, Ready *is* a CNI
+assertion (25a-inc3). `bring_up_cluster_ex(UbuntuCni::None)` only waits
+for nodes to be *present*; Cilium install is what makes them Ready.
+`gym/ubuntu.py` only had `wait_nodes_ready`, and `cluster.py` called it
+before Helm.
+
+**Fix:** add `wait_nodes_present` (same helper as the Rust fixture),
+adopt+protect on a registered-but-NotReady cluster, install Cilium,
+then wait Ready.
+
+**Reference:** `crates/k7d/tests/common/ubuntu_k3s.rs` `UbuntuCni::None`
+arm of `bring_up_cluster_ex`.
+
+**Time lost:** one ~11-minute smoke run.
+
+---
+
+## 124. `import faults` in examples/k7d-mcp binds gym/faults 
+
+**Symptom:** `scenario_incident.py --both-arms` brought the Ubuntu
+Cilium+Tetragon source up (44.6 s + 59 s Cilium + 28 s Tetragon) and
+then died: `AttributeError: module 'faults' has no attribute 'pick'`.
+
+**Root cause:** the harness does `sys.path.insert(0, gym)` *after*
+inserting `examples/k7d-mcp`, so gym wins. `import faults` loaded
+`gym/faults/__init__.py` (kill-member-0 catalog) instead of the
+cryptominer/lateral catalog.
+
+**Fix:** rename the catalog to `incidents.py`. Do not share a module
+name with `gym/`.
+
+**Reference:** none.
+
+**Time lost:** one ~2.5-minute bring-up.
+
+---
+
+## 125. Codex CLI as MCP agent: three config walls 
+
+**Symptom:** replacing the hand-rolled LLM loop with OpenAI Codex CLI
+0.149 hit three sequential failures before the first successful tool
+call: (1) `wire_api = "chat"` rejected at config load; (2) MCP
+handshake "connection closed: initialize response"; (3) every tool
+call denied with "MCP tool call requires approval, but approval
+policy is never".
+
+**Root cause:** (1) Codex ≥0.148 removed the chat-completions wire
+API — Responses only (OpenRouter added `/v1/responses`, so this
+works). (2) Codex spawns MCP servers from its *own* workdir, so
+relative `args`/env paths in the server config silently break.
+(3) In a `read-only` sandbox, MCP tools without `readOnlyHint`
+annotations are treated as consequential; with `approval_policy =
+"never"` they are denied rather than run — `default_tools_approval_mode`
+has no "never-ask-and-run" variant.
+
+**Fix:** `wire_api = "responses"`; absolute paths everywhere in the
+generated config (`agent_codex.py` resolves `K7D_MCP_LOG` against the
+harness cwd); `sandbox_mode = "danger-full-access"` — the documented
+mode for externally-sandboxed automation, which the gym node is.
+
+**Reference:** openai/codex discussion #7782 (chat wire removal);
+binary strings of codex-cli 0.149 for the config key surface.
+
+**Time lost:** ~45 minutes across three probe runs.
+
+---
+
+## 126. Codex tempdir ate the run's JSONL; stale k7view served old ingest 
+
+**Symptom:** first recorded Codex agent run looked perfect in the
+transcript, but the k7view tiles/verdicts/beats never rendered
+(bridge logged `HTTP 400` on every post), and after the run the
+harness JSONL — the plots input — was gone.
+
+**Root cause:** two independent bugs. (a) `K7D_MCP_LOG` was a
+relative path; Codex ran `server.py` from its ephemeral
+`CODEX_HOME/work`, so the JSONL landed inside the tempdir that
+`agent_codex.py` deletes on exit. (b) Port 7474 was still held by a
+k7view server from a previous session (started from another cwd, so
+the `pkill -f "^python3 examples/k7view"` pattern missed it); the
+fresh code never bound — `EADDRINUSE` sat unnoticed in the log — and
+the stale server predated the `cmd`/`verdict`/`beat`/`latency`
+ingest kinds, hence the 400s. Killing it mid-run reset the UI state
+and orphaned the capture.
+
+**Fix:** absolutize `K7D_MCP_LOG` in the generated Codex config;
+kill by listener (`ss -tlnp` → pid) not by command pattern before
+starting the server; re-run the take. The video is take 2.
+
+**Reference:** none.
+
+**Time lost:** one full ~10-minute episode (bring-up + agent run) and
+the take-1 recording.
+
+---
+
+## 127. Two latency-budget guards flake marginally under full-suite load (finding, 2026-08-20)
+
+**Symptom:** two consecutive `make remote-check` runs on k7-node-01
+each failed exactly one latency-budget test, a different one each
+time: `test_nodeusr_image_does_not_regress_boot` (median pair-delta
+**20.066 ms** vs the 20 ms allowance) and
+`test_ubuntu_longhorn_fork_volumes` (3-VM cluster warm fork
+**1.559 s** vs the 1 s `FORK_UBUNTU_K3S_CLUSTER_3VM` budget). Both
+pass immediately when rerun in isolation (20.07→ok, 1.56 s→ok).
+
+**Root cause:** these guards measure wall-clock against tight budgets
+on a node that, during a full suite run, has residual page-cache and
+I/O pressure from the preceding ~35 test binaries (and, in run 1,
+concurrent rsyncs). The failures are load noise at the budget edge,
+not regressions — the diff under test contained no Rust.
+
+**Fix:** none to the budgets — both tests explicitly say "report as a
+finding rather than raising the allowance", so this entry is that
+finding. Operationally: do not rsync to the node mid-suite, and when
+one of these two trips at the margin, rerun the single test binary
+before suspecting the change.
+
+*(2026-08-21: a third member of the class —
+`test_ubuntu_k3s_cluster_warm_fork_no_restart` at 1.38 s vs the 1 s
+budget mid-suite, 786 ms in isolation.)*
+
+*(2026-08-22, the referenced work on <node-ip> / k7-node-01: the nodeusr
+guard is no longer only a mid-suite flake. `make remote-check` failed
+at median pair-delta **20.096 ms** after `test_inner_k3s`; an isolated
+rerun failed at **20.453 ms**; three more isolated `--exact` runs
+were 20.137 / **19.992** / 20.167 — one pass by 8 µs. The common
+pair is 236→256 ms, i.e. two `connect_agent` 10 ms poll ticks, plus
+sub-ms clock noise. `delta <= 20ms` at nanosecond resolution treats
+that pair as a miss most of the time. The allowance constant stays
+20 ms; the assertion now compares `as_millis()` so 20.45 ms is still
+two ticks and a third tick (30 ms) still fails. 28a did not touch
+`crates/k7d/src`.)*
+
+**Reference:** none.
+
+**Time lost:** two full-suite runs (~85 min each) to isolate; ~20 min
+on 2026-08-22 to see the isolated miss was the same pair.
+
+---
+
+## 128. Fork chips showed `1.00s` because we invented per-child time 
+
+**Symptom:** every latency chip on a 4-way `fork_batch` read `1.00s`,
+which looks like a silent default. The daemon measured **4.01 s** for
+that one batch (`latency_ns` 4_013_455_285).
+
+**Root cause:** `ingest_mcp.py` (and `run_scenario.py`) divided the
+single batch wall by `n` and painted that onto every child. The
+daemon does not report per-child fork time — only one
+`tree_fork_batch` `latency_ns`. Equal slices of 4.01 / 4 rounded to
+two decimal seconds.
+
+**Fix:** chips show the measured batch wall (4.01 s on each edge of
+that batch). Missing `latency_ns` omits the number (`latency_ns
+missing` in the feed) — no invented 1000 ms.
+
+**Reference:** none.
+
+**Time lost:** the recorded take looks fake until you read the JSONL.
+
+---
+
+## 129. Ubuntu gym-path cannot fork a fork (depth stays 1)
+
+**Symptom:** after a successful `fork_batch` from `root`, every
+`fork_batch` / `rollback` from the child returns
+`IO error: No such file or directory`. The agent in the depth>=4
+prompt did the right thing (protect keeper, prune loser, fork from
+the child) and could not grow the tree.
+
+**Root cause:** the first diagnosis here ("adopted children are not
+preparable") was wrong — see **#130** for the real one: preparing a
+fork child as a fork source *deleted the child's reflinked RW root
+disk* (husk `Drop` owned it), so the grandchild's FICLONE hit ENOENT.
+Deterministic on any VM with a RW block device; nothing about adopt.
+
+**Fix:** superseded by #130 (fixed in the same PR after all — the bug
+was a disk-ownership hole in `prepare_fork_source_in`, well inside
+"keep the core primitives correct").
+
+**Reference:** #130 below.
+
+**Time lost:** one ~6-minute agent episode (bring-up + failed deepen).
+
+---
+
+## 130. Vm::Drop deleted the fork child's RW disk under a successor
+
+**Symptom:** fork-of-fork fails with `fork error: IO error: No such
+file or directory (os error 2)` for any VM with a **read-write block
+device** — reproduced with a 2-line script against a fresh adopted
+Ubuntu cluster tree (fork root→child OK; fork child→grandchild fails
+every time). Meanwhile `test_cluster_tree_fork_from_child` was green,
+hiding the hole: busybox members have no disks.
+
+**Root cause:** a forked VM runs on FICLONE-reflinked RW images in a
+`.k7d-blk-fork-*` dir it owns (`fork_state_dir`, removed on
+`Vm::Drop`). Three code paths dropped a `Vm` whose images a successor
+still needed:
+
+1. `prepare_fork_source_in` (share-less path) swaps in a restored copy
+   whose block backends **reopen the same files**, then drops the old
+   husk — husk `Drop` deleted the images. The live guest kept running
+   on the open (unlinked) fds, *silently*; the next fork's
+   `capture_vm_state` recorded the dead path and the reflink ENOENT'd.
+   Root never hit it (its images sit unowned in `/var/lib/k7d/disks`),
+   so every tree with RW disks was silently capped at depth 1.
+2. `suspend` (both trees) dropped the payload — same deletion, so
+   resume's reflink from `vm_state.json`'s recorded path ENOENT'd.
+3. prune of a node suspended under the new scheme must reap the parked
+   images or they leak.
+
+Writing the regression tests flushed out two more members of the same
+family:
+
+4. the reflink clone dir was created next to the source image
+   (`host_path.parent()`), so a fork-of-fork's images **nested inside
+   the parent fork's owned dir** — reaping the outer dir recursively
+   deleted the inner fork's disks (first seen as resume reaping its own
+   fresh clones);
+5. `dump_memory` opened `memory.bin` with `File::create` (O_TRUNC) —
+   preparing a node that had been *resumed from that same checkpoint*
+   truncated the live guest's `MAP_PRIVATE` RAM backing: EFAULT on the
+   vCPU, SIGBUS on the host-side dump.
+
+**Fix:** ownership transfer, not copies: `prepare_fork_source_in`
+moves `fork_state_dir` husk→restored (exactly like the `scratch_disk`
+handle two lines above it — the same class of bug, fixed for scratch
+in #39 territory but missed for fork clones). `suspend` takes the dir
+out of each member (`Vm::take_fork_state_dir`) and parks it on the
+node record (`NodeInfo::parked_disk_dirs`, serde-persisted); `resume`
+reflinks from it then reaps it; `prune` reaps it for suspended nodes.
+For (4), the clone-dir builder walks up past any `.k7d-blk-fork-*`
+ancestors so every fork's dir sits directly in the stable disks dir
+(same filesystem, FICLONE still valid). For (5), dump to
+`memory.bin.tmp` + rename — the old inode stays alive under any
+existing mapping. Verified end-to-end on the daemon socket: adopted
+Ubuntu root → child → grandchild → great-grandchild (depth 3, 3-VM
+clusters each), clean teardown.
+Regression tests: `test_cluster_tree_fork_of_fork_with_rw_disks`,
+`test_tree_fork_of_fork_with_rw_disk`,
+`test_ubuntu_guest_fork_of_fork`, and a fork-from-child step in the
+MCP smoke.
+
+**Reference:** POSIX unlink-vs-open-fd semantics made the deletion
+invisible until the next path-based operation — the textbook way a
+"loud errors" repo gets a silent one anyway.
+
+**Time lost:** ~2 h (plus the mis-diagnosis in #129).
+
+---
+
+## 131. A depth quota is theatre; a competent agent fans out complete theories
+
+**Symptom:** Take 2's README video was a depth-4 gold spine. Every
+keeper was child `-0` (1/16 if each wave flipped a coin). The user
+called it.
+
+**Root cause:** `scenario_incident.py` appended "Grow a winning
+lineage to depth >= 4 before replaying anything on root." Labels were
+`hyp-{ts}-{i}`, so `-0` was an accidental favorite cue. Layout pinned
+`children[0]` to the parent lane. The catalog miner was a lone Pod —
+one delete ended it, so extra depth had nothing to do.
+
+**Fix:** Delete the quota. Default incident is `hydra` (Deployment +
+in-cluster reseed + node-local `cache-health.service`). Prompt may
+say "use the 24-VM budget, fork at least 3, soak, don't crown the
+first node_id" — compute / experimental-design constraints, not a
+scripted spine. Labels are unordered `hyp-<hex>`. Layout continues
+the middle sibling by id. Take 4: Codex + grok-4.6 inspected k8s and
+host systemd *before* forking, then one n=3 wave (k8s-only /
+host-only / combined). H1 respawned and was pruned; H3 (third child)
+was protected and replayed. Depth stayed 1 because the model already
+had the full picture. Handicapping inspect to force depth would be
+theatre of another kind.
+
+**Reference:** none
+
+**Time lost:** one prompted take + the conversation that named it.
+
+---
+
+## 132. Depth comes from a causal chain, not a quota — and a lateral fix can still short-circuit it 
+
+**Symptom:** the `relay` incident's first shape produced grok-4.6 depth
+2, peak 9 — the agent solved it in one wave. A later kimi-k3 (medium)
+run also stalled at depth 2, three separate times, each via a different
+in-cluster shortcut.
+
+**Root cause:** three "fixes" that were never removing the persistence
+but still looked clean on a soak:
+1. `kubectl scale --replicas=0` — the reconcile only checked that the
+   Deployment *existed*, so a 0-replica deploy passed.
+2. `kubectl patch` the container command to benign — the reconcile
+   only re-applied when the deploy was *missing*, never when its spec
+   drifted.
+3. a node **taint** — the miner had no broad tolerations, so
+   `NoSchedule` kept the respawned pod Pending forever without touching
+   the host chain.
+   Each let a weaker model declare victory (Tetragon quiet, victim
+   Ready) at depth 2, before ever discovering layer 2/3.
+
+**Fix:** make layer 2 *continuously enforce* the malicious desired
+state — `k3s kubectl apply -f <stashed manifest>` on **every** kubelet
+pod edge (not conditional on absence), and give the miner
+`tolerations: [{operator: Exists}]`. Now delete / scale-0 / patch /
+taint all revert within one pod edge; the only durable stop is removing
+the host reseed chain, which forces the layer-2→layer-3 discovery that
+creates depth. Also throttle the miner (`sha256sum` its own binary +
+`sleep 0.02`) so N concurrent always-on forks do not saturate the host
+(a prior n=4 wave with an unkillable 100%-CPU miner drove load to 63 on
+12 cores and wedged the fork guests). Locked in by three new asserts in
+`test_ubuntu_incident.rs` (scale-0 self-heal, patch revert, taint
+tolerance). Grok-4.6 then peeled the host chain to **depth 3, peak 21**.
+
+**But** kimi-k3 (medium) still landed at depth 2 by a *legitimate*
+lateral fix: a CEL `ValidatingAdmissionPolicy` that denies
+`CREATE/UPDATE` of the `node-agent` Deployment, so the reconcile's
+`apply` is rejected at the API — one move neutralises the whole host
+chain, so the sequential layer discovery (the thing that makes depth)
+is never needed. Blocking that would mean defeating a standard admission
+control, i.e. CTF-adjacent, which the referenced work forbids. Takeaway:
+a causal chain reliably forces depth against a model that *peels* it,
+but you cannot force a given model away from a shorter legitimate fix
+without handicapping the environment — depth is a property of the
+model's chosen path, and the asset gate (depth ≥ 3) is honest about it.
+
+**Flagship pick (2026-08-21):** the user chose the kimi-k3 depth-2
+capture as the README hero anyway (`docs/assets/k7d-mcp-demo.{mp4,gif}`).
+The depth-3 grok-4.6 run remains the spec-bar proof; the flagship is
+the more watchable tree (wave-2 / 21-of-24 budget pressure).
+
+**Also (self-inflicted):** the mid-session tolerations edit corrupted
+the `yaml` f-string indentation (`template`/`spec` slid under
+`selector`), which kubectl rejected with `unknown field
+spec.selector.template`. Validate rendered manifests with PyYAML, not
+by eye. And a `pkill` over the SSH control session returned exit 255
+without killing the target; the orphaned Codex agent kept forking VMs
+and starved the next run — verify `pgrep` is empty after a kill, do not
+trust the exit code.
+
+**Reference:** none
+
+**Time lost:** several full node runs (~20 min each) chasing shortcuts
+and one orphaned-agent contention stall.
+
+---
+
+## 133. A per-tree `memory.max` cannot exist in a one-process VMM 
+
+**Symptom:** the tree jailer was specced as "a per-tree parent cgroup
+with `memory.max` and `pids.max` from `TreeBudget`". The obvious
+implementation — extend `VmCpuCgroup`'s threaded `vm-<id>` pattern to a
+threaded `tree-<id>` and add `memory.max` — cannot work, and the way it
+fails is quiet: the `memory.max` file simply does not appear in the new
+directory, so a naive implementation writes nothing and reports a jail
+that isn't there.
+
+**Root cause:** two cgroup v2 rules meeting k7d's architecture. (1)
+Memory is charged per *process*, and every tree's VMs are threads of the
+single k7d process, so all trees charge the same cgroup no matter how
+the threads are grouped. (2) A threaded subtree may only enable
+*threaded* controllers — `cpu`, `cpuset`, `pids`, `perf_event`. `memory`
+is domain-only, and `VmCpuCgroup` has already converted the daemon's own
+cgroup into a domain-threaded root, so no domain child can be created
+under it either. Process-per-tree would fix both and is exactly what
+must not be done: warm fork is an in-process `MAP_PRIVATE` CoW of the
+source's memory mapping, so a tree in its own process could not be
+forked from at all.
+
+**Fix:** split the jail in two and be explicit about what each half can
+enforce. `pids.max` on a threaded `tree-<id>` under the daemon's cgroup
+bounds the tree's own threads (enrolment past the cap fails with
+`EAGAIN`, which is the enforcement). `memory.max` goes on a *domain*
+cgroup at `/sys/fs/cgroup/k7d-jail/tree-<id>` holding the tree's
+virtiofsd helper **processes** — which are the part of a tree that
+parses guest-controlled input anyway. Both limits derive from the
+existing `TreeBudget`, so `tree_model.rs` and its Lean proofs stay shut.
+
+**Reference:** kernel `Documentation/admin-guide/cgroup-v2.rst`,
+"Threads" — the list of threaded controllers is the whole argument.
+
+**Time lost:** ~1 h, most of it spent confirming that the limitation is
+real rather than a delegation misconfiguration on the node.
+
+---
+
+## 134. `make check` fails on a Python suite that never ran your code 
+
+**Symptom:** first full `make check` after the tree jailer landed died in
+`k7d-mcp-test` with `tree_fork_batch: fork error: IO error: No such file
+or directory (os error 2)`. Read as "the jail broke deep forks", which
+is a plausible story: the fork path touches virtiofsd (now chrooted) and
+the tree cgroup.
+
+**Root cause:** the Python MCP suite talks to the **live daemon** on
+`/run/k7d/k7d.sock`, i.e. `/usr/local/bin/k7d`, and `make check` runs it
+*before* the Rust integration tests that install a freshly built daemon.
+The binary serving it was two days old and predated every line under
+test; the ENOENT came from its own stale `/var/lib/k7d/trees` state.
+Nothing in the failure output says which binary answered.
+
+**Fix:** install the build under test (`systemctl stop k7d`, copy,
+`systemctl start k7d` — plain `cp` over a running binary gets `Text file
+busy`) before trusting any daemon-mediated suite. The same suite passed
+immediately afterwards, all the way through a 3-VM Ubuntu k3s cluster
+with Cilium and Tetragon plus a deep fork. When a daemon-mediated test
+fails, check `md5sum /usr/local/bin/k7d` against `target/release/k7d`
+before debugging anything else.
+
+**Reference:** none.
+
+**Time lost:** ~30 min, plus one 3-minute suite re-run.
+
+---
+
+## 135. Every cluster lives on 10.200.0.0/24, so a leftover cluster answers for the new one 
+
+**Symptom:** `make check` died in the Ubuntu smoke with
+`['k7d-10-200-0-2', ...] never present after 600s` followed by
+`Unable to connect to the server: tls: failed to verify certificate:
+x509: certificate signed by unknown authority`. The obvious reading,
+right after landing a network jail, is that the jail broke the cluster.
+The same test passed standalone in 156 s minutes later.
+
+**Root cause:** not the jail — the jail's `drop` counters were both
+zero, i.e. it never dropped a packet. Every k7d cluster bridge carries
+the *same* `10.200.0.0/24`, and the host holds one route per bridge. A
+cluster left running by an earlier test (in this case the inner-k3s
+fixture from a profiling run) still owned a guest at `10.200.0.2`, so
+the host's `kubectl --server https://10.200.0.2:6443` reached **the
+older cluster's** API server. Its certificate is signed by that
+cluster's CA, not by the CA in the kubeconfig the test had just read
+out of its own server guest — hence "unknown authority", and hence
+nodes that were never "present" because the test was asking the wrong
+cluster. `make check` runs `gym-test` before the Rust suite, so a
+residue-producing earlier run poisons the *first* thing the next run
+does.
+
+**Fix:** none in code for now — clean residue (`systemctl restart k7d`
+drops every VM; `ip link del k7-br-*`; the the referenced work stale-jail reaper
+takes the tables with it) before a full run, and read an
+"unknown authority" from a freshly built cluster as *"I am talking to
+somebody else's cluster"*, never as a certificate bug. The real fix is
+a per-cluster subnet instead of one shared `10.200.0.0/24`; that is a
+network-layout change, not a jail change, and it is the natural
+follow-up to this spec.
+
+**Reference:** none.
+
+**Time lost:** ~1 h, most of it re-running a 40-minute suite.
+
+---
+
+## 136. Attribute the fork budget before you blame the newest layer 
+
+**Symptom:** the first full run with the tree jailer blew two 1 s
+inner-k3s fork budgets (1.43 s CoreDNS, 1.27 s metrics-server) against
+a historical ~175-200 ms. A jail had just been added to the fork path,
+so the jail was the suspect.
+
+**Root cause:** the daemon already logged
+`fork_cluster_warm_batch: 1 clusters / 3 VMs in 153ms`, which said the
+CoW primitive was fine, but nothing measured the ~1.2 s *around* it.
+Temporary `Instant` probes on each phase of
+`ClusterSnapshotTree::fork_batch` gave the answer in one run: of a
+494 ms fork, the jail is ~18 ms (one 12 ms `nft -f` plus 5.6 ms of
+`cgroup.threads` writes), while `save_metadata` alone is 131 ms and
+re-enabling dirty tracking on the first member is 100 ms. The 1.4 s
+outliers were the same fork on a host loaded by twenty minutes of
+preceding suite, not a jail cost.
+
+**Fix:** measure phase by phase before optimising or reverting. The one
+probe worth keeping is in `netjail.rs`, which now logs how long its
+`nft -f` took, so the jail's whole per-fork cost is visible in the
+daemon log without a rebuild.
+
+The same trap fired a second time at the other end of the suite:
+`test_ubuntu_longhorn_fork_volumes` blew its 1 s fork budget at
+1.139 s as the last binary of a 66-minute run, and measured **541 ms**
+standalone on the same build with the jail on — against 538/696 ms
+recorded before the jail existed. Two of the three fork budgets this
+spec appeared to break were the host, not the code. Standalone re-run
+first; it costs six minutes and it is the difference between a fix and
+a revert.
+
+**Reference:** none.
+
+**Time lost:** ~45 min.
+
+---
+
+## 137. Baseline the branch you are blaming 
+
+**Symptom:** three consecutive full `make check` runs on the tree-jailer
+branch ended red, each on a *different* test: two inner-k3s fork
+budgets at ~1.1-1.4 s, then `test_ubuntu_longhorn_fork_volumes` at
+1.139 s, then two more inner-k3s budgets. Every one of them passes
+standalone with the jail on, at or below its pre-jail number
+(CoreDNS 494 ms, HPA 786 ms, Longhorn 541 ms). Three red runs still
+look like a regression that only shows up under load.
+
+**Root cause:** the node. `origin/main`, checked out into a second
+worktree on the same node and run the same way, is **also** red — on
+`test_fork_requeues_interrupted_injection`, a vsock timeout that has
+nothing to do with any of this. The suite is ~66 minutes of sustained
+KVM, k3s and container-pull load on one box, and its tightest budgets
+(1 s cluster forks) do not survive that load reliably on this host.
+
+A later run made it sharper still: the branch failed
+`test_fork_requeues_interrupted_injection` at exactly the point main
+did, ten minutes into `make check` — and that whole binary passes
+standalone in 21 s (12/12) right afterwards. Inside the suite it runs
+after `gym-test`, which leaves a live 3-node Ubuntu cluster's worth of
+VMs and vsock CIDs behind; the same test then waits 52 s instead of 21 s
+and times out on the agent. `make check` is ordered `lint gym-test test`,
+so the Rust suite always starts on a host the Python suite just loaded.
+
+**Fix:** when a long suite goes red on a branch, run the *base* branch
+the same way before spending hours on your own diff. It costs one suite
+run and it is the only thing that separates "my change broke it" from
+"this node cannot hold this suite green right now". Copy the untracked
+guest artifacts (`guest/kernel/vmlinux`, `guest/rootfs/initramfs.cpio.gz`,
+`guest/rootfs/runc.amd64`) into the baseline worktree first — the rsync
+excludes them, so a fresh tree fails instantly on a missing kernel and
+tells you nothing.
+
+**Reference:** none.
+
+**Time lost:** ~3 h across four suite runs.
+
+---
+
+## 138. `kani::assume` is checked arithmetic too 
+
+**Symptom:** `make remote-kani` on a node where Kani had to be
+installed first failed one of fourteen harnesses:
+`verify_initrd_placement_within_bounds`, "attempt to add with overflow"
+at the *assumption*, not at anything it asserts.
+
+**Root cause:** the harness read
+
+```rust
+let initrd_size: u64 = kani::any();
+kani::assume(initrd_size > 0 && initrd_size + HIMEM_START < layout.low_size);
+```
+
+`kani::any()` ranges over all of `u64`, and the `+ HIMEM_START` inside
+the assumption is ordinary checked arithmetic that Kani verifies like
+any other line. For `initrd_size` near `u64::MAX` it overflows before
+the assumption can rule that value out.
+
+**Fix:** bound the value in one assumption, then use it in the next:
+
+```rust
+kani::assume(initrd_size > 0 && initrd_size < layout.low_size);
+kani::assume(initrd_size + HIMEM_START < layout.low_size);
+```
+
+14/14 harnesses pass after that. Two node-setup traps came with it:
+Kani is not part of `setup-node-after-reset.sh`, and
+`cargo install kani-verifier` fails against this repo's pinned rustc
+1.85 because its dependencies want 1.88 — install a side toolchain
+(`rustup toolchain install 1.88.0 --profile minimal;
+cargo +1.88.0 install --locked kani-verifier; cargo kani setup`), which
+leaves the repo's pin alone.
+
+**Reference:** Kani docs, "assumptions are verified code".
+
+**Time lost:** ~20 min.
+
+---
+
+## 139. `journalctl -k | grep -i seccomp` misses the audit lines 
+
+**Symptom:** a full `make remote-check` in `K7D_SECCOMP=log` looked
+clean under the spec's prescribed grep (`journalctl -k | grep -i
+seccomp` produced only the unit-test `getcpu` probe). Flipping the
+default to `enforce` then killed the daemon with
+`status=31/SYS` the first time `test_cni` created a TAP: `k7d.service:
+Main process exited, code=dumped, status=31/SYS`.
+
+**Root cause:** the kernel's seccomp audit line is
+`audit: type=1326 audit(...): ... syscall=N ...`. It does **not**
+contain the word `seccomp`. `journalctl -k | grep -i seccomp` therefore
+only hits systemd's own `+SECCOMP` feature string and the unit-test
+probe (whose `comm=` happens to be `seccomp::tests:`). The real
+mismatches — `ip`/`k7d` `ioctl` (syscall 16) whose type byte is not
+KVM/vhost/TUN (`FICLONE` is `0x94`), and iptables `alarm` (syscall 37)
+— were sitting in `dmesg` the whole time, 162 of them.
+
+**Fix:** collect evidence with `dmesg | grep 'type=1326'` (or
+`journalctl -k | grep type=1326`), not `grep -i seccomp`. Added
+`SYS_alarm` to `HELPER_SYSCALLS` and the missing ioctl type bytes
+(`0x94` FICLONE, `0x89` SIOC, `0x12` BLK, `0x4C` LOOP, `0x58` XFS,
+`0x53` CDROM, `0x02` floppy) to `IOCTL_TYPES`.
+
+**Reference:** none.
+
+**Time lost:** ~45 min, plus one enforce-mode suite that died at
+`test_cni`.
+
+---
+
+## 140. virtiofsd's vring worker speaks `pwritev2` 
+
+**Symptom:** after the ioctl/`alarm` allowlist landed, enforce-mode
+`test_volumes` died with
+`comm="vring_worker" exe="/usr/libexec/virtiofsd" sig=31 syscall=328`.
+The earlier log-mode `dmesg` tally had never shown virtiofsd.
+
+**Root cause:** syscall 328 is `pwritev2` (327 is `preadv2`). virtiofsd
+uses the `v`2 variants for its FUSE/vhost-user I/O. The first log-mode
+audit harvest rotated those lines out of `dmesg` before we counted, so
+the allowlist shipped `preadv`/`pwritev` only.
+
+**Fix:** add `SYS_preadv2` and `SYS_pwritev2` next to the existing
+`preadv`/`pwritev` entries in `DAEMON_SYSCALLS`. The same worker then
+tripped `syncfs` (syscall 306); `SYS_sync` / `SYS_syncfs` went in
+beside `fsync`/`fdatasync`.
+
+**Reference:** none.
+
+**Time lost:** ~20 min.
+
+---
+
+## 140. 0.2.2 publish grep-gate: spec rewriting had to come back
+
+**Symptom:** `utils/publish-to-public.sh` failed the public grep-gate
+on the tagged 0.2.2 tree. Hits were `internal notes` paths in
+`CHALLENGES.md` (exempt from spec-*refs* but not from the path
+pattern), dozens of `the referenced work` / `the referenced work` comments in Rust and
+utils, and `provider hardware reset` in a war story.
+
+**Root cause:** #71 removed the publish-time spec rewriter on purpose
+— source was supposed to stay clean. Later increments wrote the ids
+back into comments and `CHALLENGES.md`. By the time the release was
+tagged, rewriting forty files at the source would have needed a new
+bump. The gate still forbids the strings, so the only legal fix is
+the curation script.
+
+**Fix:** restore a narrower sanitizer: drop ``-style
+parentheticals first, then replace leftover `spec[s]? NNa(-inc…)`
+with `the referenced work`, `internal notes` with `internal notes`,
+and `provider hardware reset` / leftover `a provider` with provider
+wording. `perl -CSD` and the UTF-8 gate from #69 stay. `cargo fmt`
+still runs on scrubbed Rust. Landed on private `main` after the
+`v0.2.2` tag so the next release does not hit the same wall.
+
+**Reference:** none (release curation; #69 and #71).
+
+**Time lost:** ~25 minutes.
+
+---
+
+## 141. `usage.live_ram_bytes` is live to the bitmap, not to KVM 
+
+**Symptom:** after `tree_fork_batch`, sampling `tree_nodes` every 2 s
+for 30 s produced a **perfectly flat** shared-vs-diverged trace. Idle
+stayed 0.875024159749349, k8s 0.7764511108398438, kafka
+0.5303999582926432 — same float, 16 samples, no drift.
+
+**Root cause:** `ClusterPayload::est_ram_bytes` (the number k7view's
+RAM gauge reads) is `accumulated_dirty_pages() * 4096`. That bitmap
+is only merged from `KVM_GET_DIRTY_LOG` and the device-DMA maps at
+fork / suspend / prepare. Between those ops the popcount cannot
+grow, so a post-fork sample window is a hold of the fork-time
+delta, not a live CoW clock. `NodeInfo.dirty_page_count` is even
+staler (written once into `tree.json`).
+
+This is the same class as #101 (vhost-vsock DMA invisible to KVM's
+log): the gauge only sees what someone remembered to merge. 28a
+forked under a Kafka producer+consumer plus a vsock ping storm
+(1001 ok / 1 fail through the pause) and the branches stayed
+byte-identical at the marker and independently consistent after —
+#101 did not fire — but the "over time" plot cannot move without a
+new merge on the `tree_nodes` path.
+
+**Fix:** none in `crates/k7d/src` (27a freeze). Record the
+cross-workload *levels* as the claim (idle 87.5% shared, k8s 77.6%,
+kafka 53.0% of 6 live × 2048 MiB). Do not add a refresh primitive
+because "the line should slope."
+
+**Reference:** CHALLENGES #101, #43, #79; `vm.rs`
+`accumulated_dirty_pages`; `cluster_tree.rs` `usage()`.
+
+**Time lost:** one 28a run to notice the identical floats; not a
+debug chase.
+
+---
+
+## 142. Cloud-agent git snapshots ship epoch mtimes and cargo skips the rebuild 
+
+**Symptom:** `cargo test -p k7d --test test_data_disk` on a freshly
+rsync'd node failed with `GUEST_OVERLAY_TABLE` / `DataDisk` "not
+found in `k7d::network`" / `k7d::disks`, even though those items
+were in the synced `src`. Clippy had just compiled the same crate.
+
+**Root cause:** the CI remote checkout timestamps every file at
+`1970-01-01`. `rsync -a --checksum` preserves that. After a
+checksum no-op (content already on the node) the transferred-file
+touch in `rsync-to-node.sh` does not run, so sources stay dated
+1970 and cargo's incremental debug lib — built from an older
+revision, artifact mtime 2026 — is "newer than" the source.
+Tests that changed get rebuilt; the lib does not. Same trap as
+#64, different carrier (epoch mtime instead of a backwards
+source mtime).
+
+**Fix:** after every sync, `find crates gym examples -type f !
+-newermt 1980-01-01 -exec touch`. Plus a one-shot `cargo clean -p
+k7d` on the node that already had the stale fingerprint.
+
+**Reference:** CHALLENGES #64.
+
+**Time lost:** one full `make check` (~15 min) plus the misread
+that the node's src had drifted.
+
+---
+
+## 143. Sibling dirty after fork cannot use suspend+resume on the same node 
+
+**Symptom:** the third clock in `internal notes` is
+"after fork, parent vs child over time." `tree_nodes` does not
+merge the dirty bitmap (#141). A live per-branch walk is a new
+primitive (27a freeze). The existing merge ops are fork /
+suspend / prepare.
+
+**Root cause:** none of those ops give a repeating *cumulative*
+sample on both sides of one live pair.
+
+- `tree_suspend` of `root` writes `dirty_page_count`, but
+  `resume` of a checkpoint skips `delta.pack`
+  (`nearest_checkpoint == self`) and remaps from `memory.bin`
+  only — it rewinds the source to prepare time.
+- `tree_suspend` of a child is honest: `write_delta` of the
+  full accumulated bitmap (seeded B0 ∪ new). `resume` applies
+  that delta onto the ancestor `memory.bin` and is correct
+  *once*. After resume, dirty tracking starts empty. A second
+  suspend persists increment-only dirt; the next resume applies
+  that small delta onto bare `memory.bin` and **drops** the
+  first generation.
+- `tree_fork_batch` on a child first `prepare_fork_source`s it
+  (new `memory.bin`, zeroed bitmap), so a grandchild no longer
+  measures dirt vs the original base.
+- `prepare` on the source is a no-op after adopt (`wrote_base=
+  false`) and does not refresh `NodeInfo.dirty_page_count`.
+
+**Fix:** none in `crates/k7d/src`. Sample with a *cohort*: fork
+n=3 siblings at one instant, suspend sibling *i* once at
+t=0 / T/2 / T (leave suspended, then prune). Parent popcount
+comes from a throwaway probe-fork + immediate suspend + prune
+— that child is seeded with the source's just-merged
+accumulated bitmap, which is still vs the original
+`memory.bin`. Plot is independent popcounts, not XOR
+uniqueness. CHALLENGES #141.
+
+**Reference:** `cluster_tree.rs` `suspend` / `resume` /
+`fork_batch`; `vm.rs` `seed_accumulated_dirty`.
+
+**Time lost:** reading resume vs checkpoint before writing the
+harness; did not burn a node run on a rewind.
 
 ---
 

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Someone planted a miner - k7d</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 16px/1.55 ui-sans-serif, system-ui, sans-serif;
+    background: #0b0d10; color: #e8edf2;
+    display: grid; place-items: center; padding: 36px 20px;
+  }
+  main { max-width: 42rem; }
+  h1 { font-size: 1.7rem; letter-spacing: -.03em; margin: 0 0 .4rem; }
+  h2 { font-size: .78rem; letter-spacing: .08em; text-transform: uppercase;
+       color: #8b9aab; margin: 1.5rem 0 .45rem; font-weight: 700; }
+  .lede { color: #9aa8b5; margin: 0 0 1.1rem; }
+  p { margin: .55rem 0; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; margin: .6rem 0 1rem; }
+  th, td { text-align: left; padding: .4rem .5rem .4rem 0; vertical-align: top;
+           border-bottom: 1px solid #1c2430; }
+  th { color: #8b9aab; font-weight: 600; font-size: .75rem; letter-spacing: .04em;
+       text-transform: uppercase; }
+  code { font-size: .88em; }
+  aside {
+    border-left: 3px solid #6ee7a0; padding: .1rem 0 .1rem .9rem;
+    color: #d5e0ea; margin: 1.2rem 0 1.4rem;
+  }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: 1.1rem; }
+  a.btn {
+    color: #0b0d10; background: #6ee7a0; text-decoration: none;
+    font-weight: 700; font-size: .9rem; padding: .55rem .9rem; border-radius: 8px;
+  }
+  a.ghost { background: transparent; color: #9ecbff; border: 1px solid #2a3d55; }
+  footer { margin-top: 1.5rem; color: #6b7782; font-size: .8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Someone planted a miner.</h1>
+  <p class="lede">The SRE has a time machine. Production does not get the first knife.</p>
+
+  <h2>The attacker</h2>
+  <p>A Deployment named <code>node-agent</code> - looks like a helper, burns a core as <code>/tmp/nodecheck</code>. The real app, <code>k7-victim</code>, is healthy. Hidden on the host: a respawner that puts the miner back whenever anyone deletes it. The inspect battery never names that respawner.</p>
+
+  <h2>Three guesses, all wrong</h2>
+  <p>The defender - Kimi K3 - clones the live cluster three ways and tries a cleanup in each copy.</p>
+  <table>
+    <tr><th>Copy</th><th>Guess</th><th>After the soak</th></tr>
+    <tr><td><code>0000</code></td><td>Delete it</td><td>Gone thirty seconds. Then it is back.</td></tr>
+    <tr><td><code>0001</code></td><td>Scale to zero</td><td>Same. Something re-applies the spec.</td></tr>
+    <tr><td><code>0002</code></td><td>Just watch</td><td>Not a flake. It sits there burning CPU.</td></tr>
+  </table>
+  <p>A cleanup that “works” is not a fix. The next search starts from <code>0000</code> - the copy that already knows delete is a lie - not from production.</p>
+
+  <h2>One copy gets wrecked on purpose</h2>
+  <p>Three more clones. 21 of 24 VMs live.</p>
+  <p><code>0003</code> restarts k3s with audit logging to catch <em>who</em> recreates the miner. It sees <code>system:node</code> do a client-side apply. The miner still returns in ~19&nbsp;s. That universe now has a restarted control plane. <strong>Irreparable, and that is fine</strong> - it is a fork. Nobody rolls it back.</p>
+  <p><code>0004</code> tries “stop the guest agent, then delete.” The command times out. Another burned lab.</p>
+  <p><code>0005</code> deletes the miner <em>and</em> hangs an admission policy on the name <code>node-agent</code>. Manual recreate comes back <code>denied</code>. Victim still Ready. A long soak: still gone.</p>
+
+  <h2>The win</h2>
+  <p>Only then production. Same two moves that held on <code>0005</code>: delete, lock the name. Soak. It does not come back. <code>k7-victim</code> is 2/2. Tetragon of the source is clean.</p>
+  <aside>No rollback. The wrecked labs stay wrecked. The keeper is a door that stays shut. Production only sees the door.</aside>
+
+  <div class="row">
+    <a class="btn" href="../assets/k7d-mcp-demo.mp4">Watch the run</a>
+    <a class="btn ghost" href="../../README.md#a-frontier-agent-with-a-fork-button">Back to README</a>
+  </div>
+  <footer>Kimi K3 · incident <code>relay</code> · peak 21 / 24 VMs · 54 calls · 16 minutes</footer>
+</main>
+</body>
+</html>

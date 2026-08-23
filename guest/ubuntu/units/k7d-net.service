@@ -1,0 +1,19 @@
+[Unit]
+# Static addressing from the kernel command line. The daemon already
+# knows every TAP's guest IP, so there is nothing for DHCP to discover —
+# and systemd-networkd is masked in this image precisely so the two
+# cannot race for eth0.
+Description=k7d static network configuration from the kernel command line
+After=systemd-modules-load.service
+Before=network-pre.target network.target k7-agent.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/k7d-netconfig
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

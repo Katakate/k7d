@@ -1,0 +1,166 @@
+#!/bin/sh
+# Choose this VM's k3s role from the kernel command line .
+#
+#   k7d.k3s=server|agent,<server-ip>,<token>
+#   k7d.cni=flannel|none          (optional; default flannel)
+#
+# Same shape as k7d-netconfig / k7d.ip=: one image, role decided at boot,
+# nothing to discover. The k3s units are shipped disabled; this oneshot
+# writes /etc/rancher/k3s/config.yaml and starts the matching unit.
+#
+# k7d.cni=none is the referenced work: the server config gets
+# `flannel-backend: none`, `disable-kube-proxy: true`, and
+# `disable-network-policy: true` so Cilium owns kube-proxy replacement
+# *and* NetworkPolicy. k3s's embedded kube-router otherwise REJECTs
+# policied pods with icmp-port-unreachable (CHALLENGES.md #117).
+# Agents inherit; they do not need the flags. Any other value is a
+# loud failure.
+#
+# Agents wait for the server's /readyz (not just a TCP connect) so the
+# first join does not bounce into k3s' tens-of-seconds backoff
+# . The token is a pre-shared cmdline value — there
+# is nothing to read back out of the server first.
+#
+# Loud on every failure: a malformed spec or a k3s that will not start
+# fails the unit so the zero-failed-units assertion says so.
+set -eu
+
+log() { echo "k7d-k3sconfig: $*"; }
+die() { log "$*" >&2; exit 1; }
+
+SPEC=""
+IP_SPEC=""
+CNI=""
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+        k7d.k3s=*) SPEC="${tok#k7d.k3s=}" ;;
+        k7d.ip=*) IP_SPEC="${tok#k7d.ip=}" ;;
+        k7d.cni=*) CNI="${tok#k7d.cni=}" ;;
+    esac
+done
+
+# Absent means today's inc2 path. Anything else must be one of the two
+# documented values — a typo must not silently keep flannel.
+if [ -z "$CNI" ]; then
+    CNI="flannel"
+fi
+case "$CNI" in
+    flannel|none) ;;
+    *) die "k7d.cni=$CNI: must be flannel or none" ;;
+esac
+
+if [ -z "$SPEC" ]; then
+    # inc1 VMs, and any node that is just a distro guest, have no k3s role.
+    log "no k7d.k3s= on the command line; k3s stays disabled"
+    exit 0
+fi
+
+ROLE=$(echo "$SPEC" | cut -d, -f1)
+SERVER_IP=$(echo "$SPEC" | cut -d, -f2)
+TOKEN=$(echo "$SPEC" | cut -d, -f3)
+
+[ -n "$ROLE" ] && [ -n "$SERVER_IP" ] && [ -n "$TOKEN" ] \
+    || die "k7d.k3s=$SPEC: expected server|agent,<server-ip>,<token>"
+case "$ROLE" in
+    server|agent) ;;
+    *) die "k7d.k3s=$SPEC: role must be server or agent" ;;
+esac
+
+OWN_IP=$(echo "$IP_SPEC" | cut -d, -f1 | cut -d/ -f1)
+[ -n "$OWN_IP" ] || die "k7d.k3s= requires k7d.ip= so the node has an advertise address"
+
+# /dev/kmsg is what k3s' containerd logs through; without it the daemon
+# starts and then sits in CrashLoop with a message that looks like a
+# cgroup problem .
+[ -e /dev/kmsg ] || die "/dev/kmsg is missing — k3s containerd will not start"
+
+NODE_NAME="k7d-$(echo "$OWN_IP" | tr . -)"
+hostname "$NODE_NAME"
+printf '%s\n' "$NODE_NAME" > /etc/hostname
+printf '127.0.0.1 localhost\n127.0.1.1 %s\n' "$NODE_NAME" > /etc/hosts
+
+mkdir -p /etc/rancher/k3s /var/lib/rancher/k3s/agent/images
+
+wait_http() {
+    # Wait until URL returns one of the accepted codes. 401 on /readyz
+    # means the apiserver is up and anonymous auth is off — that is
+    # still "ready enough to join"; 200 is the anonymous-auth case.
+    url=$1
+    shift
+    i=0
+    code=""
+    while [ "$i" -lt 90 ]; do
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "$url" || true)
+        for ok in "$@"; do
+            if [ "$code" = "$ok" ]; then
+                log "$url HTTP $code"
+                return 0
+            fi
+        done
+        i=$((i + 1))
+        sleep 2
+    done
+    die "$url never reached an accepted status (last HTTP '${code:-none}')"
+}
+
+case "$ROLE" in
+    server)
+        # The pod and service CIDRs are moved off k3s' defaults on
+        # purpose. The host these VMs run on is itself a k3s node whose
+        # cluster uses 10.42.0.0/16 and 10.43.0.0/16, and bridged guest
+        # frames traverse the host's nat table
+        # (`bridge-nf-call-iptables=1`). Reusing those ranges means the
+        # host's own `cilium masquerade non-cluster` rule matches guest
+        # pod-to-pod traffic and SNATs it, so a pod can reach pods on its
+        # own node and nothing beyond it (CHALLENGES #121). k7d's guest
+        # subnet (10.200.0.0/24) dodges the same collision.
+        cat > /etc/rancher/k3s/config.yaml <<EOF
+token: ${TOKEN}
+advertise-address: ${OWN_IP}
+node-ip: ${OWN_IP}
+node-name: ${NODE_NAME}
+tls-san:
+  - ${OWN_IP}
+write-kubeconfig-mode: "644"
+cluster-cidr: 10.244.0.0/16
+service-cidr: 10.245.0.0/16
+cluster-dns: 10.245.0.10
+EOF
+        if [ "$CNI" = "none" ]; then
+            # Written before k3s starts so the first apiserver process is
+            # already kube-proxy-free and CNI-less .
+            cat >> /etc/rancher/k3s/config.yaml <<'CNIEOF'
+flannel-backend: none
+disable-kube-proxy: true
+disable-network-policy: true
+CNIEOF
+        fi
+        log "server CNI=$CNI"
+        timeout 180 systemctl start k3s.service \
+            || die "k3s.service did not start within 180s"
+        i=0
+        while [ "$i" -lt 90 ]; do
+            if k3s kubectl get --raw=/readyz 2>/dev/null | grep -q ok; then
+                log "server /readyz ok"
+                exit 0
+            fi
+            i=$((i + 1))
+            sleep 2
+        done
+        die "k3s.service is running but /readyz never returned ok"
+        ;;
+    agent)
+        cat > /etc/rancher/k3s/config.yaml <<EOF
+server: https://${SERVER_IP}:6443
+token: ${TOKEN}
+node-ip: ${OWN_IP}
+node-name: ${NODE_NAME}
+EOF
+        # Trap 2: /readyz, not just the port. 200 or 401 both mean the
+        # apiserver is serving; a refused/empty connect does not.
+        wait_http "https://${SERVER_IP}:6443/readyz" 200 401
+        timeout 180 systemctl start k3s-agent.service \
+            || die "k3s-agent.service did not start within 180s"
+        log "k3s-agent started, joining ${SERVER_IP}"
+        ;;
+esac

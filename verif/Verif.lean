@@ -19,6 +19,7 @@ import Verif.Equiv.Acct
 import Verif.Equiv.Anc
 import Verif.Equiv.Lru
 import Verif.Equiv.Evict
+import Verif.Equiv.Chain
 import Verif.Equiv.Latency
 import Verif.Equiv.K7dl
 import Verif.Equiv.Transfer

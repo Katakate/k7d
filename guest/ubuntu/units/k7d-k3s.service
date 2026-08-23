@@ -1,0 +1,18 @@
+[Unit]
+# Role selection for the baked-in k3s. The k3s/k3s-agent units are
+# shipped disabled; this oneshot reads k7d.k3s= and starts the right one.
+# After the agent so connect_agent is not racing k3s for the vCPUs.
+Description=k7d k3s role from the kernel command line
+After=k7d-net.service k7-agent.service
+Wants=k7d-net.service k7-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/k7d-k3sconfig
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=240
+
+[Install]
+WantedBy=multi-user.target

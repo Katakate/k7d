@@ -139,6 +139,71 @@ theorem ancestor_ids_fuel_never_truncates (t : TreeModel) (hwf : WellFormed t)
   unfold satAdd U64_MAX at *
   omega
 
+-- ## Restore-chain depth (mirrors `restore_chain_depth`, the referenced work)
+
+/-- The fuel-bounded walk inside `tree_model::restore_chain_depth`: one
+parent hop per fuel unit, counting non-checkpoint nodes until the first
+`hasBase` ancestor (`satAdd USIZE_MAX` mirrors the Rust
+`usize::saturating_add` on the depth counter). `none` for a missing
+node, a root path with no checkpoint, or fuel exhaustion. -/
+def restoreChainWalk (t : TreeModel) : Nat → Nat → Option Nat → Option Nat
+  | 0, _, _ => none
+  | _ + 1, _, none => none
+  | fuel + 1, depth, some c =>
+    match lookup t c with
+    | none => none
+    | some n =>
+      if n.hasBase then some depth
+      else restoreChainWalk t fuel (satAdd USIZE_MAX depth 1) n.parent
+
+/-- Mirror of `tree_model::restore_chain_depth`: how many `delta.pack`s
+a resume must apply — non-checkpoint hops from `id` (inclusive) to the
+nearest `hasBase` ancestor. Fuel-bounded by `max_id().saturating_add(2)`
+like `ancestorIds`; saturation-exact, like every mirror. -/
+def restoreChainDepth (t : TreeModel) (id : Nat) : Option Nat :=
+  restoreChainWalk t (satAdd U64_MAX (maxId t) 2) 0 (some id)
+
+/-- The Rust fuel `max_id().saturating_add(2)` is at least 2 — enough
+for the two theorems below to unfold the walk without side conditions. -/
+theorem restore_fuel_ge_two (t : TreeModel) :
+    2 ≤ satAdd U64_MAX (maxId t) 2 := by
+  unfold satAdd U64_MAX; omega
+
+/-- `usize::MAX` is positive (needed to evaluate the first saturating
+depth increment exactly). -/
+theorem one_le_usize_max : 1 ≤ USIZE_MAX := by
+  unfold USIZE_MAX
+  rcases System.Platform.numBits_eq with h | h <;> rw [h] <;> norm_num
+
+/-- the referenced work: a checkpoint node's restore chain is 0 — resume reads
+its own `memory.bin` and applies no deltas. -/
+theorem restore_chain_depth_checkpoint (t : TreeModel) (id : Nat)
+    (n : NodeInfo) (hl : lookup t id = some n) (hb : n.hasBase = true) :
+    restoreChainDepth t id = some 0 := by
+  unfold restoreChainDepth
+  obtain ⟨k, hk⟩ : ∃ k, satAdd U64_MAX (maxId t) 2 = k + 1 :=
+    ⟨satAdd U64_MAX (maxId t) 2 - 1, by have := restore_fuel_ge_two t; omega⟩
+  rw [hk]
+  simp [restoreChainWalk, hl, hb]
+
+/-- the referenced work, the load-bearing distinction: a non-checkpoint node
+whose *parent* is a checkpoint has restore chain exactly 1 — however
+deep it sits in the tree graph. `root → child → grandchild` is graph
+depth 2, yet the grandchild's restore chain is 1 once the child was
+prepared (`fork_batch` always prepares its source). -/
+theorem restore_chain_depth_hop (t : TreeModel) (id p : Nat)
+    (n m : NodeInfo) (hl : lookup t id = some n) (hb : n.hasBase = false)
+    (hp : n.parent = some p) (hlp : lookup t p = some m)
+    (hbp : m.hasBase = true) :
+    restoreChainDepth t id = some 1 := by
+  unfold restoreChainDepth
+  obtain ⟨k, hk⟩ : ∃ k, satAdd U64_MAX (maxId t) 2 = k + 2 :=
+    ⟨satAdd U64_MAX (maxId t) 2 - 2, by have := restore_fuel_ge_two t; omega⟩
+  have hs : satAdd USIZE_MAX 0 1 = 1 := by
+    unfold satAdd; have := one_le_usize_max; omega
+  rw [hk]
+  simp [restoreChainWalk, hl, hb, hp, hs, hlp, hbp]
+
 -- ## Implicit protection (mirrors `implicitly_protected`)
 
 /-- The dedup-append inner loop of `tree_model::implicitly_protected`. -/

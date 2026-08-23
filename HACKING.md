@@ -2,7 +2,7 @@
 
 ## Requirements
 
-k7d is Linux x86_64 + KVM only — the rust-vmm crates (kvm-ioctls,
+k7d is Linux x86_64 + KVM only - the rust-vmm crates (kvm-ioctls,
 kvm-bindings, vm-memory) do not compile on macOS or Windows. You need:
 
 - `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`
@@ -56,7 +56,7 @@ make remote-verif             # Aeneas/Lean tree proofs (after remote-install-ve
 ### Surviving a dropped connection
 
 The full suite takes 25-40 minutes, so the long `remote-*` targets do not
-run over the SSH connection — `utils/remote-run.sh` starts them detached
+run over the SSH connection - `utils/remote-run.sh` starts them detached
 on the node (`nohup setsid`, output to `/run/k7d-remote/<target>/log`)
 and the local side is only a viewer that streams that log and exits with
 the run's recorded exit code.
@@ -75,7 +75,7 @@ than an artifact built from different content (CHALLENGES.md #64).
 ### One workspace, one run at a time
 
 A run of a *different* name on the same node waits instead of rsyncing
-into a live build — the node has one `/root/k7d` and one `/dev/kvm`, and
+into a live build - the node has one `/root/k7d` and one `/dev/kvm`, and
 two runs sharing them fail in a different place each time, which reads as
 flakiness rather than contention. The waiter prints who holds the lock.
 
@@ -88,18 +88,18 @@ CHALLENGES.md #75.
 
 ## Verification suite
 
-- `make kani` / `make remote-kani` — Kani bounded model checking of
+- `make kani` / `make remote-kani` - Kani bounded model checking of
   proof harnesses co-located with the `unsafe` code (`vm.rs`,
   `fork.rs`, `snapshot.rs`, devices). Run after touching unsafe blocks
   or address arithmetic.
-- `make verif-gen && make verif-build` (or `make remote-verif`) —
+- `make verif-gen && make verif-build` (or `make remote-verif`) - 
   regenerate `verif/Verif/TreeModel.lean` from
   `crates/k7d/src/tree_model.rs` via Charon + Aeneas, then `lake build`
   the theorems. Mandatory when `tree_model.rs` changes. Toolchain
   install: `make remote-install-verif` (once per node). Any new Aeneas axiom not in
   `verif/axiom-allowlist.txt` fails the build (`utils/check-verif-axioms.sh`).
-- `make miri` — Miri on the pure (non-KVM) unit tests.
-- `make fuzz` — libFuzzer runs over the agent protocol and virtio-blk
+- `make miri` - Miri on the pure (non-KVM) unit tests.
+- `make fuzz` - libFuzzer runs over the agent protocol and virtio-blk
   request parsing.
 
 ## Running pods in k7d via containerd / k3s
@@ -110,7 +110,7 @@ Four steps register the `k7` RuntimeClass on a k3s node:
    install the guest kernel and initramfs somewhere the daemon can read
    them (`packaging/install.sh` uses `/usr/local/share/k7d/`), then
    create a `k7d.service` systemd unit with `ExecStart=/usr/local/bin/k7d`,
-   `Environment=RUST_LOG=info` and — required — the guest pair:
+   `Environment=RUST_LOG=info` and - required - the guest pair:
 
    ```ini
    Environment=K7D_KERNEL=/usr/local/share/k7d/vmlinux
@@ -136,7 +136,7 @@ Four steps register the `k7` RuntimeClass on a k3s node:
      snapshotter = "overlayfs"
    ```
 
-   Do **not** add an `[options]` section with `BinaryName` — containerd
+   Do **not** add an `[options]` section with `BinaryName` - containerd
    resolves the binary from `runtime_type` automatically, and the
    option value leaks into the cgroup path and breaks shim startup.
    `pod_annotations` forwards the `k7d.katakate.org/*` annotations
@@ -160,7 +160,7 @@ Integration tests self-install all of this
 
 ## Ground rules
 
-- Failures must be loud — no silent default fallbacks
+- Failures must be loud - no silent default fallbacks
 - Clean up resources (KVM fds, TAP devices, virtiofsd children, temp
   files) via `Drop` or scopeguard
 - No `unwrap()` in library code (tests and `main` only)

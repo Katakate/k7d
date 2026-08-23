@@ -1,10 +1,10 @@
-# cluster-tree-search — RL-shaped demo of k7d cluster fork
+# cluster-tree-search - RL-shaped demo of k7d cluster fork
 
 **What this is:** a scripted “tree search” over warm-forked multi-VM
 clusters. Not SWE-bench. Not a training run. No GPU.
 
 **What it shows:** fork N branches from a live checkpoint, score a
-trivial reward, protect the winner, prune the losers — and print the
+trivial reward, protect the winner, prune the losers - and print the
 fork wall-clock. This is the packaging surface for the unique claim:
 k7d forks a *whole Kubernetes cluster*, not a process sandbox.
 
@@ -50,21 +50,21 @@ python3 run_demo.py --mode inner-k3s --branches 4
 
 Flags:
 
-- `--keep` — leave the tree around for `tree_nodes` inspection
-- `--tree-id NAME` — stable tree id (default `cts-<pid>`)
-- `K7D_SOCKET` — override control socket (default `/run/k7d/k7d.sock`)
+- `--keep` - leave the tree around for `tree_nodes` inspection
+- `--tree-id NAME` - stable tree id (default `cts-<pid>`)
+- `K7D_SOCKET` - override control socket (default `/run/k7d/k7d.sock`)
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `k7d_client.py` | Thin JSON-lines client (`tree_fork_batch` / `tree_rollback` / `tree_protect` / …). Not a product SDK. |
+| `k7d_client.py` | Thin JSON-lines client (`tree_fork_batch` / `tree_rollback` / `tree_protect` / …). Not a product SDK. The gym (`gym/server.py`) imports this file - dependency is gym → examples/; this demo does not import gym. |
 | `run_demo.py` | The demo driver |
 | `../docs/assets/cluster-fork-demo.gif` | Captured busybox demo for the root README |
 
 ## Numbers
 
 Budgets and measured values live in [`LATENCY_BUDGETS.md`](../../LATENCY_BUDGETS.md)
-and are enforced by integration tests — this demo *prints* the wall-clock;
+and are enforced by integration tests - this demo *prints* the wall-clock;
 it does not redefine the budget. See also the benchmark post:
 [`docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md`](../../docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md).

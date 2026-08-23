@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState};
+use crate::virtio_mmio::{VirtioBackend, VirtqueueState, VIRTIO_ID_VSOCK};
 
 /// Default guest vsock CID.
 pub const DEFAULT_GUEST_CID: u64 = 3;
@@ -79,7 +79,6 @@ fn cid_seed_pid() -> u64 {
 /// Default agent vsock port.
 pub const AGENT_VSOCK_PORT: u32 = 1024;
 
-const VIRTIO_ID_VSOCK: u32 = 19;
 const VSOCK_NUM_QUEUES: usize = 3;
 const VSOCK_QUEUE_SIZE: u16 = 256;
 

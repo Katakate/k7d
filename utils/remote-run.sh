@@ -63,6 +63,12 @@ LOCK_MAX_HOLD=21600  # 6h: a hung run must not own the node forever
 LOCK_START_GRACE=180 # release if the run it was taken for never starts
 
 mkdir -p "$(dirname "$LOCAL_LOG")"
+# The reattach path never truncates/creates the local log (only start_run
+# does), but `local_log_size` reads it via `<` — under `set -e` a missing
+# file kills the viewer with a bare "No such file or directory" instead of
+# reattaching from offset 0. Fresh checkouts reattaching to an in-flight
+# run hit this (CHALLENGES #116).
+[[ -f "$LOCAL_LOG" ]] || : >"$LOCAL_LOG"
 
 node_sh() { ssh "${SSH_OPTS[@]}" "$NODE" "$@"; }
 
