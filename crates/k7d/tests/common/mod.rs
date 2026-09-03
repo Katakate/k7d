@@ -14,15 +14,95 @@
 //! best-effort style into product code.
 #![allow(dead_code)]
 
+pub mod ml_platform;
+pub mod tree_fork_budget;
 pub mod ubuntu;
 pub mod ubuntu_helm;
 pub mod ubuntu_k3s;
+pub mod warp;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// A snapshot-tree root on the node's reflink XFS, removed on Drop.
+///
+/// Incremental keyframes  `FICLONE` their ancestor's
+/// `memory.bin`, which needs source and destination on one
+/// reflink-capable filesystem. The node's root FS — where
+/// `tempfile::tempdir()` lands — is ext4 and cannot clone at all, so a
+/// test that means to exercise the incremental path has to ask for the
+/// XFS explicitly, exactly as the deploy does.
+///
+/// Fails loud rather than silently falling back to `/tmp`: a test that
+/// quietly ran the full-dump path would assert nothing about the
+/// feature it is named after.
+pub struct ReflinkTreeRoot {
+    path: PathBuf,
+}
+
+impl ReflinkTreeRoot {
+    /// Provision (or reuse) the XFS and mint an empty tree root under it.
+    ///
+    /// Deliberately goes to `DISKS_DIR/trees` rather than following
+    /// `/var/lib/k7d/trees`: on a node whose old ext4 tree root still
+    /// has trees in it, `ensure_reflink_tree_root` refuses to move them
+    /// and hands back the ext4 path. That is the right call for the
+    /// operator's data and the wrong one for a test that exists to
+    /// exercise `FICLONE`.
+    pub fn new(tag: &str) -> Self {
+        k7d::disks::ensure_loopback_xfs(
+            Path::new(k7d::disks::DISKS_IMAGE),
+            Path::new(k7d::disks::DISKS_DIR),
+            k7d::disks::DISKS_IMAGE_SIZE,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "the referenced work needs a reflink-capable tree root on this node, and \
+                 provisioning the XFS loopback failed: {e}"
+            )
+        });
+        let trees = Path::new(k7d::disks::DISKS_DIR).join(k7d::disks::TREES_SUBDIR);
+        std::fs::create_dir_all(&trees).expect("create trees dir on the XFS");
+        let path = trees.join(format!("t-{tag}-{}-{}", std::process::id(), run_id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create reflink tree root");
+        k7d::disks::assert_reflink_capable(&path)
+            .expect("the tree root we just made on the XFS must be reflink-capable");
+        Self { path }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ReflinkTreeRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Bytes in use on the filesystem holding `path`.
+///
+/// This, sampled either side of an operation, is the only honest way to
+/// price a reflink: a cloned file reports its whole logical length from
+/// `stat`, and `du` re-counts a shared extent in full on every
+/// invocation that sees it. Neither says whether the extents were
+/// actually shared. Free space does.
+#[must_use]
+pub fn fs_used_bytes(path: &Path) -> u64 {
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path has no NUL");
+    // SAFETY: `c` outlives the call and `buf` is a valid, owned statvfs.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut buf) };
+    assert!(rc == 0, "statvfs({}) failed", path.display());
+    let frsize = buf.f_frsize;
+    frsize * (buf.f_blocks - buf.f_bfree)
+}
 
 /// Idempotent, best-effort cleanup of host-side k7 runtime leaks left
 /// by a prior integration test: orphan `virtiofsd` / shim processes,

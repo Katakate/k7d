@@ -117,16 +117,17 @@ class K7dClient:
         source_id: str,
         labels: list[str],
         timeout: float | None = 180,
+        dilation: int | None = None,
     ) -> dict[str, Any]:
-        return self.call(
-            {
-                "op": "tree_fork_batch",
-                "tree_id": tree_id,
-                "source_id": source_id,
-                "labels": labels,
-            },
-            timeout=timeout,
-        )
+        req: dict[str, Any] = {
+            "op": "tree_fork_batch",
+            "tree_id": tree_id,
+            "source_id": source_id,
+            "labels": labels,
+        }
+        if dilation is not None:
+            req["dilation"] = dilation
+        return self.call(req, timeout=timeout)
 
     def tree_prepare_fork_source(
         self,
@@ -198,3 +199,29 @@ class K7dClient:
 
     def list_vms(self) -> dict[str, Any]:
         return self.call({"op": "list_vms"})
+
+    def auto_warp(self, cluster_id: str, mode: str) -> dict[str, Any]:
+        """Start, switch, or stop a cluster's auto-warp loop (34a-inc3).
+
+        ``mode`` is ``off`` | ``jump`` | ``micro``. ``off`` returns the
+        finished run's counters.
+        """
+        return self.call(
+            {"op": "auto_warp", "cluster_id": cluster_id, "mode": mode}
+        )
+
+    def auto_warp_status(self, cluster_id: str) -> dict[str, Any]:
+        return self.call({"op": "auto_warp_status", "cluster_id": cluster_id})
+
+    def auto_warp_hold(
+        self, cluster_id: str, holder: str, hold: bool
+    ) -> dict[str, Any]:
+        """Fifth safety check: gym exec over vsock must hold first."""
+        return self.call(
+            {
+                "op": "auto_warp_hold",
+                "cluster_id": cluster_id,
+                "holder": holder,
+                "hold": hold,
+            }
+        )

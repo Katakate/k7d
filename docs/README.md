@@ -10,6 +10,6 @@ This directory only keeps repo-local assets referenced by the README:
 
 | Path | Purpose |
 |------|---------|
-| `assets/` | Demo GIF / asciinema cast / agent-run video for the README |
+| `assets/` | Agent-run videos, GIF highlights, and their JSONL transcripts for the README |
 | `demo/` | Tiny explainer for the frontier-agent run (`agent.html`) |
-| `blog/` | Benchmark methodology write-up linked from the README |
+| `blog/` | Benchmark write-up and the frontier-agent post linked from the README |

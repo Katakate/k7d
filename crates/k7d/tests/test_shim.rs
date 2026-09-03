@@ -1384,6 +1384,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            dilation: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -1642,6 +1643,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            dilation: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -2568,6 +2570,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            dilation: None,
         })
         .expect("fork_vm");
     let (fork_id, fork_cid) = match forked {
@@ -2758,6 +2761,7 @@ spec:
         tree_id: tree_id.clone(),
         source_id: "root".to_string(),
         label: "probe".to_string(),
+        dilation: None,
     }) {
         Ok(k7d::control::Response::TreeForked { guest_cids, .. }) => guest_cids,
         other => {

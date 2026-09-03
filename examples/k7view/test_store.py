@@ -389,6 +389,99 @@ def test_llm_extract_json() -> None:
     assert extract_json("no json here") is None
 
 
+def test_store_live_dilation_and_guest_clock() -> None:
+    s = ViewStore()
+    s.apply_snapshot(
+        "t1",
+        [_node("root"), _node("a", parent="root")],
+        live_dilation={"root": 8, "a": 8},
+    )
+    slot = s.snapshot()["trees"]["t1"]
+    assert slot["live_dilation"] == {"root": 8, "a": 8}
+    s.ingest(
+        {
+            "type": "guest_clock",
+            "tree_id": "t1",
+            "node_id": "root",
+            "cid": 42,
+            "uptime_s": 384.0,
+        }
+    )
+    clock = s.snapshot()["trees"]["t1"]["guest_clock"]
+    assert clock["base_uptime_s"] == 384.0
+    assert clock["uptime_s"] == 384.0
+    s.ingest(
+        {
+            "type": "guest_clock",
+            "tree_id": "t1",
+            "node_id": "root",
+            "cid": 42,
+            "uptime_s": 392.0,
+        }
+    )
+    clock = s.snapshot()["trees"]["t1"]["guest_clock"]
+    assert clock["base_uptime_s"] == 384.0
+    assert clock["uptime_s"] == 392.0
+    try:
+        s.ingest({"type": "guest_clock", "tree_id": "t1"})
+        raise AssertionError("guest_clock without uptime_s must be loud")
+    except ValueError:
+        pass
+
+
+def test_rollout_manifest() -> None:
+    sys.path.insert(0, str(HERE))
+    from dilated import (  # noqa: E402
+        DILATED_MAX_LIVE_VMS,
+        DILATED_WAVES,
+        FORK_SETTLE_WALL_S,
+        ROLLOUT_GUEST_TIMEOUT_S,
+        ROLLOUT_INITIAL_DELAY_S,
+        apply_argv,
+        deploy_name,
+        dilated_budget,
+        dilation_token,
+        node_bridge,
+        rollout_manifest,
+    )
+
+    yaml = rollout_manifest("rancher/mirrored-pause:3.6")
+    assert "initialDelaySeconds: 40" in yaml
+    assert f"periodSeconds: {10}" in yaml or "periodSeconds: 10" in yaml
+    assert "replicas: 2" in yaml
+    assert "rancher/mirrored-pause:3.6" in yaml
+    assert "/hostbin/true" in yaml
+    assert "path: /lib64" in yaml
+    assert "/hostbin/sleep" not in yaml
+    assert "name: k7-rollout-w1" in rollout_manifest(
+        "rancher/mirrored-pause:3.6", "k7-rollout-w1"
+    )
+    assert deploy_name(0) == "k7-rollout-w0"
+    assert deploy_name(2) == "k7-rollout-w2"
+    assert node_bridge("k7v-dilated", "root").startswith("k7-br-")
+    assert node_bridge("k7v-dilated", "w0-rollout-2-0002") != node_bridge(
+        "k7v-dilated", "root"
+    )
+    try:
+        rollout_manifest("no-tag")
+        raise AssertionError("image without tag must be loud")
+    except ValueError:
+        pass
+    assert DILATED_WAVES == [6, 4, 4]
+    assert ROLLOUT_INITIAL_DELAY_S == 40
+    assert ROLLOUT_GUEST_TIMEOUT_S == 120
+    assert ROLLOUT_GUEST_TIMEOUT_S > ROLLOUT_INITIAL_DELAY_S
+    assert FORK_SETTLE_WALL_S == 2.0
+    argv = apply_argv("/tmp/k7-dilated-rollout.yaml")
+    assert "--validate=false" in argv
+    assert argv[-2:] == ["-f", "/tmp/k7-dilated-rollout.yaml"]
+    b = dilated_budget()
+    assert b["max_live_vms"] == DILATED_MAX_LIVE_VMS == 24
+    assert dilation_token("patched (abi 2, default factor 1)\n") == "patched"
+    assert dilation_token("stock (KVM_HAS_DEVICE_ATTR: Inappropriate ioctl for device)") == "stock"
+    assert dilation_token("") == ""
+
+
 def test_wave_sizes() -> None:
     sys.path.insert(0, str(HERE))
     from run_scenario import pressure_budget, wave_sizes  # noqa: E402
@@ -396,6 +489,7 @@ def test_wave_sizes() -> None:
     assert wave_sizes("smoke", 4, 3) == [4]
     assert wave_sizes("max", 8, 3) == [8, 4, 4]
     assert wave_sizes("max", 12, 2) == [12, 6]
+    assert wave_sizes("ubuntu-dilated", 6, 3) == [6, 4, 4]
     b = pressure_budget(3, 8, 256)
     assert b["max_live_vms"] >= 27
     assert b["max_live_vms"] <= 36
@@ -414,6 +508,8 @@ def main() -> int:
     test_store_normalizes_stub_state()
     test_ingest_mcp_bridge()
     test_llm_extract_json()
+    test_store_live_dilation_and_guest_clock()
+    test_rollout_manifest()
     test_wave_sizes()
     print("ok")
     return 0

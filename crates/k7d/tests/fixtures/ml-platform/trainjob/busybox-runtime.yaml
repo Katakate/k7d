@@ -1,0 +1,75 @@
+# Custom TrainingRuntime on digest-pinned busybox .
+# PlainML — no torch / MPI policy, so Trainer does not inject torchrun.
+# Not CUDA, not PyTorch, not the stock ClusterTrainingRuntime image.
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainingRuntime
+metadata:
+  name: busybox-cpu-gloo
+  namespace: default
+  labels:
+    trainer.kubeflow.org/framework: custom
+spec:
+  mlPolicy:
+    numNodes: 2
+  template:
+    spec:
+      replicatedJobs:
+        - name: node
+          replicas: 1
+          template:
+            metadata:
+              labels:
+                trainer.kubeflow.org/trainjob-ancestor-step: trainer
+            spec:
+              template:
+                spec:
+                  restartPolicy: Never
+                  containers:
+                    - name: node
+                      image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+                      imagePullPolicy: IfNotPresent
+                      command: ["/bin/sh", "-c"]
+                      args:
+                        - |
+                          set -eu
+                          mkdir -p /www
+                          echo "cpu-gloo $(hostname)" > /www/whoami
+                          httpd -p 8080 -h /www
+                          # Trainer maps numNodes onto one Job (replicas=1)
+                          # with Parallelism=numNodes. Pods are
+                          # <trainjob>-node-0-<idx>. Subdomain is the
+                          # TrainJob name. busybox nslookup ignores search
+                          # domains (CHALLENGES #148).
+                          peers="gpu-trainjob-run-node-0-0.gpu-trainjob-run.default.svc.cluster.local gpu-trainjob-run-node-0-1.gpu-trainjob-run.default.svc.cluster.local"
+                          wait_url() {
+                            path="$1"
+                            for h in $peers; do
+                              n=0
+                              while [ "$n" -lt 30 ]; do
+                                if nslookup "$h" >/tmp/dns.out 2>&1 && wget -q -T 2 -O- "http://$h:8080$path" >/tmp/peer.out 2>&1; then
+                                  echo "rendezvous ok $h $path $(cat /tmp/peer.out)"
+                                  break
+                                fi
+                                n=$((n + 1))
+                                sleep 2
+                              done
+                              if [ "$n" -eq 30 ]; then
+                                echo "DNS/rendezvous failed for hostname $h path $path" >&2
+                                cat /tmp/dns.out >&2 || true
+                                exit 1
+                              fi
+                            done
+                          }
+                          wait_url /whoami
+                          echo done > /www/done
+                          wait_url /done
+                          echo "cpu-gloo train complete"
+                          # Stay Running so fork has an in-flight TrainJob
+                          # (Trainer Complete needs workers to exit, which
+                          # drops GPU used before the fork).
+                          sleep 86400
+                      resources:
+                        limits:
+                          nvidia.com/gpu: "1"
+                        requests:
+                          nvidia.com/gpu: "1"

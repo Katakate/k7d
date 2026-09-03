@@ -293,7 +293,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--incident",
         default="",
-        help="relay | sleeper | hydra | cryptominer | lateral (default: relay)",
+        help="relay | dormant | sleeper | hydra | cryptominer | lateral (default: relay)",
     )
     p.add_argument("--smoke", action="store_true", help="skip inject; fork/exec/diff/prune only")
     p.add_argument("--log-dir", default=str(HERE / "logs"))

@@ -1,0 +1,22 @@
+# k7d : the agent may create AF_VSOCK. `allow all` does
+# not include dbus/unix/mount (CHALLENGES #161). `px` conflicts with
+# allow-all's implicit ix. Workload probes change_profile via aa-exec.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile k7-agent /usr/local/bin/k7-agent flags=(attach_disconnected,mediate_deleted) {
+  allow all,
+  capability,
+  network,
+  mount,
+  umount,
+  remount,
+  pivot_root,
+  dbus,
+  unix,
+  signal,
+  ptrace,
+  userns,
+  network vsock,
+  change_profile -> k7-deny-vsock,
+}

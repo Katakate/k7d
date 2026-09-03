@@ -11,11 +11,13 @@
 //! bridge only disappears when the *last* VM on it stops (the shim-era
 //! shared-bridge teardown race).
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k7d::api::AgentClient;
 use k7d::control::{Client, NetConfig, Request, Response, VmConfig};
@@ -342,6 +344,144 @@ fn test_daemon_bridge_refcount_across_vms() {
     drop(guard);
 }
 
+/// The `warp_clock` op : every VM on one cluster bridge
+/// gets the same forward jump, under pause, in one call.
+///
+/// The mechanism's correctness on a real workload is
+/// `test_warp_clock.rs`'s job (a live Ubuntu k3s cluster, a
+/// CrashLoopBackOff pod firing early). This is the control-plane half:
+/// the op finds the cluster's VMs by `cluster_id`, both guests' clocks
+/// actually move, the daemon reports its own latency, and the two ways
+/// to ask for nothing — a zero delta, an unknown cluster — are loud
+/// errors rather than quiet successes.
+#[test]
+fn test_daemon_warp_clock_moves_every_vm_on_a_cluster() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+    let guard = spawn_daemon("warp");
+    let cluster_id = "warpc";
+
+    let on_cluster = || {
+        let mut c = default_config();
+        c.network = Some(NetConfig {
+            cluster_id: cluster_id.to_string(),
+            vm_index: None,
+            pod_netns: None,
+        });
+        c
+    };
+    let (vm_a, cid_a, _) = create_vm(&guard, on_cluster());
+    let (vm_b, cid_b, _) = create_vm(&guard, on_cluster());
+    // A VM on no cluster must not be dragged along.
+    let (vm_lone, cid_lone, _) = create_vm(&guard, default_config());
+
+    // Wait for all three agents before reading any clock: a guest still
+    // booting has not derived its wall clock from kvmclock yet.
+    for cid in [cid_a, cid_b, cid_lone] {
+        guest_exec(cid, &["echo", "ready"]);
+    }
+    let guest_epoch = |cid: u64| -> i64 {
+        guest_exec(cid, &["sh", "-c", "date +%s"])
+            .parse()
+            .expect("guest `date +%s` prints a number")
+    };
+    let host_epoch = || -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("host clock is past the epoch")
+                .as_secs(),
+        )
+        .expect("host epoch fits in i64")
+    };
+    let ahead = |cid: u64| guest_epoch(cid) - host_epoch();
+    let before = [ahead(cid_a), ahead(cid_b), ahead(cid_lone)];
+
+    // Forward-only, never a no-op: both ways of asking for nothing fail.
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::WarpClock {
+                cluster_id: cluster_id.to_string(),
+                delta_ms: 0,
+            }
+        ),
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::WarpClock {
+                cluster_id: "no-such-cluster".to_string(),
+                delta_ms: 120_000,
+            }
+        ),
+        Response::Error { .. }
+    ));
+
+    let delta_ms = 120_000;
+    match call(
+        &guard,
+        &Request::WarpClock {
+            cluster_id: cluster_id.to_string(),
+            delta_ms,
+        },
+    ) {
+        Response::Warped {
+            cluster_id: cid,
+            vm_ids,
+            delta_ms: echoed,
+            latency_ns,
+        } => {
+            assert_eq!(cid, cluster_id);
+            assert_eq!(echoed, delta_ms);
+            assert_eq!(
+                vm_ids,
+                vec![vm_a.clone(), vm_b.clone()],
+                "the op must warp exactly the cluster's VMs, in vm_index order"
+            );
+            assert!(latency_ns > 0, "the daemon must report its own latency");
+            eprintln!(
+                "MEASUREMENT 34a-inc2 daemon warp_clock 2 VMs: {:.1}ms",
+                latency_ns as f64 / 1e6
+            );
+        }
+        other => panic!("unexpected warp_clock response: {other:?}"),
+    }
+
+    // 1 s of `date` granularity either side of a 120 s jump.
+    let jumped = |what: &str, cid: u64, was: i64| -> i64 {
+        let now = ahead(cid);
+        eprintln!("{what}: guest was {was}s off the host, now {now}s");
+        now - was
+    };
+    for (what, cid, was) in [("VM A", cid_a, before[0]), ("VM B", cid_b, before[1])] {
+        let moved = jumped(what, cid, was);
+        assert!(
+            (moved - 120).abs() <= 3,
+            "{what}'s clock moved {moved}s, wanted 120s"
+        );
+    }
+    let lone_moved = jumped("the off-cluster VM", cid_lone, before[2]);
+    assert!(
+        lone_moved.abs() <= 3,
+        "a VM on no cluster must not be warped, but its clock moved {lone_moved}s"
+    );
+
+    // Warped VMs are running VMs: the resume is part of the op.
+    for cid in [cid_a, cid_b] {
+        assert_eq!(guest_exec(cid, &["echo", "alive"]), "alive");
+    }
+
+    for vm_id in [vm_a, vm_b, vm_lone] {
+        assert!(matches!(
+            call(&guard, &Request::StopVm { vm_id }),
+            Response::Ok
+        ));
+    }
+    drop(guard);
+}
+
 /// Exec a command in a guest via its agent, asserting exit code 0, and
 /// return trimmed stdout.
 fn guest_exec(cid: u64, argv: &[&str]) -> String {
@@ -477,12 +617,14 @@ fn test_daemon_fork_vm() {
         &Request::ForkVm {
             vm_id: src_id.clone(),
             sandbox_id: None,
+            dilation: None,
         },
     ) {
         Response::VmForked {
             vm_id,
             guest_cid,
             source_guest_cid,
+            ..
         } => (vm_id, guest_cid, source_guest_cid),
         other => panic!("unexpected fork_vm response: {other:?}"),
     };
@@ -551,12 +693,13 @@ fn test_daemon_tree_lifecycle() {
     guest_exec(root_cid, &["sh", "-c", "echo prefork > /tmp/state"]);
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cid) = match call(
+    let (fork_node, fork_cid, latency_ns) = match call(
         &guard,
         &Request::TreeFork {
             tree_id: tree_id.clone(),
             source_id: root_id.clone(),
             label: "branch-a".to_string(),
+            dilation: None,
         },
     ) {
         Response::TreeForked {
@@ -566,19 +709,15 @@ fn test_daemon_tree_lifecycle() {
             ..
         } => {
             assert_eq!(guest_cids.len(), 1);
-            assert!(
-                latency_ns > 0,
-                "tree_fork must report latency_ns, got {latency_ns}"
-            );
-            (node_id, guest_cids[0])
+            (node_id, guest_cids[0], latency_ns)
         }
         other => panic!("unexpected tree_fork response: {other:?}"),
     };
     let fork_elapsed = fork_start.elapsed();
-    eprintln!("daemon tree fork round-trip: {fork_elapsed:?}");
-    assert!(
-        fork_elapsed < k7d::latency::DAEMON_TREE_FORK,
-        "daemon tree fork should be <{:?}, was {fork_elapsed:?}",
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "daemon tree",
+        fork_elapsed,
+        latency_ns,
         k7d::latency::DAEMON_TREE_FORK,
     );
 
@@ -646,6 +785,7 @@ fn test_daemon_tree_lifecycle() {
             usage,
             budget,
             live_guest_cids,
+            ..
         } => {
             let fork_info = nodes
                 .iter()
@@ -733,6 +873,7 @@ fn test_daemon_tree_lifecycle() {
                 tree_id,
                 source_id: "root".to_string(),
                 label: "zombie".to_string(),
+                dilation: None,
             }
         ),
         Response::Error { .. }
@@ -773,6 +914,7 @@ fn test_daemon_tree_rl_verbs() {
                 tree_id: tree_id.clone(),
                 source_id: root_id.clone(),
                 labels: vec![],
+                dilation: None,
             }
         ),
         Response::Error { .. }
@@ -784,6 +926,7 @@ fn test_daemon_tree_rl_verbs() {
             tree_id: tree_id.clone(),
             source_id: root_id.clone(),
             labels: vec!["a".into(), "b".into(), "c".into()],
+            dilation: None,
         },
     ) {
         Response::TreeForkBatch { forks, latency_ns } => {
@@ -913,6 +1056,7 @@ fn test_daemon_cluster_tree_fork() {
             config: default_config(),
             budget: None,
             tree_id: Some("dctree".to_string()),
+            egress: None,
         },
     ) {
         Response::TreeCreated {
@@ -931,6 +1075,7 @@ fn test_daemon_cluster_tree_fork() {
             tree_id: tree_id.clone(),
             source_id: root_id.clone(),
             label: "twin".to_string(),
+            dilation: None,
         },
     ) {
         Response::TreeForked {
@@ -938,7 +1083,9 @@ fn test_daemon_cluster_tree_fork() {
             guest_cids,
             fork_memory_full_copy,
             latency_ns,
+            dilation,
         } => {
+            assert_eq!(dilation, 1, "undilated source forks at 1");
             assert!(
                 latency_ns > 0,
                 "cluster tree_fork must report latency_ns, got {latency_ns}"
@@ -997,6 +1144,7 @@ fn test_daemon_cluster_tree_fork() {
             tree_id: tree_id.clone(),
             source_id: fork_node.clone(),
             label: "grand".to_string(),
+            dilation: None,
         },
     ) {
         Response::TreeForked {
@@ -1027,8 +1175,8 @@ fn test_daemon_cluster_tree_fork() {
                 .find(|n| n.id == fork_node)
                 .expect("child listed");
             assert!(
-                child_info.has_base_snapshot,
-                "fork from child must write a base snapshot"
+                !child_info.has_base_snapshot,
+                "fork from child inherits the ancestor keyframe; no new memory.bin"
             );
         }
         other => panic!("unexpected tree_nodes after grandchild: {other:?}"),
@@ -1069,6 +1217,7 @@ fn test_daemon_tree_adopt_cluster() {
                 vm_ids: vec!["vm-nope".to_string()],
                 budget: None,
                 tree_id: None,
+                egress: None,
             }
         ),
         Response::Error { .. }
@@ -1085,6 +1234,7 @@ fn test_daemon_tree_adopt_cluster() {
                 vm_ids: vec![lone_id.clone()],
                 budget: None,
                 tree_id: None,
+                egress: None,
             }
         ),
         Response::Error { .. }
@@ -1117,6 +1267,7 @@ fn test_daemon_tree_adopt_cluster() {
             vm_ids: vec![id1, id0],
             budget: None,
             tree_id: Some("dadopt-tree".to_string()),
+            egress: None,
         },
     ) {
         Response::TreeCreated {
@@ -1143,6 +1294,7 @@ fn test_daemon_tree_adopt_cluster() {
             tree_id: tree_id.clone(),
             source_id: root_id,
             label: "twin".to_string(),
+            dilation: None,
         },
     ) {
         Response::TreeForked { guest_cids, .. } => guest_cids,
@@ -1484,6 +1636,7 @@ fn test_daemon_tree_watch() {
             tree_id: tree_id.clone(),
             source_id: root_id,
             label: "watched".to_string(),
+            dilation: None,
         },
     );
     let (node_id, latency_ns) = match forked {
@@ -1519,4 +1672,199 @@ fn test_daemon_tree_watch() {
         Response::Ok
     ));
     drop(guard);
+}
+
+/// `k7d doctor` must exit without binding a control socket.
+#[test]
+fn test_doctor_cli_does_not_start_a_daemon() {
+    let out = Command::new(env!("CARGO_BIN_EXE_k7d"))
+        .arg("doctor")
+        .output()
+        .expect("run k7d doctor");
+    assert!(
+        out.status.success(),
+        "doctor should exit 0 on this KVM host, got {:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("kvm"), "missing kvm line: {stdout}");
+    assert!(
+        stdout.contains("vhost_vsock"),
+        "missing vhost_vsock line: {stdout}"
+    );
+    assert!(stdout.contains("tun"), "missing tun line: {stdout}");
+    assert!(
+        stdout.contains("cgroup_v2"),
+        "missing cgroup_v2 line: {stdout}"
+    );
+    assert!(
+        stdout.contains("doctor: ok"),
+        "doctor summary missing: {stdout}"
+    );
+    assert!(
+        !stdout.contains("listening on"),
+        "doctor must not start serving, got: {stdout}"
+    );
+}
+
+/// The `doctor` control verb reports the same four host checks.
+#[test]
+fn test_doctor_verb_reports_host() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("doctor");
+    match call(&guard, &Request::Doctor) {
+        Response::Doctor {
+            kvm,
+            vhost_vsock,
+            tun,
+            cgroup_v2,
+            ok,
+            details,
+        } => {
+            assert!(kvm, "kvm");
+            assert!(vhost_vsock, "vhost_vsock");
+            assert!(tun, "tun");
+            assert!(cgroup_v2, "cgroup_v2");
+            assert!(ok, "ok");
+            assert_eq!(details.len(), 4, "{details:?}");
+        }
+        other => panic!("unexpected doctor response: {other:?}"),
+    }
+}
+
+/// Five-minute try path: busybox 3-node tree + 4 CoW forks, clocks printed.
+#[test]
+fn test_quickstart_busybox_four_forks() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("qstart");
+    let mut client = k7d::control::Client::connect(guard.socket.to_str().expect("utf8 socket"))
+        .expect("connect");
+    let kernel = workspace_path("guest/kernel/vmlinux");
+    let initrd = workspace_path("guest/rootfs/initramfs.cpio.gz");
+    let tree_id = format!("qs-test-{}", std::process::id());
+    let clocks = k7d::quickstart::run_busybox_demo(
+        &mut client,
+        &tree_id,
+        4,
+        false,
+        Some(kernel.to_str().expect("utf8 kernel")),
+        Some(initrd.to_str().expect("utf8 initrd")),
+    )
+    .expect("quickstart demo");
+    assert_eq!(clocks.branches.len(), 4, "{clocks:?}");
+    assert!(
+        clocks.create_ms > 0,
+        "create wall-clock must be measured: {}",
+        clocks.create_ms
+    );
+    assert!(
+        clocks.fork_ms > 0,
+        "fork wall-clock must be measured: {}",
+        clocks.fork_ms
+    );
+    assert!(
+        clocks.fork_daemon_ms > 0,
+        "daemon fork latency must be measured: {}",
+        clocks.fork_daemon_ms
+    );
+    assert!(!clocks.kept);
+    k7d::quickstart::print_clocks(&clocks);
+}
+
+/// the referenced work on stock modules: `dilation: Some(8)` is refused
+/// naming the patch, `Some(0)` is refused, `None` / `Some(1)` inherit
+/// the undilated source.
+#[test]
+fn test_daemon_tree_fork_dilation_override_on_stock_host() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("dild0");
+
+    let (tree_id, root_id, _root_cid) = match call(
+        &guard,
+        &Request::TreeCreate {
+            config: default_config(),
+            budget: None,
+            tree_id: Some("dild0".to_string()),
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            root_id,
+            guest_cids,
+        } => (tree_id, root_id, guest_cids[0]),
+        other => panic!("unexpected tree_create: {other:?}"),
+    };
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id.clone(),
+            label: "zero".to_string(),
+            dilation: Some(0),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("dilation 0"),
+                "dilation 0 must be a loud error, got {message}"
+            );
+        }
+        other => panic!("dilation: Some(0) must be an error, got {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id.clone(),
+            label: "x8".to_string(),
+            dilation: Some(8),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("utils/kvm-dilation"),
+                "stock host must name the patch, got {message}"
+            );
+        }
+        other => panic!("dilation: Some(8) on stock must be an error, got {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id.clone(),
+            label: "one".to_string(),
+            dilation: Some(1),
+        },
+    ) {
+        Response::TreeForked { dilation, .. } => {
+            assert_eq!(dilation, 1);
+        }
+        other => panic!("dilation: Some(1) must succeed, got {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id,
+            label: "inherit".to_string(),
+            dilation: None,
+        },
+    ) {
+        Response::TreeForked { dilation, .. } => {
+            assert_eq!(dilation, 1);
+        }
+        other => panic!("dilation: None must inherit, got {other:?}"),
+    }
+
+    assert!(matches!(
+        call(&guard, &Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
 }

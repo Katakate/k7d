@@ -38,6 +38,7 @@ rsync_rc=0
 rsync -azc --delete \
     --exclude target --exclude .git --exclude reference \
     --exclude tmp --exclude dist \
+    --exclude "examples/k7d-mcp/logs*" \
     --exclude "guest/kernel/linux-*" --exclude "guest/kernel/vmlinux" \
     --exclude "guest/rootfs/initramfs.cpio.gz" \
     --exclude "guest/rootfs/runc.amd64" \

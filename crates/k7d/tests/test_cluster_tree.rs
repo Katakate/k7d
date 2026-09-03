@@ -11,6 +11,8 @@ use k7d::network::ClusterNetwork;
 use k7d::tree::{NodeState, TreeBudget};
 use k7d::vm::Vm;
 
+mod common;
+
 fn workspace_path(relative: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -189,8 +191,7 @@ fn test_cluster_tree_fork_preserves_topology() {
 }
 
 /// Children are not checkpoints at fork. The next fork from a child
-/// must `prepare_fork_source` (auto, inside `fork_batch`) so the parent
-/// chain actually deepens instead of failing or flattening to root.
+/// inherits the ancestor keyframe + dirty bitmap — no new memory.bin.
 #[test]
 fn test_cluster_tree_fork_from_child() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -223,8 +224,8 @@ fn test_cluster_tree_fork_from_child() {
         "grandchild parent must be the child, not root"
     );
     assert!(
-        tree.get_node(&child).unwrap().has_base_snapshot,
-        "fork from child must checkpoint the child first"
+        !tree.get_node(&child).unwrap().has_base_snapshot,
+        "fork from child inherits the ancestor keyframe; no new memory.bin"
     );
     assert!(tree
         .get_payload(&child)
@@ -232,6 +233,13 @@ fn test_cluster_tree_fork_from_child() {
         .members
         .iter()
         .all(|vm| vm.fork_source_base_path().is_some()));
+
+    tree.suspend(&grand).expect("suspend grand");
+    tree.resume(&grand).expect("resume grand");
+    assert!(
+        !tree.get_node(&grand).unwrap().has_base_snapshot,
+        "resume of an inherited grandchild must not mint a keyframe"
+    );
 
     tree.prune(&root_id).expect("prune");
 }
@@ -326,7 +334,9 @@ fn test_cluster_tree_fork_batch_50() {
     let labels: Vec<&str> = labels_owned.iter().map(String::as_str).collect();
 
     let start = Instant::now();
-    let ids = tree.fork_batch(&root_id, &labels).expect("fork_batch 50");
+    let ids = tree
+        .fork_batch(&root_id, &labels, None)
+        .expect("fork_batch 50");
     let elapsed = start.elapsed();
     eprintln!(
         "cluster-tree fork_batch {N}×3-VM: {elapsed:?} ({:.1} ms/cluster)",
@@ -627,4 +637,104 @@ fn test_cluster_tree_fork_of_fork_with_rw_disks() {
     for img in &root_images {
         let _ = std::fs::remove_file(img);
     }
+}
+
+/// the referenced work on the cluster tree: preparing a cluster child clones each
+/// member's keyframe from that member's own ancestor keyframe.
+///
+/// This is the shape GRPO actually runs — a generation is N cluster
+/// children of one parent, and before this each child's checkpoint cost
+/// `members × guest RAM` of dump. The per-member bookkeeping is the part
+/// that can go wrong quietly: clone member 2 from member 1's keyframe
+/// and the cluster still boots, it just has two copies of one node's
+/// memory, so the assertions below check identity per member and not
+/// merely that the cluster came up.
+#[test]
+fn test_cluster_tree_prepare_incremental() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let root = build_cluster("ct-inc-root", 2);
+    let root_dir = common::ReflinkTreeRoot::new("ct-inc");
+    let (mut tree, root_id) = ClusterSnapshotTree::new_cluster(
+        root,
+        root_dir.path().to_path_buf(),
+        cluster_tree_budget(),
+    )
+    .expect("new_cluster");
+
+    // Give each member a distinct marker, so a keyframe cloned from the
+    // wrong member's ancestor is visible rather than merely wasteful.
+    let child = tree.fork(&root_id, "child").expect("fork");
+    for (idx, vm) in tree
+        .get_payload_mut(&child)
+        .expect("child payload")
+        .members
+        .iter_mut()
+        .enumerate()
+    {
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        agent
+            .exec(&[
+                "sh",
+                "-c",
+                &format!("echo 'member-{idx}' > /tmp/who; echo child > /tmp/gen"),
+            ])
+            .expect("write marker");
+    }
+
+    let before = common::fs_used_bytes(root_dir.path());
+    let started = Instant::now();
+    let outcome = tree.prepare_fork_source(&child).expect("prepare");
+    let elapsed = started.elapsed();
+    let grew = common::fs_used_bytes(root_dir.path()).saturating_sub(before);
+    assert!(outcome.wrote_base);
+    assert!(
+        outcome.incremental,
+        "every member of a cluster child on a reflink FS must clone its \
+         own ancestor keyframe"
+    );
+
+    let span: u64 = (0..tree.get_node(&child).unwrap().vm_count)
+        .map(|i| {
+            let mem = root_dir
+                .path()
+                .join("nodes")
+                .join(&child)
+                .join("members")
+                .join(i.to_string())
+                .join("memory.bin");
+            std::fs::metadata(&mem).expect("member keyframe").len()
+        })
+        .sum();
+    eprintln!(
+        "30b cluster: prepare {:?}, XFS grew {grew} B of a {span} B cluster keyframe",
+        elapsed
+    );
+    assert!(
+        grew < span / 2,
+        "a cluster's incremental keyframe must share extents: grew {grew} B \
+         for a {span} B cluster span"
+    );
+
+    // Every member of a grandchild sees its OWN member's state.
+    let grand = tree.fork(&child, "grand").expect("fork of child");
+    for (idx, vm) in tree
+        .get_payload_mut(&grand)
+        .expect("grand payload")
+        .members
+        .iter_mut()
+        .enumerate()
+    {
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        let who = agent.exec(&["cat", "/tmp/who"]).expect("read marker");
+        assert_eq!(
+            who.stdout.trim(),
+            format!("member-{idx}"),
+            "member {idx} of a grandchild booted from the wrong member's keyframe"
+        );
+        let gen = agent.exec(&["cat", "/tmp/gen"]).expect("read gen");
+        assert_eq!(gen.stdout.trim(), "child");
+    }
+
+    tree.prune(&root_id).expect("prune");
 }

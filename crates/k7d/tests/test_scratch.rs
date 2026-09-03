@@ -370,7 +370,7 @@ fn test_warm_fork_scratch_is_cow_and_isolated() {
     );
 
     let mut forks = source
-        .fork_warm_batch(&["scratch-fork-a", "scratch-fork-b"])
+        .fork_warm_batch(&["scratch-fork-a", "scratch-fork-b"], None)
         .expect("warm fork must reflink the scratch image, never byte-copy it");
     let mut fork_b = forks.pop().unwrap();
     let mut fork_a = forks.pop().unwrap();

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fail loud if the 29b-inc2 vsock jail is not enforcing. A missing
+# profile is a guest that looks healthy and still hands AF_VSOCK to
+# every uid.
+set -eu
+aa-enabled >/dev/null
+grep -q 'k7-agent (enforce)' /sys/kernel/security/apparmor/profiles \
+  || { echo "k7d-vsock-apparmor-check: k7-agent profile not enforcing" >&2; exit 1; }
+grep -q 'k7-deny-vsock (enforce)' /sys/kernel/security/apparmor/profiles \
+  || { echo "k7d-vsock-apparmor-check: k7-deny-vsock profile not enforcing" >&2; exit 1; }

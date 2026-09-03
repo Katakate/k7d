@@ -41,6 +41,10 @@ churns scale/ConfigMaps/pause pods, warm-forks once (asserts CoW +
 
 ## Run
 
+The five-minute try path is `sudo ./scripts/quickstart.sh`
+(or `k7d quickstart` against a running daemon). This demo is the
+same busybox tree with scoring / protect / prune on top.
+
 ```bash
 cd examples/cluster-tree-search
 python3 run_demo.py --mode busybox --branches 4
@@ -60,7 +64,6 @@ Flags:
 |---|---|
 | `k7d_client.py` | Thin JSON-lines client (`tree_fork_batch` / `tree_rollback` / `tree_protect` / …). Not a product SDK. The gym (`gym/server.py`) imports this file - dependency is gym → examples/; this demo does not import gym. |
 | `run_demo.py` | The demo driver |
-| `../docs/assets/cluster-fork-demo.gif` | Captured busybox demo for the root README |
 
 ## Numbers
 

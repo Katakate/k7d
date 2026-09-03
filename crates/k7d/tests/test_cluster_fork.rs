@@ -842,6 +842,7 @@ fn test_cluster_fork_activate_drains_pending_tx_without_kick() {
         &state,
         "kick-fork",
         tap,
+        None,
     );
     // Undo the crafted post on the source before it resumes (its own worker
     // must not emit the stale frame).
@@ -981,6 +982,7 @@ fn test_cluster_fork_warm_batch_8() {
             fork_ids: &member_ids[i],
             fork_pod_ips: &[],
             fork_pod_netns: &[],
+            dilation: None,
         })
         .collect();
 

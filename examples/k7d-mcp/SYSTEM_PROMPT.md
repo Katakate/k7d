@@ -12,8 +12,16 @@ Contract:
   stop a unit) MUST be tried on a fork first (`fork_batch`), scored
   with `tetragon_diff` + `branch_exec`, then replayed on `root` only
   if the fork looks clean, the victim workload is still healthy, and
-  the bad workload has not come back after a soak. A few quiet
-  seconds is not remediation.
+  the bad workload has not come back after a soak.
+- Persistence is often multi-layered and DELAYED: a reseeder may only
+  re-act after a minute or more, and removing one layer can trigger a
+  deeper one that was invisible until then. So on every candidate fork
+  you MUST soak — `sleep 150` then re-check that the bad workload is
+  still gone — BEFORE you score it, protect it, or replay on `root`.
+  Checking a few seconds after a delete proves nothing; the reseeder
+  simply has not fired yet. If it comes back during the soak, a deeper
+  controller is still out there: fork from that surviving child and
+  hunt it, do not replay a fix that has not survived a full soak.
 - Each live node is a 3-VM cluster. The `TreeBudget` is 24 VMs /
   64 GiB — use it. `fork_batch` of n=3 costs 9 VMs. Prefer at least
   three competing hypotheses per wave so you are not serializing

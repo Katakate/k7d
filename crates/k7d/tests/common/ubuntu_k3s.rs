@@ -30,6 +30,10 @@ pub const K3S_TOKEN: &str = "K7dUbuntuClusterToken.inc2";
 /// churn so the fork test is not also an image-pull test.
 pub const CHURN_PAUSE: &str = "docker.io/rancher/mirrored-pause:3.6";
 
+/// Busybox from the same airgap tarball, so a pod that only has to run
+/// `sh` is not also an image-pull test.
+pub const BUSYBOX: &str = "docker.io/rancher/mirrored-library-busybox:1.36.1";
+
 pub const CONVERGE: Duration = Duration::from_secs(120);
 
 /// What `k7d-k3sconfig` writes into the server's `config.yaml`, off k3s'
@@ -275,8 +279,183 @@ pub fn kubectl(kubeconfig: &Path, args: &[&str]) -> Result<String, String> {
     Ok(stdout)
 }
 
+/// Quote one argv token for `sh -c`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `k3s kubectl` inside the server guest.
+///
+/// Host-side `kubectl` validates the serving cert against host time.
+/// A dilated guest mints that cert from its own `CLOCK_REALTIME`, so
+/// at large N the CA's `notBefore` sits in the host's future
+/// (CHALLENGES #191). Talking to the API server from inside the guest
+/// is the path that does not wait for the host to catch up.
+pub fn guest_kubectl(agent: &mut AgentClient, args: &[&str]) -> Result<String, String> {
+    // `--request-timeout` keeps the in-guest call inside the agent's
+    // 30 s exec window. A blocking `rollout status --timeout=300s`
+    // would look like a hung vsock (CHALLENGES #194).
+    let mut cmd = String::from("k3s kubectl --request-timeout=20s");
+    for a in args {
+        cmd.push(' ');
+        cmd.push_str(&sh_quote(a));
+    }
+    let out = agent
+        .exec(&["sh", "-c", &cmd])
+        .map_err(|e| format!("k3s kubectl {} failed to run: {e:?}", args.join(" ")))?;
+    if out.exit_code != 0 {
+        return Err(format!(
+            "k3s kubectl {} exit {}: {}{}",
+            args.join(" "),
+            out.exit_code,
+            out.stderr,
+            out.stdout
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// [`apply_yaml`] via [`guest_kubectl`].
+pub fn guest_apply_yaml(agent: &mut AgentClient, tag: &str, yaml: &str) {
+    let path = format!("/tmp/k7d-{tag}.yaml");
+    let cmd = format!(
+        "cat > {path} << 'K7D_YAML_EOF'\n{yaml}\nK7D_YAML_EOF\nk3s kubectl apply -f {path}"
+    );
+    sh_ok(agent, &cmd);
+}
+
+/// Are all `names` `Ready`, asked of the in-guest API server?
+pub fn guest_nodes_ready(agent: &mut AgentClient, names: &[String]) -> bool {
+    let Ok(text) = guest_kubectl(agent, &["get", "nodes", "--no-headers"]) else {
+        return false;
+    };
+    names.iter().all(|n| {
+        text.lines().any(|l| {
+            let mut cols = l.split_whitespace();
+            cols.next() == Some(n.as_str()) && cols.next() == Some("Ready")
+        })
+    })
+}
+
+/// [`wait_nodes_ready`] through [`guest_kubectl`] — the N≥12 path
+/// (CHALLENGES #191).
+pub fn wait_nodes_ready_via_guest(agent: &mut AgentClient, names: &[String], ceiling: Duration) {
+    let start = Instant::now();
+    loop {
+        match guest_kubectl(agent, &["get", "nodes", "--no-headers"]) {
+            Ok(text) => {
+                let all = names.iter().all(|n| {
+                    text.lines().any(|l| {
+                        let mut cols = l.split_whitespace();
+                        cols.next() == Some(n.as_str()) && cols.next() == Some("Ready")
+                    })
+                });
+                if all {
+                    eprintln!(
+                        "cluster: {} Ready after {:?} (in-guest kubectl)\n{text}",
+                        names.len(),
+                        start.elapsed()
+                    );
+                    return;
+                }
+                eprintln!("cluster: waiting for nodes via guest:\n{text}");
+            }
+            Err(e) => eprintln!("cluster: k3s kubectl get nodes: {e}"),
+        }
+        if start.elapsed() > ceiling {
+            panic!(
+                "cluster: {} nodes never Ready via guest kubectl after {ceiling:?}",
+                names.len()
+            );
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
 pub fn wait_nodes_ready(kubeconfig: &Path, names: &[String], ceiling: Duration) {
     wait_nodes(kubeconfig, names, ceiling, true);
+}
+
+/// `kubectl apply` an inline manifest, failing loudly.
+pub fn apply_yaml(kubeconfig: &Path, tag: &str, yaml: &str) {
+    let path = format!("/tmp/k7d-{tag}-{}.yaml", std::process::id());
+    std::fs::write(&path, yaml).expect("write manifest");
+    kubectl(kubeconfig, &["apply", "-f", &path]).unwrap_or_else(|e| panic!("apply {tag}: {e}"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `.status.phase` of a pod in `default`, empty when unknown.
+pub fn pod_phase(kubeconfig: &Path, pod: &str) -> String {
+    kubectl(
+        kubeconfig,
+        &["get", "pod", pod, "-o", "jsonpath={.status.phase}"],
+    )
+    .unwrap_or_default()
+    .trim()
+    .to_string()
+}
+
+/// `.status.containerStatuses[0].restartCount` of a pod in `default`.
+pub fn pod_restarts(kubeconfig: &Path, pod: &str) -> u64 {
+    kubectl(
+        kubeconfig,
+        &[
+            "get",
+            "pod",
+            pod,
+            "-o",
+            "jsonpath={.status.containerStatuses[0].restartCount}",
+        ],
+    )
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    .unwrap_or(0)
+}
+
+/// Run one throwaway pod to completion before a test starts measuring.
+///
+/// The cluster is Ready ~40 s after boot, but each agent is still
+/// unpacking k3s' airgap image tarball into its own containerd for a
+/// while after that. A test that starts a pod before then measures the
+/// unpack and blames itself for `ContainerCreating`.
+pub fn settle_cluster(kubeconfig: &Path, tag: &str) {
+    let pod = format!("{tag}-settle");
+    apply_yaml(
+        kubeconfig,
+        &pod,
+        &format!(
+            r"apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ok
+    image: {BUSYBOX}
+    imagePullPolicy: IfNotPresent
+    command: ['sh', '-c', 'exit 0']
+"
+        ),
+    );
+    let started = Instant::now();
+    loop {
+        let phase = pod_phase(kubeconfig, &pod);
+        if phase == "Succeeded" {
+            eprintln!(
+                "cluster settled: a pod ran to completion in {:?}",
+                started.elapsed()
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < CONVERGE * 3,
+            "no pod could run before the test started (phase {phase:?}): {}",
+            kubectl(kubeconfig, &["describe", "pod", &pod]).unwrap_or_else(|e| e)
+        );
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    let _ = kubectl(kubeconfig, &["delete", "pod", &pod, "--ignore-not-found"]);
 }
 
 pub fn wait_nodes_present(kubeconfig: &Path, names: &[String], ceiling: Duration) {
@@ -443,7 +622,16 @@ pub fn bring_up_cluster_sized(
     let names = UbuntuCluster::node_names(server_ip);
     match cni {
         UbuntuCni::Flannel => {
-            wait_nodes_ready(&kubeconfig, &names, BOOT_UBUNTU_K3S_CLUSTER_3NODE);
+            // Host-side kubectl validates the serving cert against host
+            // time. A dilated guest mints that cert in the host's
+            // future (CHALLENGES #191), so N>1 talks to the API server
+            // from inside the guest rather than waiting for the host
+            // clock to catch up.
+            if size.dilation > 1 {
+                wait_nodes_ready_via_guest(&mut sag, &names, BOOT_UBUNTU_K3S_CLUSTER_3NODE);
+            } else {
+                wait_nodes_ready(&kubeconfig, &names, BOOT_UBUNTU_K3S_CLUSTER_3NODE);
+            }
         }
         UbuntuCni::None => {
             // Ready is a CNI assertion once kube-proxy and flannel are

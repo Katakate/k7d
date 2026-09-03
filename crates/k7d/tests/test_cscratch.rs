@@ -391,7 +391,7 @@ fn test_warm_fork_keeps_per_container_limits_independently() {
     }
 
     let mut fork = source
-        .fork_warm_batch(&["cscratch-fork-a"])
+        .fork_warm_batch(&["cscratch-fork-a"], None)
         .expect("warm fork must reflink the per-container image, never byte-copy it")
         .pop()
         .expect("one fork");

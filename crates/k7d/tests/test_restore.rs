@@ -247,6 +247,41 @@ fn test_legacy_snapshot_readable() {
     restored.shutdown();
 }
 
+/// A snapshot records the time dilation its source ran at (spec
+/// 34a-inc9), and a host without the carried KVM patch refuses to
+/// restore a dilated one instead of silently resuming the guest at 1x.
+/// Runs on stock modules — which is exactly the host that must say no.
+/// Synthesized by editing a stock snapshot's `metadata.json`, since a
+/// stock host cannot mint a dilated VM to snapshot.
+#[test]
+fn test_restore_dilated_snapshot_on_stock_host_is_refused() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    if k7d::vm::host_supports_dilation().is_ok() {
+        panic!("this host runs the dilation patch; `make check` must run on stock modules");
+    }
+
+    let snapshot_dir = create_snapshot_of_booted_vm();
+    let meta_path = snapshot_dir.path().join("metadata.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["dilation"], 1,
+        "an undilated VM's snapshot must record dilation 1, got {}",
+        meta["dilation"]
+    );
+    meta["dilation"] = serde_json::json!(8);
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let err = Vm::restore(snapshot_dir.path())
+        .err()
+        .expect("a stock host must refuse to restore a dilated snapshot");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dilation x8") && msg.contains("utils/kvm-dilation"),
+        "refusal must name the factor and the fix, got: {msg}"
+    );
+}
+
 #[test]
 fn test_restore_latency_under_budget() {
     let _ = env_logger::builder().is_test(true).try_init();

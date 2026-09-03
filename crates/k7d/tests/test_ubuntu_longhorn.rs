@@ -70,6 +70,7 @@ const DATA_DISK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const LONGHORN_NODE: NodeSize = NodeSize {
     memory_mb: 4096,
     vcpus: 4,
+    dilation: 1,
 };
 
 /// Probe pods pull this through the bridge. Not Never, not airgap.

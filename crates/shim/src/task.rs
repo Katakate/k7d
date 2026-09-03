@@ -873,6 +873,7 @@ fn annotation_adopt_cluster(
         vm_ids,
         budget,
         tree_id: Some(tree_id.to_string()),
+        egress: None,
     })? {
         k7d::control::Response::TreeCreated { ref guest_cids, .. } => {
             if *guest_cids != pre_adopt_cids {
@@ -907,6 +908,7 @@ fn annotation_fork_tree(
         tree_id: tree_id.to_string(),
         source_id,
         label,
+        dilation: None,
     })? {
         k7d::control::Response::TreeForked {
             node_id,
@@ -983,6 +985,7 @@ fn sandbox_create_fork_adopt(
     let (fork_vm_id, fork_cid) = match daemon.call(&k7d::control::Request::ForkVm {
         vm_id: src_vm_id.clone(),
         sandbox_id: Some(sandbox_id.to_string()),
+        dilation: None,
     })? {
         k7d::control::Response::VmForked {
             vm_id, guest_cid, ..
@@ -1671,6 +1674,9 @@ impl Task for K7Service {
                         vm_index: ann.fork_vm_index,
                         pod_netns: cni_netns.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     }),
+                    // Dilation is a bench mechanism , not
+                    // something a pod asks for.
+                    dilation: None,
                 };
                 // Declare the spare image-slot devices
                 // while the VmConfig is still parked — they must be in

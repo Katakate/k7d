@@ -315,7 +315,9 @@ fn test_fork_warm_batch_10() {
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
 
     let start = std::time::Instant::now();
-    let forks = source.fork_warm_batch(&id_refs).expect("batch warm fork");
+    let forks = source
+        .fork_warm_batch(&id_refs, None)
+        .expect("batch warm fork");
     let elapsed = start.elapsed();
 
     eprintln!("10× warm fork batch latency: {elapsed:?}");
@@ -504,7 +506,8 @@ fn test_fork_requeues_interrupted_injection() {
     events.data[8] = 1;
     events.data[9] = 0x35;
 
-    let fork = k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, "reinject");
+    let fork =
+        k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, "reinject", None);
     source.resume().expect("resume source");
     let mut fork = fork.expect("materialise fork");
 

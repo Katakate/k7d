@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] — 2026-09-03
+
+Guest time warp sits next to warm fork: a cluster can jump idle wall
+clock, dilate KVM time, and still snapshot and fork. Mid-tree forks
+take O(divergence) reflink keyframes. A host-enforced network jail
+contains a rogue agent, and the gym can fork, prepare, and score a
+live red-vs-blue lease.
+
+### Added
+
+- Guest time warp: lockstep forward jump (`WarpClock`), auto-warp of
+  idle wall time, continuous KVM dilation (validated at N=8),
+  bidirectional N, adaptive N on a paused cluster, snapshot/fork of a
+  dilated VM, and fork at a different N than the source.
+- Two-arm time-warp benchmark: 1.83× wall-clock at zero fidelity delta;
+  dilation-N sweep as a fidelity-cost curve; ×8 dilated fork-tree clip.
+- Reflink keyframes: O(divergence) fork points down the tree; inherit
+  an ancestor keyframe so a mid-tree prepare is not required.
+- Gym: `POST /env/{id}/fork`, `POST /env/{id}/prepare` (memory.bin, no
+  new VM), AutoWarp jump | micro | dilate on `POST /lease`,
+  `GYM_SCOREBOARD=grpo`, live red-vs-blue self-play, relay soak harvest.
+- Dual-child Ubuntu cluster write isolation, and rollback after a dirty
+  child.
+- Rogue-agent network jail: egress policy, host lockdown, per-TAP
+  anti-spoof, conntrack/rate caps, AppArmor deny `AF_VSOCK`.
+- Fake GPU + DCGM fixture on Ubuntu k3s, then JobSet, TrainJob /
+  Kubeflow Trainer, Kueue, KubeRay, and Soft-RoCE — each then forked.
+- `k7d doctor` (CLI + `{"op":"doctor"}`): `/dev/kvm`,
+  `/dev/vhost-vsock`, `/dev/net/tun`, cgroup v2.
+- `k7d quickstart`: busybox 3-node tree, 4 forks, both fork clocks
+  (~105 ms CI guest / ~1.1 s Ubuntu k3s+Cilium+Tetragon).
+- k7view fork-tree videos with a real no-fork baseline; blog #7.
+
+### Fixed
+
+- Unprivileged Ubuntu pod exec under `k7-deny-vsock`.
+- Host rpcbind/NFS listening on `0.0.0.0:111` (Portmapper reports).
+- Gym returning 502 on a downed Tetragon API instead of scoring it.
+- Live mid-tree `/fork` documented as 23 s; measured 0.51 s.
+
+### Changed
+
+- README: Mermaid diagrams, time-warp section, both fork clocks in the
+  hero table; asciinema hero GIF dropped.
+- TreeFork budgets asserted on daemon `latency_ns`.
+- Public sanitizer widened; public markdown no longer carries spec ids
+  or leftover HN wording.
+- Fixture plots stamped synthetic, not trained.
+
 ## [0.3.0] — 2026-08-23
 
 Ubuntu 24.04 is now a first-class guest: a three-node k3s cluster boots

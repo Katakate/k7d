@@ -59,6 +59,37 @@ pub const MMIO_DEVICE_SIZE: u64 = 0x1000;
 /// kernel-side DMA has to be reported to the warm-fork dirty delta by hand.
 pub const VIRTIO_ID_VSOCK: u32 = 19;
 
+/// Virtio device-type ID for `virtio-net`. Only its queue *direction*
+/// matters here — see [`queue_is_driver_filled`].
+pub const VIRTIO_ID_NET: u32 = 1;
+
+/// How often a backend's `wait_quiescent` re-reads its worker's `parked`
+/// flag while `Vm::pause` waits for it.
+///
+/// It is the *floor* on a pause, not a timeout: `set_paused` kicks the
+/// worker's eventfd, so the worker leaves its 100 ms `poll` and parks
+/// within tens of microseconds — but the waiter only notices one poll
+/// interval later, and every device of every VM pays that serially. At
+/// the 1 ms this used to be, the auto-warp policy loop
+/// measured a 6.3 ms mean pause across a 3-node cluster and spent more
+/// wall time stopping the guests than the warps gave back
+/// (`CHALLENGES.md` #183). Fork pays it once and did not notice; a
+/// policy loop pays it 30 times a second.
+pub(crate) const PARK_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// How often a parked worker re-reads `paused` while it waits to be let
+/// go again.
+///
+/// This is dead time on the resumed guest's device: frames sit in the
+/// TAP buffer and requests sit in the ring for up to this long after
+/// `Vm::resume` returns. Fork resumes once, so the 2 ms it used to be
+/// cost nothing; a policy loop pausing 30 times a second was handing
+/// the guests a device that was idle a third of the time. Longer than
+/// [`PARK_POLL`] because a parked worker polls for the whole of a
+/// multi-second fork pause, where the waiter polls only for the tens of
+/// microseconds a park takes.
+pub(crate) const UNPARK_POLL: std::time::Duration = std::time::Duration::from_micros(200);
+
 /// State of a single virtqueue as programmed by the guest.
 #[derive(Debug, Clone, Default)]
 pub struct VirtqueueState {
@@ -111,6 +142,14 @@ pub trait VirtioBackend: Send {
     /// that snapshot/fork memory captures never race in-flight device DMA
     /// (e.g. a virtio-blk read completing mid-memcpy). Default: no-op.
     fn wait_quiescent(&self) {}
+    /// Whether paused workers have stopped touching the backing file
+    /// and guest memory. Default true (no worker). Used so a fork can
+    /// delay `FICLONE` until a stuck virtio-blk `pwrite` finishes —
+    /// cloning an 8 GiB scratch while the worker holds the inode has
+    /// been measured at 4–7 s (CHALLENGES #162).
+    fn is_quiescent(&self) -> bool {
+        true
+    }
     /// OR the backend's device-DMA dirty page bitmap into `acc` (one bit
     /// per 4 KiB guest page, `u64` words).
     ///
@@ -447,6 +486,12 @@ impl MmioDevice {
         self.backend.wait_quiescent();
     }
 
+    /// See [`VirtioBackend::is_quiescent`].
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        self.backend.is_quiescent()
+    }
+
     /// Merge the backend's device-DMA dirty pages into `acc` (see
     /// [`VirtioBackend::merge_dirty_pages`]), then — for vhost-vsock — mark
     /// the pages the kernel vhost worker DMAs into.
@@ -461,6 +506,31 @@ impl MmioDevice {
         if self.backend.device_type() == VIRTIO_ID_VSOCK {
             mark_virtqueue_pages_dirty(&self.queues, acc, mem_host_addr, mem_span);
         }
+    }
+}
+
+/// Whether queue `index` of a `device_type` device is one the **driver**
+/// fills with requests, so `avail.idx == used.idx` means "nothing in
+/// flight" .
+///
+/// The distinction is the whole check. On a receive queue — virtio-net
+/// RX, vsock RX — a guest at rest keeps buffers posted for traffic that
+/// has not arrived, so `avail.idx` legitimately runs ahead of `used.idx`
+/// forever; reading that as work in flight would decline every warp on
+/// every cluster. Only the driver-to-device direction is a handshake.
+///
+/// Unknown device types are reported as driver-filled: a device this
+/// function has not been taught is one whose queues should hold up a
+/// jump until someone teaches it.
+#[must_use]
+pub fn queue_is_driver_filled(device_type: u32, index: usize) -> bool {
+    match device_type {
+        // virtio-net: even queues are RX (device-filled), odd are TX.
+        VIRTIO_ID_NET => index % 2 == 1,
+        // vsock: queue 0 RX (device-filled), 1 TX, 2 event (device-filled).
+        VIRTIO_ID_VSOCK => index == 1,
+        // virtio-blk and virtio-fs are request/response throughout.
+        _ => true,
     }
 }
 
@@ -628,6 +698,14 @@ impl MmioDeviceRegistry {
         for dev in &self.devices {
             dev.lock().unwrap().wait_quiescent();
         }
+    }
+
+    /// True when every backend reports [`VirtioBackend::is_quiescent`].
+    #[must_use]
+    pub fn all_quiescent(&self) -> bool {
+        self.devices
+            .iter()
+            .all(|d| d.lock().unwrap().is_quiescent())
     }
 
     /// Merge every backend's device-DMA dirty pages into `acc`. `mem_host_addr`

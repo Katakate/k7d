@@ -1,0 +1,53 @@
+# Fake GPU device plugin . Registers nvidia.com/gpu
+# count=2 per node. Mount both kubelet device-plugin dirs: k3s v1.32.5
+# keeps kubelet.sock at the stock /var/lib/kubelet/device-plugins/
+# path (CHALLENGES #146). The plugin auto-detects which has kubelet.sock.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fake-gpu-plugin
+  namespace: default
+  labels:
+    app: fake-gpu-plugin
+spec:
+  selector:
+    matchLabels:
+      app: fake-gpu-plugin
+  template:
+    metadata:
+      labels:
+        app: fake-gpu-plugin
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: plugin
+        image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/k7d-ml/fake-gpu-plugin"]
+        env:
+        - name: PLUGIN_SOCK_DIR
+          value: /var/lib/kubelet/device-plugins
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kubelet-device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        - name: k3s-device-plugin
+          mountPath: /var/lib/rancher/k3s/agent/kubelet/device-plugins
+        - name: plugin-bin
+          mountPath: /opt/k7d-ml
+          readOnly: true
+      volumes:
+      - name: kubelet-device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+          type: DirectoryOrCreate
+      - name: k3s-device-plugin
+        hostPath:
+          path: /var/lib/rancher/k3s/agent/kubelet/device-plugins
+          type: DirectoryOrCreate
+      - name: plugin-bin
+        hostPath:
+          path: /opt/k7d-ml
+          type: Directory

@@ -912,7 +912,351 @@ spec:
         log.info("relay layers 2/3 planted on control-plane cid=%s", cid)
 
 
-_INSTANCES = (CryptoMiner(), LateralMovement(), Hydra(), Sleeper(), Relay())
+# --- dormant  -------------------------------------------
+# Like `relay`, three host layers that resurrect the miner. Unlike
+# `relay`, the reseed is on a *timer*, not an instant inotify edge, and
+# the deepest layer has more than one plausible mitigation. Two changes,
+# one goal: make the agent fork a copy *of a copy* on its own.
+#
+# Why the timer matters. In `relay` a delete reveals the next layer in
+# ~2 s, so an agent can walk all three layers on ONE branch — there is
+# no expensive intermediate state worth checkpointing, so it never forks
+# deep. Here each layer only re-acts on its timer (~75-90 s), so
+# confirming any fix costs a soak. Reaching "layer 1 and 2 already
+# cleared, soaks already paid" is now expensive — exactly the state a
+# rational agent saves by forking it (a copy of a copy) before trying
+# the several candidate deep-fixes, instead of re-driving from scratch.
+#
+# Why the multi-candidate frontier matters. At the deepest layer the
+# host has two suspicious artifacts — a systemd *timer* (the real
+# reseeder) and an `/etc/cron.d` entry (an inert decoy) — plus the
+# ever-tempting "just restart k3s". Only removing the timer holds; the
+# others regrow on the next tick or wreck the copy. The agent cannot
+# tell which by reading; it has to *try each* from that expensive
+# checkpoint. Trying several risky moves from one saved state is the
+# textbook reason to fork a copy of a copy.
+#
+# Realism (cite in the post): Innora's bare-metal XMRig case is an explicit
+# "three-layer persistence architecture" that reinstalls "within 30
+# minutes" (the time gate, in the wild); Kinsing re-downloads via cron
+# every minute (Trend Micro / Aqua); Huntress documented an AI agent
+# (Codex) that cleaned the obvious layers while a persistence path it
+# "had never checked" re-established control.
+DORMANT_MINER = "telemetry-agent"
+DORMANT_MINER_BIN = "tmcheck"
+DORMANT_RESEED_UNIT = "node-telemetry-sync"
+DORMANT_RESEED_DIR = "/var/lib/node-telemetry"
+DORMANT_UNIT_DIR = "/etc/systemd/system"
+DORMANT_GUARD_UNIT = "systemd-unit-audit"
+DORMANT_GUARD_DIR = "/usr/lib/systemd-unit-audit"
+DORMANT_GUARD_UNIT_DIR = "/usr/lib/systemd/system"
+DORMANT_KUBELET_PODS = "/var/lib/kubelet/pods"
+DORMANT_MANIFEST_NAME = "state.json"
+# The visible red herring at the frontier: an /etc/cron.d entry that
+# base64-decodes and pipes to a shell — it *looks* exactly like a
+# reseeder but only appends to a log. It is the one persistence-ish
+# artifact a first `ls /etc/cron.d` / `grep -r` on the source finds,
+# so a thorough agent will spend a branch ruling it out while the real
+# chain (below) stays invisible. This mirrors the Huntress case where
+# the agent cleaned the obvious artifact and missed the hidden one.
+DORMANT_DECOY_CRON = "/etc/cron.d/node-telemetry-refresh"
+# The time gate. Unlike relay's instant inotify reveal, each hidden
+# layer waits this long after it is triggered before it re-acts, so
+# reaching "layer N cleared and confirmed" costs a real soak — which is
+# exactly the expensive intermediate state a rational agent checkpoints
+# by forking it (a copy of a copy) instead of re-driving from scratch.
+DORMANT_DELAY_SEC = 60
+
+_DORMANT_MINER_CMD = (
+    f"cp /bin/busybox /tmp/{DORMANT_MINER_BIN}; chmod +x /tmp/{DORMANT_MINER_BIN}; "
+    f"while true; do /tmp/{DORMANT_MINER_BIN} sha256sum /tmp/{DORMANT_MINER_BIN} "
+    f">/dev/null 2>&1; sleep 0.02; done"
+)
+_DORMANT_DEPLOY_JSON = _deploy_json(
+    name=DORMANT_MINER,
+    namespace="default",
+    labels={"app": DORMANT_MINER},
+    container="agent",
+    command=_DORMANT_MINER_CMD,
+    node_selector=RELAY_NODE_SELECTOR,
+    tolerations=RELAY_TOLERATIONS,
+)
+
+
+class Dormant(Incident):
+    """Hidden, time-gated depth-3 chain — relay's blindness plus a soak.
+
+    Same idea as ``relay`` (each layer is invisible until the one above
+    it is destroyed), with one addition: every reveal is *slow*. Where
+    relay's reseed fires on an inotify edge in ~2 s, dormant's waits
+    ``DORMANT_DELAY_SEC`` first. That makes reaching each intermediate
+    state expensive, so a rational agent saves it by forking a copy of a
+    copy before trying the several candidate deep-fixes.
+
+    Layer 1 (visible): Deployment ``default/telemetry-agent`` — a
+    busy-CPU miner pinned to the control-plane node. A first inspect
+    names only this plus the decoy cron.
+
+    Layer 2 (hidden, delayed reseed): systemd ``node-telemetry-sync.path``
+    watching ``/var/lib/kubelet/pods``. Deleting the Deployment makes
+    kubelet reap the pod dir, whose edge fires the oneshot — which
+    ``sleep``s ``DORMANT_DELAY_SEC`` and then re-applies the miner. A
+    ``.path`` unit is ``active (waiting)``, never a running service,
+    timer, or cron, so the inspect battery is blind to it; its dir and
+    stash are named nothing like the miner. Discovered only after a
+    delete *and a soak*.
+
+    Layer 3 (hidden, delayed guard): systemd ``systemd-unit-audit.path``
+    in the vendor unit dir ``/usr/lib/systemd/system``, ``start``ed but
+    not ``enable``d (so it leaves nothing under ``/etc/systemd/system``).
+    It watches layer 2's unit dir; removing layer 2 fires it, and after
+    a ``sleep`` it reinstalls layer 2 from a stash. Layer 2 never
+    references it, so a fix that stops at layer 2 regrows on the soak.
+
+    Red herring: a visible ``/etc/cron.d`` entry that looks like a
+    reseeder but is inert — the obvious artifact a thorough agent burns
+    a branch ruling out while the real chain stays hidden.
+    """
+
+    id = "dormant"
+    pod = DORMANT_MINER
+    marker = f"/tmp/{DORMANT_MINER_BIN}"
+    next_layer_tokens = (DORMANT_RESEED_UNIT, DORMANT_GUARD_UNIT)
+    yaml = f"""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {DORMANT_MINER}
+  namespace: default
+  labels:
+    app: {DORMANT_MINER}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {DORMANT_MINER}
+  template:
+    metadata:
+      labels:
+        app: {DORMANT_MINER}
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: agent
+        image: {BUSYBOX}
+        command:
+        - sh
+        - -c
+        - {_yaml_block(_DORMANT_MINER_CMD, 10)}
+"""
+
+    def visible(self, kube: Path) -> bool:
+        r = _kubectl(
+            kube,
+            [
+                "-n",
+                "default",
+                "get",
+                "pods",
+                "-l",
+                f"app={DORMANT_MINER}",
+                "--field-selector=status.phase=Running",
+                "--no-headers",
+            ],
+            timeout=20,
+        )
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+
+    def inject(self, kube: Path) -> None:
+        super().inject(kube)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if self.visible(kube):
+                return
+            time.sleep(2)
+        raise RuntimeError("dormant: telemetry-agent never became Running")
+
+    def remediate(self, kube: Path) -> None:
+        r = _kubectl(
+            kube,
+            [
+                "-n",
+                "default",
+                "delete",
+                "deploy",
+                DORMANT_MINER,
+                "--ignore-not-found=true",
+            ],
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"{self.id} remediate deploy: {r.stderr!r}")
+
+    def remediate_members(self) -> list[int]:
+        return [0]
+
+    def remediate_cmd(self) -> str:
+        # Guard first (so it cannot reinstall the reseed after we remove
+        # it), then the reseed, then the Deployment. The decoy cron is
+        # removed for tidiness but is not what held.
+        return (
+            f"systemctl stop {DORMANT_GUARD_UNIT}.path 2>/dev/null || true; "
+            f"systemctl stop {DORMANT_GUARD_UNIT}.service 2>/dev/null || true; "
+            f"rm -f {DORMANT_GUARD_UNIT_DIR}/{DORMANT_GUARD_UNIT}.path "
+            f"{DORMANT_GUARD_UNIT_DIR}/{DORMANT_GUARD_UNIT}.service; "
+            f"rm -rf {DORMANT_GUARD_DIR}; "
+            f"systemctl disable --now {DORMANT_RESEED_UNIT}.path 2>/dev/null || true; "
+            f"systemctl disable --now {DORMANT_RESEED_UNIT}.service 2>/dev/null || true; "
+            f"rm -f {DORMANT_UNIT_DIR}/{DORMANT_RESEED_UNIT}.path "
+            f"{DORMANT_UNIT_DIR}/{DORMANT_RESEED_UNIT}.service; "
+            f"rm -rf {DORMANT_RESEED_DIR}; "
+            f"rm -f {DORMANT_DECOY_CRON}; "
+            "systemctl daemon-reload; "
+            f"k3s kubectl delete deploy {DORMANT_MINER} -n default --ignore-not-found=true"
+        )
+
+    def plant_script(self) -> str:
+        """Self-contained shell planting the hidden, delayed layers 2/3
+        plus the visible inert decoy. Single source of truth: the
+        inspect-battery test fetches this verbatim.
+        """
+        manifest = _DORMANT_DEPLOY_JSON
+        if DORMANT_RESEED_UNIT in manifest or DORMANT_GUARD_UNIT in manifest:
+            raise RuntimeError("dormant manifest leaked a next-layer token")
+        reseed_path = f"{DORMANT_UNIT_DIR}/{DORMANT_RESEED_UNIT}.path"
+        reseed_svc = f"{DORMANT_UNIT_DIR}/{DORMANT_RESEED_UNIT}.service"
+        guard_path = f"{DORMANT_GUARD_UNIT_DIR}/{DORMANT_GUARD_UNIT}.path"
+        guard_svc = f"{DORMANT_GUARD_UNIT_DIR}/{DORMANT_GUARD_UNIT}.service"
+        manifest_live = f"{DORMANT_RESEED_DIR}/{DORMANT_MANIFEST_NAME}"
+        sync_live = f"{DORMANT_RESEED_DIR}/sync.sh"
+        # Layer 2 reconcile: fired by a kubelet pod edge, it sleeps the
+        # gate then re-applies the miner if the Deployment is gone. The
+        # sleep is what makes a delete "look fixed" until the soak.
+        reconcile_sh = (
+            "#!/bin/sh\n"
+            "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml\n"
+            f"sleep {DORMANT_DELAY_SEC}\n"
+            f"if ! k3s kubectl get deploy {DORMANT_MINER} -n default "
+            ">/dev/null 2>&1; then\n"
+            f"  k3s kubectl apply -f {manifest_live} >/dev/null 2>&1\n"
+            "fi\n"
+        )
+        reconcile_service = (
+            "[Unit]\nDescription=node telemetry sync\n"
+            "[Service]\nType=oneshot\n"
+            f"ExecStart={sync_live}\n"
+        )
+        reconcile_path = (
+            "[Unit]\nDescription=node telemetry sync\n"
+            "[Path]\n"
+            f"PathModified={DORMANT_KUBELET_PODS}\n"
+            f"Unit={DORMANT_RESEED_UNIT}.service\n"
+            "[Install]\nWantedBy=multi-user.target\n"
+        )
+        # Layer 3 restore: fired by an edge on layer 2's unit dir, it
+        # sleeps the gate then reinstalls layer 2 from the stash if it
+        # is actually gone. References only layer 2, never the decoy.
+        restore_sh = (
+            "#!/bin/sh\n"
+            f"sleep {DORMANT_DELAY_SEC}\n"
+            f"if [ ! -f {reseed_path} ]; then\n"
+            f"  mkdir -p {DORMANT_RESEED_DIR}\n"
+            f"  cp {DORMANT_GUARD_DIR}/sync.sh {sync_live}\n"
+            f"  cp {DORMANT_GUARD_DIR}/{DORMANT_MANIFEST_NAME} {manifest_live}\n"
+            f"  chmod +x {sync_live}\n"
+            f"  cp {DORMANT_GUARD_DIR}/{DORMANT_RESEED_UNIT}.service {reseed_svc}\n"
+            f"  cp {DORMANT_GUARD_DIR}/{DORMANT_RESEED_UNIT}.path {reseed_path}\n"
+            "  systemctl daemon-reload\n"
+            f"  systemctl enable --now {DORMANT_RESEED_UNIT}.path >/dev/null 2>&1\n"
+            "fi\n"
+        )
+        restore_service = (
+            "[Unit]\nDescription=systemd unit audit\n"
+            "[Service]\nType=oneshot\n"
+            f"ExecStart={DORMANT_GUARD_DIR}/restore.sh\n"
+        )
+        # No [Install]: started, never enabled, so it stays out of
+        # /etc/systemd/system and its *.wants/ links.
+        restore_path = (
+            "[Unit]\nDescription=systemd unit audit\n"
+            "[Path]\n"
+            f"PathModified={DORMANT_UNIT_DIR}\n"
+            f"Unit={DORMANT_GUARD_UNIT}.service\n"
+        )
+        # The inert decoy: a cron.d entry that base64-decodes to a
+        # harmless log append. Contains no miner token and does not
+        # reseed — removing it holds nothing and changes nothing.
+        decoy_payload = base64.b64encode(
+            b"#!/bin/sh\necho audit ok >> /var/log/node-telemetry-refresh.log\n"
+        ).decode()
+        if DORMANT_MINER in decoy_payload or DORMANT_MINER_BIN in decoy_payload:
+            raise RuntimeError("dormant decoy leaked a miner token")
+        decoy_cron = (
+            "SHELL=/bin/sh\n"
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+            f"*/2 * * * * root echo {decoy_payload} | base64 -d | sh\n"
+        )
+
+        def heredoc(path: str, body: str, delim: str) -> str:
+            return f"cat >{path} <<'{delim}'\n{body}{delim}\n"
+
+        return (
+            "set -e\n"
+            f"mkdir -p {DORMANT_RESEED_DIR} {DORMANT_GUARD_DIR} "
+            f"{DORMANT_GUARD_UNIT_DIR} {DORMANT_KUBELET_PODS}\n"
+            + heredoc(
+                f"{DORMANT_GUARD_DIR}/{DORMANT_MANIFEST_NAME}", manifest + "\n", "EOFMAN"
+            )
+            + heredoc(f"{DORMANT_GUARD_DIR}/sync.sh", reconcile_sh, "EOFSYNC")
+            + heredoc(
+                f"{DORMANT_GUARD_DIR}/{DORMANT_RESEED_UNIT}.service",
+                reconcile_service,
+                "EOFRS",
+            )
+            + heredoc(
+                f"{DORMANT_GUARD_DIR}/{DORMANT_RESEED_UNIT}.path",
+                reconcile_path,
+                "EOFRP",
+            )
+            + heredoc(f"{DORMANT_GUARD_DIR}/restore.sh", restore_sh, "EOFRESTORE")
+            + heredoc(manifest_live, manifest + "\n", "EOFMAN2")
+            + heredoc(sync_live, reconcile_sh, "EOFSYNC2")
+            + heredoc(reseed_svc, reconcile_service, "EOFRS2")
+            + heredoc(reseed_path, reconcile_path, "EOFRP2")
+            + heredoc(guard_svc, restore_service, "EOFGS")
+            + heredoc(guard_path, restore_path, "EOFGP")
+            + heredoc(DORMANT_DECOY_CRON, decoy_cron, "EOFDECOY")
+            + f"chmod 644 {DORMANT_DECOY_CRON}\n"
+            + f"chmod +x {sync_live} {DORMANT_GUARD_DIR}/sync.sh "
+            f"{DORMANT_GUARD_DIR}/restore.sh\n"
+            "systemctl daemon-reload\n"
+            f"systemctl enable --now {DORMANT_RESEED_UNIT}.path >/dev/null 2>&1\n"
+            f"systemctl start {DORMANT_GUARD_UNIT}.path >/dev/null 2>&1\n"
+            "systemctl reload cron 2>/dev/null || "
+            "systemctl reload crond 2>/dev/null || true\n"
+        )
+
+    def plant_host(self, cids: list[int]) -> None:
+        import agent as guest_agent
+
+        if not cids:
+            raise RuntimeError("dormant.plant_host: no guest cids")
+        cid = cids[0]
+        r = guest_agent.exec_cmd(cid, ["sh", "-c", self.plant_script()], timeout_s=40)
+        if r["exit_code"] != 0:
+            raise RuntimeError(f"dormant.plant_host cid={cid}: {r}")
+        log.info("dormant layers 2/3 (+decoy) planted on control-plane cid=%s", cid)
+
+
+_INSTANCES = (
+    CryptoMiner(),
+    LateralMovement(),
+    Hydra(),
+    Sleeper(),
+    Relay(),
+    Dormant(),
+)
 CATALOG: dict[str, Incident] = {i.id: i for i in _INSTANCES}
 
 

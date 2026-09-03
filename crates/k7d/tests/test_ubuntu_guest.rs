@@ -234,6 +234,7 @@ fn assert_kernel_flavour_covers_cilium_and_tetragon(agent: &mut AgentClient) {
         "nfsv4",
         "xfrm_user",
         "cpuidle_haltpoll",
+        "rdma_rxe",
     ] {
         assert!(
             module_names.contains(module),
@@ -710,6 +711,128 @@ fn test_ubuntu_guest_bridge_tcp() {
 
     vm_a.shutdown();
     vm_b.shutdown();
+    drop(net);
+}
+
+/// the referenced work: a non-agent uid cannot create `AF_VSOCK`, while the
+/// agent still serves a round trip.
+///
+/// Enforcement is AppArmor: `k7-deny-vsock` on `/usr/bin/python3*`
+/// (`allow all` + `deny network vsock`); `k7-agent` on the agent
+/// binary allows vsock. k3s units attach the named deny profile;
+/// CRI AppArmor is off so pods inherit it (CHALLENGES #166).
+/// Boundary is a non-agent uid running a profiled workload
+/// interpreter. `SystemCallFilter` cannot match `socket()` by family;
+/// `RestrictAddressFamilies` returns EAFNOSUPPORT.
+/// See `internal notes`.
+#[test]
+fn test_ubuntu_vsock_denied_to_non_agent() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let image = node_image();
+    let disk = VmDisk::clone_of(&image.base_image(), "vsockdeny");
+    let mut net = ClusterNetwork::create("ubvsd").expect("cluster bridge");
+    let tap = net.add_tap().expect("tap");
+
+    let mut vm = build_node_vm(&image, &disk, tap);
+    vm.start().expect("Ubuntu node VM should start");
+    let mut agent = match vm.connect_agent(BOOT_TO_AGENT_CEILING) {
+        Ok(a) => a,
+        Err(e) => panic!(
+            "no agent within {BOOT_TO_AGENT_CEILING:?}: {e}\n--- serial ---\n{}",
+            vm.serial_output(Duration::from_secs(1))
+        ),
+    };
+    assert_systemd_healthy(&mut agent, "vsockdeny");
+
+    let pong = agent.ping().expect("agent ping before deny probe");
+    assert_eq!(pong.version, "0.1.0");
+    assert_eq!(sh_ok(&mut agent, "echo AGENT_OK").trim(), "AGENT_OK");
+
+    let profiles = sh_ok(&mut agent, "cat /sys/kernel/security/apparmor/profiles");
+    assert!(
+        profiles.contains("k7-agent (enforce)"),
+        "k7-agent AppArmor profile not enforcing:\n{profiles}"
+    );
+    assert!(
+        profiles.contains("k7-deny-vsock (enforce)"),
+        "k7-deny-vsock AppArmor profile not enforcing:\n{profiles}"
+    );
+
+    // Fail loud if this image lost python3 — the probe is not a new
+    // package, it is the same interpreter test_ubuntu_guest_bridge_tcp
+    // already uses.
+    let af = sh_ok(
+        &mut agent,
+        "python3 -c 'import socket; print(int(socket.AF_VSOCK))'",
+    );
+    assert_eq!(af.trim(), "40", "python3 AF_VSOCK is not 40: {af}");
+
+    const PROBE: &str = "\
+#!/usr/bin/python3
+import socket, os, sys
+aa = open('/proc/self/attr/current').read().strip()
+print('aa=%s uid=%d' % (aa, os.getuid()))
+try:
+    socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    print('opened')
+    sys.exit(0)
+except OSError as e:
+    print('errno=%d' % e.errno)
+    sys.exit(1)
+";
+    agent
+        .write_file("/usr/local/share/k7-vsock-probe.py", PROBE.as_bytes())
+        .expect("write vsock probe");
+    sh_ok(&mut agent, "chmod 0755 /usr/local/share/k7-vsock-probe.py");
+
+    // `allow all` inherit-execs, so a bare agent.exec of python3 stays
+    // in k7-agent and can open vsock. aa-exec change_profiles into
+    // k7-deny-vsock (the same named profile k3s units attach).
+    // setpriv then drops to nobody without dbus.
+    let (code, stdout, stderr) = sh(
+        &mut agent,
+        "aa-exec -p k7-deny-vsock -- \
+         setpriv --reuid=nobody --regid=nogroup --clear-groups \
+         /usr/bin/python3 /usr/local/share/k7-vsock-probe.py",
+    );
+    if code == 0 {
+        let diag = sh_ok(
+            &mut agent,
+            "cat /sys/kernel/security/apparmor/profiles; \
+             aa-status 2>/dev/null | head -40 || true; \
+             dmesg | grep -i apparmor | tail -20 || true",
+        );
+        panic!(
+            "nobody opened AF_VSOCK (wanted EPERM/EACCES): \
+             stdout={stdout} stderr={stderr}\n{diag}"
+        );
+    }
+    let errno_ok = stdout.contains("errno=1") || stdout.contains("errno=13");
+    assert!(
+        errno_ok,
+        "expected EPERM (1) or EACCES (13) for nobody AF_VSOCK, got \
+         exit={code} stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("uid=65534"),
+        "probe did not run as nobody (65534): stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("k7-deny-vsock"),
+        "probe was not in k7-deny-vsock (agent ix inherit?): \
+         stdout={stdout} stderr={stderr}"
+    );
+
+    let pong2 = agent.ping().expect("agent ping after deny probe");
+    assert_eq!(pong2.version, "0.1.0");
+    assert_eq!(
+        sh_ok(&mut agent, "echo AGENT_STILL_OK").trim(),
+        "AGENT_STILL_OK"
+    );
+
+    vm.shutdown();
     drop(net);
 }
 

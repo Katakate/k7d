@@ -12,7 +12,11 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/k7d-k3sconfig
 StandardOutput=journal+console
 StandardError=journal+console
-TimeoutStartSec=240
+# Guest seconds. 240 s is 15 s of wall at dilation N=16 — shorter than
+# k3s-agent's unpack — and systemd TERM's the oneshot before the
+# script's own timeout can fire (34a-inc6). 900 s is 56 s of wall at
+# 16× and still only a hang ceiling at 1×.
+TimeoutStartSec=900
 
 [Install]
 WantedBy=multi-user.target

@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,22 @@ pub enum SnapshotError {
     Kvm(String),
     #[error("VM must be paused before snapshotting")]
     NotPaused,
+    /// An incremental keyframe could not `FICLONE` its ancestor: the two
+    /// paths are not on one reflink-capable filesystem. The caller falls
+    /// back to a full dump — loudly .
+    #[error(
+        "FICLONE {ancestor} -> {dest}: {detail} — an incremental keyframe needs \
+         ancestor and child on one reflink-capable filesystem (the tree root \
+         belongs on the XFS loopback, see `disks::ensure_reflink_tree_root`)"
+    )]
+    ReflinkUnsupported {
+        /// The ancestor `memory.bin` we tried to clone.
+        ancestor: std::path::PathBuf,
+        /// The clone destination.
+        dest: std::path::PathBuf,
+        /// The `FICLONE` errno.
+        detail: String,
+    },
 }
 
 /// Saved vCPU general-purpose registers.
@@ -273,6 +289,17 @@ pub struct SnapshotMetadata {
     /// leaves the clock alone rather than guessing an origin.
     #[serde(default)]
     pub kvmclock: Option<KvmClockState>,
+    /// Time dilation factor the source ran at . Restore
+    /// applies it to the new VM before its first vCPU exists and fails
+    /// loudly on a host without the patch. Snapshots from before the
+    /// field existed were all taken at 1 (the capture refused anything
+    /// else), which is what the serde default says.
+    #[serde(default = "one")]
+    pub dilation: u32,
+}
+
+const fn one() -> u32 {
+    1
 }
 
 /// Saved IRQ chip state (LAPIC + PIC + IOAPIC) for interrupt delivery after restore.
@@ -354,6 +381,11 @@ pub struct VmState {
     /// off this state re-bases its own clock from it.
     #[serde(default)]
     pub kvmclock: Option<KvmClockState>,
+    /// Time dilation factor of the source ; every fork
+    /// off this state runs at the same one. See
+    /// [`SnapshotMetadata::dilation`].
+    #[serde(default = "one")]
+    pub dilation: u32,
 }
 
 /// Capture the full in-memory VM state for warm fork.
@@ -377,6 +409,7 @@ pub fn capture_vm_state(vm: &Vm) -> Result<VmState, SnapshotError> {
         virtiofs_shares: vm.virtiofs_shares().to_vec(),
         block_devices: vm.block_devices().to_vec(),
         kvmclock: Some(capture_kvmclock(vm)?),
+        dilation: vm.dilation(),
     })
 }
 
@@ -766,17 +799,37 @@ fn capture_cpu_state(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<CpuState, SnapshotE
 /// `mem_span` is the guest physical address span (see [`Vm::mem_span`]), used
 /// to bounds-check the descriptor the guest published.
 ///
+/// Returns the guest-physical page indices the injection **wrote**. These
+/// are host-side writes into guest RAM: KVM's dirty log cannot see them,
+/// so an incremental keyframe that clones an ancestor `memory.bin` and
+/// patches only the dirty set has to be told about them explicitly, or
+/// the child boots on the ancestor's stale event ring (the #101 class —
+/// see `Vm::prepare_fork_source_incremental_in`). The full-dump path
+/// writes every page anyway and ignores the return value.
+///
 /// This mirrors Firecracker's `prepare_save` → `send_transport_reset_event`.
 pub(crate) fn inject_vsock_transport_reset_into(
     mem_span: u64,
     device_states: &[MmioDeviceState],
     target_mem_addr: u64,
-) {
+) -> Vec<u64> {
     const VSOCK_DEVICE_TYPE: u32 = 19;
     const EVQ_INDEX: usize = 2;
     const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
 
     let mem_base = target_mem_addr;
+    let mut written_pages: Vec<u64> = Vec::new();
+    // Record every guest-physical byte range the injection writes, as
+    // page indices. Ranges are tiny (4/8/2 bytes) but may straddle a
+    // page boundary, so walk from the first to the last page touched.
+    let mut mark = |gpa: u64, len: u64| {
+        let mut page = gpa / 4096;
+        let last = (gpa + len - 1) / 4096;
+        while page <= last {
+            written_pages.push(page);
+            page += 1;
+        }
+    };
 
     for state in device_states {
         if state.device_type != VSOCK_DEVICE_TYPE || !state.activated {
@@ -825,6 +878,7 @@ pub(crate) fn inject_vsock_transport_reset_into(
                 let val = VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le_bytes();
                 std::ptr::copy_nonoverlapping(val.as_ptr(), buf_hva, 4);
             }
+            mark(buf_gpa, 4);
 
             // Add the descriptor to the used ring.
             let used_ring_offset = 4 + (used_idx % evq.size) as u64 * 8;
@@ -834,11 +888,13 @@ pub(crate) fn inject_vsock_transport_reset_into(
                 std::ptr::write_volatile(entry_ptr, u32::from(desc_idx));
                 std::ptr::write_volatile(entry_ptr.add(1), 4); // len = sizeof(u32)
             }
+            mark(evq.used_addr + used_ring_offset, 8);
             // Advance used idx.
             // SAFETY: used_base + 2 points to the used ring idx field.
             unsafe {
                 std::ptr::write_volatile((used_base + 2) as *mut u16, used_idx.wrapping_add(1));
             }
+            mark(evq.used_addr + 2, 2);
 
             log::info!(
                 "snapshot: injected TRANSPORT_RESET into vsock event queue \
@@ -846,6 +902,7 @@ pub(crate) fn inject_vsock_transport_reset_into(
             );
         }
     }
+    written_pages
 }
 
 /// Dump guest memory to a file.
@@ -856,14 +913,7 @@ pub(crate) fn inject_vsock_transport_reset_into(
 /// touched) 32-bit MMIO hole —.
 fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
     let mem_size = vm.mem_span() as usize;
-
-    let host_addr: *const u8 = if vm.is_restored() {
-        vm.mem_host_addr() as *const u8
-    } else {
-        vm.guest_memory()
-            .get_host_address(GuestAddress(0))
-            .map_err(|e| SnapshotError::Kvm(format!("failed to get host address: {e}")))?
-    };
+    let host_addr = dump_host_addr(vm)?;
 
     // Write to a temp file and rename over `memory.bin`. NEVER truncate
     // the destination in place: a VM resumed from this very checkpoint
@@ -884,6 +934,355 @@ fn dump_memory(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
     drop(mem_file);
     fs::rename(&tmp_path, &mem_path)?;
     Ok(())
+}
+
+/// Host address the guest-physical span starts at, for reading guest RAM
+/// out of a paused VM.
+fn dump_host_addr(vm: &Vm) -> Result<*const u8, SnapshotError> {
+    if vm.is_restored() {
+        Ok(vm.mem_host_addr() as *const u8)
+    } else {
+        vm.guest_memory()
+            .get_host_address(GuestAddress(0))
+            .map(<*mut u8>::cast_const)
+            .map_err(|e| SnapshotError::Kvm(format!("failed to get host address: {e}")))
+    }
+}
+
+/// A reflink clone of an ancestor keyframe, opened for writing, that has
+/// not been published under its final name yet.
+///
+/// Held across the `TRANSPORT_RESET` injection so the injection only
+/// happens once the clone is known to have succeeded: on a non-reflink
+/// filesystem the caller falls back to a full dump, and a second
+/// injection would push a second event into the guest's vsock event
+/// queue.
+struct ClonedKeyframe {
+    file: fs::File,
+    tmp_path: PathBuf,
+    dest_path: PathBuf,
+    published: bool,
+}
+
+impl Drop for ClonedKeyframe {
+    fn drop(&mut self) {
+        // An unpublished clone must not survive the failure that
+        // abandoned it: `create_new` would then fail EEXIST on every
+        // later prepare of this node.
+        if !self.published {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+impl ClonedKeyframe {
+    /// `FICLONE` `ancestor_mem` into `snapshot_dir/memory.bin.tmp`.
+    ///
+    /// Fails with [`SnapshotError::ReflinkUnsupported`] when the two
+    /// paths are not on one reflink-capable filesystem, so the caller
+    /// can fall back to the full dump **loudly**.
+    fn clone_from(
+        snapshot_dir: &Path,
+        ancestor_mem: &Path,
+        mem_span: u64,
+    ) -> Result<Self, SnapshotError> {
+        use std::os::fd::AsRawFd;
+
+        // Same tmp + rename discipline as the full dump (#130): the file
+        // we are about to publish may already be MAP_PRIVATE-mapped by a
+        // live VM, so the old inode must stay alive.
+        let tmp_path = snapshot_dir.join("memory.bin.tmp");
+        // A tmp file left behind by a crashed prepare would make
+        // `create_new` fail EEXIST forever.
+        let _ = fs::remove_file(&tmp_path);
+
+        let ancestor = fs::File::open(ancestor_mem)?;
+        let ancestor_len = ancestor.metadata()?.len();
+        if ancestor_len != mem_span {
+            return Err(SnapshotError::Kvm(format!(
+                "ancestor keyframe {} is {ancestor_len} bytes but this VM's guest-physical \
+                 span is {mem_span} — refusing to clone a base of a different shape",
+                ancestor_mem.display(),
+            )));
+        }
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        // SAFETY: both fds are valid for the duration of the call;
+        // FICLONE takes the source fd as its integer argument.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, ancestor.as_raw_fd()) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SnapshotError::ReflinkUnsupported {
+                ancestor: ancestor_mem.to_path_buf(),
+                dest: tmp_path,
+                detail: err.to_string(),
+            });
+        }
+        Ok(Self {
+            file,
+            tmp_path,
+            dest_path: snapshot_dir.join("memory.bin"),
+            published: false,
+        })
+    }
+
+    /// `pwrite` every page set in `dirty_bitmap` from the paused mapping
+    /// at `host_addr` into the clone, then publish it with `rename`.
+    ///
+    /// Returns the bytes of dirt written — the keyframe's physical disk
+    /// cost, which is what the tree's disk budget must count: the cloned
+    /// file reports its full logical length, and `st_blocks` is no help
+    /// because XFS counts a shared extent in every file that references
+    /// it . A dirty page outside the span is an error,
+    /// never a silent skip.
+    fn patch_and_publish(
+        mut self,
+        dirty_bitmap: &[u64],
+        host_addr: *const u8,
+        mem_span: u64,
+    ) -> Result<u64, SnapshotError> {
+        let t_write = Instant::now();
+        let (written, runs) = self.patch(dirty_bitmap, host_addr, mem_span)?;
+        let write_took = t_write.elapsed();
+        // Deliberately no `fsync`: the full dump this replaces does not
+        // fsync either (`dump_memory` writes and renames), and a
+        // keyframe is host-lifetime state, not a durable artifact. An
+        // fsync here costs 2-5 s per member against ~100 ms of writes,
+        // because every patched page has to break a shared extent and
+        // that lands in the refcount btree (the referenced work §5,
+        // CHALLENGES #154). Readers and `MAP_PRIVATE` see the page
+        // cache regardless.
+        fs::rename(&self.tmp_path, &self.dest_path)?;
+        self.published = true;
+        log::info!(
+            "snapshot: patched {} MiB in {runs} run(s) in {write_took:?}",
+            written / (1024 * 1024),
+        );
+        Ok(written)
+    }
+
+    /// Write the dirty set a **run at a time**, not a page at a time.
+    ///
+    /// Guest dirt is clustered, and one `pwrite` per 4 KiB page is what
+    /// made the first measured incremental keyframe slower than the full
+    /// dump it was meant to replace: ~400 000 syscalls for a 30 s-idle
+    /// k3s node . Coalescing adjacent
+    /// pages into a single write turns that into a few thousand.
+    fn patch(
+        &self,
+        dirty_bitmap: &[u64],
+        host_addr: *const u8,
+        mem_span: u64,
+    ) -> Result<(u64, u64), SnapshotError> {
+        use std::os::unix::fs::FileExt;
+
+        let pages = mem_span.div_ceil(4096);
+        // Checked up front, and once, so the walk below stays total and
+        // allocation-free — which is what makes it model-checkable.
+        if let Some(top) = highest_dirty_page(dirty_bitmap) {
+            if top >= pages {
+                return Err(SnapshotError::Kvm(format!(
+                    "dirty bitmap marks page {top}, beyond the {pages}-page \
+                     guest-physical span — refusing to write a keyframe from a \
+                     bitmap that does not describe this VM"
+                )));
+            }
+        }
+
+        let mut written: u64 = 0;
+        let mut runs: u64 = 0;
+        for_each_dirty_run(dirty_bitmap, |start, end| {
+            let offset = start * 4096;
+            let len = ((end - start) * 4096) as usize;
+            // SAFETY: every run lies within the set bits of the bitmap,
+            // whose highest is below `pages` by the check above, so
+            // `offset + len <= mem_span`; `host_addr` points at a
+            // mapping of at least `mem_span` bytes kept alive by the
+            // borrowed (paused) VM.
+            let bytes = unsafe { std::slice::from_raw_parts(host_addr.add(offset as usize), len) };
+            self.file.write_all_at(bytes, offset)?;
+            written += len as u64;
+            runs += 1;
+            Ok::<(), SnapshotError>(())
+        })?;
+        Ok((written, runs))
+    }
+}
+
+/// Highest page index set in `dirty_bitmap`, or `None` if it is clear.
+///
+/// The bound check for the whole walk: a bitmap whose top set bit is
+/// inside the guest-physical span has every set bit inside it.
+fn highest_dirty_page(dirty_bitmap: &[u64]) -> Option<u64> {
+    for (word_idx, &word) in dirty_bitmap.iter().enumerate().rev() {
+        if word != 0 {
+            return Some((word_idx as u64) * 64 + u64::from(63 - word.leading_zeros()));
+        }
+    }
+    None
+}
+
+/// Call `f(start, end)` once per maximal run of contiguous set pages in
+/// `dirty_bitmap`, in ascending order, as half-open page ranges.
+///
+/// Split out of [`ClonedKeyframe::patch`] so the arithmetic that decides
+/// which bytes get written — the part whose soundness the `unsafe`
+/// slice in the caller rests on — is pure, total and allocation-free,
+/// and so can be model-checked (`verify_dirty_runs_cover_exactly`).
+fn for_each_dirty_run<F, E>(dirty_bitmap: &[u64], mut f: F) -> Result<(), E>
+where
+    F: FnMut(u64, u64) -> Result<(), E>,
+{
+    // The open run, as [start, end).
+    let mut run: Option<(u64, u64)> = None;
+    for (word_idx, &word) in dirty_bitmap.iter().enumerate() {
+        if word == 0 {
+            if let Some((start, end)) = run.take() {
+                f(start, end)?;
+            }
+            continue;
+        }
+        for bit in 0..64u64 {
+            let page_idx = (word_idx as u64) * 64 + bit;
+            if word & (1u64 << bit) == 0 {
+                if let Some((start, end)) = run.take() {
+                    f(start, end)?;
+                }
+                continue;
+            }
+            match run {
+                Some((start, end)) if end == page_idx => run = Some((start, page_idx + 1)),
+                open => {
+                    if let Some((start, end)) = open {
+                        f(start, end)?;
+                    }
+                    run = Some((page_idx, page_idx + 1));
+                }
+            }
+        }
+    }
+    if let Some((start, end)) = run.take() {
+        f(start, end)?;
+    }
+    Ok(())
+}
+
+/// Write the non-memory half of a snapshot: `cpu.json`, `devices.json`,
+/// `irqchip.json`, `metadata.json`. Shared by the full and incremental
+/// keyframe paths so a restore cannot tell them apart.
+fn write_state_files(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
+    let cpu_states = capture_all_cpu_states(vm)?;
+    let cpu_json = serde_json::to_string_pretty(&cpu_states)?;
+    fs::write(snapshot_dir.join("cpu.json"), cpu_json)?;
+
+    let device_states = {
+        let registry = vm.mmio_registry().lock().unwrap();
+        registry.snapshot_device_states()
+    };
+    let devices_json = serde_json::to_string_pretty(&device_states)?;
+    fs::write(snapshot_dir.join("devices.json"), devices_json)?;
+
+    // Save IRQ chip state for interrupt delivery after restore.
+    let irqchip_state = capture_irqchip_state(vm)?;
+    let irqchip_json = serde_json::to_string_pretty(&irqchip_state)?;
+    fs::write(snapshot_dir.join("irqchip.json"), irqchip_json)?;
+
+    let metadata = SnapshotMetadata {
+        memory_size_bytes: vm.memory_size(),
+        kernel_path: vm.kernel_path().to_string_lossy().to_string(),
+        initrd_path: vm.initrd_path().map(|p| p.to_string_lossy().to_string()),
+        guest_cid: vm.guest_cid(),
+        timestamp_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        block_devices: vm.block_devices().to_vec(),
+        kvmclock: Some(capture_kvmclock(vm)?),
+        dilation: vm.dilation(),
+    };
+    let metadata_json = serde_json::to_string_pretty(&metadata)?;
+    fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
+    Ok(())
+}
+
+/// Snapshot a paused VM as an **incremental keyframe** against
+/// `ancestor_mem` : clone the ancestor's `memory.bin` and
+/// overwrite only `dirty_bitmap`, then write the same state files a
+/// full snapshot writes.
+///
+/// `dirty_bitmap` must already be the complete set of pages that differ
+/// from the ancestor keyframe — the KVM log ∪ device-DMA ∪ vsock-ring
+/// merge `Vm::get_and_accumulate_dirty` returns. The
+/// `TRANSPORT_RESET` injection this function performs is a *host* write
+/// into guest RAM that no bitmap can have seen, so its pages are OR'd in
+/// here before anything is written.
+///
+/// Returns the bytes of dirt written (the keyframe's physical cost).
+pub(crate) fn snapshot_vm_incremental(
+    vm: &Vm,
+    snapshot_dir: &Path,
+    ancestor_mem: &Path,
+    dirty_bitmap: &mut [u64],
+) -> Result<u64, SnapshotError> {
+    if vm.is_running() || vm.vcpu_fds().len() != vm.vcpu_count() as usize {
+        return Err(SnapshotError::NotPaused);
+    }
+    let start = Instant::now();
+    fs::create_dir_all(snapshot_dir)?;
+
+    let mem_span = vm.mem_span();
+    let host_addr = dump_host_addr(vm)?;
+
+    // Clone before injecting: a non-reflink filesystem sends the caller
+    // to the full dump, which injects a TRANSPORT_RESET of its own, and
+    // two events in the guest's vsock event queue is not a state the
+    // driver ever sees on a real reset.
+    let t_clone = Instant::now();
+    let clone = ClonedKeyframe::clone_from(snapshot_dir, ancestor_mem, mem_span)?;
+    log::info!(
+        "snapshot: FICLONE of {} took {:?}",
+        ancestor_mem.display(),
+        t_clone.elapsed()
+    );
+
+    let device_states_for_reset = {
+        let registry = vm.mmio_registry().lock().unwrap();
+        registry.snapshot_device_states()
+    };
+    let injected =
+        inject_vsock_transport_reset_into(mem_span, &device_states_for_reset, vm.mem_host_addr());
+    for page in injected {
+        let word = (page / 64) as usize;
+        if word >= dirty_bitmap.len() {
+            return Err(SnapshotError::Kvm(format!(
+                "TRANSPORT_RESET injection wrote page {page}, outside the \
+                 {}-word dirty bitmap of this VM",
+                dirty_bitmap.len()
+            )));
+        }
+        dirty_bitmap[word] |= 1u64 << (page % 64);
+    }
+
+    let written = clone.patch_and_publish(dirty_bitmap, host_addr, mem_span)?;
+    log::info!(
+        "snapshot: incremental keyframe {} MiB dirt over {} in {:?}",
+        written / (1024 * 1024),
+        ancestor_mem.display(),
+        start.elapsed()
+    );
+
+    write_state_files(vm, snapshot_dir)?;
+    log::info!(
+        "snapshot: incremental complete in {:?} to {}",
+        start.elapsed(),
+        snapshot_dir.display()
+    );
+    Ok(written)
 }
 
 /// Take a snapshot of the given VM to the specified directory.
@@ -921,36 +1320,7 @@ pub fn snapshot_vm(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
         start.elapsed()
     );
 
-    let cpu_states = capture_all_cpu_states(vm)?;
-    let cpu_json = serde_json::to_string_pretty(&cpu_states)?;
-    fs::write(snapshot_dir.join("cpu.json"), cpu_json)?;
-
-    let device_states = {
-        let registry = vm.mmio_registry().lock().unwrap();
-        registry.snapshot_device_states()
-    };
-    let devices_json = serde_json::to_string_pretty(&device_states)?;
-    fs::write(snapshot_dir.join("devices.json"), devices_json)?;
-
-    // Save IRQ chip state for interrupt delivery after restore.
-    let irqchip_state = capture_irqchip_state(vm)?;
-    let irqchip_json = serde_json::to_string_pretty(&irqchip_state)?;
-    fs::write(snapshot_dir.join("irqchip.json"), irqchip_json)?;
-
-    let metadata = SnapshotMetadata {
-        memory_size_bytes: vm.memory_size(),
-        kernel_path: vm.kernel_path().to_string_lossy().to_string(),
-        initrd_path: vm.initrd_path().map(|p| p.to_string_lossy().to_string()),
-        guest_cid: vm.guest_cid(),
-        timestamp_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        block_devices: vm.block_devices().to_vec(),
-        kvmclock: Some(capture_kvmclock(vm)?),
-    };
-    let metadata_json = serde_json::to_string_pretty(&metadata)?;
-    fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
+    write_state_files(vm, snapshot_dir)?;
 
     log::info!(
         "snapshot: complete in {:?} to {}",
@@ -959,4 +1329,118 @@ pub fn snapshot_vm(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> {
     );
 
     Ok(())
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::highest_dirty_page;
+
+    /// `highest_dirty_page` really is the maximum. This is the bound the
+    /// `unsafe` slice in `ClonedKeyframe::patch` rests on: `patch`
+    /// compares one number against the page count and every run the walk
+    /// then emits is at or below it, so no write reads past the end of
+    /// the paused VM's mapping.
+    ///
+    /// The walk itself is checked exhaustively in `dirty_run_tests`
+    /// rather than here — a symbolic bitmap unrolls the 64-bit loop into
+    /// a formula that puts CBMC out of memory (CHALLENGES #155).
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn verify_highest_dirty_page_is_max() {
+        let word: u64 = kani::any();
+        let top = highest_dirty_page(&[word]);
+        match top {
+            None => assert_eq!(word, 0, "None only for a clear bitmap"),
+            Some(top) => {
+                assert!(top < 64);
+                assert!(word & (1u64 << top) != 0, "the reported page is set");
+                let mut p = top + 1;
+                while p < 64 {
+                    assert!(word & (1u64 << p) == 0, "nothing is set above it");
+                    p += 1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dirty_run_tests {
+    use super::{for_each_dirty_run, highest_dirty_page};
+
+    fn runs(bitmap: &[u64]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let r: Result<(), ()> = for_each_dirty_run(bitmap, |s, e| {
+            out.push((s, e));
+            Ok(())
+        });
+        r.unwrap();
+        out
+    }
+
+    /// The runs must be exactly the dirty set: every page handed to the
+    /// writer is dirty, every dirty page is handed over exactly once,
+    /// and the runs are non-empty, ascending, disjoint and maximal.
+    ///
+    /// That is what makes an incremental keyframe equal to the full dump
+    /// it replaces: a page the walk misses leaves the child running on
+    /// the ancestor's stale bytes. Checked exhaustively over every
+    /// 16-page pattern, straddling the word boundary so a run that
+    /// crosses it is covered too — the shapes are all there, and a
+    /// symbolic version of this is what put CBMC out of memory
+    /// (CHALLENGES #155).
+    #[test]
+    fn dirty_runs_cover_the_dirty_set_exactly() {
+        for pattern in 0u32..(1 << 16) {
+            // Bits 56..64 of word 0 and 0..8 of word 1.
+            let w0 = u64::from(pattern & 0xFF) << 56;
+            let w1 = u64::from(pattern >> 8);
+            let mut seen0 = 0u64;
+            let mut seen1 = 0u64;
+            let mut prev_end: Option<u64> = None;
+            for (start, end) in runs(&[w0, w1]) {
+                assert!(start < end, "{pattern:#x}: runs are non-empty");
+                assert!(end <= 128, "{pattern:#x}: no run leaves the bitmap");
+                assert!(
+                    prev_end.is_none_or(|e| start > e),
+                    "{pattern:#x}: runs are ascending, disjoint and maximal"
+                );
+                prev_end = Some(end);
+                for p in start..end {
+                    let (bit, seen) = if p < 64 {
+                        (1u64 << p, &mut seen0)
+                    } else {
+                        (1u64 << (p - 64), &mut seen1)
+                    };
+                    let word = if p < 64 { w0 } else { w1 };
+                    assert!(word & bit != 0, "{pattern:#x}: page {p} is not dirty");
+                    assert!(*seen & bit == 0, "{pattern:#x}: page {p} written twice");
+                    *seen |= bit;
+                }
+            }
+            assert_eq!(seen0, w0, "{pattern:#x}: word 0 covered exactly");
+            assert_eq!(seen1, w1, "{pattern:#x}: word 1 covered exactly");
+        }
+    }
+
+    /// A run spanning the word boundary must come out as **one** run,
+    /// spelled out because it is the case the per-word loop would most
+    /// plausibly get wrong.
+    #[test]
+    fn dirty_run_joins_across_the_word_boundary() {
+        assert_eq!(runs(&[1 << 63, 1]), vec![(63, 65)]);
+        assert_eq!(runs(&[1 << 63, 0b11]), vec![(63, 66)]);
+        // Bit 62 of word 0 and bit 0 of word 1 are not adjacent.
+        assert_eq!(runs(&[1 << 62, 1]), vec![(62, 63), (64, 65)]);
+        assert_eq!(runs(&[u64::MAX, u64::MAX]), vec![(0, 128)]);
+        assert_eq!(runs(&[0, 0]), Vec::new());
+    }
+
+    #[test]
+    fn highest_dirty_page_spans_words() {
+        assert_eq!(highest_dirty_page(&[0, 0]), None);
+        assert_eq!(highest_dirty_page(&[0b101, 0]), Some(2));
+        assert_eq!(highest_dirty_page(&[u64::MAX, 1]), Some(64));
+        assert_eq!(highest_dirty_page(&[1, 1 << 63]), Some(127));
+    }
 }

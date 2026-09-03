@@ -7,7 +7,7 @@ diffs, protecting winners, and pruning losers under a real
 `TreeBudget`.
 
 k7d itself stays a Unix-socket daemon. This process is a node-local
-sidecar .
+sidecar.
 
 ## Tools
 
@@ -70,7 +70,7 @@ pre-fork inspect battery cannot name. Also `sleeper` / `hydra` /
 remediates on a fork, then replays on the source. Teardown always
 `prune`+`drop`s the tree.
 
-Guest is the 25a Ubuntu image via `gym/ubuntu.py`. Never
+Guest is the Ubuntu image via `gym/ubuntu.py`. Never
 `K7D_KERNEL`/`K7D_INITRD` (those are the busybox RuntimeClass pair).
 
 ## Tests

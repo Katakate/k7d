@@ -15,7 +15,7 @@ class TestIncidents(unittest.TestCase):
     def test_catalog_allowlist(self) -> None:
         self.assertEqual(
             incidents.allowlist(),
-            ["cryptominer", "hydra", "lateral", "relay", "sleeper"],
+            ["cryptominer", "dormant", "hydra", "lateral", "relay", "sleeper"],
         )
         self.assertEqual(incidents.pick(None).id, "relay")
         for fid in incidents.allowlist():
@@ -61,6 +61,34 @@ class TestIncidents(unittest.TestCase):
         self.assertIn("PathModified=/etc/systemd/system", script)
         self.assertEqual(relay.remediate_members(), [0])
         self.assertTrue(callable(relay.plant_host))
+
+        dormant = incidents.get("dormant")
+        # Layer 1 is a plain control-plane Deployment; the resurrect
+        # chain never appears in what the agent applies.
+        self.assertIn("kind: Deployment", dormant.yaml)
+        self.assertNotIn("kind: CronJob", dormant.yaml)
+        self.assertNotIn("ServiceAccount", dormant.yaml)
+        self.assertIn("node-role.kubernetes.io/control-plane", dormant.yaml)
+        script = dormant.plant_script()
+        for tok in dormant.next_layer_tokens:
+            self.assertNotIn(tok, dormant.yaml, f"{tok} leaked into the live spec")
+            self.assertIn(tok, script, f"{tok} missing from the plant")
+            self.assertIn(tok, dormant.remediate_cmd())
+        # Hidden like relay: .path units, not services/timers/cron, and
+        # the guard lives in the vendor dir started-not-enabled.
+        self.assertIn(f"{incidents.DORMANT_RESEED_UNIT}.path", script)
+        self.assertIn(f"{incidents.DORMANT_GUARD_UNIT}.path", script)
+        self.assertIn(f"PathModified={incidents.DORMANT_KUBELET_PODS}", script)
+        self.assertIn(f"PathModified={incidents.DORMANT_UNIT_DIR}", script)
+        self.assertIn(incidents.DORMANT_GUARD_UNIT_DIR, script)
+        # The time gate: each reveal sleeps before it re-acts.
+        self.assertIn(f"sleep {incidents.DORMANT_DELAY_SEC}", script)
+        # The multi-candidate frontier: an inert decoy cron sits next to
+        # the real timer, and it must not carry a miner token.
+        self.assertIn(incidents.DORMANT_DECOY_CRON, script)
+        self.assertNotIn(incidents.DORMANT_MINER, incidents.DORMANT_DECOY_CRON)
+        self.assertEqual(dormant.remediate_members(), [0])
+        self.assertTrue(callable(dormant.plant_host))
 
     def test_unknown_is_loud(self) -> None:
         with self.assertRaises(incidents.UnknownIncident) as ctx:

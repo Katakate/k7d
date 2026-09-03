@@ -1,0 +1,65 @@
+# 2-worker JobSet on the fake GPU fixture .
+# CPU/Gloo-shaped rendezvous over JobSet headless DNS — not CUDA.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: gpu-jobset-done
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 2
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 2
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: train
+              image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -eu
+                mkdir -p /www
+                echo "cpu-gloo $(hostname)" > /www/whoami
+                httpd -p 8080 -h /www
+                # busybox nslookup does not apply resolv.conf search
+                # (CHALLENGES #148). Use the JobSet headless FQDN.
+                # Keep httpd up until both peers have /done — a worker
+                # that exits after its own wget leaves the sibling with
+                # "No route to host" (CHALLENGES #149).
+                peers="gpu-jobset-done-workers-0-0.gpu-jobset-done.default.svc.cluster.local gpu-jobset-done-workers-1-0.gpu-jobset-done.default.svc.cluster.local"
+                wait_url() {
+                  path="$1"
+                  for h in $peers; do
+                    n=0
+                    while [ "$n" -lt 30 ]; do
+                      if nslookup "$h" >/tmp/dns.out 2>&1 && wget -q -T 2 -O- "http://$h:8080$path" >/tmp/peer.out 2>&1; then
+                        echo "rendezvous ok $h $path $(cat /tmp/peer.out)"
+                        break
+                      fi
+                      n=$((n + 1))
+                      sleep 2
+                    done
+                    if [ "$n" -eq 30 ]; then
+                      echo "DNS/rendezvous failed for hostname $h path $path (JobSet headless Service; short name gpu-jobset-done-workers-*-0.gpu-jobset-done is NXDOMAIN to busybox nslookup)" >&2
+                      cat /tmp/dns.out >&2 || true
+                      exit 1
+                    fi
+                  done
+                }
+                wait_url /whoami
+                echo done > /www/done
+                wait_url /done
+                echo "cpu-gloo train complete"
+                sleep 2
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                requests:
+                  nvidia.com/gpu: "1"

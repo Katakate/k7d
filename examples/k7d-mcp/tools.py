@@ -19,6 +19,7 @@ from k7d_client import K7dClient  # noqa: E402
 import agent  # noqa: E402
 from host import k7_bridge_name, list_bridges  # noqa: E402
 from logutil import JsonlLog  # noqa: E402
+from mutation import looks_destructive as _looks_destructive  # noqa: E402
 from scoring import curl_api  # noqa: E402
 
 TETRAGON_NS = "kube-system"
@@ -190,7 +191,12 @@ class K7dMcp:
                         f"member {member} out of range for {node_id} (have {len(cids)})"
                     )
                 cid = cids[member]
-                r = agent.exec_cmd(cid, ["sh", "-c", cmd], timeout_s=60)
+                # Long enough to soak past a timer-based reseeder (the
+                # `dormant` incident's layers fire at ~75-90s), so a
+                # `sleep 120; recheck` confirmation completes instead of
+                # timing out mid-soak. Only reached on a genuinely stuck
+                # command; normal execs return in well under a second.
+                r = agent.exec_cmd(cid, ["sh", "-c", cmd], timeout_s=240)
                 result = {
                     "stdout": r["stdout"],
                     "stderr": r["stderr"],
@@ -316,22 +322,6 @@ class K7dMcp:
                 f"(k7-br-*={sorted(visible)})"
             )
         return name
-
-
-def _looks_destructive(cmd: str) -> bool:
-    s = cmd.lower()
-    keys = (
-        "delete",
-        "drain",
-        "cordon",
-        "kill",
-        "rm -",
-        "kubectl delete",
-        "systemctl stop",
-        "iptables",
-        "pkill",
-    )
-    return any(k in s for k in keys)
 
 
 def _tetragon_events(bridge: str, certs_dir: Path | None, guest_ip: str) -> str:

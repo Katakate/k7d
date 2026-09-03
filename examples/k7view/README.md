@@ -29,8 +29,7 @@ Not a trainer. Not Claude Mythos.
 
 ## Run (on the KVM node)
 
-Use `K7_NODE_IP=<node-ip>` only for this demo. Do not touch
-`<node-ip>` or `<node-ip>`.
+Run on a Linux/KVM host with `k7d` listening on `/run/k7d/k7d.sock`.
 
 ```bash
 # terminal 1
@@ -47,7 +46,23 @@ K7D_KERNEL=/usr/local/share/k7d/vmlinux \
 K7D_INITRD=/usr/local/share/k7d/initramfs.cpio.gz \
 python3 examples/k7view/run_scenario.py --profile max --keep
 # equivalent:  python3 examples/k7view/run_scenario.py --video --keep
+
+# terminal 2 - ×8 dilated Ubuntu k3s . Requires patched
+# KVM modules (`make remote-dilation-install`). Never K7D_KERNEL/INITRD.
+python3 examples/k7view/run_scenario.py --profile ubuntu-dilated --keep \
+    --log /tmp/k7d-dilated-tree.jsonl
 ```
+
+`--profile ubuntu-dilated` creates a 3-node Ubuntu k3s source through
+`/run/k7d/k7d.sock` with `config.dilation = 8` (CreateVm × 3 + adopt,
+same helpers as `gym/ubuntu.py`), then 3 waves (`6 + 4 + 4`) forking
+from the previous winner. Each branch applies a Deployment whose
+readiness gate is guest time (`initialDelaySeconds: 40`); under ×8
+that is ~5–6 s of wall. Fork latency chips stay wall-clock. The
+header shows wall `T+mm:ss` next to `guest T+mm:ss ×N` (uptime from
+the existing vsock probe, N from `tree_nodes.live_dilation`). JSONL
+records every fork latency, rollout wall/guest time, and
+`live_dilation`.
 
 `--profile max` default is 3 waves (`8 + 4 + 4` cluster forks of a
 3-VM busybox cluster) plus a 6-branch single-VM tree. Wave 0 forks from
@@ -55,14 +70,13 @@ root (depth 1). Later waves call real `tree_prepare_fork_source` on the
 winner, then `fork_batch` from that child (depth 2, then 3). k7d parent
 ids are authentic - the UI does not invent edges. Wave 1 fills
 ~90% of `max_live_vms`; later waves park losers first (the RL policy of
-killing branches - kept for protect-chain visibility). Since spec
-9g-inc1 the daemon also evicts for incoming VMs inside `fork_batch`
-(CHALLENGES #115), so parking is no longer required for a legal
-under-budget fork.
+killing branches - kept for protect-chain visibility). The daemon also
+evicts for incoming VMs inside `fork_batch` (CHALLENGES #115), so
+parking is no longer required for a legal under-budget fork.
 The graph is generation-based so a
 `fork_batch` fan-out does not stack on one x position.
 
-Measured on `<node-ip>` (12 cores / 62 GiB, 2026-08-19), after
+Measured on a 12-core / 62 GiB box (2026-08-19), after
 child `prepare_fork_source` landed - **k7d parent chains, not UI
 fiction**:
 
@@ -90,12 +104,12 @@ ssh -L 7474:127.0.0.1:7474 root@${K7_NODE_IP}
 # http://127.0.0.1:7474/
 ```
 
-## Live inc1 agent runs (MCP bridge)
+## Live agent runs (MCP bridge)
 
 `ingest_mcp.py` tails the `k7d-mcp` harness JSONL and posts cmd /
 verdict / beat / latency / note events into `/api/ingest`, so a real
-27a-inc1 agent run renders live with zero changes to the harness or
-the MCP server:
+agent run renders live with zero changes to the harness or the MCP
+server:
 
 ```bash
 # on the node, next to server.py
@@ -112,7 +126,7 @@ python3 examples/k7view/ingest_mcp.py --replay path/to/ep-fork-0-x.jsonl \
     --speed 4 --stub-socket /tmp/k7d-stub.sock
 ```
 
-## Recording the demo video 
+## Recording the demo video
 
 Capture runs on any workstation that can reach the UI - the k7d node
 needs nothing beyond the stdlib server. `capture.py` drives headless
@@ -124,12 +138,18 @@ phase, grabs PNG frames, and encodes with ffmpeg:
 ssh -N -L 7475:127.0.0.1:7474 root@${K7_NODE_IP} &   # tunnel
 python3 examples/k7view/capture.py --url http://127.0.0.1:7475/ \
     --out /tmp/take1 --fps 8 --start-phase agent --stop-phase idle
-# /tmp/take1/capture.mp4 is real-time; trim/speed the boring parts:
-ffmpeg -i /tmp/take1/capture.mp4 -vf "setpts=PTS/1.5" -an k7d-mcp-demo.mp4
-# README gif (<=15 s highlight, palette pass keeps the dark theme clean):
-ffmpeg -ss 10 -t 14 -i k7d-mcp-demo.mp4 -vf \
+# /tmp/take1/capture.mp4 is real-time; the agent videos may speed the
+# boring parts. The dilated-tree hero (27a-inc1e) must NOT use setpts:
+python3 examples/k7view/capture.py --url http://127.0.0.1:7475/ \
+    --out /tmp/dilated --fps 8 --start-phase ready --stop-phase idle --max-s 90
+# trim only (cut source bring-up if it leaked in; open on the Ready root).
+# If CDP lagged, capture.mp4 encoded at --fps is a silent speed-up
+# (CHALLENGES #203) — re-encode from frames at N/duration instead:
+#   ffmpeg -framerate 181/90 -i /tmp/dilated/frames/f_%05d.png ...
+ffmpeg -ss 0 -i /tmp/dilated/capture.mp4 -c copy -an docs/assets/k7d-dilated-tree.mp4
+ffmpeg -ss 0 -t 14 -i docs/assets/k7d-dilated-tree.mp4 -vf \
   "fps=10,scale=960:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse" \
-  k7d-mcp-demo.gif
+  docs/assets/k7d-dilated-tree.gif
 ```
 
 ## Tests

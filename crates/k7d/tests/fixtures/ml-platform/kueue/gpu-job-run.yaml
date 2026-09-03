@@ -1,0 +1,26 @@
+# First GPU Job: admits against ClusterQueue quota 1 and stays Running
+# so the fork sees the Admitted/Pending split. Busybox operand, not CUDA.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-job-run
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: user-queue
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: sleep
+        image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+        imagePullPolicy: IfNotPresent
+        command: ["sleep", "86400"]
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "100m"
+            memory: 64Mi
+            nvidia.com/gpu: "1"

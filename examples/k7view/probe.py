@@ -19,6 +19,17 @@ sys.path.insert(0, str(HERE.parents[1] / "gym"))
 import agent as guest_agent  # noqa: E402
 
 
+def parse_uptime(text: str) -> float | None:
+    """First field of ``/proc/uptime`` (seconds). None if missing/unparseable."""
+    if not text:
+        return None
+    first = text.split()[0] if text.split() else ""
+    try:
+        return float(first)
+    except ValueError:
+        return None
+
+
 def live_targets(trees: dict[str, Any]) -> list[tuple[str, str, int]]:
     """(tree_id, node_id, cid) for live members only."""
     out: list[tuple[str, str, int]] = []
@@ -35,6 +46,26 @@ def live_targets(trees: dict[str, Any]) -> list[tuple[str, str, int]]:
                 except (TypeError, ValueError):
                     continue
     return out
+
+
+def root_server_target(trees: dict[str, Any]) -> tuple[str, str, int] | None:
+    """Root node's first CID (the k3s server). Guest-clock source."""
+    for tid, slot in (trees or {}).items():
+        nodes = slot.get("nodes") or {}
+        members = slot.get("members") or {}
+        for nid, node in nodes.items():
+            if node.get("parent"):
+                continue
+            if node.get("state") not in (None, "live"):
+                continue
+            cids = members.get(nid) or []
+            if not cids:
+                continue
+            try:
+                return tid, nid, int(cids[0])
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def probe_one(cid: int, n: int) -> dict[str, Any]:
@@ -134,8 +165,31 @@ class RealProbe:
             if not targets:
                 continue
             self.n += 1
-            _tid, _nid, cid = random.choice(targets)
+            root = root_server_target(getattr(self.store, "trees", {}))
+            # Exec ticks (uptime) prefer the root server — that is the
+            # guest-clock source. Other ticks stay a random live CID.
+            if self.n % 3 == 0 and root is not None:
+                tid, nid, cid = root
+            else:
+                tid, nid, cid = random.choice(targets)
             try:
-                probe_one(cid, self.n)
+                result = probe_one(cid, self.n)
+            except Exception:
+                continue
+            up = parse_uptime(result.get("uptime") or "")
+            if up is None:
+                continue
+            try:
+                self.ingest_fn(
+                    [
+                        {
+                            "type": "guest_clock",
+                            "tree_id": tid,
+                            "node_id": nid,
+                            "cid": cid,
+                            "uptime_s": up,
+                        }
+                    ]
+                )
             except Exception:
                 continue

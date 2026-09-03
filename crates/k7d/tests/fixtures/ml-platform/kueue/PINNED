@@ -1,0 +1,9 @@
+# Kueue v0.19.2 (2026-08-20). Test helper fetches the release
+# manifests.yaml and refuses to apply if the sha256 mismatches.
+# Controller image rewritten to digest. Operand is digest-pinned
+# busybox (not CUDA / not a production batch scheduler).
+KUEUE_VERSION=v0.19.2
+MANIFESTS_URL=https://github.com/kubernetes-sigs/kueue/releases/download/v0.19.2/manifests.yaml
+MANIFESTS_SHA256=88881eb50734eb920b67486ebc2aa978ed325e1b12d99b22fc51a6d7e9e4d370
+IMAGE=registry.k8s.io/kueue/kueue:v0.19.2@sha256:8a77be2df3d441d1a99b60eb1625c835b5f4feda5db02ece26818cf2a30c4d86
+OPERAND=docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662

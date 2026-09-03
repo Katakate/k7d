@@ -6,8 +6,8 @@ k7d is pre-1.0. Security fixes land on the latest release only until 1.0.0.
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅        |
-| < 0.1   | ❌        |
+| 0.3.x   | ✅        |
+| < 0.3   | ❌        |
 
 ## Reporting a vulnerability
 

@@ -194,6 +194,38 @@ pub const SUSPEND_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 /// from `vm_state.json`. projects ~40 ms; ceiling at 750 ms.
 pub const RESUME_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 
+/// Lockstep guest-clock warp of a 3-VM cluster .
+///
+/// The daemon's `WarpClock` op end to end: pause all three members,
+/// then per member one `KVM_GET_CLOCK` + `KVM_SET_CLOCK` and, per vCPU,
+/// a `KVM_{GET,SET}_DEVICE_ATTR` pair for `KVM_VCPU_TSC_OFFSET`, an
+/// `IA32_TSC_DEADLINE` read-back and a `KVM_KVMCLOCK_CTRL`, then resume
+/// all three. No disk, no memory copy, no bridge work — a few dozen
+/// ioctls under the same pause, which is why it can be lockstep at all.
+/// The bound that matters is not throughput but the width of the pause
+/// window: everything inside it is time the cluster is not running, and
+/// the whole point of the op is that the guests cannot tell the jump
+/// from a scheduling hiccup. Projects sub-millisecond of ioctls on top
+/// of a 3-VM pause/resume; ceiling at 250 ms for suite-tail headroom.
+/// Enforced by `test_warp_clock_moves_a_live_cluster_in_lockstep`.
+pub const WARP_CLUSTER_3VM: Duration = Duration::from_millis(250);
+
+/// Incremental keyframe for a 3-VM Ubuntu cluster child .
+///
+/// `prepare_fork_source` on a tree child whose ancestor already has a
+/// keyframe on the same reflink filesystem: per member a pause, the
+/// dirty merge, an `FICLONE` of the ancestor's `memory.bin`, a `pwrite`
+/// per run of dirty pages, `rename`, and the restore-swap. The clone is
+/// metadata-only, so the cost is the divergence, not the 6 GiB of guest
+/// RAM the root's full dump moves (7.327 s, the referenced work Result).
+///
+/// Measured on the 3x2 GiB Ubuntu cluster at the 28a divergence levels
+/// after 30 s of divergence : idle 0.73 s, k8s 0.85 s,
+/// kafka 2.26 s — against 6.4 s for the root's full dump of the same
+/// cluster. The ceiling is ~2x the worst level. Enforced by
+/// `test_keyframe_cost_ubuntu_divergence_levels`.
+pub const PREPARE_KEYFRAME_INCREMENTAL_CLUSTER_3VM: Duration = Duration::from_millis(4500);
+
 /// Pool-compatible `create_vm` served from the
 /// warm pool (mirrors the 100 ms cold-boot ceiling): pop an idle
 /// agent-ready VM, registry insert, sandbox-record write, and one

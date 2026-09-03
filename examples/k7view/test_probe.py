@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for real-probe formatting (no vsock)."""
 
-from probe import format_probe, live_targets
+from probe import format_probe, live_targets, parse_uptime, root_server_target
 
 
 def test_live_targets_skips_suspended() -> None:
@@ -16,6 +16,19 @@ def test_live_targets_skips_suspended() -> None:
     }
     got = live_targets(trees)
     assert got == [("t1", "a", 42), ("t1", "a", 43)]
+    trees_root = {
+        "t1": {
+            "nodes": {
+                "root": {"id": "root", "state": "live", "parent": None},
+                "a": {"id": "a", "state": "live", "parent": "root"},
+            },
+            "members": {"root": [10, 11], "a": [20]},
+        }
+    }
+    assert root_server_target(trees_root) == ("t1", "root", 10)
+    assert parse_uptime("12.5 48.0") == 12.5
+    assert parse_uptime("") is None
+    assert parse_uptime("not-a-number") is None
 
 
 def test_format_probe_is_measured() -> None:

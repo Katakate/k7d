@@ -506,6 +506,98 @@ theorem k7dl_parse_header_equiv (b : Array Std.U8 28#usize) :
     absBytes_getElem! b 18 (by scalar_tac), absBytes_getElem! b 19 (by scalar_tac),
     ← hpc, ← hms]
 
+-- ## k7dl_set_base_identity / k7dl_base_identity 
+
+/-- Equivalence: `tree_model::k7dl_set_base_identity` computes the
+mirror `K7dlCodec.setBaseIdentity` (and never panics). -/
+theorem k7dl_set_base_identity_equiv (hdr : Array Std.U8 28#usize) (bi : Std.U64) :
+    tree_model.k7dl_set_base_identity hdr bi
+      ⦃ out => absBytes out = K7dlCodec.setBaseIdentity (absBytes hdr) bi.bv ⦄ := by
+  unfold tree_model.k7dl_set_base_identity
+  step as ⟨s, back, hs, hslen, hback⟩
+  step as ⟨a, ha⟩
+  step as ⟨s1, hs1⟩
+  step as ⟨s2, hs2⟩
+  have hhlen : (↑hdr : List Std.U8).length = 28 := by scalar_tac
+  have hb8 : (List.map (@UScalar.mk .U8) bi.bv.toLEBytes).length = 8 := by simp
+  have hsplit : (↑hdr : List Std.U8)
+      = (↑hdr : List Std.U8).take 20 ++ (↑hdr : List Std.U8).drop 20 :=
+    (List.take_append_drop 20 _).symm
+  have htake : ((↑hdr : List Std.U8).take 20).length = 20 := by
+    rw [List.length_take, hhlen]; omega
+  have hdrop : ((↑hdr : List Std.U8).drop 20).length = 8 := by
+    rw [List.length_drop, hhlen]
+  have hout : (↑(back s2) : List Std.U8)
+      = (↑hdr : List Std.U8).take 20
+        ++ List.map (@UScalar.mk .U8) bi.bv.toLEBytes := by
+    rw [hback, hs2, hs1, Array.val_to_slice, ha]
+    -- Only the `setSlice!` target splits; the `take 20` on the right of
+    -- the goal must stay as it is.
+    conv_lhs => rw [hsplit]
+    rw [setSlice!_append_exact _ _ _ _ htake.symm (by simp [hb8, hdrop])]
+    rw [hb8, List.drop_eq_nil_of_le (by simp [hdrop]), List.append_nil]
+  simp only [absBytes, hout, List.map_append, map_bv_mk, List.map_take,
+    K7dlCodec.setBaseIdentity, toLEBytes_u64]
+
+/-- Equivalence: `tree_model::k7dl_base_identity` computes the mirror
+`K7dlCodec.baseIdentity` (and never panics). -/
+theorem k7dl_base_identity_equiv (hdr : Array Std.U8 28#usize) :
+    tree_model.k7dl_base_identity hdr
+      ⦃ out => out.bv = K7dlCodec.baseIdentity (absBytes hdr) ⦄ := by
+  unfold tree_model.k7dl_base_identity
+  -- Eight `index_usize` binds, then a plain `ok` — no ninth step.
+  step as ⟨i, hi⟩
+  replace hi : i = (↑hdr : List Std.U8)[20]! :=
+    hi.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i1, hi1⟩
+  replace hi1 : i1 = (↑hdr : List Std.U8)[21]! :=
+    hi1.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i2, hi2⟩
+  replace hi2 : i2 = (↑hdr : List Std.U8)[22]! :=
+    hi2.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i3, hi3⟩
+  replace hi3 : i3 = (↑hdr : List Std.U8)[23]! :=
+    hi3.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i4, hi4⟩
+  replace hi4 : i4 = (↑hdr : List Std.U8)[24]! :=
+    hi4.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i5, hi5⟩
+  replace hi5 : i5 = (↑hdr : List Std.U8)[25]! :=
+    hi5.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i6, hi6⟩
+  replace hi6 : i6 = (↑hdr : List Std.U8)[26]! :=
+    hi6.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  step as ⟨i7, hi7⟩
+  replace hi7 : i7 = (↑hdr : List Std.U8)[27]! :=
+    hi7.trans (List.Inhabited_getElem_eq_getElem! _ _ (by scalar_tac))
+  -- Unlike `parse_header`, this `from_le_bytes` is not inside a monadic
+  -- bind, so no `step` spec unfolded it — do it by hand.
+  simp only [core.num.U64.from_le_bytes, Array.make, List.map_cons,
+    List.map_nil, BitVec.cast_eq]
+  rw [fromLEBytes_u64]
+  simp only [BitVec.cast_eq, K7dlCodec.baseIdentity]
+  rw [absBytes_getElem! hdr 20 (by scalar_tac),
+    absBytes_getElem! hdr 21 (by scalar_tac),
+    absBytes_getElem! hdr 22 (by scalar_tac),
+    absBytes_getElem! hdr 23 (by scalar_tac),
+    absBytes_getElem! hdr 24 (by scalar_tac),
+    absBytes_getElem! hdr 25 (by scalar_tac),
+    absBytes_getElem! hdr 26 (by scalar_tac),
+    absBytes_getElem! hdr 27 (by scalar_tac)]
+  rw [hi, hi1, hi2, hi3, hi4, hi5, hi6, hi7]
+
+/-- Equivalence: `tree_model::k7dl_base_identity_ok` computes the
+mirror `K7dlCodec.baseIdentityOk` (and never panics). -/
+theorem k7dl_base_identity_ok_equiv (pack base : Std.U64) :
+    tree_model.k7dl_base_identity_ok pack base
+      ⦃ r => r = K7dlCodec.baseIdentityOk pack.bv base.bv ⦄ := by
+  unfold tree_model.k7dl_base_identity_ok
+  simp only [K7dlCodec.baseIdentityOk, uscalar_eq_iff_bv,
+    show (0#u64).bv = 0#64 from by decide]
+  split
+  · simp_all [spec_ok]
+  · split <;> simp_all [spec_ok]
+
 -- ## k7dl_encode_entry ≡ K7dlCodec.encodeEntry
 
 /-- Equivalence: `tree_model::k7dl_encode_entry` computes the mirror

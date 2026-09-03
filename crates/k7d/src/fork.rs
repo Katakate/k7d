@@ -171,9 +171,16 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<(), ForkError> {
         .write(true)
         .create_new(true)
         .open(dst)?;
+    let t_clone = std::time::Instant::now();
     // SAFETY: both fds are valid for the duration of the call; FICLONE takes
     // the source fd as its integer argument.
     let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE, src_file.as_raw_fd()) };
+    log::info!(
+        "FICLONE {} -> {} in {:?}",
+        src.display(),
+        dst.display(),
+        t_clone.elapsed()
+    );
     if rc < 0 {
         let err = std::io::Error::last_os_error();
         let _ = fs::remove_file(dst);
@@ -291,6 +298,7 @@ fn restore_vm_inner(
     let vm_fd = kvm
         .create_vm()
         .map_err(|e| RestoreError::Kvm(format!("create VM: {e}")))?;
+    restore_dilation(&vm_fd, bundle.dilation)?;
 
     vm_fd
         .set_tss_address(0xfffb_d000usize)
@@ -364,6 +372,7 @@ fn restore_vm_inner(
         &cpu_states,
         irqchip_state.as_ref(),
         bundle.kvmclock.as_ref(),
+        bundle.dilation,
     )?;
 
     // Fresh CID by default (concurrent restores from one snapshot must
@@ -600,7 +609,47 @@ fn restore_vm_inner(
         guest_ip_for_vm,
         Vec::new(),
         bundle.block_devices.clone(),
+        bundle.dilation,
     ))
+}
+
+/// Put a restored VM on the time dilation its source ran at (spec
+/// 34a-inc9). Must run right after `KVM_CREATE_VM`: the factor rides on
+/// each vCPU's TSC multiplier, which is programmed at vCPU creation.
+/// A live `SET` on paused vCPUs is the referenced work; restore still applies
+/// the factor before any vCPU exists because that is when this path
+/// builds the VM.
+///
+/// Every piece of time the snapshot carries is in *guest* units — the
+/// `IA32_TSC` MSR is the guest's TSC, `KVM_GET_CLOCK` is guest
+/// nanoseconds, LAPIC counts and TSC deadlines are guest ticks — and the
+/// patched kernel converts between those and wall time on the way in
+/// and out. Restoring them onto a VM at the same factor is therefore
+/// exactly the undilated restore. A stock host cannot do it, and says
+/// so here instead of silently resuming the guest at 1x.
+fn resolve_fork_dilation(requested: Option<u32>, source: u32) -> Result<u32, RestoreError> {
+    match requested {
+        Some(0) => Err(RestoreError::Kvm(
+            "dilation 0 is not a factor — omit the field to inherit the source's, or pass 1..=64"
+                .into(),
+        )),
+        Some(n) => Ok(n),
+        None => Ok(source),
+    }
+}
+
+fn restore_dilation(vm_fd: &kvm_ioctls::VmFd, dilation: u32) -> Result<(), RestoreError> {
+    if dilation == 0 {
+        return Err(RestoreError::Kvm(
+            "dilation 0 is not a factor — omit the field to inherit the source's, or pass 1..=64"
+                .into(),
+        ));
+    }
+    if dilation == 1 {
+        return Ok(());
+    }
+    crate::vm::set_dilation(vm_fd, dilation)
+        .map_err(|e| RestoreError::Kvm(format!("time dilation x{dilation}: {e}")))
 }
 
 /// Create one vCPU per captured [`CpuState`] and fully restore each, in
@@ -616,6 +665,7 @@ fn create_and_restore_vcpus(
     cpu_states: &[CpuState],
     irqchip: Option<&crate::snapshot::IrqChipState>,
     kvmclock: Option<&KvmClockState>,
+    dilation: u32,
 ) -> Result<Vec<VcpuFd>, RestoreError> {
     if cpu_states.is_empty() {
         return Err(RestoreError::InvalidSnapshot(
@@ -641,18 +691,12 @@ fn create_and_restore_vcpus(
         // registered a pvclock page — the MSR restore just above — and
         // returns EINVAL when it has not, which is the honest answer
         // for a snapshot of a guest that never had kvmclock.
-        let kvmclock_ctrl: libc::c_ulong = 0x0000_AE7D;
-        // SAFETY: vcpu_fd is valid; KVM_KVMCLOCK_CTRL takes no args.
-        if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), kvmclock_ctrl) } < 0 {
-            log::warn!(
-                "restore: KVM_KVMCLOCK_CTRL on vCPU {i}: {} — this guest has no \
-                 kvmclock page registered",
-                std::io::Error::last_os_error()
-            );
+        if let Err(e) = crate::vm::kvmclock_ctrl(&vcpu_fd) {
+            log::warn!("restore: {e} on vCPU {i} — this guest has no kvmclock page registered");
         }
         vcpu_fds.push(vcpu_fd);
     }
-    restore_kvmclock(vm_fd, kvmclock)?;
+    restore_kvmclock(vm_fd, kvmclock, dilation)?;
     Ok(vcpu_fds)
 }
 
@@ -675,9 +719,19 @@ fn create_and_restore_vcpus(
 ///
 /// The forward jump is the same event as a host suspend, which is what
 /// the `KVM_KVMCLOCK_CTRL` above tells the guest to expect.
+///
+/// Under time dilation  the rest is handed back in
+/// *guest* nanoseconds — `dilation` times the wall time — because that
+/// is what a pause already does: a paused dilated VM's kvmclock is host
+/// time through the patched affine map, so it keeps advancing N× while
+/// no vCPU runs. Scaling here makes a snapshot/restore
+/// indistinguishable, clock-wise, from a pause of the same wall
+/// duration, and a warm fork lands on the same reading as its
+/// still-running source instead of `(N-1) × at_rest` behind it.
 fn restore_kvmclock(
     vm_fd: &kvm_ioctls::VmFd,
     kvmclock: Option<&KvmClockState>,
+    dilation: u32,
 ) -> Result<(), RestoreError> {
     let Some(state) = kvmclock else {
         log::warn!(
@@ -695,7 +749,9 @@ fn restore_kvmclock(
             state.host_unix_ns - now_ns
         );
     }
-    let at_rest_ns = now_ns.saturating_sub(state.host_unix_ns);
+    let at_rest_ns = now_ns
+        .saturating_sub(state.host_unix_ns)
+        .saturating_mul(u64::from(dilation));
     let data = kvm_bindings::kvm_clock_data {
         clock: state.clock_ns.saturating_add(at_rest_ns),
         // Flags are an input only for KVM_CLOCK_REALTIME, which asks
@@ -707,7 +763,7 @@ fn restore_kvmclock(
         .set_clock(&data)
         .map_err(|e| RestoreError::Kvm(format!("KVM_SET_CLOCK: {e}")))?;
     log::info!(
-        "restore: kvmclock resumed at {}ns ({}ms of wall time at rest)",
+        "restore: kvmclock resumed at {}ns ({}ms of guest time at rest, dilation x{dilation})",
         data.clock,
         at_rest_ns / 1_000_000
     );
@@ -1208,11 +1264,10 @@ fn fork_memory_for_state(
     // The mapping, `base.mem` and the dirty bitmap all cover the guest
     // physical span, not just RAM.
     let mem_size = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
-    // Virtio-blk queues must be quiescent before ANY memory capture: the
-    // in-process worker drains + parks on pause (`Vm::pause` waits for it),
-    // so this converges immediately in practice — it is the used==avail
-    // safety net mirroring `drain_fs_queues`.
-    drain_device_queues(state, source_mem_addr, fork_id, VIRTIO_ID_BLOCK, "blk");
+    // Virtio-blk parks on pause without emptying the ring (CHALLENGES
+    // #162): leftover descriptors are replayed on the child. Do not wait
+    // for used==avail here — that was a 200 ms tax per member on a busy
+    // guest after we stopped draining.
     if state.virtiofs_shares.is_empty() {
         let fork_mem_addr =
             mmap_base_mem_private(base_mem_path, mem_size).map_err(ForkError::Restore)?;
@@ -1263,7 +1318,10 @@ fn drain_device_queues(
     device_type: u32,
     tag: &str,
 ) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Mirror virtio-blk/net `wait_quiescent`: 200 ms is above the
+    // worker poll, and a stuck ring will not drain because we waited
+    // longer (CHALLENGES #162 stacked this 2 s on top of pause).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     for dev in &state.devices {
         if dev.device_type != device_type {
             continue;
@@ -1323,10 +1381,11 @@ pub fn restore_vm_from_state(
     source_mem_addr: u64,
     state: &VmState,
     fork_id: &str,
+    dilation: Option<u32>,
 ) -> Result<Vm, ForkError> {
     let (fork_mem_addr, fork_mem_file) =
         fork_memory_for_state(base_mem_path, dirty_bitmap, source_mem_addr, state, fork_id)?;
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, fork_id, None, fork_mem_file)
+    build_vm_from_state_and_mem_inner(state, fork_mem_addr, fork_id, None, fork_mem_file, dilation)
 }
 
 /// Like [`restore_vm_from_state`] but reattaches a pre-built TAP for the
@@ -1341,10 +1400,18 @@ pub fn restore_vm_from_state_with_tap(
     state: &VmState,
     fork_id: &str,
     tap: TapDevice,
+    dilation: Option<u32>,
 ) -> Result<Vm, ForkError> {
     let (fork_mem_addr, fork_mem_file) =
         fork_memory_for_state(base_mem_path, dirty_bitmap, source_mem_addr, state, fork_id)?;
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, fork_id, Some(tap), fork_mem_file)
+    build_vm_from_state_and_mem_inner(
+        state,
+        fork_mem_addr,
+        fork_id,
+        Some(tap),
+        fork_mem_file,
+        dilation,
+    )
 }
 
 /// One cluster to materialise inside [`fork_cluster_warm_batch`].
@@ -1357,6 +1424,9 @@ pub struct ClusterForkRequest<'a> {
     pub fork_pod_ips: &'a [Option<Ipv4Addr>],
     /// Optional per-member pod netns paths (empty = skip NAT).
     pub fork_pod_netns: &'a [Option<PathBuf>],
+    /// Child dilation factor . `None` inherits the
+    /// source's. One factor for every member of this request.
+    pub dilation: Option<u32>,
 }
 
 /// All-in-one cluster warm fork: clone the bridge topology and warm-fork
@@ -1374,11 +1444,35 @@ pub fn fork_cluster_warm(
     fork_pod_netns: &[Option<PathBuf>],
     fork_ids: &[&str],
 ) -> Result<(ClusterNetwork, Vec<Vm>), ForkError> {
+    fork_cluster_warm_dilated(
+        source_net,
+        sources,
+        fork_cluster_id,
+        fork_pod_ips,
+        fork_pod_netns,
+        fork_ids,
+        None,
+    )
+}
+
+/// [`fork_cluster_warm`] with an explicit child dilation factor
+/// . `None` inherits the source's.
+#[allow(clippy::too_many_arguments)]
+pub fn fork_cluster_warm_dilated(
+    source_net: &ClusterNetwork,
+    sources: &mut [(&mut Vm, u32)],
+    fork_cluster_id: &str,
+    fork_pod_ips: &[Option<Ipv4Addr>],
+    fork_pod_netns: &[Option<PathBuf>],
+    fork_ids: &[&str],
+    dilation: Option<u32>,
+) -> Result<(ClusterNetwork, Vec<Vm>), ForkError> {
     let req = ClusterForkRequest {
         fork_cluster_id,
         fork_ids,
         fork_pod_ips,
         fork_pod_netns,
+        dilation,
     };
     let mut out = fork_cluster_warm_batch(source_net, sources, &[req])?;
     out.pop()
@@ -1474,6 +1568,7 @@ pub fn fork_cluster_warm_batch(
     }
 
     let start = std::time::Instant::now();
+    let t_pause = std::time::Instant::now();
 
     // 1. Pause every source once and capture dirty + CPU/device/IRQ state.
     //    Sources stay paused through all materialisations so each fork's
@@ -1502,13 +1597,34 @@ pub fn fork_cluster_warm_batch(
         let src_mem_addr = vm.mem_host_addr();
         captured.push((dirty, state, src_mem_addr, base_path));
     }
+    log::info!(
+        "fork_cluster_warm_batch: pause+capture {n_members} members in {:?}",
+        t_pause.elapsed()
+    );
+
+    // One in-flight pwrite/FLUSH may still hold the inode after
+    // `Vm::pause`'s 200 ms wait_quiescent. Wait a little longer so
+    // FICLONE is not the 3–7 s XFS stall (CHALLENGES #162). The worker
+    // now parks without draining the rest of the ring, so this should
+    // be a no-op. Cap at 200 ms — a longer wait is itself over budget.
+    let t_q = std::time::Instant::now();
+    while !sources.iter().all(|(vm, _)| vm.devices_quiescent())
+        && t_q.elapsed() < std::time::Duration::from_millis(200)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    log::info!(
+        "fork_cluster_warm_batch: extra quiesce {:?} parked={}",
+        t_q.elapsed(),
+        sources.iter().all(|(vm, _)| vm.devices_quiescent())
+    );
 
     // 2. Host-net setup per request (bridges + TAPs + optional pod NAT).
     //    Kept sequential: iptables / `ip link` are not safe to race.
     let mut err: Option<ForkError> = None;
     let mut nets: Vec<ClusterNetwork> = Vec::with_capacity(requests.len());
-    // Flat job list: (cluster_idx, member_idx, tap, fork_id).
-    let mut jobs: Vec<(usize, usize, TapDevice, String)> =
+    // Flat job list: (cluster_idx, member_idx, tap, fork_id, dilation).
+    let mut jobs: Vec<(usize, usize, TapDevice, String, Option<u32>)> =
         Vec::with_capacity(requests.len() * n_members);
 
     for (ci, req) in requests.iter().enumerate() {
@@ -1535,27 +1651,31 @@ pub fn fork_cluster_warm_batch(
         } else {
             req.fork_pod_netns.to_vec()
         };
-        for (mi, (_src_vm, vm_index)) in sources.iter().enumerate() {
-            match fork_net.add_tap_at(*vm_index) {
-                Ok(tap) => {
-                    jobs.push((ci, mi, tap, req.fork_ids[mi].to_string()));
-                }
-                Err(e) => {
-                    err = Some(ForkError::Reflink(format!(
-                        "add_tap_at({vm_index}) on '{}': {e}",
-                        req.fork_cluster_id
-                    )));
-                    break;
+        // One `add_taps_at` per cluster: all member TAPs plus their
+        // anti-spoof pins in a single nft transaction (the referenced work — one
+        // nft process per TAP triples the per-cluster fork cost).
+        let indices: Vec<u32> = sources.iter().map(|(_src_vm, idx)| *idx).collect();
+        match fork_net.add_taps_at(&indices) {
+            Ok(taps) => {
+                for (mi, tap) in taps.into_iter().enumerate() {
+                    jobs.push((ci, mi, tap, req.fork_ids[mi].to_string(), req.dilation));
+                    if let (Some(pod_ip), Some(netns)) = (pod_ips[mi], pod_netns[mi].as_deref()) {
+                        if let Err(e) = fork_net.install_pod_nat(indices[mi], pod_ip, netns) {
+                            log::warn!(
+                                "fork_cluster_warm_batch: install_pod_nat({}) on '{}' \
+                                 failed (non-fatal): {e}",
+                                indices[mi],
+                                req.fork_cluster_id
+                            );
+                        }
+                    }
                 }
             }
-            if let (Some(pod_ip), Some(netns)) = (pod_ips[mi], pod_netns[mi].as_deref()) {
-                if let Err(e) = fork_net.install_pod_nat(*vm_index, pod_ip, netns) {
-                    log::warn!(
-                        "fork_cluster_warm_batch: install_pod_nat({vm_index}) on '{}' \
-                         failed (non-fatal): {e}",
-                        req.fork_cluster_id
-                    );
-                }
+            Err(e) => {
+                err = Some(ForkError::Reflink(format!(
+                    "add_taps_at({indices:?}) on '{}': {e}",
+                    req.fork_cluster_id
+                )));
             }
         }
         if err.is_some() {
@@ -1575,7 +1695,7 @@ pub fn fork_cluster_warm_batch(
         let results: Vec<Result<(usize, usize, Vm), ForkError>> = std::thread::scope(|s| {
             let handles: Vec<_> = jobs
                 .into_iter()
-                .map(|(ci, mi, tap, fork_id)| {
+                .map(|(ci, mi, tap, fork_id, dilation)| {
                     s.spawn(move || {
                         let (dirty, state, src_mem_addr, base_path) = &captured_ref[mi];
                         let t = std::time::Instant::now();
@@ -1586,6 +1706,7 @@ pub fn fork_cluster_warm_batch(
                             state,
                             &fork_id,
                             tap,
+                            dilation,
                         );
                         log::info!(
                             "fork_cluster_warm_batch member '{fork_id}': materialised in {:?}",
@@ -1667,7 +1788,7 @@ pub fn build_vm_from_state_and_mem(
     fork_mem_addr: u64,
     log_tag: &str,
 ) -> Result<Vm, ForkError> {
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, None, None)
+    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, None, None, None)
 }
 
 /// Same as [`build_vm_from_state_and_mem`] but reattaches a pre-built TAP
@@ -1682,7 +1803,7 @@ pub fn build_vm_from_state_and_mem_with_tap(
     log_tag: &str,
     tap: TapDevice,
 ) -> Result<Vm, ForkError> {
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, Some(tap), None)
+    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, Some(tap), None, None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1692,6 +1813,7 @@ fn build_vm_from_state_and_mem_inner(
     log_tag: &str,
     tap: Option<TapDevice>,
     fork_mem_file: Option<fs::File>,
+    dilation: Option<u32>,
 ) -> Result<Vm, ForkError> {
     let start = std::time::Instant::now();
     // `mem_size` is guest RAM; the mapping and every guest-physical bound
@@ -1725,6 +1847,8 @@ fn build_vm_from_state_and_mem_inner(
         let vm_fd = kvm
             .create_vm()
             .map_err(|e| RestoreError::Kvm(format!("create VM: {e}")))?;
+        let child_dilation = resolve_fork_dilation(dilation, state.dilation)?;
+        restore_dilation(&vm_fd, child_dilation)?;
 
         vm_fd
             .set_tss_address(0xfffb_d000usize)
@@ -1767,6 +1891,7 @@ fn build_vm_from_state_and_mem_inner(
             &state.cpus,
             Some(&state.irqchip),
             state.kvmclock.as_ref(),
+            state.dilation,
         )?;
 
         // Inject TRANSPORT_RESET into the FORK's memory only. The source is
@@ -2167,6 +2292,7 @@ fn build_vm_from_state_and_mem_inner(
             guest_ip_for_vm,
             state.virtiofs_shares.clone(),
             fork_block_devices,
+            child_dilation,
         );
         if let Some(file) = fork_mem_file {
             vm.set_fork_mem_file(file);

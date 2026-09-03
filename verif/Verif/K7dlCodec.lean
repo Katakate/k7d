@@ -73,10 +73,29 @@ def u64FromLe (b0 b1 b2 b3 b4 b5 b6 b7 : Byte) : BitVec 64 :=
 
 /-- Mirror of `crate::tree_model::k7dl_header_bytes`.
 
-Layout: `magic(4) ++ version(4 LE) ++ pc(4 LE) ++ ms(8 LE) ++ reserved(8)`. -/
+Layout: `magic(4) ++ version(4 LE) ++ pc(4 LE) ++ ms(8 LE) ++ id(8 LE)`,
+with the trailing base identity left zero — `setBaseIdentity` stamps it. -/
 def headerBytes (pc : BitVec 32) (ms : BitVec 64) : List Byte :=
   magic ++ u32ToLe version ++ u32ToLe pc ++ u64ToLe ms
     ++ List.replicate 8 (BitVec.ofNat 8 0)
+
+/-- Mirror of `crate::tree_model::k7dl_set_base_identity`: replace the
+header's trailing 8 bytes with `bi` little-endian . -/
+def setBaseIdentity (hdr : List Byte) (bi : BitVec 64) : List Byte :=
+  hdr.take 20 ++ u64ToLe bi
+
+/-- Mirror of `crate::tree_model::k7dl_base_identity_ok`: may a pack
+minted against `pack` be applied onto a base whose identity is `base`?
+A zero on either side is "unknown", not "mismatched". -/
+def baseIdentityOk (pack base : BitVec 64) : Bool :=
+  if pack = 0#64 then true
+  else if base = 0#64 then true
+  else pack = base
+
+/-- Mirror of `crate::tree_model::k7dl_base_identity`. -/
+def baseIdentity (hdr : List Byte) : BitVec 64 :=
+  u64FromLe hdr[20]! hdr[21]! hdr[22]! hdr[23]!
+    hdr[24]! hdr[25]! hdr[26]! hdr[27]!
 
 /-- Mirror of `crate::tree_model::k7dl_parse_header`. -/
 def parseHeader (bs : List Byte) : Except DeltaError (BitVec 32 × BitVec 64) :=
@@ -157,5 +176,43 @@ theorem k7dl_entry_roundtrip (idx : BitVec 32) (page : List Byte) :
     parseEntry (encodeEntry idx page) = (idx, page) := by
   show (u32FromLe _ _ _ _, page) = (idx, page)
   rw [u32_le_roundtrip idx]
+
+/-- the referenced work / CHALLENGES #144: the guard rejects exactly the case it
+exists for — two *known* generations that disagree. -/
+theorem baseIdentityOk_rejects_known_mismatch (pack base : BitVec 64)
+    (hp : pack ≠ 0#64) (hb : base ≠ 0#64) (hne : pack ≠ base) :
+    baseIdentityOk pack base = false := by
+  simp [baseIdentityOk, hp, hb, hne]
+
+/-- …and accepts a pack applied onto the generation it names, so the
+guard cannot refuse a resume that should work. -/
+theorem baseIdentityOk_self (id : BitVec 64) : baseIdentityOk id id = true := by
+  simp [baseIdentityOk]
+
+/-- An unknown identity on either side loads: every pack written before
+the referenced work carries a zero there. -/
+theorem baseIdentityOk_unknown (pack base : BitVec 64)
+    (h : pack = 0#64 ∨ base = 0#64) : baseIdentityOk pack base = true := by
+  rcases h with h | h <;> simp [baseIdentityOk, h]
+
+/-- the referenced work: the base identity survives its own round-trip through the
+header's trailing u64. -/
+theorem k7dl_base_identity_roundtrip (pc : BitVec 32) (ms bi : BitVec 64) :
+    baseIdentity (setBaseIdentity (headerBytes pc ms) bi) = bi := by
+  unfold baseIdentity setBaseIdentity headerBytes
+  simp only [magic, u32ToLe, version, u64ToLe, List.replicate,
+    List.cons_append, List.nil_append, List.take]
+  simp only [List.getElem!_cons_succ, List.getElem!_cons_zero]
+  exact u64_le_roundtrip bi
+
+/-- the referenced work, the load-bearing half: stamping the identity does not
+disturb `page_count` or `mem_size`. If it did, a resumed node would
+scatter its pages by an index the writer never meant. -/
+theorem k7dl_set_base_identity_preserves_header (pc : BitVec 32) (ms bi : BitVec 64) :
+    parseHeader (setBaseIdentity (headerBytes pc ms) bi)
+      = parseHeader (headerBytes pc ms) := by
+  unfold setBaseIdentity headerBytes parseHeader
+  simp only [magic, u32ToLe, version, u64ToLe, List.replicate,
+    List.cons_append, List.nil_append, List.take]
 
 end Verif.K7dlCodec

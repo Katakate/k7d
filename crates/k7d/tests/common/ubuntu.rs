@@ -254,13 +254,28 @@ pub fn build_node_vm_with_data(
 pub struct NodeSize {
     pub memory_mb: u64,
     pub vcpus: u32,
+    /// Continuous time dilation factor : the node's
+    /// clocks run this many times faster than wall time. 1 is stock and
+    /// needs no kernel patch; anything else needs `utils/kvm-dilation`
+    /// installed and fails the boot loudly if it is not.
+    pub dilation: u32,
 }
 
 impl NodeSize {
     pub const DEFAULT: Self = Self {
         memory_mb: NODE_MEMORY_MB,
         vcpus: NODE_VCPUS,
+        dilation: 1,
     };
+
+    /// The same node, with its clocks dilated `n` times.
+    #[must_use]
+    pub const fn dilated(self, n: u32) -> Self {
+        Self {
+            dilation: n,
+            ..self
+        }
+    }
 }
 
 /// [`build_node_vm_with_data`] with an explicit node size.
@@ -279,6 +294,7 @@ pub fn build_node_vm_sized(
         .memory_mb(size.memory_mb)
         .vcpus(size.vcpus)
         .vsock(true)
+        .dilation(size.dilation)
         .network(tap)
         .block_device(&disk.path, false);
     for dd in data_disks {

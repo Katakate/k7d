@@ -40,6 +40,8 @@ def _new_slot(tree_id: str, kind: str, memory_mb: int) -> dict[str, Any]:
         "budget": None,
         "usage": None,
         "memory_mb": memory_mb,
+        "live_dilation": {},
+        "guest_clock": None,
     }
 
 
@@ -224,6 +226,7 @@ class ViewStore:
         usage: dict[str, Any] | None = None,
         budget: dict[str, Any] | None = None,
         live_guest_cids: dict[str, Any] | None = None,
+        live_dilation: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         ts = now_ms()
         cur = {n["id"]: _norm_node(n) for n in nodes if "id" in n}
@@ -255,6 +258,16 @@ class ViewStore:
         if live_guest_cids:
             for nid, cids in live_guest_cids.items():
                 slot["members"][nid] = list(cids or [])
+        if live_dilation is not None:
+            out: dict[str, int] = {}
+            for nid, factor in live_dilation.items():
+                try:
+                    out[str(nid)] = int(factor)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"live_dilation[{nid!r}] is not an int: {factor!r}"
+                    ) from exc
+            slot["live_dilation"] = out
         emitted = [self._push(e) for e in derived]
         return emitted
 
@@ -461,6 +474,31 @@ class ViewStore:
                     "label": node_id,
                     "latency_ms": payload.get("latency_ms"),
                     "cow": payload.get("cow") or [],
+                }
+            )
+        if kind == "guest_clock":
+            up = payload.get("uptime_s")
+            if up is None:
+                raise ValueError("guest_clock ingest requires uptime_s")
+            try:
+                uptime_s = float(up)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"guest_clock uptime_s is not a float: {up!r}") from exc
+            clock = dict(slot.get("guest_clock") or {})
+            if clock.get("base_uptime_s") is None:
+                clock["base_uptime_s"] = uptime_s
+            clock["uptime_s"] = uptime_s
+            clock["node_id"] = node_id
+            clock["cid"] = payload.get("cid")
+            clock["ts_unix_ms"] = payload.get("ts_unix_ms") or now_ms()
+            slot["guest_clock"] = clock
+            return self._push(
+                {
+                    "tree_id": tree_id,
+                    "op": "guest_clock",
+                    "node_id": node_id,
+                    "label": node_id or tree_id,
+                    "uptime_s": uptime_s,
                 }
             )
         if kind == "tick":

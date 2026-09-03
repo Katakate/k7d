@@ -51,8 +51,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{self, VmState};
 use crate::tree_model::{
-    self, k7dl_encode_entry, k7dl_header_bytes, k7dl_parse_entry, k7dl_parse_header, DeltaError,
-    K7DL_ENTRY_SIZE, K7DL_HEADER_SIZE,
+    self, k7dl_base_identity, k7dl_encode_entry, k7dl_header_bytes, k7dl_parse_entry,
+    k7dl_parse_header, k7dl_set_base_identity, DeltaError, K7DL_ENTRY_SIZE, K7DL_HEADER_SIZE,
 };
 use crate::vm::{Vm, VmError};
 
@@ -85,7 +85,9 @@ pub struct NodeInfo {
     /// Number of dirty pages this node's delta captures (0 for root/checkpoints).
     /// For a cluster payload this is the Σ over members.
     pub dirty_page_count: u32,
-    /// Whether this node has its own `base.mem` (checkpoint / fork-point).
+    /// Whether this node **owns** a `memory.bin` (checkpoint). Distinct
+    /// from `Vm::fork_source_base_path`: an in-tree child can `fork_warm`
+    /// against an ancestor file without owning a keyframe .
     /// For a cluster payload, every member's `members/{i}/memory.bin`
     /// exists if and only if `has_base_snapshot` is true.
     pub has_base_snapshot: bool,
@@ -114,10 +116,59 @@ pub struct NodeInfo {
     /// (CHALLENGES.md #130). Empty for live nodes and legacy files.
     #[serde(default)]
     pub parked_disk_dirs: Vec<PathBuf>,
+    /// Generation of this node's `memory.bin`, minted afresh every time
+    /// a keyframe is written here. A `delta.pack` records the identity
+    /// of the base it was diffed against, and `resume` refuses to apply
+    /// one whose identity is not this (CHALLENGES #144). 0 means
+    /// "unknown": legacy `tree.json` files and v1 packs.
+    #[serde(default)]
+    pub base_identity: u64,
+    /// Physical bytes this node's `memory.bin` cost the filesystem.
+    ///
+    /// An incremental keyframe  is a reflink clone of its
+    /// ancestor plus the dirty pages, so its *logical* length is the
+    /// full guest-physical span while it physically adds only the dirt.
+    /// `st_blocks` does not help — XFS counts a shared extent in every
+    /// file that references it — so the daemon records the true cost at
+    /// write time and [`SnapshotTree::usage`] sums that. `None` is a
+    /// legacy `tree.json` with no record; those fall back to the file's
+    /// logical length, which is what they cost.
+    #[serde(default)]
+    pub base_disk_bytes: Option<u64>,
 }
 
 fn default_vm_count() -> u32 {
     1
+}
+
+/// What a `prepare_fork_source` call actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepareOutcome {
+    /// `true` when this call wrote a new keyframe; `false` when the node
+    /// was already a fork source (idempotent no-op).
+    pub wrote_base: bool,
+    /// `true` when the keyframe was written incrementally — `FICLONE` of
+    /// the nearest ancestor's `memory.bin` plus the dirty pages (spec
+    /// 30b) — rather than as a full O(guest RAM) dump.
+    pub incremental: bool,
+    /// Physical bytes the keyframe added to the filesystem: the dirty
+    /// set on the incremental path, the whole guest span on the full
+    /// one, 0 for an idempotent no-op. Reported rather than measured
+    /// because a reflinked file's `stat` and `du` both lie about it
+    /// (CHALLENGES #152).
+    pub disk_bytes: u64,
+}
+
+impl PrepareOutcome {
+    /// The idempotent no-op: nothing was written.
+    #[must_use]
+    pub fn already_prepared() -> Self {
+        Self {
+            wrote_base: false,
+            incremental: false,
+            disk_bytes: 0,
+        }
+    }
 }
 
 impl NodeInfo {
@@ -157,10 +208,10 @@ pub enum TreeError {
     #[error("tree jail: {0}")]
     Jail(String),
     #[error(
-        "restore chain for node {node} is {depth} hop(s) to the nearest checkpoint \
-         (limit {max}); resume applies exactly one delta.pack on top of the nearest \
-         `memory.bin`, so a deeper chain means corrupt tree metadata — \
-         `fork_batch` always prepares its source "
+        "node {node} has no checkpoint ancestor to resume from \
+         (restore-chain depth {depth}, limit {max}); resume maps exactly one \
+         `memory.bin` and applies this node's delta.pack — unprepared hops \
+         in between are not extra packs "
     )]
     ChainTooDeep {
         node: NodeId,
@@ -215,6 +266,24 @@ pub struct SnapshotTree {
     /// scratch when a tree is reconstructed.
     pure_ids: HashMap<NodeId, u64>,
     next_pure_id: u64,
+    /// For each live node: the node whose `memory.bin` its VM is a
+    /// `MAP_PRIVATE` mapping of, and the generation of that keyframe.
+    ///
+    /// This is what makes an incremental keyframe  sound —
+    /// "the pages that differ from the ancestor base" is only the VM's
+    /// accumulated dirty set if the VM really was materialized from that
+    /// exact generation. Runtime-only: a suspended node has no mapping,
+    /// and a rebuilt tree re-records at resume.
+    cow_base: HashMap<NodeId, (NodeId, u64)>,
+    /// Whether this tree's storage can `FICLONE` .
+    ///
+    /// Probed once at construction rather than discovered per keyframe,
+    /// because the disk budget has to *project* a keyframe's cost before
+    /// writing it: projecting the O(divergence) cost on a filesystem
+    /// that is about to force a full dump would let the write blow
+    /// `max_disk_bytes`. The per-write `EXDEV`/`EOPNOTSUPP` fallback
+    /// stays as the backstop.
+    reflink_root: bool,
     /// This tree's cgroup jail . `None` only when
     /// `K7D_TREE_CGROUP=off`. Declared after `live_vms` so the VMs (and
     /// their threads) are gone before the cgroup is removed.
@@ -248,6 +317,7 @@ impl SnapshotTree {
         budget: TreeBudget,
     ) -> Result<(Self, NodeId), TreeError> {
         fs::create_dir_all(root_dir.join("nodes"))?;
+        let root_dir_for_probe = root_dir.clone();
         let tree_id = format!("tree-{}", std::process::id());
         let now = now_unix();
 
@@ -267,6 +337,7 @@ impl SnapshotTree {
             root_vm.allow_slow_fork();
         }
         root_vm.prepare_fork_source_in(&root_node_dir)?;
+        let root_span = root_vm.mem_span();
 
         let info = NodeInfo {
             id: root_id.clone(),
@@ -282,6 +353,11 @@ impl SnapshotTree {
             kind: PayloadKind::Vm,
             vm_count: 1,
             parked_disk_dirs: Vec::new(),
+            // The root's keyframe is a full dump, so it physically
+            // costs its whole span. Generation 1 is the first identity
+            // this tree mints (0 is reserved for "unknown").
+            base_identity: 1,
+            base_disk_bytes: Some(root_span),
         };
 
         let mut nodes = HashMap::new();
@@ -304,6 +380,11 @@ impl SnapshotTree {
             next_id: 0,
             pure_ids,
             next_pure_id: 1,
+            // The root's VM maps its own freshly written keyframe, so a
+            // re-prepare of the root would have nothing above it to
+            // clone — leave it unrecorded and let it take the full dump.
+            cow_base: HashMap::new(),
+            reflink_root: probe_reflink_root(&root_dir_for_probe),
             jail,
         };
         tree.jail_vm(&root_id)?;
@@ -423,51 +504,177 @@ impl SnapshotTree {
             .map(|(id, vm)| (id.as_str(), vm))
     }
 
-    /// Snapshot a live node so later forks from it take the warm path.
+    /// The keyframe this node's live VM is a `MAP_PRIVATE` mapping of,
+    /// if it is still the file the tree recorded at fork/resume time.
     ///
-    /// Root is prepared at [`Self::new`]. Children from [`Self::fork_batch`]
-    /// are not — they have no `fork_source_base_path` until this runs
-    /// (CHALLENGES.md #59). Idempotent: returns `false` when already prepared.
-    pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<bool, TreeError> {
+    /// An incremental keyframe is only correct when the VM's memory
+    /// really is that file plus the VM's accumulated dirty set, so the
+    /// answer comes from what the tree *did* (`cow_base`), not from the
+    /// topology: an ancestor that has re-prepared since holds a new
+    /// generation at the same path, and cloning it would produce a
+    /// keyframe that is neither the ancestor nor this node. Such a node
+    /// falls back to the full dump.
+    fn cow_base_keyframe(&self, node_id: &NodeId) -> Option<PathBuf> {
+        if !self.reflink_root {
+            return None;
+        }
+        let (ancestor, identity) = self.cow_base.get(node_id)?;
+        if self.nodes.get(ancestor)?.base_identity != *identity {
+            log::warn!(
+                "tree: node '{node_id}' was forked off '{ancestor}' generation \
+                 {identity}, which has since re-prepared — writing a full keyframe"
+            );
+            return None;
+        }
+        let mem = self.node_dir(ancestor).join("memory.bin");
+        mem.is_file().then_some(mem)
+    }
+
+    /// Record that `node_id`'s VM maps `ancestor`'s current keyframe.
+    fn record_cow_base(&mut self, node_id: &NodeId, ancestor: &NodeId) {
+        let Some(identity) = self.nodes.get(ancestor).map(|n| n.base_identity) else {
+            return;
+        };
+        self.cow_base
+            .insert(node_id.clone(), (ancestor.clone(), identity));
+    }
+
+    /// The next unused base-generation number for this tree.
+    ///
+    /// Derived from the records rather than a counter so it survives a
+    /// `tree.json` round-trip without another persisted field. Never 0 —
+    /// that value means "unknown" to [`tree_model::k7dl_base_identity_ok`].
+    fn mint_base_identity(&self) -> u64 {
+        self.nodes
+            .values()
+            .map(|n| n.base_identity)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Make `source_id` legal for `fork_warm` without writing a keyframe.
+    ///
+    /// A live child already maps its nearest checkpoint's `memory.bin`
+    /// plus an accumulated dirty bitmap. Point `fork_source_base_path`
+    /// at that file and let `fork_warm` memcpy dirty pages in-process.
+    /// Write a new keyframe only when no ancestor file exists, or when
+    /// the VM has virtiofs shares (FUSE DMA is invisible to the dirty
+    /// log — inherit would fork a stale file).
+    fn ensure_forkable(&mut self, source_id: &NodeId) -> Result<(), TreeError> {
+        let (already, virtiofs) = {
+            let vm = self
+                .live_vms
+                .get(source_id)
+                .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
+            (
+                vm.fork_source_base_path().is_some(),
+                !vm.virtiofs_shares().is_empty(),
+            )
+        };
+        if already {
+            return Ok(());
+        }
+        // Virtiofs FUSE DMA is invisible to the dirty log — inherit
+        // would fork a stale file. Write a keyframe instead.
+        if !virtiofs {
+            if let Ok(ckpt) = self.nearest_checkpoint(source_id) {
+                if ckpt != *source_id {
+                    if let Some(mem) = {
+                        let p = self.node_dir(&ckpt).join("memory.bin");
+                        p.is_file().then_some(p)
+                    } {
+                        let vm = self
+                            .live_vms
+                            .get_mut(source_id)
+                            .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
+                        let dirty = vm.accumulated_dirty_pages().unwrap_or(0);
+                        log::info!(
+                            "tree: inherit {ckpt}/memory.bin on {source_id} \
+                             ({dirty} dirty pages, no new keyframe)"
+                        );
+                        vm.set_fork_source_base_path(mem);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        self.prepare_fork_source(source_id)?;
+        Ok(())
+    }
+
+    /// Snapshot a live node so later forks from it take the warm path
+    /// against *this* node's `memory.bin` (dirty set reset).
+    ///
+    /// Root is prepared at [`Self::new`]. In-tree children inherit an
+    /// ancestor path at fork  and are not checkpoints until
+    /// this runs. Idempotent on `has_base_snapshot` — an inherited
+    /// `fork_source_base_path` is not a keyframe this node owns, so a
+    /// later explicit prepare still writes (CHALLENGES.md #59, #182).
+    ///
+    /// A child with a checkpoint ancestor takes the **incremental** path
+    /// : `FICLONE` that ancestor's `memory.bin` and overwrite
+    /// only the pages this node has dirtied since it was forked off it,
+    /// so a fork point down the tree costs O(divergence). Root, virtiofs
+    /// VMs, and any node whose ancestor keyframe is on a different (or
+    /// non-reflink) filesystem fall back to the full dump — loudly.
+    pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
         self.ensure_live(node_id)?;
+        if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
+            return Ok(PrepareOutcome::already_prepared());
+        }
         let dir = self.node_dir(node_id);
-        // The base dump is a full `memory.bin` of the VM's guest-physical
-        // span. Make disk headroom for it BEFORE writing  —
-        // `usage()` only sees the file after the fact, so without this the
-        // write silently blows `max_disk_bytes` until the next auto_evict.
+        let ancestor_mem = self.cow_base_keyframe(node_id);
+        // Make disk headroom BEFORE writing  — `usage()`
+        // only sees the keyframe after the fact, so without this the
+        // write silently blows `max_disk_bytes` until the next
+        // auto_evict. On the incremental path the projection is the
+        // dirty estimate, not the whole span: projecting a full dump
+        // there would evict nodes to make room for disk we will not use.
         {
             let vm = self
                 .live_vms
                 .get(node_id)
                 .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-            if vm.fork_source_base_path().is_none() {
-                let projected = vm.mem_span();
-                self.evict_disk_for_incoming(projected)?;
-            }
+            let projected = if ancestor_mem.is_some() {
+                vm.accumulated_dirty_pages().unwrap_or(0) * 4096
+            } else {
+                vm.mem_span()
+            };
+            self.evict_disk_for_incoming(projected)?;
         }
         let vm = self
             .live_vms
             .get_mut(node_id)
             .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-        if vm.fork_source_base_path().is_some() {
-            return Ok(false);
-        }
         if !vm.virtiofs_shares().is_empty() {
             vm.allow_slow_fork();
         }
         log::info!("tree: prepare_fork_source({node_id})");
-        vm.prepare_fork_source_in(&dir)?;
+        let prepared = if let Some(ancestor) = &ancestor_mem {
+            vm.prepare_fork_source_incremental_in(&dir, ancestor)?
+        } else {
+            let span = vm.mem_span();
+            crate::vm::PreparedBase::full(vm.prepare_fork_source_in(&dir)?, span)
+        };
+        let identity = self.mint_base_identity();
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.has_base_snapshot = true;
+            info.base_identity = identity;
+            info.base_disk_bytes = Some(prepared.disk_bytes);
             touch(info);
         }
         self.save_metadata()?;
-        Ok(true)
+        Ok(PrepareOutcome {
+            wrote_base: true,
+            incremental: prepared.incremental,
+            disk_bytes: prepared.disk_bytes,
+        })
     }
 
     /// Fork a new branch from any live or suspended node.
     pub fn fork(&mut self, source_id: &NodeId, label: &str) -> Result<NodeId, TreeError> {
-        let ids = self.fork_batch(source_id, &[label])?;
+        let ids = self.fork_batch(source_id, &[label], None)?;
         Ok(ids.into_iter().next().expect("single fork"))
     }
 
@@ -476,6 +683,7 @@ impl SnapshotTree {
         &mut self,
         source_id: &NodeId,
         labels: &[&str],
+        dilation: Option<u32>,
     ) -> Result<Vec<NodeId>, TreeError> {
         self.ensure_live(source_id)?;
         // Make headroom for the `labels.len()` incoming live VMs (spec
@@ -486,21 +694,27 @@ impl SnapshotTree {
         self.evict_for_incoming(source_id, labels.len())?;
         // evict_for_incoming may have suspended things; re-verify.
         self.ensure_live(source_id)?;
-        // Children are not checkpoints until prepared. Same policy as
-        // daemon `fork_vm`: prepare on demand rather than fail.
-        self.prepare_fork_source(source_id)?;
+        // In-tree forks inherit the ancestor keyframe + dirty bitmap.
+        // Do not write a new memory.bin / restore-swap on the source.
+        self.ensure_forkable(source_id)?;
 
-        let source_vm = self
-            .live_vms
-            .get_mut(source_id)
-            .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
-        let forks = source_vm.fork_warm_batch(labels)?;
-        // Snapshot the source's accumulated dirty bitmap AFTER fork_warm_batch
-        // returns (it was updated in place during the fork). The children
-        // must seed their own bitmaps with this, otherwise their delta on
-        // suspend won't cover pages the source had dirtied before the fork
-        // (which were memcpy'd into the child's CoW mapping at fork time).
-        let source_bitmap_at_fork = source_vm.accumulated_dirty_bitmap().unwrap_or_default();
+        let (forks, source_bitmap_at_fork, source_base) = {
+            let source_vm = self
+                .live_vms
+                .get_mut(source_id)
+                .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
+            let forks = source_vm.fork_warm_batch(labels, dilation)?;
+            // Snapshot the source's accumulated dirty bitmap AFTER
+            // fork_warm_batch returns (updated in place). Children seed
+            // this so their suspend delta covers pre-fork dirty pages
+            // memcpy'd into the CoW mapping.
+            let bitmap = source_vm.accumulated_dirty_bitmap().unwrap_or_default();
+            let base = source_vm
+                .fork_source_base_path()
+                .map(std::path::Path::to_path_buf);
+            (forks, bitmap, base)
+        };
+        let cow_ancestor = self.nearest_checkpoint(source_id)?;
 
         let mut new_ids = Vec::with_capacity(forks.len());
         let now = now_unix();
@@ -523,6 +737,8 @@ impl SnapshotTree {
                 kind: PayloadKind::Vm,
                 vm_count: 1,
                 parked_disk_dirs: Vec::new(),
+                base_identity: 0,
+                base_disk_bytes: None,
             };
 
             // Start the fork's vCPU; the tree owns it from here.
@@ -532,9 +748,14 @@ impl SnapshotTree {
             // Seed the fork's accumulated bitmap with the source's bitmap
             // at fork time — see comment above on the source.
             fork_vm.seed_accumulated_dirty(&source_bitmap_at_fork)?;
+            if let Some(base) = &source_base {
+                fork_vm.set_fork_source_base_path(base.clone());
+            }
 
             self.nodes.insert(new_id.clone(), info);
             self.live_vms.insert(new_id.clone(), fork_vm);
+            // Child maps the checkpoint's memory.bin, not a new keyframe.
+            self.record_cow_base(&new_id, &cow_ancestor);
             self.jail_vm(&new_id)?;
             if let Some(src) = self.nodes.get_mut(source_id) {
                 src.children.push(new_id.clone());
@@ -544,17 +765,20 @@ impl SnapshotTree {
         }
         self.save_metadata()?;
 
-        // The source was just prepared, so every new child's restore chain
-        // is exactly 1 hop (its own future delta on the source's memory.bin).
-        // `.max(1)` because `max_chain_depth: 0` would demand eager
-        // checkpointing of every child, a policy the referenced work rejects.
+        // Resume applies one delta.pack onto the nearest checkpoint, so
+        // unprepared hops in between are not extra packs. The child must
+        // be forkable (inherited or prepared path) and have a checkpoint.
         #[cfg(debug_assertions)]
         for id in &new_ids {
-            let chain = self.restore_chain_depth(id)?;
             debug_assert!(
-                chain <= self.budget.max_chain_depth.max(1),
-                "fork_batch child {id} has restore chain {chain} > max_chain_depth {}",
-                self.budget.max_chain_depth,
+                self.nearest_checkpoint(id).is_ok(),
+                "fork_batch child {id} has no checkpoint ancestor"
+            );
+            debug_assert!(
+                self.live_vms
+                    .get(id)
+                    .is_some_and(|vm| vm.fork_source_base_path().is_some()),
+                "fork_batch child {id} is not forkable"
             );
         }
 
@@ -643,13 +867,24 @@ impl SnapshotTree {
         // Deltas index pages of the guest physical span, not of RAM (19a).
         let mem_size = vm.mem_span();
 
+        // Name the keyframe this pack is a diff against, so a resume
+        // onto a base that has since re-prepared fails loud instead of
+        // scattering the pack's pages over a stranger's memory
+        // (CHALLENGES #144). A checkpoint's own pack sits on its own
+        // `memory.bin`.
+        let base_identity = self
+            .nearest_checkpoint(node_id)
+            .ok()
+            .and_then(|base| self.nodes.get(&base).map(|n| n.base_identity))
+            .unwrap_or(0);
+
         // Write delta + vm_state.json. Then drop the VM (munmap memory, close fds).
         let dirty_pages = write_delta(
             &node_dir.join("delta.pack"),
             &bitmap,
             src_mem,
             mem_size,
-            node_parent(&self.nodes, node_id).unwrap_or_default(),
+            base_identity,
         )?;
         let state_json = serde_json::to_string(&state)?;
         atomic_write(&node_dir.join("vm_state.json"), state_json.as_bytes())?;
@@ -661,6 +896,8 @@ impl SnapshotTree {
         // the Vm (CHALLENGES.md #130).
         let parked = vm.take_fork_state_dir();
         drop(vm);
+        // No mapping, no CoW base — resume re-records one.
+        self.cow_base.remove(node_id);
 
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.state = NodeState::Suspended;
@@ -687,20 +924,16 @@ impl SnapshotTree {
             ));
         }
 
-        // Restore-chain safety cap . `max_chain_depth` counts
-        // non-checkpoint hops to the nearest `has_base_snapshot` ancestor —
-        // NOT tree-graph depth (root→child→grandchild is legal at depth 1).
-        // The code below applies exactly one delta.pack, so independent of
-        // the budget a chain deeper than 1 would resume corrupt memory;
-        // fail loud instead. Every `fork_batch` prepares its source, so a
-        // chain > 1 can only mean hand-edited or corrupt tree metadata.
-        let chain = self.restore_chain_depth(node_id)?;
-        let max = self.budget.max_chain_depth.min(1);
-        if chain > max {
+        // Resume applies exactly one delta.pack onto the nearest
+        // checkpoint's memory.bin. Unprepared hops on the parent path
+        // are not extra packs (in-tree inherit). Fail loud only when
+        // there is no checkpoint file to map.
+        if self.nearest_checkpoint(node_id).is_err() {
+            let chain = self.restore_chain_depth(node_id).unwrap_or(usize::MAX);
             return Err(TreeError::ChainTooDeep {
                 node: node_id.clone(),
                 depth: chain,
-                max,
+                max: 0,
             });
         }
 
@@ -710,6 +943,10 @@ impl SnapshotTree {
         // Find the nearest ancestor with a memory.bin (checkpoint).
         let base_node = self.nearest_checkpoint(node_id)?;
         let base_path = self.node_dir(&base_node).join("memory.bin");
+        let base_identity = self
+            .nodes
+            .get(&base_node)
+            .map_or(0, |info| info.base_identity);
 
         // Load state + delta, materialize the VM.
         let node_dir = self.node_dir(node_id);
@@ -721,9 +958,16 @@ impl SnapshotTree {
 
         // Apply this node's delta on top of base.mem. (If the node is the same
         // as base_node — i.e. a checkpoint that also has a delta — we skip.)
-        if base_node != *node_id {
-            apply_delta(&node_dir.join("delta.pack"), fork_mem_addr, mem_span)?;
-        }
+        let applied = if base_node == *node_id {
+            AppliedDelta::empty(mem_span)
+        } else {
+            apply_delta(
+                &node_dir.join("delta.pack"),
+                fork_mem_addr,
+                mem_span,
+                base_identity,
+            )?
+        };
 
         let mut vm = crate::fork::build_vm_from_state_and_mem(
             &state,
@@ -732,8 +976,23 @@ impl SnapshotTree {
         )?;
         vm.start()?;
         vm.enable_dirty_tracking()?;
+        // The pack's pages are exactly this VM's divergence from
+        // `base_path`. Dirty tracking restarts empty, so without this
+        // re-seed the *next* suspend writes a pack that covers only what
+        // the guest touched after resume, and the pages restored here
+        // silently revert to the base — a suspend→resume→suspend cycle
+        // would lose them (CHALLENGES #143). Same reason a fork child
+        // seeds from its source's bitmap.
+        vm.seed_accumulated_dirty(&applied.bitmap)?;
+        // The mapping is always `MAP_PRIVATE` of the nearest
+        // checkpoint's `memory.bin` (own file if this node is the
+        // checkpoint). Set the path so the next fork inherits instead
+        // of writing a keyframe. A checkpoint keeps `has_base_snapshot`
+        // so a later prepare is still a no-op (CHALLENGES #144).
+        vm.set_fork_source_base_path(base_path.clone());
 
         self.live_vms.insert(node_id.clone(), vm);
+        self.record_cow_base(node_id, &base_node);
         self.jail_vm(node_id)?;
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.state = NodeState::Live;
@@ -775,6 +1034,7 @@ impl SnapshotTree {
                 drop(vm);
             }
             self.pure_ids.remove(&id);
+            self.cow_base.remove(&id);
             let _ = fs::remove_dir_all(self.node_dir(&id));
             if let Some(info) = self.nodes.remove(&id) {
                 // Suspended nodes park their RW disk-clone dirs on the
@@ -821,10 +1081,12 @@ impl SnapshotTree {
         let mut disk_bytes: u64 = 0;
         for info in self.nodes.values() {
             let dir = self.node_dir(&info.id);
-            for file in ["memory.bin", "delta.pack"] {
-                if let Ok(md) = fs::metadata(dir.join(file)) {
-                    disk_bytes = disk_bytes.saturating_add(md.len());
-                }
+            disk_bytes = disk_bytes.saturating_add(keyframe_disk_bytes(
+                &dir.join("memory.bin"),
+                info.base_disk_bytes,
+            ));
+            if let Ok(md) = fs::metadata(dir.join("delta.pack")) {
+                disk_bytes = disk_bytes.saturating_add(md.len());
             }
         }
         let live_node_count = self.live_vms.len();
@@ -1027,6 +1289,10 @@ impl SnapshotTree {
             if let Some(info) = self.nodes.get_mut(&id) {
                 info.state = NodeState::Evicted;
                 info.has_base_snapshot = false;
+                // The keyframe is gone, so it costs nothing and names no
+                // generation any pack may still claim.
+                info.base_disk_bytes = None;
+                info.base_identity = 0;
                 touch(info);
             }
             evicted.push(id);
@@ -1132,11 +1398,11 @@ impl SnapshotTree {
         }
     }
 
-    /// Restore-chain depth: how many non-checkpoint nodes sit between
-    /// `node_id` (inclusive) and its nearest `has_base_snapshot` ancestor —
-    /// i.e. how many `delta.pack`s a resume would have to apply. 0 for a
-    /// checkpoint node. This is what `TreeBudget::max_chain_depth` caps;
-    /// it is NOT tree-graph depth .
+    /// Unprepared hops between `node_id` (inclusive) and its nearest
+    /// `has_base_snapshot` ancestor. Resume applies **one** `delta.pack`
+    /// onto that ancestor ; this hop-count is not a
+    /// correctness cap. 0 for a checkpoint node. Not tree-graph depth
+    /// .
     ///
     /// The walk itself is the verified pure function
     /// [`tree_model::restore_chain_depth`] ; this wrapper only
@@ -1201,19 +1467,54 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn node_parent(nodes: &HashMap<NodeId, NodeInfo>, id: &NodeId) -> Option<String> {
-    nodes
-        .get(id)
-        .and_then(|n| n.parent.clone())
-        .map(|p| p.chars().take(16).collect())
-}
-
 /// Rough estimate of non-reclaimable RAM for a live VM: 4 KiB × popcount of
 /// the accumulated dirty bitmap. This is a lower bound — pages dirtied before
 /// dirty tracking was enabled aren't counted, but `prepare_fork_source_in`
 /// enables tracking immediately, so the lower bound is tight in practice.
 fn estimate_vm_ram(vm: &Vm) -> u64 {
     vm.accumulated_dirty_pages().unwrap_or(0) * 4096
+}
+
+/// Can this tree's storage `FICLONE`? Probed once per tree .
+///
+/// A `false` here is not an error — the tree works, every keyframe just
+/// costs a full guest-RAM dump — but it is the difference between a
+/// GRPO generation costing its divergence and costing `N × guest RAM`,
+/// so say it once, loudly, at the top.
+pub(crate) fn probe_reflink_root(root_dir: &Path) -> bool {
+    match crate::disks::assert_reflink_capable(root_dir) {
+        Ok(()) => {
+            log::info!(
+                "tree: {} is reflink-capable — keyframes down the tree are incremental",
+                root_dir.display()
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "tree: {} cannot FICLONE ({e}) — every keyframe costs a FULL guest-RAM \
+                 dump instead of O(divergence). Put the tree root on the reflink XFS \
+                 (`disks::ensure_reflink_tree_root`, the referenced work §3).",
+                root_dir.display()
+            );
+            false
+        }
+    }
+}
+
+/// Physical disk a node's `memory.bin` costs.
+///
+/// `recorded` is the daemon's write-time measurement  —
+/// the only honest number for an incremental keyframe, whose logical
+/// length is the full guest-physical span and whose `st_blocks` counts
+/// extents it merely shares with its ancestor. A node written before
+/// that record existed, or by the full-dump path, costs its length.
+fn keyframe_disk_bytes(mem_path: &Path, recorded: Option<u64>) -> u64 {
+    match fs::metadata(mem_path) {
+        Ok(md) => recorded.unwrap_or(md.len()),
+        // No keyframe on disk costs nothing, whatever the record says.
+        Err(_) => 0,
+    }
 }
 
 // --- K7DL delta format ---
@@ -1228,12 +1529,16 @@ fn estimate_vm_ram(vm: &Vm) -> u64 {
 ///
 /// For each bit set in `dirty_bitmap`, copy the 4 KiB page from `src_addr` into
 /// the delta file. Returns the number of pages written.
+///
+/// `base_identity` names the generation of the `memory.bin` this pack is
+/// a diff against; [`apply_delta`] refuses to apply it onto any other
+/// (CHALLENGES #144). 0 means "unknown" and applies anywhere.
 pub fn write_delta(
     path: &Path,
     dirty_bitmap: &[u64],
     src_addr: u64,
     mem_size: u64,
-    _base_node_id: String,
+    base_identity: u64,
 ) -> Result<u32, TreeError> {
     let page_size: u64 = 4096;
     let total_pages = mem_size / page_size;
@@ -1263,7 +1568,7 @@ pub fn write_delta(
         let f = fs::File::create(&tmp)?;
         let mut w = BufWriter::new(f);
 
-        let header = k7dl_header_bytes(page_count, mem_size);
+        let header = k7dl_set_base_identity(k7dl_header_bytes(page_count, mem_size), base_identity);
         w.write_all(&header)?;
 
         for (word_idx, &word) in dirty_bitmap.iter().enumerate() {
@@ -1303,16 +1608,58 @@ pub fn write_delta(
     Ok(page_count)
 }
 
+/// What [`apply_delta`] restored.
+#[derive(Debug, Clone)]
+pub struct AppliedDelta {
+    /// Number of pages written into the mapping.
+    pub page_count: u32,
+    /// Span-indexed bitmap of exactly those pages — the resumed VM's
+    /// divergence from the base it was mapped from, which its fresh
+    /// dirty bitmap must be seeded with (CHALLENGES #143).
+    pub bitmap: Vec<u64>,
+}
+
+impl AppliedDelta {
+    /// The no-pack case: a checkpoint resumes straight off its own
+    /// `memory.bin` and diverges from it by nothing.
+    #[must_use]
+    pub fn empty(mem_size: u64) -> Self {
+        Self {
+            page_count: 0,
+            bitmap: vec![0u64; bitmap_words(mem_size)],
+        }
+    }
+}
+
+/// Words in a span-indexed dirty bitmap for `mem_size` bytes of
+/// guest-physical address space. Matches `Vm::enable_dirty_tracking`.
+fn bitmap_words(mem_size: u64) -> usize {
+    (mem_size.div_ceil(4096) as usize).div_ceil(64)
+}
+
 /// Apply a packed K7DL delta into a `MAP_PRIVATE` memory region.
 ///
 /// Writes each page from the delta file into `target_addr + page_idx * 4096`.
-/// Returns the number of pages applied.
-pub fn apply_delta(path: &Path, target_addr: u64, mem_size: u64) -> Result<u32, TreeError> {
+///
+/// `expected_base_identity` is the generation of the `memory.bin`
+/// `target_addr` maps. A pack minted against a *different* known
+/// generation is rejected: its page indices are meaningful only against
+/// the base it was diffed from, so applying it elsewhere would scatter
+/// one VM's pages through another's memory and resume a plausible-looking
+/// corrupt guest (CHALLENGES #144). A pack or a base with identity 0 is
+/// pre-30b and loads with a warning rather than failing.
+pub fn apply_delta(
+    path: &Path,
+    target_addr: u64,
+    mem_size: u64,
+    expected_base_identity: u64,
+) -> Result<AppliedDelta, TreeError> {
     let mut f = fs::File::open(path)?;
     let mut header = [0u8; K7DL_HEADER_SIZE];
     f.read_exact(&mut header)?;
 
     let (page_count, delta_mem_size) = k7dl_parse_header(&header)?;
+    let pack_identity = k7dl_base_identity(&header);
     if delta_mem_size != mem_size {
         return Err(DeltaError::MemSizeMismatch {
             got: delta_mem_size,
@@ -1320,7 +1667,25 @@ pub fn apply_delta(path: &Path, target_addr: u64, mem_size: u64) -> Result<u32, 
         }
         .into());
     }
+    if !tree_model::k7dl_base_identity_ok(pack_identity, expected_base_identity) {
+        return Err(TreeError::InvalidDelta(format!(
+            "{}: pack was written against base generation {pack_identity}, but the \
+             memory.bin it is being applied to is generation {expected_base_identity} — \
+             the base re-prepared under this suspended node, so its page indices no \
+             longer mean what they did (CHALLENGES #144)",
+            path.display(),
+        )));
+    }
+    if pack_identity == 0 || expected_base_identity == 0 {
+        log::warn!(
+            "{}: applying a delta with no base identity (pack {pack_identity}, base \
+             {expected_base_identity}) — pre-30b metadata, the base-skew check is off \
+             for this resume",
+            path.display(),
+        );
+    }
 
+    let mut bitmap = vec![0u64; bitmap_words(mem_size)];
     let mut buf = [0u8; K7DL_ENTRY_SIZE];
     for _ in 0..page_count {
         f.read_exact(&mut buf)?;
@@ -1334,8 +1699,9 @@ pub fn apply_delta(path: &Path, target_addr: u64, mem_size: u64) -> Result<u32, 
         unsafe {
             std::ptr::copy_nonoverlapping(page.as_ptr(), (target_addr + offset) as *mut u8, 4096);
         }
+        bitmap[page_idx as usize / 64] |= 1u64 << (u64::from(page_idx) % 64);
     }
-    Ok(page_count)
+    Ok(AppliedDelta { page_count, bitmap })
 }
 
 /// Atomic write: write to `path.tmp` + fsync + rename.

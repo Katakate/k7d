@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
 
 import plots  # noqa: E402
+from mutation import looks_destructive  # noqa: E402
 
 
 def _rec(**kw):
@@ -99,6 +100,38 @@ class TestPlots(unittest.TestCase):
             self.assertEqual(names, set(plots.PLOTS))
             for p in written:
                 self.assertGreater(p.stat().st_size, 100)
+
+    def test_mutating_classifier(self) -> None:
+        for cmd in (
+            "kubectl scale deploy/node-agent --replicas=0",
+            "kubectl patch deploy x -p '{}'",
+            "kubectl apply -f vap.yaml",
+            "systemctl restart k3s",
+            "pkill -f nodecheck",
+        ):
+            self.assertTrue(looks_destructive(cmd), cmd)
+        for cmd in (
+            "kubectl get pods -A",
+            "cat /proc/uptime",
+            "systemctl is-active k3s",
+            "kubectl get pods -l app=x --show-labels",
+        ):
+            self.assertFalse(looks_destructive(cmd), cmd)
+
+    def test_load_rescored_by_render_classifier(self) -> None:
+        # A row logged destructive=False by an older live classifier is
+        # re-scored at load time from its raw cmd.
+        row = _rec(
+            tool="branch_exec",
+            destructive=False,
+            on_source=True,
+            args={"cmd": "kubectl scale deploy/node-agent --replicas=0"},
+        )
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "run.jsonl"
+            src.write_text(json.dumps(row) + "\n")
+            rows = plots.load_jsonl([src])
+        self.assertTrue(rows[0]["destructive"])
 
 
 if __name__ == "__main__":

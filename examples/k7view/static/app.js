@@ -51,6 +51,28 @@
     const s = Math.floor(ms / 1000);
     return `T+${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
   };
+  const nodeFactor = (tree, nodeId) => {
+    const raw = (tree && tree.live_dilation && tree.live_dilation[nodeId]) || 1;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 1 ? n : 1;
+  };
+  const treeFactor = (tree) => {
+    if (!tree) return 1;
+    const nodes = Object.values(tree.nodes || {});
+    const root = nodes.find((n) => !n.parent);
+    if (root) return nodeFactor(tree, root.id);
+    const vals = Object.values(tree.live_dilation || {});
+    return vals.length ? nodeFactor(tree, Object.keys(tree.live_dilation)[0]) : 1;
+  };
+  const guestClockText = (tree) => {
+    const n = treeFactor(tree);
+    const gc = tree && tree.guest_clock;
+    if (!gc || gc.uptime_s == null || gc.base_uptime_s == null) {
+      return `guest T+00:00 ×${n}`;
+    }
+    const deltaMs = Math.max(0, (Number(gc.uptime_s) - Number(gc.base_uptime_s)) * 1000);
+    return `guest ${fmtT(deltaMs) || "T+00:00"} ×${n}`;
+  };
   const esc = (s) =>
     String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -661,6 +683,7 @@
       el.innerHTML =
         `<header><span class="dot ${stateName}"></span>` +
         `<h3>${pruned ? "✕ " : ""}${esc(n.label || n.id)}</h3>` +
+        (nodeFactor(tree, n.id) !== 1 ? `<span class="xn">×${nodeFactor(tree, n.id)}</span>` : "") +
         (lat && lat.latency_ms != null ? `<span class="ms">⑂ ${fmtMs(lat.latency_ms)}</span>` : "") +
         `</header>` +
         vHtml +
@@ -691,7 +714,7 @@
     ).join("");
   }
 
-  const FEED_SKIP = new Set(["tick", "trace", "members", "budget", "state"]);
+  const FEED_SKIP = new Set(["tick", "trace", "members", "budget", "state", "guest_clock"]);
 
   function renderEvents() {
     const box = $("events");
@@ -762,8 +785,13 @@
   function renderClock() {
     const tree = currentTree();
     const el = $("clock");
-    if (!tree || treeBase(tree.tree_id) == null) { el.textContent = "T+00:00"; return; }
-    el.textContent = fmtT(Date.now() - treeBase(tree.tree_id)) || "T+00:00";
+    const guest = $("guest-clock");
+    if (!tree || treeBase(tree.tree_id) == null) {
+      el.textContent = "T+00:00";
+    } else {
+      el.textContent = fmtT(Date.now() - treeBase(tree.tree_id)) || "T+00:00";
+    }
+    if (guest) guest.textContent = guestClockText(tree);
   }
 
   /* ---------- drawer ---------- */
@@ -802,6 +830,7 @@
       <b>parent</b><span>${esc(node.parent || "—")}</span>
       <b>dirty</b><span>${node.dirty_page_count || 0} pages (${fmtBytes((node.dirty_page_count || 0) * 4096)})</span>
       <b>fork</b><span>${lat.latency_ms != null ? fmtMs(lat.latency_ms) : "—"} · ${cow}</span>
+      <b>dilation</b><span>×${nodeFactor(tree, node.id)}</span>
       <b>cids</b><span>${cids.join(", ") || "—"}</span>`;
     const note = (tree.notes || {})[node.id] || "";
     const err = (tree.errors || {})[node.id] || "";

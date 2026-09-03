@@ -577,4 +577,78 @@ fn test_gym_ubuntu_source_kill_partition_release() {
         owned.assert_gone(&tree_id, &format!("after {fault_id} release"));
         measure(&format!("after_{fault_id}"));
     }
+
+    // the referenced work: lease n=1, POST /env/{id}/fork n=2, children obs, clean release.
+    {
+        let body = r#"{"fault_id":"none","n":1,"group_id":"g-midfork","ttl_s":180}"#;
+        let (code, lease) = http("POST", &format!("{}/lease", gym.base), Some(body), 180);
+        assert_eq!(code, 200, "lease n=1 for mid-fork: {lease}");
+        let parent = lease["envs"][0]["env_id"].as_str().unwrap().to_string();
+        let lid = lease["lease_id"].as_str().unwrap().to_string();
+
+        let (code, rej) = http(
+            "POST",
+            &format!("{}/env/{parent}/fork", gym.base),
+            Some(r#"{"n":32}"#),
+            10,
+        );
+        assert_eq!(code, 409, "over-budget mid-fork must 409: {rej}");
+        let err = rej["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("need ") && err.contains("n=32"),
+            "409 must spell the budget: {err}"
+        );
+
+        let (code, fork) = http(
+            "POST",
+            &format!("{}/env/{parent}/fork", gym.base),
+            Some(r#"{"n":2,"labels":["child-0","child-1"]}"#),
+            180,
+        );
+        assert_eq!(code, 200, "mid-episode fork: {fork}");
+        assert_eq!(fork["lease_id"], lid);
+        assert_eq!(fork["parent_env_id"], parent);
+        let children = fork["envs"].as_array().expect("fork envs");
+        assert_eq!(children.len(), 2);
+        let mut all_envs = lease["envs"].as_array().unwrap().clone();
+        all_envs.extend(children.iter().cloned());
+        let owned = LeaseResidue::from_envs(&all_envs);
+
+        let (code, parent_obs) = http(
+            "POST",
+            &format!("{}/env/{parent}/obs", gym.base),
+            Some("{}"),
+            30,
+        );
+        assert_eq!(code, 200, "parent still usable after fork: {parent_obs}");
+        assert!(
+            parent_obs["observation"].get("readyz").is_some(),
+            "parent obs: {parent_obs}"
+        );
+        for child in children {
+            let eid = child["env_id"].as_str().unwrap();
+            let (code, obs) = http(
+                "POST",
+                &format!("{}/env/{eid}/obs", gym.base),
+                Some("{}"),
+                30,
+            );
+            assert_eq!(code, 200, "child obs {eid}: {obs}");
+            assert!(
+                obs["observation"].get("readyz").is_some(),
+                "child obs must be API, not uname: {obs}"
+            );
+        }
+
+        let (code, rel) = http(
+            "POST",
+            &format!("{}/lease/{lid}/release", gym.base),
+            Some("{}"),
+            90,
+        );
+        assert_eq!(code, 200, "release mid-fork: {rel}");
+        assert_http_residue_empty(&rel, "mid-fork");
+        owned.assert_gone(&tree_id, "after mid-fork release");
+        measure("after_mid_episode_fork");
+    }
 }

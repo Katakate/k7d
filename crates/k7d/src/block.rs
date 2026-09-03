@@ -16,12 +16,18 @@
 //!    every guest-memory store marks a bit in a per-device page bitmap that
 //!    [`Vm::get_and_accumulate_dirty`](crate::vm::Vm) merges into the warm
 //!    fork's dirty delta via [`VirtioBackend::merge_dirty_pages`].
-//! 2. **Deterministic pause.** On pause the worker first drains every
-//!    pending request (so `used.idx == avail.idx`), then parks and reports
-//!    quiescence via [`VirtioBackend::wait_quiescent`] — guaranteeing the
-//!    dirty bitmap is complete before the fork memcpy starts.
+//! 2. **Deterministic pause.** On pause the worker finishes the request
+//!    already in `handle_request` (if any), then parks and reports
+//!    quiescence via [`VirtioBackend::wait_quiescent`]. Remaining avail
+//!    descriptors stay on the ring — the child worker and the parent
+//!    resume replay them (same contract as virtio-net / CHALLENGES #79).
+//!    Draining the whole queue was a 0.5–7 s `pwrite`/`sync_data` storm
+//!    on a busy inner-k3s guest and made `FICLONE` of the 8 GiB scratch
+//!    wait on the same inode (CHALLENGES #162). DMA from the in-flight
+//!    request is still in the dirty bitmap before memcpy.
 
 use std::fs::File;
+use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,7 +40,7 @@ use crate::network::{
     get_avail_desc, mark_dirty, put_used_desc, read_used_idx, VirtqDesc, VIRTQ_DESC_F_NEXT,
     VIRTQ_DESC_F_WRITE,
 };
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState};
+use crate::virtio_mmio::{VirtioBackend, VirtqueueState, PARK_POLL, UNPARK_POLL};
 
 /// Virtio device-type ID for block devices.
 pub const VIRTIO_ID_BLOCK: u32 = 2;
@@ -194,8 +200,12 @@ pub struct BlockBackend {
     acked_features: u64,
     kick: Option<EventFd>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// `pthread_self` of the worker (0 if none). Used to `EINTR` an
+    /// in-flight `pwrite`/`fdatasync` on pause so `FICLONE` is not
+    /// stuck on the inode (CHALLENGES #162).
+    worker_tid: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
-    /// When true the worker drains pending requests, then parks (see #29).
+    /// When true the worker parks after the in-flight request (see #162).
     paused: Arc<AtomicBool>,
     /// True while the worker is parked in the paused state (or exited) —
     /// i.e. no more guest-memory writes will happen until unpause.
@@ -253,6 +263,7 @@ impl BlockBackend {
             acked_features: 0,
             kick: None,
             worker: None,
+            worker_tid: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             parked: Arc::new(AtomicBool::new(true)),
@@ -278,12 +289,14 @@ impl BlockBackend {
     /// Stop the worker thread. Must be called before guest memory is freed.
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        interrupt_blk_worker(&self.worker_tid);
         if let Some(ref kick) = self.kick {
             let _ = kick.write(1);
         }
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+        self.worker_tid.store(0, Ordering::SeqCst);
     }
 }
 
@@ -346,10 +359,15 @@ impl VirtioBackend for BlockBackend {
 
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
-        // Wake the worker so it drains + parks (pause) or resumes promptly
-        // (unpause).
+        // Wake the worker so it parks (pause) or resumes promptly (unpause).
         if let Some(ref kick) = self.kick {
             let _ = kick.write(1);
+        }
+        // Break out of pwrite/fdatasync so FICLONE is not serialized
+        // behind a 3–7 s XFS lock (CHALLENGES #162). SIGRTMIN is the
+        // same no-op, no-SA_RESTART handler the vCPU pause path uses.
+        if paused {
+            interrupt_blk_worker(&self.worker_tid);
         }
     }
 
@@ -357,18 +375,27 @@ impl VirtioBackend for BlockBackend {
         if self.worker.is_none() {
             return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 200 ms > the worker's 100 ms poll. A stuck scratch-disk IO
+        // already will not park; waiting 2 s then proceeding (the old
+        // bound) just blew `FORK_INNER_K3S_CLUSTER_3VM` (CHALLENGES #162).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while !self.parked.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) {
             if std::time::Instant::now() >= deadline {
                 log::warn!(
-                    "virtio-blk ({}): worker did not park within 2s — fork dirty \
+                    "virtio-blk ({}): worker did not park within 200ms — fork dirty \
                      delta may miss in-flight device DMA",
                     self.host_path.display()
                 );
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(PARK_POLL);
         }
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.worker.is_none()
+            || !self.running.load(Ordering::SeqCst)
+            || self.parked.load(Ordering::SeqCst)
     }
 
     fn merge_dirty_pages(&self, acc: &mut [u64]) {
@@ -408,6 +435,7 @@ impl VirtioBackend for BlockBackend {
             paused: Arc::clone(&self.paused),
             parked: Arc::clone(&self.parked),
             dirty: Arc::clone(&self.dirty),
+            worker_tid: Arc::clone(&self.worker_tid),
             idx_seed: self.idx_seed,
         };
 
@@ -457,27 +485,30 @@ struct WorkerCtx {
     paused: Arc<AtomicBool>,
     parked: Arc<AtomicBool>,
     dirty: Arc<Vec<AtomicU64>>,
+    worker_tid: Arc<AtomicU64>,
     idx_seed: u16,
 }
 
 /// Worker thread: wait for queue kicks, service requests against the
-/// backing file. On pause: drain pending requests, then park (so the ring
-/// reaches `used.idx == avail.idx` and all device DMA is recorded in the
-/// dirty bitmap before the fork memcpy).
+/// backing file. On pause: finish the request already in flight (see
+/// [`process_queue`]), then park. Do **not** drain the rest of the avail
+/// ring — that is a multi-second `pwrite`/`FLUSH` storm on a busy guest
+/// and stalls `FICLONE` of the scratch (CHALLENGES #162). Leftover
+/// descriptors are replayed on the child and on parent resume.
 fn blk_worker(ctx: &WorkerCtx) {
+    accept_worker_interrupt();
+    // SAFETY: this is the worker thread; the value is only used as a
+    // pthread_t for SIGRTMIN while `running` is true, then zeroed.
+    let self_tid = unsafe { libc::pthread_self() as u64 };
+    ctx.worker_tid.store(self_tid, Ordering::SeqCst);
     let mut last_avail = ctx.idx_seed;
     let mut last_used = ctx.idx_seed;
 
     while ctx.running.load(Ordering::SeqCst) {
         if ctx.paused.load(Ordering::SeqCst) {
-            // Complete everything in flight so used.idx catches avail.idx,
-            // then park. The vCPU is stopping/stopped, so no new requests
-            // arrive; completions are safe (their pages are recorded in the
-            // dirty bitmap, which is merged after wait_quiescent).
-            process_queue(ctx, &mut last_avail, &mut last_used);
             ctx.parked.store(true, Ordering::SeqCst);
             while ctx.paused.load(Ordering::SeqCst) && ctx.running.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(UNPARK_POLL);
             }
             ctx.parked.store(false, Ordering::SeqCst);
             continue;
@@ -500,13 +531,74 @@ fn blk_worker(ctx: &WorkerCtx) {
     }
     // Report quiescence on exit too, so wait_quiescent never hangs on a
     // shut-down device.
+    ctx.worker_tid.store(0, Ordering::SeqCst);
     ctx.parked.store(true, Ordering::SeqCst);
 }
 
-/// Drain every available descriptor chain: parse, execute, complete.
+/// Make sure this worker can actually receive [`interrupt_blk_worker`]'s
+/// signal, whatever mask it was born with.
+///
+/// A new thread inherits the signal mask of the thread that spawned it,
+/// and this one is spawned from device activation — an MMIO exit, so *on
+/// a vCPU thread*, which blocks its own stop signal deliberately. A
+/// worker that inherits a block on `SIGRTMIN` does not merely miss its
+/// kicks: the signal is a real-time one, so each pause *queues* another
+/// undeliverable instance against the per-user `RLIMIT_SIGPENDING` until
+/// it is full and no thread in the process can be signalled at all
+/// (`CHALLENGES.md` #185). The vCPU path uses a different signal now, so
+/// this is belt to that braces — a mask inherited from anywhere must not
+/// be able to swallow a kick silently.
+fn accept_worker_interrupt() {
+    // SAFETY: a freshly zeroed sigset_t filled only through libc's own
+    // accessors, and a null old-set pointer, which is allowed.
+    let rc = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGRTMIN());
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut())
+    };
+    assert_eq!(rc, 0, "pthread_sigmask(SIG_UNBLOCK, SIGRTMIN) failed: {rc}");
+}
+
+/// Interrupt `pwrite`/`fdatasync`/`poll` on the virtio-blk worker.
+/// `SIGRTMIN` has a no-op handler without `SA_RESTART` (`vm.rs`).
+fn interrupt_blk_worker(tid: &AtomicU64) {
+    let raw = tid.load(Ordering::SeqCst);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: `raw` is `pthread_self` from the live worker, or we lose
+    // the race with exit and pthread_kill returns ESRCH.
+    let _ = unsafe { libc::pthread_kill(raw as libc::pthread_t, libc::SIGRTMIN()) };
+}
+
+/// Drain available descriptor chains until the queue is empty or pause
+/// is requested. A pause check *before* each request lets the current
+/// `pwrite`/`sync_data` finish and then parks, instead of emptying a
+/// full inner-k3s ring onto the 8 GiB scratch (CHALLENGES #162).
 fn process_queue(ctx: &WorkerCtx, last_avail: &mut u16, last_used: &mut u16) {
-    while let Some(head) = get_avail_desc(ctx.mem_base, &ctx.q, last_avail) {
-        let used_len = handle_request(ctx, head);
+    loop {
+        // Check before taking a descriptor — `get_avail_desc` advances
+        // `last_avail`, and a skipped chain would never complete on the
+        // parent worker after resume.
+        if ctx.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(head) = get_avail_desc(ctx.mem_base, &ctx.q, last_avail) else {
+            return;
+        };
+        let Some(used_len) = handle_request(ctx, head) else {
+            // The pause interrupted this write. Put the chain back on the
+            // avail ring (`get_avail_desc` already advanced past it) and
+            // park: it is replayed on resume, exactly like the chains
+            // pause leaves untouched behind it. Completing it with
+            // VIRTIO_BLK_S_IOERR instead is a hard write error for a
+            // request nothing was wrong with, and the guest's ext4
+            // aborts its journal and remounts read-only for it
+            // (CHALLENGES.md #178).
+            *last_avail = last_avail.wrapping_sub(1);
+            return;
+        };
         let slot = u64::from(*last_used % ctx.q.size);
         put_used_desc(ctx.mem_base, &ctx.q, last_used, head, used_len);
         // The used-ring entry + idx are device writes into guest memory —
@@ -518,9 +610,12 @@ fn process_queue(ctx: &WorkerCtx, last_avail: &mut u16, last_used: &mut u16) {
     }
 }
 
-/// Service one request chain. Returns the used-ring length (bytes written
-/// into device-writable buffers, including the status byte).
-fn handle_request(ctx: &WorkerCtx, head: u16) -> u32 {
+/// Service one request chain.
+///
+/// `Some(used_ring_length)` — bytes written into device-writable
+/// buffers, including the status byte. `None` when the pause signal cut
+/// the request short and it must be replayed rather than completed.
+fn handle_request(ctx: &WorkerCtx, head: u16) -> Option<u32> {
     // Walk the descriptor chain, bounded by the queue size (we do not
     // advertise VIRTIO_F_INDIRECT_DESC, so a longer chain is malformed).
     let desc_base = ctx.mem_base + ctx.q.desc_addr.raw_value();
@@ -529,7 +624,7 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> u32 {
     loop {
         if idx >= ctx.q.size || descs.len() >= ctx.q.size as usize {
             log::error!("virtio-blk: malformed descriptor chain (idx={idx})");
-            return 0;
+            return Some(0);
         }
         // SAFETY: idx < q.size, so the pointer stays within the descriptor
         // table in guest RAM, which the mapping keeps valid.
@@ -552,7 +647,7 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> u32 {
         Ok(l) => l,
         Err(e) => {
             log::error!("virtio-blk: rejecting malformed request: {e}");
-            return 0;
+            return Some(0);
         }
     };
 
@@ -569,7 +664,7 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> u32 {
     let (req_type, sector) = parse_request_header(&header).expect("16-byte header parses");
 
     let data = &descs[layout.data_start..layout.data_end];
-    let (status, mut used_len) = execute_request(ctx, req_type, sector, data, layout.data_len);
+    let (status, mut used_len) = execute_request(ctx, req_type, sector, data, layout.data_len)?;
 
     // SAFETY: layout.status was bounds-checked against mem_size with
     // len >= 1; the destination lies within guest RAM.
@@ -578,19 +673,21 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> u32 {
     }
     mark_dirty(&ctx.dirty, layout.status.addr, 1);
     used_len += 1; // status byte
-    used_len
+    Some(used_len)
 }
 
-/// Execute a parsed request against the backing file. Returns
-/// `(status, bytes_written_to_guest)` — the status byte is accounted by the
-/// caller.
+/// Execute a parsed request against the backing file.
+///
+/// `Some((status, bytes_written_to_guest))` completes the chain — the
+/// status byte is accounted by the caller. `None` means the pause
+/// signal cut a `pwrite` short: see [`process_queue`].
 fn execute_request(
     ctx: &WorkerCtx,
     req_type: u32,
     sector: u64,
     data: &[DescMeta],
     data_len: u64,
-) -> (u8, u32) {
+) -> Option<(u8, u32)> {
     match req_type {
         VIRTIO_BLK_T_IN => {
             let Some(offset) = io_byte_offset(sector, data_len, ctx.capacity_sectors) else {
@@ -599,14 +696,14 @@ fn execute_request(
                      capacity={} sectors)",
                     ctx.capacity_sectors
                 );
-                return (VIRTIO_BLK_S_IOERR, 0);
+                return Some((VIRTIO_BLK_S_IOERR, 0));
             };
             let mut file_off = offset;
             let mut written: u32 = 0;
             for d in data {
                 if !d.write {
                     log::error!("virtio-blk: IN request with device-readable data descriptor");
-                    return (VIRTIO_BLK_S_IOERR, 0);
+                    return Some((VIRTIO_BLK_S_IOERR, 0));
                 }
                 // SAFETY: d was bounds-checked against mem_size; the range
                 // lies within guest RAM, which outlives the worker (joined
@@ -619,13 +716,13 @@ fn execute_request(
                 };
                 if let Err(e) = ctx.file.read_exact_at(buf, file_off) {
                     log::error!("virtio-blk: pread {} bytes at {file_off}: {e}", d.len);
-                    return (VIRTIO_BLK_S_IOERR, 0);
+                    return Some((VIRTIO_BLK_S_IOERR, 0));
                 }
                 mark_dirty(&ctx.dirty, d.addr, u64::from(d.len));
                 file_off += u64::from(d.len);
                 written += d.len;
             }
-            (VIRTIO_BLK_S_OK, written)
+            Some((VIRTIO_BLK_S_OK, written))
         }
         VIRTIO_BLK_T_OUT => {
             if ctx.readonly {
@@ -633,7 +730,7 @@ fn execute_request(
                     "virtio-blk: rejecting write to read-only device (sector={sector} \
                      len={data_len})"
                 );
-                return (VIRTIO_BLK_S_IOERR, 0);
+                return Some((VIRTIO_BLK_S_IOERR, 0));
             }
             let Some(offset) = io_byte_offset(sector, data_len, ctx.capacity_sectors) else {
                 log::error!(
@@ -641,39 +738,87 @@ fn execute_request(
                      capacity={} sectors)",
                     ctx.capacity_sectors
                 );
-                return (VIRTIO_BLK_S_IOERR, 0);
+                return Some((VIRTIO_BLK_S_IOERR, 0));
             };
             let mut file_off = offset;
             for d in data {
                 if d.write {
                     log::error!("virtio-blk: OUT request with device-writable data descriptor");
-                    return (VIRTIO_BLK_S_IOERR, 0);
+                    return Some((VIRTIO_BLK_S_IOERR, 0));
                 }
                 // SAFETY: d was bounds-checked against mem_size; the range
                 // lies within guest RAM, which outlives the worker.
                 let buf = unsafe {
                     std::slice::from_raw_parts((ctx.mem_base + d.addr) as *const u8, d.len as usize)
                 };
-                if let Err(e) = ctx.file.write_all_at(buf, file_off) {
+                if let Err(e) = write_all_at_unless_paused(ctx, buf, file_off) {
+                    if io_aborted_for_pause(ctx, &e) {
+                        // Nothing is wrong with this request — the host
+                        // froze the VM mid-`pwrite`. Defer it instead of
+                        // handing the guest a hard write error.
+                        return None;
+                    }
                     log::error!("virtio-blk: pwrite {} bytes at {file_off}: {e}", d.len);
-                    return (VIRTIO_BLK_S_IOERR, 0);
+                    return Some((VIRTIO_BLK_S_IOERR, 0));
                 }
                 file_off += u64::from(d.len);
             }
-            (VIRTIO_BLK_S_OK, 0)
+            Some((VIRTIO_BLK_S_OK, 0))
         }
-        VIRTIO_BLK_T_FLUSH => match ctx.file.sync_data() {
-            Ok(()) => (VIRTIO_BLK_S_OK, 0),
-            Err(e) => {
-                log::error!("virtio-blk: fdatasync: {e}");
-                (VIRTIO_BLK_S_IOERR, 0)
-            }
-        },
+        VIRTIO_BLK_T_FLUSH => {
+            // Do not `sync_data` the 8 GiB scratch. `fdatasync` sits in
+            // uninterruptible D-state on a dirty XFS journal; SIGRTMIN
+            // cannot break it, and `FICLONE` then waits on the same
+            // inode for 3–7 s (CHALLENGES #162). Completions already
+            // hit the page cache; FICLONE shares those extents. The
+            // guest still sees a successful FLUSH.
+            Some((VIRTIO_BLK_S_OK, 0))
+        }
         other => {
             log::warn!("virtio-blk: unsupported request type {other}");
-            (VIRTIO_BLK_S_UNSUPP, 0)
+            Some((VIRTIO_BLK_S_UNSUPP, 0))
         }
     }
+}
+
+fn io_aborted_for_pause(ctx: &WorkerCtx, err: &std::io::Error) -> bool {
+    ctx.paused.load(Ordering::SeqCst) && err.kind() == ErrorKind::Interrupted
+}
+
+/// Like [`FileExt::write_all_at`] but stop on pause instead of retrying
+/// `EINTR` — std retries `Interrupted` and would ignore `SIGRTMIN`.
+fn write_all_at_unless_paused(
+    ctx: &WorkerCtx,
+    mut buf: &[u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        if ctx.paused.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "virtio-blk write aborted for pause",
+            ));
+        }
+        match ctx.file.write_at(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "virtio-blk pwrite wrote 0 bytes",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {
+                if ctx.paused.load(Ordering::SeqCst) {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -15,6 +15,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mutation import looks_destructive  # noqa: E402
+
 
 PLOTS = (
     "01-tree-utilization.png",
@@ -39,6 +42,11 @@ def load_jsonl(paths: list[Path]) -> list[dict[str, Any]]:
                 raise SystemExit(f"{p}:{i}: {e}") from e
             if not isinstance(rec, dict) or "tool" not in rec:
                 raise SystemExit(f"{p}:{i}: expected object with tool")
+            # Re-score mutating commands with today's classifier so both
+            # comparison arms are judged by one rule (see mutation.py).
+            if rec.get("tool") == "branch_exec":
+                cmd = str((rec.get("args") or {}).get("cmd") or "")
+                rec["destructive"] = looks_destructive(cmd)
             rec["_src"] = str(p)
             rows.append(rec)
     if not rows:

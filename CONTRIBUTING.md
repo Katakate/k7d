@@ -16,8 +16,8 @@ If you edit elsewhere, use a remote Linux/KVM host via the Makefile
 
 ## Workflow
 
-1. Read [`HACKING.md`](HACKING.md) and the relevant section of the docs /
-   architecture notes under `docs/`.
+1. Read [`HACKING.md`](HACKING.md) and the product docs at
+   [docs.katakate.org/k7d](https://docs.katakate.org/k7d).
 2. Make a focused change; keep errors loud (no silent defaults).
 3. On a KVM host: `make check` (fmt + deny + clippy + tests with
    `--test-threads=1`). For kubectl paths: `make test-integration`.
@@ -29,8 +29,8 @@ The primary test host has KVM, virtiofsd, and k3s.
 
 ## Project direction
 
-See the README roadmap. Near-term: `/etc/k7d/config.toml`, CoreDNS /
-Ingress fidelity inside the cluster-fork fixture, then cross-node fork.
+See the README roadmap. Near-term: `/etc/k7d/config.toml`, then
+cross-node fork.
 
 ## Reporting issues
 

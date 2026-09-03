@@ -195,7 +195,8 @@ fn main() {
         let state = k7d::snapshot::capture_vm_state(&source).expect("capture state");
         let src_mem = source.mem_host_addr();
         let fork_id = format!("repro-{i}");
-        let fork = k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, &fork_id);
+        let fork =
+            k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, &fork_id, None);
         source.resume().expect("resume source");
         let mut fork = fork.expect("materialise fork");
 

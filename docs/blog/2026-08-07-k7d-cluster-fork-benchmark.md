@@ -14,8 +14,7 @@ from those files, **trust the tests**.
 
 ## Hardware
 
-Pinned bare-metal provider bare-metal node used for all figures below
-(prefer sync/rebuild over wipe when ready - see `editor-config/rules/contributor hygiene.mdc`):
+Pinned bare-metal node used for all figures below:
 
 | | |
 |---|---|
@@ -90,9 +89,9 @@ against the source still works after adopt/fork.
 
 | Operation | kind | vcluster | CubeSandbox-style sandbox clone | **k7d** |
 |---|---|---|---|---|
-| Fresh isolated Kubernetes | ~30-60 s cold | ~20 s | n/a (not a cluster) | **warm fork of a live 3-node cluster (~105 ms typical)** |
+| Fresh isolated Kubernetes | ~30-60 s cold | ~20 s | n/a (not a cluster) | **warm fork of a live 3-node cluster: ~105 ms CI guest / ~1.1 s Ubuntu k3s+Cilium+Tetragon** |
 | Unit of fork | n/a | n/a | one microVM / process sandbox | **the whole cluster** (control plane + workers) |
-| Surviving TLS across fork | n/a | n/a | no (new sandbox) | **yes** (held `?watch=true` stream survives - Inc 4/5 proof) |
+| Surviving TLS across fork | n/a | n/a | no (new sandbox) | **yes** (held `?watch=true` stream survives) |
 | Source still answers after fork | n/a | n/a | n/a | **yes** (CID-stable prepare) |
 
 k7d is complementary to E2B / CubeSandbox: they fork a **sandbox**;
@@ -105,7 +104,7 @@ purpose - different unit of isolation.
 - “&lt;5 MB per instance” density (our guests run kubelet; CubeSandbox’s
   own amortized density table is already ~21-26 MB).
 - That the virtiofs era (~2 s full-copy) was the intended steady state - 
-  that was the pre-14a slow path, now the explicit fallback for RW
+  that was the old full-copy path, now the explicit fallback for RW
   hostPath only.
 
 ## Demo

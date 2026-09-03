@@ -208,3 +208,75 @@ fn test_create_is_idempotent() {
     // net1's Drop will tear down the bridge.
     drop(net1);
 }
+
+/// the referenced work: `ClusterNetwork::create` no longer installs (and actively
+/// drains) the iptables `INPUT -i <bridge> -j ACCEPT` — the jail's
+/// `input` chain owns the guest→host decision. Also: the egress policy
+/// threads through create → fork_from (inheritance) → set_egress, and
+/// every TAP gets its anti-spoof table.
+#[test]
+fn test_egress_policy_threading_and_input_drain() {
+    use k7d::netjail::{self, CidrPort, EgressMode, EgressPolicy};
+
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+    let deny = EgressPolicy {
+        mode: EgressMode::Deny,
+        allow: Vec::new(),
+        allow_dns: None,
+    };
+    let mut src = ClusterNetwork::create_with_egress("egrsrc", deny.clone()).expect("bridge");
+    assert_eq!(src.egress(), &deny, "policy must be recorded");
+    assert!(
+        netjail::jail_installed(src.bridge_name()),
+        "jail table must exist"
+    );
+
+    // The drained iptables INPUT ACCEPT must not exist for this bridge.
+    let out = std::process::Command::new("iptables")
+        .args(["-S", "INPUT"])
+        .output()
+        .expect("iptables -S INPUT");
+    let rules = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !rules.contains(&format!("-i {} -j ACCEPT", src.bridge_name())),
+        "the INPUT -i <bridge> ACCEPT must be drained :\n{rules}"
+    );
+
+    // Every TAP carries its per-TAP anti-spoof table.
+    let tap = src.add_tap().expect("tap");
+    assert!(
+        netjail::tap_jail_installed(tap.name()),
+        "TAP {} must have its anti-spoof table",
+        tap.name()
+    );
+
+    // Forks inherit the source's posture — a contained tree must not
+    // mint an Open child.
+    let fork = ClusterNetwork::fork_from(&src, "egrfork").expect("fork bridge");
+    assert_eq!(fork.egress(), &deny, "fork must inherit the policy");
+    drop(fork);
+
+    // set_egress atomically replaces the ruleset and keeps the table.
+    let wl = EgressPolicy {
+        mode: EgressMode::Whitelist,
+        allow: vec![CidrPort {
+            cidr: "203.0.113.0/24".into(),
+            port: 4791,
+        }],
+        allow_dns: None,
+    };
+    src.set_egress(wl.clone()).expect("set_egress");
+    assert_eq!(src.egress(), &wl);
+    assert!(
+        netjail::jail_installed(src.bridge_name()),
+        "jail table must survive a set_egress replace"
+    );
+
+    let tap_name = tap.name().to_string();
+    drop(tap);
+    assert!(
+        !netjail::tap_jail_installed(&tap_name),
+        "dropping the TAP must remove its anti-spoof table"
+    );
+    drop(src);
+}

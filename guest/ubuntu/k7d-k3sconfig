@@ -80,16 +80,24 @@ printf '%s\n' "$NODE_NAME" > /etc/hostname
 printf '127.0.0.1 localhost\n127.0.1.1 %s\n' "$NODE_NAME" > /etc/hosts
 
 mkdir -p /etc/rancher/k3s /var/lib/rancher/k3s/agent/images
+# Baked by build-node-image.sh. A second [plugins.'io.containerd.cri.v1.runtime']
+# table (the {{ template "base" }} + overlay shape) is invalid TOML —
+# containerd exits 1 (CHALLENGES #166).
+[ -f /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl ] \
+    || die "missing containerd v3 template (CRI AppArmor must stay off)"
 
 wait_http() {
     # Wait until URL returns one of the accepted codes. 401 on /readyz
     # means the apiserver is up and anonymous auth is off — that is
     # still "ready enough to join"; 200 is the anonymous-auth case.
+    # 300 × 2 s = 600 s of *guest* time: at dilation N=16 that is 37 s
+    # of wall, enough for the server to mint TLS; 90 × 2 s was 11 s and
+    # N=16 died there (34a-inc6).
     url=$1
     shift
     i=0
     code=""
-    while [ "$i" -lt 90 ]; do
+    while [ "$i" -lt 300 ]; do
         code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "$url" || true)
         for ok in "$@"; do
             if [ "$code" = "$ok" ]; then
@@ -136,10 +144,10 @@ disable-network-policy: true
 CNIEOF
         fi
         log "server CNI=$CNI"
-        timeout 180 systemctl start k3s.service \
-            || die "k3s.service did not start within 180s"
+        timeout 600 systemctl start k3s.service \
+            || die "k3s.service did not start within 600s"
         i=0
-        while [ "$i" -lt 90 ]; do
+        while [ "$i" -lt 300 ]; do
             if k3s kubectl get --raw=/readyz 2>/dev/null | grep -q ok; then
                 log "server /readyz ok"
                 exit 0
@@ -159,8 +167,8 @@ EOF
         # Trap 2: /readyz, not just the port. 200 or 401 both mean the
         # apiserver is serving; a refused/empty connect does not.
         wait_http "https://${SERVER_IP}:6443/readyz" 200 401
-        timeout 180 systemctl start k3s-agent.service \
-            || die "k3s-agent.service did not start within 180s"
+        timeout 600 systemctl start k3s-agent.service \
+            || die "k3s-agent.service did not start within 600s"
         log "k3s-agent started, joining ${SERVER_IP}"
         ;;
 esac

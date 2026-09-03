@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.3.0
+# Version: 0.4.0
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"
@@ -100,6 +100,7 @@ while [[ ! -S /run/k7d/k7d.sock ]]; do
   sleep 0.2
 done
 echo "==> k7d ${VERSION} running (socket=/run/k7d/k7d.sock)"
+echo "==> try: k7d doctor && k7d quickstart"
 
 if [[ "$WITH_K3S" -eq 1 ]]; then
   CONFIG=/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl

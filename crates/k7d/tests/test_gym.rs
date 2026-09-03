@@ -731,3 +731,150 @@ fn test_gym_fault_catalog_contain_restore() {
         measure(&format!("after_{fault_id}"));
     }
 }
+
+/// POST /lease `autowarp_mode` starts the daemon policy; `/act` exec
+/// holds it; `/release` stops it and returns the counters.
+#[test]
+fn test_gym_autowarp_mode_jump() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    common::ensure_k7d_daemon_running();
+
+    let tree_id = format!("gym-src-warp-{}", std::process::id());
+    wipe_stale_gym_test_trees();
+    wipe_tree(&tree_id);
+    let gym = spawn_gym(&tree_id, 64);
+
+    let (code, bad) = http(
+        "POST",
+        &format!("{}/lease", gym.base),
+        Some(
+            r#"{"fault_id":"none","n":1,"group_id":"warp-bad","ttl_s":60,"autowarp_mode":"fast"}"#,
+        ),
+        10,
+    );
+    assert_eq!(code, 400, "unknown mode must be 400: {bad}");
+    let err = bad["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("off|jump|micro|dilate"),
+        "loud mode error missing: {err}"
+    );
+
+    let (code, dilate) = http(
+        "POST",
+        &format!("{}/lease", gym.base),
+        Some(
+            r#"{"fault_id":"none","n":1,"group_id":"warp-dilate","ttl_s":60,"autowarp_mode":"dilate"}"#,
+        ),
+        10,
+    );
+    assert_eq!(code, 400, "dilate on create-mode gym must be 400: {dilate}");
+    let dilate_err = dilate["error"].as_str().unwrap_or("");
+    assert!(
+        dilate_err.contains("GYM_SOURCE_MODE=ubuntu"),
+        "dilate must require the ubuntu source : {dilate_err}"
+    );
+
+    let (code, lease) = http(
+        "POST",
+        &format!("{}/lease", gym.base),
+        Some(
+            r#"{"fault_id":"none","n":1,"group_id":"warp-jump","ttl_s":90,"autowarp_mode":"jump"}"#,
+        ),
+        180,
+    );
+    assert_eq!(code, 200, "lease jump: {lease}");
+    assert_eq!(lease["autowarp_mode"], "jump");
+    let env = &lease["envs"][0];
+    assert_eq!(env["autowarp_mode"], "jump");
+    let cluster_id = env["cluster_id"]
+        .as_str()
+        .expect("cluster_id on env")
+        .to_string();
+    assert!(
+        cluster_id.starts_with(&format!("{tree_id}-")),
+        "cluster_id={cluster_id} tree={tree_id}"
+    );
+
+    let mut client = Client::connect(k7d_sock()).expect("k7d client");
+    match client
+        .call(&Request::AutoWarpStatus {
+            cluster_id: cluster_id.clone(),
+        })
+        .expect("status")
+    {
+        Response::AutoWarp { mode, .. } => {
+            assert_eq!(mode, k7d::autowarp::AutoWarpMode::Jump);
+        }
+        other => panic!("status: {other:?}"),
+    }
+
+    let env_id = env["env_id"].as_str().expect("env_id");
+    let (code, act) = http(
+        "POST",
+        &format!("{}/env/{env_id}/act", gym.base),
+        Some(r#"{"action":"exec","args":["echo","gym-ok"]}"#),
+        30,
+    );
+    assert_eq!(code, 200, "exec under hold: {act}");
+    assert_eq!(act["ok"], true, "exec: {act}");
+    assert!(
+        act["stdout"].as_str().unwrap_or("").contains("gym-ok"),
+        "exec: {act}"
+    );
+
+    let lease_id = lease["lease_id"].as_str().expect("lease_id");
+    let (code, rel) = http(
+        "POST",
+        &format!("{}/lease/{lease_id}/release", gym.base),
+        Some("{}"),
+        60,
+    );
+    assert_eq!(code, 200, "release: {rel}");
+    assert_eq!(rel["released"], true);
+    let stats = rel["autowarp"]
+        .as_array()
+        .expect("release returns autowarp stats");
+    assert_eq!(stats.len(), 1, "{stats:?}");
+    assert_eq!(stats[0]["mode"], "off");
+    assert_eq!(stats[0]["cluster_id"], cluster_id);
+
+    match client
+        .call(&Request::AutoWarpStatus {
+            cluster_id: cluster_id.clone(),
+        })
+        .expect("status after release")
+    {
+        Response::AutoWarp { mode, .. } => {
+            assert_eq!(mode, k7d::autowarp::AutoWarpMode::Off);
+        }
+        other => panic!("status after release: {other:?}"),
+    }
+}
+
+/// `dilate` is CreateVm N=8, not `Request::AutoWarp`. Create-mode
+/// (busybox) is out of scope for inc4 — refuse loud on stock KVM.
+#[test]
+fn test_gym_autowarp_mode_dilate_refuses_create() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    common::ensure_k7d_daemon_running();
+
+    let tree_id = format!("gym-src-dilate-{}", std::process::id());
+    wipe_stale_gym_test_trees();
+    wipe_tree(&tree_id);
+    let gym = spawn_gym(&tree_id, 64);
+
+    let (code, rec) = http(
+        "POST",
+        &format!("{}/lease", gym.base),
+        Some(
+            r#"{"fault_id":"none","n":1,"group_id":"warp-dilate","ttl_s":60,"autowarp_mode":"dilate"}"#,
+        ),
+        10,
+    );
+    assert_eq!(code, 400, "dilate on create-mode gym must be 400: {rec}");
+    let err = rec["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("GYM_SOURCE_MODE=ubuntu"),
+        "dilate must require the ubuntu source : {err}"
+    );
+}

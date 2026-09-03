@@ -1,0 +1,678 @@
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1339,6 +1339,20 @@
+ 	s64 kvmclock_offset;
+ 
+ 	/*
++	 * k7d continuous time dilation (utils/kvm-dilation): the guest's
++	 * clocks advance @dilation nanoseconds per wall nanosecond.  1 is
++	 * stock behaviour.  Set via KVM_SET_DEVICE_ATTR on the VM fd, either
++	 * before any vCPU exists, or with every vCPU paused.  (@dilation_base_ns,
++	 * @dilation_base_out_ns) pins the affine
++	 * map at the instant the factor last changed, so guest time changes
++	 * slope there instead of jumping; both zero at @dilation of 1 is the
++	 * identity, which is stock.
++	 */
++	u32 dilation;
++	s64 dilation_base_ns;
++	s64 dilation_base_out_ns;
++
++	/*
+ 	 * This also protects nr_vcpus_matched_tsc which is read from a
+ 	 * preemption-disabled region, so it must be a raw spinlock.
+ 	 */
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -562,6 +562,28 @@
+ #define KVM_VCPU_TSC_CTRL 0 /* control group for the timestamp counter (TSC) */
+ #define   KVM_VCPU_TSC_OFFSET 0 /* attribute for the TSC offset */
+ 
++/*
++ * k7d continuous time dilation, on the VM fd (utils/kvm-dilation).  A stock
++ * kernel has no VM-level device attributes at all and answers
++ * KVM_HAS_DEVICE_ATTR with -ENOTTY, which is how userspace tells a patched
++ * host from a stock one.
++ */
++#define KVM_VM_DILATION 0x64696c61 /* 'dila': control group for time dilation */
++#define   KVM_VM_DILATION_FACTOR 0 /* attribute: u32 guest-ns per wall-ns */
++#define   KVM_VM_DILATION_ABI 1 /* attribute: u32, read-only, KVM_DILATION_ABI */
++
++/*
++ * Generation of this out-of-tree patch, so userspace can tell *which* patch
++ * is loaded and not merely that one is.  The modules are built from a file in
++ * the k7d tree and swapped in and out around a test suite; without this, an
++ * edited patch that failed to rebuild presents as a patched host missing the
++ * behaviour it was edited to add, which reads as a bug in the caller.
++ *
++ *   1  create-time factor only (-EBUSY once a vCPU exists)
++ *   2  live SET with every vCPU paused
++ */
++#define KVM_DILATION_ABI 2
++
+ /* x86-specific KVM_EXIT_HYPERCALL flags. */
+ #define KVM_EXIT_HYPERCALL_LONG_MODE	BIT(0)
+ 
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -435,6 +435,48 @@
+ 				   vcpu->arch.virtual_tsc_shift);
+ }
+ 
++/*
++ * k7d continuous time dilation.  A dilated guest sees @dilation ns of guest
++ * time pass per wall ns: its TSC really runs N x faster (hardware TSC
++ * multiplier) while its pvclock is told the undilated rate.  Emulated timers
++ * are armed on host hrtimers, so every guest-time interval they are handed
++ * has to be divided by N, and every host-time interval reported back to the
++ * guest multiplied by N.
++ */
++static inline u32 kvm_dilation(struct kvm *kvm)
++{
++	return kvm->arch.dilation;
++}
++
++/* Guest-time nanoseconds -> wall nanoseconds. */
++static inline u64 kvm_dilated_host_ns(struct kvm *kvm, u64 guest_ns)
++{
++	u32 n = kvm_dilation(kvm);
++
++	return n > 1 ? div_u64(guest_ns, n) : guest_ns;
++}
++
++/* Wall nanoseconds -> guest-time nanoseconds. */
++static inline u64 kvm_dilated_guest_ns(struct kvm *kvm, u64 host_ns)
++{
++	u32 n = kvm_dilation(kvm);
++
++	return n > 1 ? host_ns * n : host_ns;
++}
++
++/*
++ * Guest TSC cycles spanning @host_ns of wall time.  The hardware multiplier
++ * makes the guest TSC tick N x virtual_tsc_khz, which nsec_to_cycles() does
++ * not know about.
++ */
++static inline u64 host_nsec_to_guest_cycles(struct kvm_vcpu *vcpu, u64 host_ns)
++{
++	u64 cycles = nsec_to_cycles(vcpu, host_ns);
++	u32 n = kvm_dilation(vcpu->kvm);
++
++	return n > 1 ? cycles * n : cycles;
++}
++
+ /* Same "calling convention" as do_div:
+  * - divide (n << 32) by base
+  * - put result in n
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2309,6 +2309,22 @@
+ }
+ #endif
+ 
++/*
++ * k7d continuous time dilation: the guest's kvmclock advances
++ * kvm->arch.dilation nanoseconds per wall nanosecond.  The affine map is
++ * pinned at the instant the factor last changed, so guest time is
++ * continuous across that instant and only its slope moves -- which keeps
++ * kvmclock_offset, and therefore KVM_GET_CLOCK / KVM_SET_CLOCK, meaningful.
++ * A pin of (0, 0) at a factor of 1 is the identity, which is stock.
++ */
++static s64 kvm_dilated_base_ns(struct kvm *kvm, s64 host_ns)
++{
++	struct kvm_arch *ka = &kvm->arch;
++
++	return ka->dilation_base_out_ns +
++	       (host_ns - ka->dilation_base_ns) * max(ka->dilation, 1u);
++}
++
+ static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock, int sec_hi_ofs)
+ {
+ 	int version;
+@@ -2447,8 +2463,14 @@
+ 		}
+ 	}
+ 
+-	/* TSC scaling required  - calculate ratio */
+-	ratio = mul_u64_u32_div(1ULL << kvm_caps.tsc_scaling_ratio_frac_bits,
++	/*
++	 * TSC scaling required  - calculate ratio.  Under k7d dilation the
++	 * hardware TSC runs N x the rate the guest is told about; that is the
++	 * whole mechanism, so the factor rides on the hardware multiplier and
++	 * nowhere else.
++	 */
++	ratio = mul_u64_u32_div((1ULL << kvm_caps.tsc_scaling_ratio_frac_bits) *
++					max(vcpu->kvm->arch.dilation, 1u),
+ 				user_tsc_khz, tsc_khz);
+ 
+ 	if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio) {
+@@ -2492,6 +2514,9 @@
+ 			 user_tsc_khz, thresh_lo, thresh_hi);
+ 		use_scaling = 1;
+ 	}
++	/* A dilated guest always needs the hardware multiplier. */
++	if (vcpu->kvm->arch.dilation > 1)
++		use_scaling = 1;
+ 	return set_tsc_khz(vcpu, user_tsc_khz, use_scaling);
+ }
+ 
+@@ -3075,13 +3100,20 @@
+ 
+ 		data->flags |= KVM_CLOCK_TSC_STABLE;
+ 		hv_clock.tsc_timestamp = ka->master_cycle_now;
+-		hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+-		kvm_get_time_scale(NSEC_PER_SEC, get_cpu_tsc_khz() * 1000LL,
++		hv_clock.system_time = kvm_dilated_base_ns(kvm, ka->master_kernel_ns) +
++				       ka->kvmclock_offset;
++		/*
++		 * Both timestamps here are host TSC values, so the dilation
++		 * factor goes into the scale rather than the ratio.
++		 */
++		kvm_get_time_scale(NSEC_PER_SEC * max(ka->dilation, 1u),
++				   get_cpu_tsc_khz() * 1000LL,
+ 				   &hv_clock.tsc_shift,
+ 				   &hv_clock.tsc_to_system_mul);
+ 		data->clock = __pvclock_read_cycles(&hv_clock, data->host_tsc);
+ 	} else {
+-		data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++		data->clock = kvm_dilated_base_ns(kvm, get_kvmclock_base_ns()) +
++			      ka->kvmclock_offset;
+ 	}
+ 
+ 	put_cpu();
+@@ -3238,6 +3270,14 @@
+ 		tgt_tsc_khz = kvm_scale_tsc(tgt_tsc_khz,
+ 					    v->arch.l1_tsc_scaling_ratio);
+ 
++	/*
++	 * The scaling ratio carries the dilation factor, so undo it here: the
++	 * guest is told the undilated rate and therefore converts its N x
++	 * faster TSC into N x wall nanoseconds.  This *is* the dilation.
++	 */
++	if (ka->dilation > 1)
++		tgt_tsc_khz = div_u64(tgt_tsc_khz, ka->dilation);
++
+ 	if (unlikely(vcpu->hw_tsc_khz != tgt_tsc_khz)) {
+ 		kvm_get_time_scale(NSEC_PER_SEC, tgt_tsc_khz * 1000LL,
+ 				   &vcpu->hv_clock.tsc_shift,
+@@ -3247,7 +3287,8 @@
+ 	}
+ 
+ 	vcpu->hv_clock.tsc_timestamp = tsc_timestamp;
+-	vcpu->hv_clock.system_time = kernel_ns + v->kvm->arch.kvmclock_offset;
++	vcpu->hv_clock.system_time = kvm_dilated_base_ns(v->kvm, kernel_ns) +
++				     v->kvm->arch.kvmclock_offset;
+ 	vcpu->last_guest_tsc = tsc_timestamp;
+ 
+ 	/* If the host uses TSC clocksource, then it is stable */
+@@ -3327,7 +3368,8 @@
+ 		 * CPU at any time.
+ 		 */
+ 		hv_clock.tsc_timestamp = ka->master_cycle_now;
+-		hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
++		hv_clock.system_time = kvm_dilated_base_ns(kvm, ka->master_kernel_ns) +
++				       ka->kvmclock_offset;
+ 
+ 	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
+ 
+@@ -3338,7 +3380,8 @@
+ 	 * since 1970-01-01.
+ 	 */
+ 	if (local_tsc_khz) {
+-		kvm_get_time_scale(NSEC_PER_SEC, local_tsc_khz * NSEC_PER_USEC,
++		kvm_get_time_scale(NSEC_PER_SEC * max(ka->dilation, 1u),
++				   local_tsc_khz * NSEC_PER_USEC,
+ 				   &hv_clock.tsc_shift,
+ 				   &hv_clock.tsc_to_system_mul);
+ 		return ts.tv_nsec + NSEC_PER_SEC * ts.tv_sec -
+@@ -6945,11 +6988,233 @@
+ 		now_raw_ns = ka->master_kernel_ns;
+ 	else
+ 		now_raw_ns = get_kvmclock_base_ns();
+-	ka->kvmclock_offset = data.clock - now_raw_ns;
++	ka->kvmclock_offset = data.clock - kvm_dilated_base_ns(kvm, now_raw_ns);
+ 	kvm_end_pvclock_update(kvm);
+ 	return 0;
+ }
+ 
++/* Largest dilation factor accepted; the TSC multiplier check bounds it too. */
++#define KVM_MAX_DILATION 64
++
++static void kvm_dilation_unlock_vcpus(struct kvm *kvm, int last)
++{
++	struct kvm_vcpu *vcpu;
++
++	for (; last >= 0; last--) {
++		vcpu = kvm_get_vcpu(kvm, last);
++		mutex_unlock(&vcpu->mutex);
++	}
++}
++
++/*
++ * Take every vCPU's mutex, or none of them.  KVM holds that mutex for the
++ * whole of KVM_RUN, so this succeeds exactly when no vCPU is executing --
++ * which is what k7d's cluster-wide pause window arranges.
++ * Same contract, and the same reason, as arm64's lock_all_vcpus().
++ */
++static bool kvm_dilation_lock_all_vcpus(struct kvm *kvm)
++{
++	struct kvm_vcpu *vcpu;
++	unsigned long i;
++
++	lockdep_assert_held(&kvm->lock);
++
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		if (!mutex_trylock(&vcpu->mutex)) {
++			kvm_dilation_unlock_vcpus(kvm, (int)i - 1);
++			return false;
++		}
++	}
++
++	return true;
++}
++
++/*
++ * Whether every vCPU can carry @factor on the hardware TSC multiplier.
++ * Asked before anything is written: a factor only part of a cluster can
++ * take would leave its members at different rates, and rates -- unlike
++ * offsets -- diverge without bound.
++ */
++static bool kvm_dilation_ratio_fits(struct kvm *kvm, u32 factor)
++{
++	struct kvm_vcpu *vcpu;
++	unsigned long i;
++	u64 ratio;
++
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		if (!vcpu->arch.virtual_tsc_khz)
++			return false;
++		ratio = mul_u64_u32_div((1ULL << kvm_caps.tsc_scaling_ratio_frac_bits) *
++						factor,
++					vcpu->arch.virtual_tsc_khz, tsc_khz);
++		if (ratio == 0 || ratio >= kvm_caps.max_tsc_scaling_ratio)
++			return false;
++	}
++
++	return true;
++}
++
++/*
++ * Reprogram one paused vCPU for the factor already stored in kvm->arch.
++ *
++ * The factor rides on the hardware TSC multiplier, so changing it changes
++ * what the guest's own counter reads by (ratio_new - ratio_old) * host_tsc.
++ * A guest whose TSC steps -- let alone steps backwards -- does not survive
++ * it, so the offset is rewritten to hold the counter at the value it had at
++ * @host_tsc.  That snapshot is shared by every vCPU of the VM so they all
++ * pivot on the same instant.
++ */
++static int kvm_dilation_reload_vcpu(struct kvm_vcpu *vcpu, u64 host_tsc)
++{
++	u64 guest_tsc;
++	int r;
++
++	vcpu_load(vcpu);
++	guest_tsc = kvm_read_l1_tsc(vcpu, host_tsc);
++	r = kvm_set_tsc_khz(vcpu, vcpu->arch.virtual_tsc_khz);
++	if (!r)
++		kvm_vcpu_write_tsc_offset(vcpu,
++			guest_tsc - kvm_scale_tsc(host_tsc,
++						  vcpu->arch.l1_tsc_scaling_ratio));
++	vcpu_put(vcpu);
++
++	return r ? -EIO : 0;
++}
++
++/*
++ * Set this VM's dilation factor, before any vCPU exists or
++ * on a live VM whose every vCPU is paused.
++ *
++ * A runnable vCPU is -EBUSY.  That is not conservatism: the factor is
++ * programmed per vCPU, and a VM whose vCPUs are at different rates has no
++ * single clock at all.
++ *
++ * Lowering the factor is not a rewind.  The affine pin keeps every
++ * nanosecond the guest has already been given (CHALLENGES #191 -- its
++ * CLOCK_REALTIME stays in the host's future); it only stops accumulating
++ * them so fast.
++ *
++ * The i8254's count_load_time is deliberately left alone: the guest
++ * calibrates against the PIT early in boot and then leaves it, and
++ * re-basing it would need pit_state.lock inside the all-vCPU lock.
++ */
++static int kvm_vm_set_dilation(struct kvm *kvm, u32 factor)
++{
++	struct kvm_vcpu *vcpu;
++	bool locked = false;
++	unsigned long i;
++	u64 host_tsc;
++	s64 now;
++	u32 old;
++	int r = 0;
++
++	if (factor < 1 || factor > KVM_MAX_DILATION)
++		return -EINVAL;
++	if (factor > 1 && !kvm_caps.has_tsc_control)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&kvm->lock);
++	old = kvm->arch.dilation;
++
++	if (kvm->created_vcpus) {
++		/*
++		 * A vCPU that is created but not yet online is neither
++		 * lockable nor programmed, so there is no instant at which
++		 * the whole VM pivots.  Refuse rather than race it.
++		 */
++		if (kvm->created_vcpus != atomic_read(&kvm->online_vcpus) ||
++		    !kvm_dilation_lock_all_vcpus(kvm)) {
++			r = -EBUSY;
++			goto out;
++		}
++		locked = true;
++		if (!kvm_dilation_ratio_fits(kvm, factor)) {
++			r = -EINVAL;
++			goto out;
++		}
++	}
++
++	now = get_kvmclock_base_ns();
++	host_tsc = rdtsc();
++
++	/*
++	 * Re-pin the map and republish the masterclock together: the pvclock
++	 * scale and the hardware multiplier are two halves of one equation and
++	 * must never be observable apart.  No vCPU can enter the guest here --
++	 * they are all paused, and this is the window KVM itself uses for a
++	 * clock change.
++	 */
++	kvm_hv_request_tsc_page_update(kvm);
++	kvm_start_pvclock_update(kvm);
++	kvm->arch.dilation_base_out_ns = kvm_dilated_base_ns(kvm, now);
++	kvm->arch.dilation_base_ns = now;
++	kvm->arch.dilation = factor;
++	pvclock_update_vm_gtod_copy(kvm);
++	kvm_end_pvclock_update(kvm);
++
++	if (locked) {
++		kvm_for_each_vcpu(i, vcpu, kvm) {
++			r = kvm_dilation_reload_vcpu(vcpu, host_tsc);
++			if (r) {
++				/*
++				 * kvm_dilation_ratio_fits() says this cannot
++				 * happen.  If it does, the VM is at mixed
++				 * rates and only saying so is honest.
++				 */
++				pr_err("kvm: dilation x%u: vCPU %lu kept its old TSC rate\n",
++				       factor, i);
++				break;
++			}
++			kvm_lapic_dilation_changed(vcpu, old, factor);
++		}
++	}
++
++out:
++	if (locked)
++		kvm_dilation_unlock_vcpus(kvm, atomic_read(&kvm->online_vcpus) - 1);
++	mutex_unlock(&kvm->lock);
++
++	return r;
++}
++
++static int kvm_vm_ioctl_dilation_attr(struct kvm *kvm, unsigned int ioctl,
++				      void __user *argp)
++{
++	struct kvm_device_attr attr;
++	u32 __user *uaddr;
++	u32 factor;
++
++	if (copy_from_user(&attr, argp, sizeof(attr)))
++		return -EFAULT;
++
++	if (attr.group != KVM_VM_DILATION || attr.flags)
++		return -ENXIO;
++	if (attr.attr != KVM_VM_DILATION_FACTOR &&
++	    attr.attr != KVM_VM_DILATION_ABI)
++		return -ENXIO;
++
++	uaddr = u64_to_user_ptr(attr.addr);
++
++	switch (ioctl) {
++	case KVM_HAS_DEVICE_ATTR:
++		/* No hardware TSC multiplier, no dilation.  Say so. */
++		return kvm_caps.has_tsc_control ? 0 : -EOPNOTSUPP;
++	case KVM_GET_DEVICE_ATTR:
++		factor = attr.attr == KVM_VM_DILATION_ABI ? KVM_DILATION_ABI
++							  : kvm->arch.dilation;
++		return put_user(factor, uaddr) ? -EFAULT : 0;
++	case KVM_SET_DEVICE_ATTR:
++		/* The ABI generation is the patch's, not the caller's. */
++		if (attr.attr == KVM_VM_DILATION_ABI)
++			return -EPERM;
++		if (get_user(factor, uaddr))
++			return -EFAULT;
++		return kvm_vm_set_dilation(kvm, factor);
++	}
++
++	return -ENXIO;
++}
++
+ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+ {
+ 	struct kvm *kvm = filp->private_data;
+@@ -7208,6 +7467,11 @@
+ 	case KVM_GET_CLOCK:
+ 		r = kvm_vm_ioctl_get_clock(kvm, argp);
+ 		break;
++	case KVM_HAS_DEVICE_ATTR:
++	case KVM_GET_DEVICE_ATTR:
++	case KVM_SET_DEVICE_ATTR:
++		r = kvm_vm_ioctl_dilation_attr(kvm, ioctl, argp);
++		break;
+ 	case KVM_SET_TSC_KHZ: {
+ 		u32 user_tsc_khz;
+ 
+@@ -12656,6 +12920,7 @@
+ 	raw_spin_lock_init(&kvm->arch.tsc_write_lock);
+ 	mutex_init(&kvm->arch.apic_map_lock);
+ 	seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc, &kvm->arch.tsc_write_lock);
++	kvm->arch.dilation = 1;
+ 	kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
+ 
+ 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1555,6 +1555,8 @@
+ 		remaining = 0;
+ 
+ 	ns = mod_64(ktime_to_ns(remaining), apic->lapic_timer.period);
++	/* .period is wall time; the count the guest reads is guest time. */
++	ns = kvm_dilated_guest_ns(apic->vcpu->kvm, ns);
+ 	return div64_u64(ns, (APIC_BUS_CYCLE_NS * apic->divide_count));
+ }
+ 
+@@ -1737,7 +1739,9 @@
+ 	 * scheduler.
+ 	 */
+ 	if (apic_lvtt_period(apic) && apic->lapic_timer.period) {
+-		s64 min_period = min_timer_period_us * 1000LL;
++		/* The floor is on the guest-visible period, not the host one. */
++		s64 min_period = kvm_dilated_host_ns(apic->vcpu->kvm,
++						     min_timer_period_us * 1000LL);
+ 
+ 		if (apic->lapic_timer.period < min_period) {
+ 			pr_info_ratelimited(
+@@ -1818,7 +1822,10 @@
+ 			nsec_to_cycles(vcpu, timer_advance_ns)));
+ 	} else {
+ 		u64 delay_ns = guest_cycles * 1000000ULL;
+-		do_div(delay_ns, vcpu->arch.virtual_tsc_khz);
++
++		/* Dilation is part of the ratio, so it is part of this too. */
++		do_div(delay_ns, vcpu->arch.virtual_tsc_khz *
++				 max(kvm_dilation(vcpu->kvm), 1u));
+ 		ndelay(min_t(u32, delay_ns, timer_advance_ns));
+ 	}
+ }
+@@ -1957,8 +1964,13 @@
+ 	now = ktime_get();
+ 	guest_tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+ 
++	/*
++	 * The deadline is in guest TSC cycles, which really do tick N x
++	 * faster than virtual_tsc_khz under dilation, so the wall time left
++	 * is N x shorter.
++	 */
+ 	ns = (tscdeadline - guest_tsc) * 1000000ULL;
+-	do_div(ns, this_tsc_khz);
++	do_div(ns, this_tsc_khz * (unsigned long)max(kvm_dilation(vcpu->kvm), 1u));
+ 
+ 	if (likely(tscdeadline > guest_tsc) &&
+ 	    likely(ns > apic->lapic_timer.timer_advance_ns)) {
+@@ -1971,9 +1983,16 @@
+ 	local_irq_restore(flags);
+ }
+ 
++/*
++ * APIC counts are guest time; lapic_timer.period and .target_expiration are
++ * host hrtimer time.  Under dilation the APIC bus keeps its nominal rate in
++ * guest time, so it ticks N x faster in wall time.
++ */
+ static inline u64 tmict_to_ns(struct kvm_lapic *apic, u32 tmict)
+ {
+-	return (u64)tmict * APIC_BUS_CYCLE_NS * (u64)apic->divide_count;
++	u64 ns = (u64)tmict * APIC_BUS_CYCLE_NS * (u64)apic->divide_count;
++
++	return kvm_dilated_host_ns(apic->vcpu->kvm, ns);
+ }
+ 
+ static void update_target_expiration(struct kvm_lapic *apic, uint32_t old_divisor)
+@@ -1995,8 +2014,8 @@
+ 	                                   apic->divide_count, old_divisor);
+ 
+ 	apic->lapic_timer.tscdeadline +=
+-		nsec_to_cycles(apic->vcpu, ns_remaining_new) -
+-		nsec_to_cycles(apic->vcpu, ns_remaining_old);
++		host_nsec_to_guest_cycles(apic->vcpu, ns_remaining_new) -
++		host_nsec_to_guest_cycles(apic->vcpu, ns_remaining_old);
+ 	apic->lapic_timer.target_expiration = ktime_add_ns(now, ns_remaining_new);
+ }
+ 
+@@ -2044,7 +2063,7 @@
+ 	}
+ 
+ 	apic->lapic_timer.tscdeadline = kvm_read_l1_tsc(apic->vcpu, tscl) +
+-		nsec_to_cycles(apic->vcpu, deadline);
++		host_nsec_to_guest_cycles(apic->vcpu, deadline);
+ 	apic->lapic_timer.target_expiration = ktime_add_ns(now, deadline);
+ 
+ 	return true;
+@@ -2086,7 +2105,7 @@
+ 	 */
+ 	delta = ktime_sub(apic->lapic_timer.target_expiration, now);
+ 	apic->lapic_timer.tscdeadline = kvm_read_l1_tsc(apic->vcpu, tscl) +
+-		nsec_to_cycles(apic->vcpu, delta);
++		host_nsec_to_guest_cycles(apic->vcpu, delta);
+ }
+ 
+ static void start_sw_period(struct kvm_lapic *apic)
+@@ -2109,6 +2128,49 @@
+ 		HRTIMER_MODE_ABS_HARD);
+ }
+ 
++/*
++ * k7d dilation changed while this vCPU was paused.
++ * .period and .target_expiration are host hrtimer time, computed from a
++ * guest-time TMICT at @old_n; the guest asked for an interval in *its*
++ * time, so both are rescaled by old/new.  The hv (VMX preemption) timer
++ * needs nothing: it is armed in guest TSC cycles, which the offset
++ * rewrite has already kept continuous.
++ */
++void kvm_lapic_dilation_changed(struct kvm_vcpu *vcpu, u32 old_n, u32 new_n)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++	int was_armed;
++	s64 left;
++
++	if (!apic || old_n == new_n || !apic->lapic_timer.period)
++		return;
++	if (apic->lapic_timer.hv_timer_in_use)
++		return;
++
++	old_n = max(old_n, 1u);
++	new_n = max(new_n, 1u);
++
++	/*
++	 * The hrtimer callback owns these fields while it runs, so cancel
++	 * before touching them.  -1 means it is running and will re-arm off
++	 * the rescaled period by itself; 0 means nothing was armed and the
++	 * guest's next TMICT write computes the interval at the new factor.
++	 */
++	was_armed = hrtimer_try_to_cancel(&apic->lapic_timer.timer);
++	apic->lapic_timer.period = mul_u64_u32_div(apic->lapic_timer.period,
++						  old_n, new_n);
++	if (was_armed <= 0)
++		return;
++
++	left = ktime_to_ns(ktime_sub(apic->lapic_timer.target_expiration,
++				     ktime_get()));
++	if (left < 0)
++		left = 0;
++	apic->lapic_timer.target_expiration =
++		ktime_add_ns(ktime_get(), mul_u64_u32_div(left, old_n, new_n));
++	start_sw_period(apic);
++}
++
+ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
+ {
+ 	if (!lapic_in_kernel(vcpu))
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -265,6 +265,7 @@
+ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu);
+ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu);
+ void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu);
++void kvm_lapic_dilation_changed(struct kvm_vcpu *vcpu, u32 old_n, u32 new_n);
+ bool kvm_can_use_hv_timer(struct kvm_vcpu *vcpu);
+ 
+ static inline enum lapic_mode kvm_apic_mode(u64 apic_base)
+--- a/arch/x86/kvm/i8254.c
++++ b/arch/x86/kvm/i8254.c
+@@ -106,10 +106,15 @@
+ static s64 kpit_elapsed(struct kvm_pit *pit, struct kvm_kpit_channel_state *c,
+ 			int channel)
+ {
++	s64 elapsed;
++
+ 	if (channel == 0)
+-		return __kpit_elapsed(pit);
++		elapsed = __kpit_elapsed(pit);
++	else
++		elapsed = ktime_to_ns(ktime_sub(ktime_get(), c->count_load_time));
+ 
+-	return ktime_to_ns(ktime_sub(ktime_get(), c->count_load_time));
++	/* The counts the guest reads back are guest time; hrtimers are not. */
++	return kvm_dilated_guest_ns(pit->kvm, elapsed);
+ }
+ 
+ static int pit_get_count(struct kvm_pit *pit, int channel)
+@@ -329,7 +334,9 @@
+ 	    ps->flags & KVM_PIT_FLAGS_HPET_LEGACY)
+ 		return;
+ 
+-	interval = mul_u64_u32_div(val, NSEC_PER_SEC, KVM_PIT_FREQ);
++	/* The PIT keeps its nominal frequency in guest time. */
++	interval = kvm_dilated_host_ns(kvm,
++			mul_u64_u32_div(val, NSEC_PER_SEC, KVM_PIT_FREQ));
+ 
+ 	pr_debug("create pit timer, interval is %llu nsec\n", interval);
+ 
+@@ -347,7 +354,8 @@
+ 	 * scheduler.
+ 	 */
+ 	if (ps->is_periodic) {
+-		s64 min_period = min_timer_period_us * 1000LL;
++		s64 min_period = kvm_dilated_host_ns(kvm,
++						     min_timer_period_us * 1000LL);
+ 
+ 		if (ps->period < min_period) {
+ 			pr_info_ratelimited(

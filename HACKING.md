@@ -47,7 +47,7 @@ make remote-verif             # Aeneas/Lean tree proofs (after remote-install-ve
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `K7_NODE_IP` | `(required: set K7_NODE_IP)` | Build/test node IP |
+| `K7_NODE_IP` | (required) | Build/test node IP |
 | `K7_NODE_USER` | `root` | SSH user |
 | `K7_SSH_KEY` | (uses `~/.ssh/id_ed25519`) | Private key content (PEM) |
 | `K7_REMOTE_RESTART` | `0` | `1` kills an in-flight run and starts fresh |
@@ -101,6 +101,14 @@ CHALLENGES.md #75.
 - `make miri` - Miri on the pure (non-KVM) unit tests.
 - `make fuzz` - libFuzzer runs over the agent protocol and virtio-blk
   request parsing.
+- `make dilation-install` / `make dilation-test` / `make dilation-revert`
+  — continuous ×N guest-clock dilation. Builds patched `kvm.ko` +
+  `kvm-amd.ko` / `kvm-intel.ko` for the running kernel from
+  `utils/kvm-dilation/` (Ubuntu x86, root, Launchpad `linux-source`).
+  Kept out of `make check`: stock CI must stay on stock modules. Never
+  leave the host patched — `dilation-test` / `remote-dilation-test`
+  revert whatever they did. Lockstep jumps (`make warp-bench`) need no
+  patch.
 
 ## Running pods in k7d via containerd / k3s
 

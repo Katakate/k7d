@@ -1,8 +1,13 @@
 .PHONY: build build-agent build-guest-kernel build-guest-rootfs \
-       test test-integration lint fmt-check deny bench check gym-test \
+       test test-integration lint fmt-check deny bench warp-bench check gym-test \
+       dilation-test dilation-fork-test dilation-install dilation-revert \
+       remote-dilation-test remote-dilation-fork-test \
+       remote-dilation-install remote-dilation-revert \
+       paper \
        k7d-mcp-deps k7d-mcp-test k7view-test \
        miri fuzz kani kani-harness verif-gen verif-build \
        rsync remote-check remote-build remote-test-integration remote-bench \
+       remote-warp-bench remote-warp-bench-dilated \
        remote-install-rust remote-miri remote-fuzz remote-kani \
        remote-install-verif remote-verif remote-release reference release
 
@@ -22,7 +27,8 @@ RELEASE_TGZ := dist/$(RELEASE_NAME).tar.gz
 define run_test_binaries
 set -e; \
 targets="$$(cargo metadata --no-deps --format-version 1 \
-  | jq -r '.packages[] | .name as $$p | .targets[] | select(.kind[] == "test") | "\($$p) \(.name)"')"; \
+  | jq -r '.packages[] | .name as $$p | .targets[] | select(.kind[] == "test") \
+      | select(.test) | "\($$p) \(.name)"')"; \
 [ -n "$$targets" ] || { echo "no test targets found in cargo metadata" >&2; exit 1; }; \
 echo "$$targets" | while read -r pkg name; do \
   echo "==> test binary: $$name (package $$pkg)"; \
@@ -42,6 +48,10 @@ endef
 
 fmt-check:
 	cargo fmt --check
+
+# MLSys 2027 paper skeleton . Local only — no KVM.
+paper:
+	$(MAKE) -C paper/mlsys2027 pdf
 
 # --- Targets that run ON the node (require Linux + KVM) ---
 
@@ -86,6 +96,36 @@ test-integration:
 
 bench:
 	cargo bench
+
+# the referenced work's two-arm time-warp benchmark (baseline vs
+# `AutoWarp { jump }`), three runs per arm from a fresh 3-node Ubuntu
+# k3s cluster each. Deliberately not part of `make check`: ~10 minutes
+# of guest time per run plus a cluster bring-up. ARMS=a runs only the
+# baseline (which is how its runtime was measured in the first place).
+warp-bench:
+	cargo bench -p k7d --bench warp_bench -- $(if $(ARMS),--arms=$(ARMS),)
+
+# the referenced work's dilation validation. Needs the carried KVM patch
+# loaded (`utils/kvm-dilation/install.sh`); fails loudly on stock
+# modules rather than skipping. Kept out of `make check` for that
+# reason — see the `[[test]] test = false` note in crates/k7d/Cargo.toml.
+dilation-test: build-agent
+	bash utils/kvm-dilation/state.sh
+	cargo test -p k7d --test test_dilation -- --test-threads=1 --nocapture
+
+# the referenced work: only the fork / snapshot / cluster-fork tests of the
+# dilation suite (minutes), without inc6's N sweep (hours).
+dilation-fork-test: build-agent
+	bash utils/kvm-dilation/state.sh
+	cargo test -p k7d --test test_dilation test_dilation_fork -- --test-threads=1 --nocapture
+
+# Load / unload the patched modules on the node. Install builds them
+# first if needed; revert must be run before any other spec's suite.
+dilation-install:
+	bash utils/kvm-dilation/install.sh
+
+dilation-revert:
+	bash utils/kvm-dilation/revert.sh
 
 # Pure-Python gym unit tests (no KVM). The Rust integration test in
 # crates/k7d/tests/test_gym.rs covers the HTTP+k7d path and does not
@@ -174,6 +214,7 @@ release: build build-agent build-guest-kernel build-guest-rootfs
 	cp guest/rootfs/initramfs.cpio.gz "dist/$(RELEASE_NAME)/"
 	cp guest/rootfs/runc.amd64 "dist/$(RELEASE_NAME)/"
 	install -m 755 packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
+	install -m 755 scripts/quickstart.sh "dist/$(RELEASE_NAME)/quickstart.sh"
 	tar -C dist -czf "$(RELEASE_TGZ)" "$(RELEASE_NAME)"
 	@echo "==> $(RELEASE_TGZ)"
 	@tar -tzf "$(RELEASE_TGZ)"
@@ -210,6 +251,34 @@ remote-release:
 
 remote-bench:
 	@bash utils/remote-run.sh bench "make bench"
+
+remote-warp-bench:
+	@bash utils/remote-run.sh warp-bench "make warp-bench ARMS=$(ARMS)"
+
+# inc5's dilated arms : the patch goes on,
+# the arms run, and the node goes back to stock whatever they did.
+remote-warp-bench-dilated:
+	@bash utils/remote-run.sh warp-bench-cd \
+	  'make dilation-install && (make warp-bench ARMS=$(if $(ARMS),$(ARMS),c,d); rc=$$?; make dilation-revert; exit $$rc)'
+
+# the referenced work on the node: build + load the patched KVM modules, run
+# the dilation suite, and put the node back on stock modules whatever
+# the suite did. Never leave a node patched — every other spec's
+# `remote-check` runs on stock (`utils/kvm-dilation/revert.sh`).
+remote-dilation-test:
+	@bash utils/remote-run.sh dilation \
+	  'make dilation-install && (make dilation-test; rc=$$?; make dilation-revert; exit $$rc)'
+
+# the referenced work's fork tests alone, same install/revert bracket.
+remote-dilation-fork-test:
+	@bash utils/remote-run.sh dilation-fork \
+	  'make dilation-install && (make dilation-fork-test; rc=$$?; make dilation-revert; exit $$rc)'
+
+remote-dilation-install:
+	@bash utils/remote-run.sh dilation-install "make dilation-install"
+
+remote-dilation-revert:
+	@bash utils/remote-run.sh dilation-revert "make dilation-revert"
 
 remote-miri:
 	@bash utils/remote-run.sh miri "make miri"

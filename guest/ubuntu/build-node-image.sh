@@ -59,7 +59,14 @@ ROOTFS_SHA256="6d20ae2cf2692719c40b2d8cf316b7629237431a16dc95464eec88256739b751"
 # attach path, `mount.nfs` for an RWX share. Both are documented
 # requirements of the CSI driver, so they belong in the node image
 # rather than in a DaemonSet that installs packages at runtime.
-APT_PACKAGES="linux-image-virtual linux-image-extra-virtual iproute2 ca-certificates curl kmod iptables conntrack open-iscsi nfs-common"
+#
+# rdma-core + ibverbs-utils are Soft-RoCE userspace .
+# The kernel module (`rdma_rxe`) already ships in linux-image-extra-virtual;
+# `rdma` already ships in iproute2. Ubuntu splits `ibv_devinfo` into
+# ibverbs-utils (source package rdma-core) — the binary `rdma-core`
+# package is udev rules, not the tool (CHALLENGES #150). Do not add
+# perftest / infiniband-diags / ib_send_bw.
+APT_PACKAGES="linux-image-virtual linux-image-extra-virtual iproute2 ca-certificates curl kmod iptables conntrack open-iscsi nfs-common rdma-core ibverbs-utils apparmor"
 
 # Units whose only unmet dependency is `network-online.target`, which
 # this image cannot reach (`systemd-networkd-wait-online` is masked and
@@ -132,11 +139,15 @@ systemd-networkd.service	k7d-net.service owns eth0; networkd would race it with 
 systemd-networkd.socket	same
 systemd-networkd-wait-online.service	would block boot waiting for a link networkd never configures
 systemd-resolved.service	/etc/resolv.conf is a real file here; resolved would replace it with a stub pointing at itself
+systemd-timesyncd.service	k7d owns the guest clock : an in-guest NTP client reaches ntp.ubuntu.com through the bridge's MASQUERADE and steps CLOCK_REALTIME back to true time within seconds, silently undoing a warp
+systemd-time-wait-sync.service	the barrier timesyncd satisfies; with timesyncd masked it would block time-sync.target forever
 apport.service	crash reporting has no upload path from a VM
 unattended-upgrades.service	same reason as apt-daily-upgrade
 nm-cloud-setup.service	NetworkManager cloud-setup waits for metadata that a k7d VM does not have
 nm-cloud-setup.timer	the timer that starts it
 open-iscsi.service	logs into remembered iSCSI targets after network-online.target, which this image cannot reach (CHALLENGES #108); Longhorn does its own iscsiadm logins and only needs iscsid
+iwpmd.service	iWARP port mapper from rdma-core; no iWARP hardware on virtio-mmio 
+rdma-ndd.service	rdma-core node-description daemon; wants dmidecode, which --no-install-recommends omits
 UNITS
 )
 
@@ -159,7 +170,11 @@ KEY=$(
             "$SCRIPT_DIR/units/k7d-k3s.service" \
             "$SCRIPT_DIR/units/k3s.service" \
             "$SCRIPT_DIR/units/k3s-agent.service" \
-            "$SCRIPT_DIR/units/k7d-no-network-online.conf"
+            "$SCRIPT_DIR/units/k7d-no-network-online.conf" \
+            "$SCRIPT_DIR/apparmor/k7-agent" \
+            "$SCRIPT_DIR/apparmor/k7-deny-vsock" \
+            "$SCRIPT_DIR/k7d-vsock-apparmor-check" \
+            "$SCRIPT_DIR/containerd/config-v3.toml.tmpl"
         echo "$ROOTFS_SHA256 $APT_PACKAGES $IMAGE_SIZE $NO_NETWORK_ONLINE_UNITS"
         echo "$MASKED_UNITS"
         echo "$K3S_VERSION $K3S_SHA256 $K3S_AIRGAP_SHA256 $K3S_IMAGES_TXT_SHA256"
@@ -285,6 +300,21 @@ install -D -m 0644 "$SCRIPT_DIR/units/k3s.service" \
     "$MNT/etc/systemd/system/k3s.service"
 install -D -m 0644 "$SCRIPT_DIR/units/k3s-agent.service" \
     "$MNT/etc/systemd/system/k3s-agent.service"
+# 29b-inc2: AppArmor vsock jail. Profiles load via apparmor.service
+# at boot; the agent unit refuses to start if they are not enforcing.
+install -D -m 0644 "$SCRIPT_DIR/apparmor/k7-agent" \
+    "$MNT/etc/apparmor.d/k7-agent"
+install -D -m 0644 "$SCRIPT_DIR/apparmor/k7-deny-vsock" \
+    "$MNT/etc/apparmor.d/k7-deny-vsock"
+install -D -m 0755 "$SCRIPT_DIR/k7d-vsock-apparmor-check" \
+    "$MNT/usr/local/sbin/k7d-vsock-apparmor-check"
+# Compile-check only (`-Q` skips the kernel load). `-p` is preprocess
+# and does not catch conflicting x modifiers (CHALLENGES #161).
+in_chroot apparmor_parser -Q /etc/apparmor.d/k7-deny-vsock \
+    || die "AppArmor profile k7-deny-vsock failed to compile"
+in_chroot apparmor_parser -Q /etc/apparmor.d/k7-deny-vsock \
+    /etc/apparmor.d/k7-agent \
+    || die "AppArmor profile k7-agent failed to compile"
 
 echo "==> clearing network-online.target ordering from $NO_NETWORK_ONLINE_UNITS"
 for unit in $NO_NETWORK_ONLINE_UNITS; do
@@ -296,7 +326,7 @@ done
 # an RWX share needs `mount.nfs`. A package that installed but left one
 # of these missing would surface as an unschedulable CSI plugin minutes
 # later, so check inside the image instead.
-for tool in /usr/sbin/iscsiadm /usr/sbin/iscsid /usr/sbin/mount.nfs; do
+for tool in /usr/sbin/iscsiadm /usr/sbin/iscsid /usr/sbin/mount.nfs /usr/bin/ibv_devinfo; do
     [[ -e "$MNT$tool" ]] || die "$tool missing from the image — check APT_PACKAGES"
 done
 in_chroot systemctl enable iscsid.service >/dev/null 2>&1 || {
@@ -310,7 +340,10 @@ install -D -m 0755 "$K3S_BIN" "$MNT/usr/local/bin/k3s"
 ln -sfn k3s "$MNT/usr/local/bin/kubectl"
 ln -sfn k3s "$MNT/usr/local/bin/crictl"
 ln -sfn k3s "$MNT/usr/local/bin/ctr"
-mkdir -p "$MNT/var/lib/rancher/k3s/agent/images"
+mkdir -p "$MNT/var/lib/rancher/k3s/agent/images" \
+    "$MNT/var/lib/rancher/k3s/agent/etc/containerd"
+install -D -m 0644 "$SCRIPT_DIR/containerd/config-v3.toml.tmpl" \
+    "$MNT/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl"
 install -D -m 0644 "$K3S_AIRGAP_FILE" \
     "$MNT/var/lib/rancher/k3s/agent/images/${K3S_AIRGAP}"
 install -D -m 0644 "$K3S_IMAGES_TXT" "$MNT/usr/local/share/k7d/k3s-images.txt"

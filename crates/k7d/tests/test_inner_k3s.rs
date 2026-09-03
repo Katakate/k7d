@@ -2658,6 +2658,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -2713,15 +2714,17 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     );
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(guest_cids.len(), 3, "fork must clone every member");
@@ -2733,7 +2736,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
                 vec![false; 3],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             let _ = watch.kill();
@@ -2760,14 +2763,20 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "inner-k3s cluster TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "inner-k3s cluster",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     // The fork's bridge is the one that appeared during TreeFork.
@@ -3609,6 +3618,7 @@ fn test_inner_k3s_coredns_dns_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -3656,15 +3666,17 @@ fn test_inner_k3s_coredns_dns_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -3677,7 +3689,7 @@ fn test_inner_k3s_coredns_dns_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -3699,14 +3711,20 @@ fn test_inner_k3s_coredns_dns_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "CoreDNS-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "CoreDNS-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -4832,6 +4850,7 @@ fn test_inner_k3s_ingress_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -4879,15 +4898,17 @@ fn test_inner_k3s_ingress_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -4900,7 +4921,7 @@ fn test_inner_k3s_ingress_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -4922,14 +4943,20 @@ fn test_inner_k3s_ingress_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "ingress-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "ingress-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -5580,6 +5607,7 @@ fn test_inner_k3s_local_path_pvc_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -5627,15 +5655,17 @@ fn test_inner_k3s_local_path_pvc_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -5648,7 +5678,7 @@ fn test_inner_k3s_local_path_pvc_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -5670,14 +5700,20 @@ fn test_inner_k3s_local_path_pvc_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "local-path-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "local-path-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -5844,6 +5880,7 @@ fn test_inner_k3s_metrics_server_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -5891,15 +5928,17 @@ fn test_inner_k3s_metrics_server_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -5912,7 +5951,7 @@ fn test_inner_k3s_metrics_server_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -5934,14 +5973,20 @@ fn test_inner_k3s_metrics_server_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "metrics-server-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "metrics-server-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -6428,6 +6473,7 @@ fn test_inner_k3s_network_policy_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -6475,15 +6521,17 @@ fn test_inner_k3s_network_policy_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -6496,7 +6544,7 @@ fn test_inner_k3s_network_policy_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -6518,14 +6566,20 @@ fn test_inner_k3s_network_policy_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "netpol-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "netpol-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -6906,6 +6960,7 @@ fn test_inner_k3s_hpa_scale_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -6953,15 +7008,17 @@ fn test_inner_k3s_hpa_scale_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -6974,7 +7031,7 @@ fn test_inner_k3s_hpa_scale_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -6996,14 +7053,20 @@ fn test_inner_k3s_hpa_scale_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "HPA-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "HPA-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -7298,6 +7361,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -7345,15 +7409,17 @@ fn test_inner_k3s_etcd_datastore_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -7366,7 +7432,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -7389,14 +7455,20 @@ fn test_inner_k3s_etcd_datastore_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "etcd-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "etcd-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -8506,6 +8578,7 @@ fn test_inner_k3s_argocd_gitops_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -8553,15 +8626,17 @@ fn test_inner_k3s_argocd_gitops_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -8574,7 +8649,7 @@ fn test_inner_k3s_argocd_gitops_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -8596,14 +8671,20 @@ fn test_inner_k3s_argocd_gitops_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM_ARGOCD,
-        "ArgoCD-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM_ARGOCD:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "ArgoCD-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM_ARGOCD,
     );
 
     let fork_bridge = list_k7_bridges()
@@ -9973,6 +10054,7 @@ fn test_inner_k3s_cilium_datapath_fork() {
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
+        egress: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -10020,15 +10102,17 @@ fn test_inner_k3s_cilium_datapath_fork() {
     }
 
     let fork_start = Instant::now();
-    let (fork_node, fork_cids) = match client.call(&Request::TreeFork {
+    let (fork_node, fork_cids, latency_ns) = match client.call(&Request::TreeFork {
         tree_id: tree_id.clone(),
         source_id: root_id.clone(),
         label: "warm".to_string(),
+        dilation: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
             guest_cids,
             fork_memory_full_copy,
+            latency_ns,
             ..
         }) => {
             assert_eq!(
@@ -10041,7 +10125,7 @@ fn test_inner_k3s_cilium_datapath_fork() {
                 vec![false; profile.vm_count],
                 "inner-k3s cluster fork must be CoW on every member"
             );
-            (node_id, guest_cids)
+            (node_id, guest_cids, latency_ns)
         }
         Ok(other) => {
             teardown(&mut client);
@@ -10063,14 +10147,20 @@ fn test_inner_k3s_cilium_datapath_fork() {
     {
         for line in String::from_utf8_lossy(&journal.stdout)
             .lines()
-            .filter(|l| l.contains("full memfd copy") || l.contains("fork_cluster_warm"))
+            .filter(|l| {
+                l.contains("full memfd copy")
+                    || l.contains("fork_cluster_warm")
+                    || l.contains("cluster_tree fork_batch")
+            })
         {
             eprintln!("  daemon: {line}");
         }
     }
-    assert!(
-        fork_elapsed <= FORK_INNER_K3S_CLUSTER_3VM,
-        "cilium-profile TreeFork took {fork_elapsed:?} > budget {FORK_INNER_K3S_CLUSTER_3VM:?}"
+    common::tree_fork_budget::assert_tree_fork_budget(
+        "cilium-profile",
+        fork_elapsed,
+        latency_ns,
+        FORK_INNER_K3S_CLUSTER_3VM,
     );
 
     let fork_bridge = list_k7_bridges()

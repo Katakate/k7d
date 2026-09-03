@@ -11,7 +11,7 @@ use std::sync::Arc;
 use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState};
+use crate::virtio_mmio::{VirtioBackend, VirtqueueState, PARK_POLL, UNPARK_POLL};
 
 const VIRTIO_ID_NET: u32 = 1;
 const NET_NUM_QUEUES: usize = 2; // RX + TX
@@ -80,6 +80,11 @@ pub struct TapDevice {
     mac: [u8; 6],
     guest_ip: Ipv4Addr,
     vm_index: u32,
+    /// Per-TAP L2 anti-spoof chain . `None` only when
+    /// `K7D_NET_JAIL=off`. Dropping it deletes the netdev table; the
+    /// struct's own `Drop` (close fd, delete link) runs first, and
+    /// `delete table` tolerates the device already being gone.
+    anti_spoof: Option<crate::netjail::TapAntiSpoof>,
 }
 
 impl TapDevice {
@@ -89,6 +94,22 @@ impl TapDevice {
     /// bridges (e.g. source and fork) can each host a TAP for the same
     /// `vm_index` without colliding on the kernel-side interface name.
     pub fn create(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
+        let mut tap = Self::create_unpinned(bridge_name, vm_index)?;
+        // Per-TAP L2 anti-spoof : the MAC/IP identity is
+        // assigned right here, so this is where the pin goes on. All
+        // bridges share 10.200.0.0/24 and forks reuse guest IPs — the
+        // pin must be per-TAP, never a global source-IP set.
+        tap.anti_spoof = crate::netjail::TapAntiSpoof::install(&tap.name, tap.mac, tap.guest_ip)?;
+        Ok(tap)
+    }
+
+    /// [`create`](Self::create) without the anti-spoof pin — for the
+    /// batch fork path, which pins a whole cluster's TAPs in ONE `nft`
+    /// invocation ([`crate::netjail::TapAntiSpoof::install_batch`])
+    /// instead of one process per TAP. Callers MUST attach the batch
+    /// guards before any guest traffic can flow (the VMs don't exist
+    /// yet at this point on the fork path).
+    fn create_unpinned(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
         let guest_ip = Ipv4Addr::new(
             GUEST_SUBNET_BASE[0],
             GUEST_SUBNET_BASE[1],
@@ -182,12 +203,15 @@ impl TapDevice {
 
         log::info!("TAP {tap_name} created: tap_mac={tap_mac_str} guest_ip={guest_ip}");
 
+        // Build the struct before pinning so its `Drop` (close fd,
+        // delete link) cleans up if a later anti-spoof install fails.
         Ok(Self {
             fd,
             name: tap_name,
             mac,
             guest_ip,
             vm_index,
+            anti_spoof: None,
         })
     }
 
@@ -207,6 +231,34 @@ impl TapDevice {
     #[must_use]
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// Whether the host side of this TAP has a frame queued for the
+    /// guest .
+    ///
+    /// Read-only and non-destructive: `poll` with a zero timeout tells
+    /// us the bridge has handed the TAP something the VMM has not yet
+    /// put in the guest's RX ring, without consuming it. The
+    /// guest-to-bridge direction needs no separate check — a frame the
+    /// guest handed over shows up as an undrained virtio-net TX queue.
+    pub fn has_pending_frame(&self) -> Result<bool, String> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a live, correctly initialised pollfd holding
+        // this TAP's own fd, which the `TapDevice` keeps open. Timeout 0
+        // means poll never blocks and never reads anything.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        if rc < 0 {
+            return Err(format!(
+                "poll({}) for a queued frame: {}",
+                self.name,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(pfd.revents & libc::POLLIN != 0)
     }
 
     /// Get the assigned guest IP address.
@@ -460,6 +512,14 @@ pub struct ClusterNetwork {
     /// `K7D_NET_JAIL=off`. Dropping it deletes the table, which is why
     /// it is a field rather than a side effect of `create`.
     jail: Option<crate::netjail::TreeNetJail>,
+    /// This tree's egress posture . Forks inherit it via
+    /// [`ClusterNetwork::fork_from`]; suspend/resume persists it in
+    /// `cluster.json`.
+    egress: crate::netjail::EgressPolicy,
+    /// The host default-route interface the jail was installed
+    /// against — kept so [`ClusterNetwork::set_egress`] can re-render
+    /// without re-detecting a possibly-changed route mid-flight.
+    default_iface: String,
 }
 
 impl ClusterNetwork {
@@ -470,6 +530,16 @@ impl ClusterNetwork {
     /// existing bridge is reused instead of being re-created. This makes the
     /// call idempotent across cooperating pods sharing a cluster.
     pub fn create(cluster_id: &str) -> Result<Self, String> {
+        Self::create_with_egress(cluster_id, crate::netjail::EgressPolicy::default())
+    }
+
+    /// [`ClusterNetwork::create`] with an explicit egress policy
+    /// . `create` delegates here with the `Open` default,
+    /// which is byte-identical to pre-29b behaviour.
+    pub fn create_with_egress(
+        cluster_id: &str,
+        egress: crate::netjail::EgressPolicy,
+    ) -> Result<Self, String> {
         // IFNAMSIZ is 16 (15 chars + NUL). Reserve 6 for the `k7-br-` prefix
         // and cap the cluster suffix at 9 chars. To keep distinct cluster IDs
         // mapping to distinct bridges even after truncation, mix in a short
@@ -561,10 +631,12 @@ impl ClusterNetwork {
         // The FORWARD ACCEPT rules above make this bridge reachable from
         // every other `k7-br-*` on the node. The jail (evaluated one
         // priority ahead of them) is what stops one tree from routing
-        // into another's guests — see `crate::netjail`.
+        // into another's guests, and  owns the egress and
+        // guest→host input decisions — see `crate::netjail`.
         let jail = crate::netjail::TreeNetJail::install(
             &bridge_name,
-            &crate::netjail::allowed_ifaces(&default_iface),
+            &crate::netjail::JailIfaces::detect(&default_iface),
+            &egress,
         )?;
 
         log::info!("bridge {bridge_name} created with gateway {gw}/24 via {default_iface}");
@@ -575,7 +647,47 @@ impl ClusterNetwork {
             next_vm_index: 0,
             entries: HashMap::new(),
             jail,
+            egress,
+            default_iface,
         })
+    }
+
+    /// This tree's egress policy.
+    #[must_use]
+    pub fn egress(&self) -> &crate::netjail::EgressPolicy {
+        &self.egress
+    }
+
+    /// Replace this bridge's egress policy, atomically re-installing
+    /// the jail ruleset (the referenced work: `tree_adopt_cluster` may adopt a
+    /// bridge born `Open` into a tree with a stricter posture). When
+    /// `K7D_NET_JAIL=off` the policy is recorded but nothing is
+    /// enforced — same contract as `create`.
+    pub fn set_egress(&mut self, egress: crate::netjail::EgressPolicy) -> Result<(), String> {
+        egress.validate()?;
+        if let Some(old) = self.jail.take() {
+            match crate::netjail::TreeNetJail::install(
+                &self.bridge_name,
+                &crate::netjail::JailIfaces::detect(&self.default_iface),
+                &egress,
+            ) {
+                Ok(new) => {
+                    // The install atomically replaced the SAME table the
+                    // old guard owns — running the old guard's Drop now
+                    // would delete the freshly installed ruleset.
+                    std::mem::forget(old);
+                    self.jail = new;
+                }
+                Err(e) => {
+                    // `nft -f` is transactional: on failure the old
+                    // ruleset is still in place, so the old guard stays.
+                    self.jail = Some(old);
+                    return Err(e);
+                }
+            }
+        }
+        self.egress = egress;
+        Ok(())
     }
 
     /// Create a TAP device on this bridge for a new VM.
@@ -614,16 +726,58 @@ impl ClusterNetwork {
 
     fn create_tap_at_index(&mut self, vm_index: u32) -> Result<TapDevice, String> {
         let tap = TapDevice::create(&self.bridge_name, vm_index)?;
+        self.register_tap_entry(&tap);
+        Ok(tap)
+    }
+
+    fn register_tap_entry(&mut self, tap: &TapDevice) {
         let entry = VmNetworkEntry {
-            vm_index,
+            vm_index: tap.vm_index(),
             tap_name: tap.name().to_string(),
             guest_ip: tap.guest_ip(),
             guest_mac: tap.mac(),
             pod_ip: None,
             pod_netns: None,
         };
-        self.entries.insert(vm_index, entry);
-        Ok(tap)
+        self.entries.insert(tap.vm_index(), entry);
+    }
+
+    /// [`add_tap_at`](Self::add_tap_at) for a whole cluster's worth of
+    /// indices at once, pinning every TAP's anti-spoof in a single
+    /// `nft` transaction — the fork path's per-cluster host-net cost is
+    /// dominated by `nft` process spawns, so the batch keeps the
+    /// 50-cluster fork budget honest . Returns the TAPs in
+    /// `indices` order; on any failure every TAP created so far is
+    /// dropped (link + netdev table teardown via `Drop`).
+    pub fn add_taps_at(&mut self, indices: &[u32]) -> Result<Vec<TapDevice>, String> {
+        for &idx in indices {
+            if self.entries.contains_key(&idx) {
+                return Err(format!(
+                    "vm_index {idx} already allocated on bridge {}",
+                    self.bridge_name
+                ));
+            }
+        }
+        let mut taps = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            taps.push(TapDevice::create_unpinned(&self.bridge_name, idx)?);
+            if idx >= self.next_vm_index {
+                self.next_vm_index = idx + 1;
+            }
+        }
+        let specs: Vec<(String, [u8; 6], Ipv4Addr)> = taps
+            .iter()
+            .map(|t| (t.name().to_string(), t.mac(), t.guest_ip()))
+            .collect();
+        if let Some(guards) = crate::netjail::TapAntiSpoof::install_batch(&specs)? {
+            for (tap, guard) in taps.iter_mut().zip(guards) {
+                tap.anti_spoof = Some(guard);
+            }
+        }
+        for tap in &taps {
+            self.register_tap_entry(tap);
+        }
+        Ok(taps)
     }
 
     /// Look up the network entry for a previously allocated `vm_index`.
@@ -672,7 +826,9 @@ impl ClusterNetwork {
     /// guest IP and MAC, so the forked guests see identical network state
     /// while the two bridges stay isolated at L2.
     pub fn fork_from(source: &Self, fork_cluster_id: &str) -> Result<Self, String> {
-        let mut fork = Self::create(fork_cluster_id)?;
+        // Fork inherits the source's egress posture : a
+        // contained tree must not mint an Open child.
+        let mut fork = Self::create_with_egress(fork_cluster_id, source.egress.clone())?;
         // We do **not** allocate the TAPs here: TAP ownership is one-per-VM,
         // so `fork_cluster_warm` calls `add_tap_at(vm_index)` per fork VM and
         // moves the resulting `TapDevice` into the `Vm`. We just align the
@@ -1473,7 +1629,13 @@ fn delete_iptables(table: Option<&str>, spec: &[&str]) -> Result<(), String> {
 fn install_bridge_forward_rules(bridge: &str) -> Result<(), String> {
     ensure_iptables(None, &["FORWARD", "-i", bridge, "-j", "ACCEPT"])?;
     ensure_iptables(None, &["FORWARD", "-o", bridge, "-j", "ACCEPT"])?;
-    ensure_iptables(None, &["INPUT", "-i", bridge, "-j", "ACCEPT"])?;
+    // The jail's `input` chain (priority filter - 1, `crate::netjail`)
+    // owns the guest→host decision since the referenced work — an unconditional
+    // iptables `INPUT -i <bridge> -j ACCEPT` here would sit AFTER the
+    // jail (which is fine) but also document a hole that no longer
+    // exists. Drain any copy a pre-29b daemon left behind so long-lived
+    // nodes converge; the loop handles historical duplicates.
+    while delete_iptables(None, &["INPUT", "-i", bridge, "-j", "ACCEPT"]).is_ok() {}
     ensure_iptables(None, &["OUTPUT", "-o", bridge, "-j", "ACCEPT"])?;
     // While guest k3s shared the host's 10.42/16 (pre-#121), the
     // global br_netfilter hook let host flannel MASQUERADE SNAT
@@ -1776,17 +1938,25 @@ impl VirtioBackend for TapNetBackend {
         if self.worker.is_none() {
             return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Same bound as virtio-blk: above the 100 ms poll, far below the
+        // 1 s cluster-fork budget (CHALLENGES #162).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while !self.parked.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) {
             if std::time::Instant::now() >= deadline {
                 log::warn!(
-                    "virtio-net: worker did not park within 2s — fork memory \
+                    "virtio-net: worker did not park within 200ms — fork memory \
                      capture may race in-flight ring writes"
                 );
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(PARK_POLL);
         }
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.worker.is_none()
+            || !self.running.load(Ordering::SeqCst)
+            || self.parked.load(Ordering::SeqCst)
     }
 
     fn merge_dirty_pages(&self, acc: &mut [u64]) {
@@ -1933,6 +2103,22 @@ pub(crate) fn read_used_idx(mem_base: u64, q: &VirtqueueState) -> u16 {
     unsafe { std::ptr::read_volatile((used_base + 2) as *const u16) }
 }
 
+/// Read guest `avail.idx` (offset +2 in `{flags:u16, idx:u16, ring[]}`).
+///
+/// Paired with [`read_used_idx`] by the auto-warp safety predicate
+/// : on a queue the driver fills with requests, the two
+/// being equal is the #79 "nothing in flight" handshake.
+pub(crate) fn read_avail_idx(mem_base: u64, q: &VirtqueueState) -> u16 {
+    if !q.ready || q.avail_addr.raw_value() == 0 {
+        return 0;
+    }
+    let avail_base = mem_base + q.avail_addr.raw_value();
+    // SAFETY: avail_base + 2 points at the idx field in guest RAM, in the
+    // caller's live mapping; the caller has paused the vCPUs and parked
+    // the device workers, so nothing is writing it.
+    unsafe { std::ptr::read_volatile((avail_base + 2) as *const u16) }
+}
+
 /// Worker thread: poll TAP for RX, poll `tx_kick` for TX, process virtqueues.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn net_worker(
@@ -1970,7 +2156,7 @@ fn net_worker(
         if paused.load(Ordering::SeqCst) {
             parked.store(true, Ordering::SeqCst);
             while paused.load(Ordering::SeqCst) && running.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(UNPARK_POLL);
             }
             parked.store(false, Ordering::SeqCst);
             continue;

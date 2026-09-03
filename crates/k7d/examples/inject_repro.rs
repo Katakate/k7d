@@ -54,7 +54,8 @@ fn main() {
             ev.data[8] = 1;
             ev.data[9] = vector;
         }
-        let fork = k7d::fork::restore_vm_from_state(&base, &dirty, src_mem, &state, "reinject");
+        let fork =
+            k7d::fork::restore_vm_from_state(&base, &dirty, src_mem, &state, "reinject", None);
         source.resume().expect("resume");
         let mut fork = fork.expect("materialise");
         fork.start().expect("start fork");

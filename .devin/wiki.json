@@ -2,23 +2,38 @@
   "repo_notes": [
     {
       "author": "k7d maintainers",
-      "content": "k7d is a Rust microVM runtime (VMM + containerd shim + guest agent) for forking live Kubernetes environments in ~100ms. Architecture: long-running k7d daemon owns KVM VMs, vsock, virtio devices, and cluster bridges; containerd-shim-k7-v1 is a thin client over /run/k7d/k7d.sock; guest k7-agent speaks JSON over vsock. Start with README.md and https://docs.katakate.org/k7d (architecture + CoW fork + snapshot tree). Latency claims are CI-enforced via crates/k7d/src/latency.rs + LATENCY_BUDGETS.md. Debugging war stories live in CHALLENGES.md. Formal methods: Kani harnesses beside unsafe code; Aeneas→Lean proofs for crates/k7d/src/tree_model.rs under verif/. Sibling project Katakate/k7 orchestrates sandboxes with Python SDKs. Product docs live in Katakate/docs (k7d/); do not recreate architecture/concepts guides in this repo."
+      "content": "k7d is a Rust microVM runtime (VMM + containerd shim + guest agent) that warm-forks live Kubernetes environments. Two clocks, always together: ~105 ms for the minimal CI guest (1 s test-enforced budget) and ~1.1 s for Ubuntu k3s+Cilium+Tetragon (48 s source bring-up). Architecture: long-running k7d daemon owns KVM VMs, vsock, virtio devices, cluster bridges, the snapshot tree, and the guest clock; containerd-shim-k7-v1 is a thin client over /run/k7d/k7d.sock; guest k7-agent speaks JSON over vsock. Start with README.md and https://docs.katakate.org/k7d (architecture + CoW fork + snapshot tree). Latency claims are CI-enforced via crates/k7d/src/latency.rs + LATENCY_BUDGETS.md. Five-minute try path: sudo ./scripts/quickstart.sh (or k7d doctor + k7d quickstart). Debugging war stories live in CHALLENGES.md. Formal methods: Kani harnesses beside unsafe code; Aeneas→Lean proofs for crates/k7d/src/tree_model.rs under verif/. Sibling project Katakate/k7 orchestrates sandboxes with Python SDKs. Product docs live in Katakate/docs (k7d/); do not recreate architecture/concepts guides in this repo."
     }
   ],
   "pages": [
     {
       "title": "Architecture overview",
-      "purpose": "Explain the daemon/shim/agent split, control socket, and how a kubectl pod with runtimeClassName k7 becomes a microVM. Anchor on https://docs.katakate.org/k7d/concepts/architecture and https://docs.katakate.org/k7d/concepts/cow-fork.",
+      "purpose": "Explain the daemon/shim/agent split, the Unix control socket (/run/k7d/k7d.sock), and how a kubectl pod with runtimeClassName k7 becomes a microVM. Anchor on https://docs.katakate.org/k7d/concepts/architecture and https://docs.katakate.org/k7d/concepts/cow-fork. README mermaid diagrams are the in-repo map.",
       "parent": null
     },
     {
       "title": "Crate map",
-      "purpose": "Map crates/k7d (VMM library + daemon control plane), crates/shim (containerd shim v2 thin client), crates/agent (guest agent), crates/replicate (placeholder). Orientation comes from the Mintlify architecture page — there is no in-repo file-map.",
+      "purpose": "Map crates/k7d (VMM library + daemon control plane), crates/shim (containerd shim v2 thin client), crates/agent (guest agent), crates/replicate (placeholder). Top-level gym/ is the Ubuntu lease/act/score harness; examples/ holds k7view, the MCP sidecar, and cluster-tree-search. Orientation also comes from the Mintlify architecture page.",
       "parent": null
     },
     {
       "title": "Fork and snapshot engine",
-      "purpose": "Document warm fork, dirty-bitmap CoW memory, virtio-blk/erofs rootfs, cluster fork (shared L2 lie on a fresh bridge), and the snapshot tree API (tree_create, tree_fork_batch, protect/prune/auto_evict). Code anchors: fork.rs, snapshot.rs, tree.rs, tree_model.rs, network.rs.",
+      "purpose": "Document warm fork, dirty-bitmap CoW memory (KVM dirty log ∪ device-written pages), virtio-blk/erofs rootfs, incremental reflink keyframes, cluster fork (shared L2 lie on a fresh bridge so TLS/TCP survive), and the snapshot tree API (tree_create / tree_create_cluster / tree_adopt_cluster, tree_fork_batch, protect/prune/rollback/auto_evict). Code anchors: fork.rs, snapshot.rs, tree.rs, tree_model.rs, network.rs.",
+      "parent": null
+    },
+    {
+      "title": "Two clocks and latency budgets",
+      "purpose": "Never quote the ~105 ms CI-guest fork without the ~1.1 s Ubuntu k3s+Cilium+Tetragon row. Source of truth is LATENCY_BUDGETS.md + crates/k7d/src/latency.rs (every row is an integration-test assertion). Methodology write-up: docs/blog/2026-08-07-k7d-cluster-fork-benchmark.md. Cluster-tree TreeFork rows are enforced on the daemon's latency_ns, not the client Instant around the Unix-socket call.",
+      "parent": "Fork and snapshot engine"
+    },
+    {
+      "title": "Time warp",
+      "purpose": "k7d owns the guest clock (kvmclock + per-vCPU TSC offsets, no RTC/NTP). Lockstep jumps (auto-warp) compress idle wait 1.83× at zero fidelity delta; a carried KVM dilation patch runs guests at ×N wall (8.00× at N=8). Gym exposes autowarp_mode off/jump/micro/dilate; dilation can be inherited or overridden on tree_fork_batch. Reproduce: make remote-warp-bench, make remote-dilation-install. Code anchors: vm.rs clock paths, gym autowarp_mode.",
+      "parent": "Fork and snapshot engine"
+    },
+    {
+      "title": "Ubuntu guests and gym",
+      "purpose": "New product / GRPO / gym work uses bare-VM Ubuntu 24.04 nodes (guest/ubuntu/), not the busybox / nested-runc inner-k3s CI guest. Boot + warm-fork Ubuntu, then k3s / Cilium / Tetragon / Longhorn and the ML-mock fixtures (fake GPU+DCGM, JobSet, Soft-RoCE, KubeRay, TrainJob, Kueue). The gym leases those nodes over /run/k7d/k7d.sock. Never fall back to K7D_KERNEL/K7D_INITRD for an Ubuntu task — those are the RuntimeClass busybox pair. Tests: crates/k7d/tests/test_ubuntu_*.rs, gym/.",
       "parent": null
     },
     {
@@ -27,13 +42,18 @@
       "parent": "Architecture overview"
     },
     {
+      "title": "Agent demo, MCP, and k7view",
+      "purpose": "Frontier-agent incident demo: examples/k7d-mcp (stdio MCP over the tree verbs + Tetragon diff) and examples/k7view (read-only SSE dashboard). Story + videos: docs/demo/README.md and docs/blog/2026-08-20-frontier-model-cluster-fork-button.md. Two-clocks honesty applies — the agent video is the Ubuntu row, not the 105 ms CI guest. Try path: sudo ./scripts/quickstart.sh.",
+      "parent": null
+    },
+    {
       "title": "Formal verification",
       "purpose": "Describe Kani proofs on unsafe/arithmetic paths and Aeneas→Lean verification of the tree budget model (verif/), plus the axiom allowlist gate (utils/check-verif-axioms.sh).",
       "parent": null
     },
     {
       "title": "Build, release, and latency budgets",
-      "purpose": "Cover Makefile targets (build, release tarball, remote-check), guest kernel/initramfs packaging, install.sh, and the CI-enforced LATENCY_BUDGETS.md numbers with the benchmark write-up under docs/blog/.",
+      "purpose": "Cover Makefile targets (build, release tarball, remote-check), guest kernel/initramfs packaging, install.sh, k7d doctor / k7d quickstart, and the CI-enforced LATENCY_BUDGETS.md numbers with the benchmark write-up under docs/blog/.",
       "parent": null
     },
     {

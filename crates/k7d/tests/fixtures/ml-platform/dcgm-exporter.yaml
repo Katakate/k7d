@@ -1,0 +1,59 @@
+# dcgm-exporter-shaped Prometheus fixture . Not NVML.
+# Serves DCGM_FI_DEV_GPU_UTIL and DCGM_FI_DEV_FB_USED on :9400.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dcgm-exporter
+  namespace: default
+  labels:
+    app: dcgm-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+    spec:
+      containers:
+      - name: dcgm-exporter
+        image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www
+          cat > /www/metrics <<EOF
+          # TYPE DCGM_FI_DEV_GPU_UTIL gauge
+          DCGM_FI_DEV_GPU_UTIL{gpu="0",UUID="GPU-fake-0",device="nvidia0",modelName="Fake-A100",Hostname="${NODE_NAME}"} 42
+          # TYPE DCGM_FI_DEV_FB_USED gauge
+          DCGM_FI_DEV_FB_USED{gpu="0",UUID="GPU-fake-0",device="nvidia0",modelName="Fake-A100",Hostname="${NODE_NAME}"} 1024
+          EOF
+          exec httpd -f -p 9400 -h /www
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        - name: metrics
+          containerPort: 9400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm-exporter
+  namespace: default
+  labels:
+    app: dcgm-exporter
+spec:
+  type: NodePort
+  selector:
+    app: dcgm-exporter
+  ports:
+  - name: metrics
+    port: 9400
+    targetPort: 9400
+    nodePort: 30400

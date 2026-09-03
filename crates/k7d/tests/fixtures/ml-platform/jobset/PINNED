@@ -1,0 +1,6 @@
+# JobSet v0.12.0 (2026-05-08). Test helper fetches manifests.yaml and
+# refuses to apply if the sha256 mismatches. Image rewritten to digest.
+JOBSET_VERSION=v0.12.0
+MANIFESTS_URL=https://github.com/kubernetes-sigs/jobset/releases/download/v0.12.0/manifests.yaml
+MANIFESTS_SHA256=a41aaf12dd0b7b0a3d626b8d6107f32c3dc889d7e7830adc46b8cdb77a8963bb
+IMAGE=registry.k8s.io/jobset/jobset:v0.12.0@sha256:e75536f1135b7bb2f19f8c3b620782fbdd9091d73398e3a272f9a5fed322980d

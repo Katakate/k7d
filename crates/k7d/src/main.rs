@@ -41,12 +41,20 @@ fn socket_path() -> String {
     control::socket_path_from_env()
 }
 
-/// `--version` and `--help` must be answered before anything else happens.
-/// Without this they fell through to "start a daemon", so an operator
-/// checking which version was installed booted a second daemon that took
-/// the control socket from the running one and deleted it on the way out.
+/// `--version` / `--help` / `doctor` / `quickstart` must be answered
+/// before anything else happens. Without this they fell through to
+/// "start a daemon", so an operator checking which version was
+/// installed booted a second daemon that took the control socket from
+/// the running one and deleted it on the way out.
 fn handle_info_flags() {
-    for arg in std::env::args().skip(1) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "doctor") {
+        run_doctor();
+    }
+    if args.iter().any(|a| a == "quickstart") {
+        run_quickstart(&args);
+    }
+    for arg in &args {
         match arg.as_str() {
             "--version" | "-V" => {
                 println!("k7d {}", env!("CARGO_PKG_VERSION"));
@@ -55,14 +63,19 @@ fn handle_info_flags() {
             "--help" | "-h" => {
                 println!(
                     "k7d {} — microVM runtime daemon (one per node, root)\n\n\
-                     Usage: k7d [--socket <path>]\n\n\
+                     Usage:\n\
+                     \x20 k7d [--socket <path>]     start the daemon\n\
+                     \x20 k7d doctor                check /dev/kvm, vhost-vsock, tun, cgroup v2\n\
+                     \x20 k7d quickstart            busybox 3-node tree + 4 forks (needs a running daemon)\n\n\
                      Options:\n\
                      \x20 --socket <path>  control socket (default: {}; env K7D_SOCKET)\n\
                      \x20 -V, --version    print version and exit\n\
                      \x20 -h, --help       print this help and exit\n\n\
                      Guest artifacts are required and come from the environment:\n\
                      \x20 K7D_KERNEL       guest kernel (vmlinux)\n\
-                     \x20 K7D_INITRD       guest initramfs\n",
+                     \x20 K7D_INITRD       guest initramfs\n\n\
+                     Five-minute try path (fetches the release tarball):\n\
+                     \x20 sudo ./scripts/quickstart.sh\n",
                     env!("CARGO_PKG_VERSION"),
                     control::DEFAULT_SOCKET,
                 );
@@ -70,6 +83,89 @@ fn handle_info_flags() {
             }
             _ => {}
         }
+    }
+}
+
+fn run_doctor() {
+    let report = k7d::doctor::run();
+    let code = k7d::doctor::print_and_exit_code(&report);
+    std::process::exit(code);
+}
+
+fn run_quickstart(args: &[String]) {
+    let keep = args.iter().any(|a| a == "--keep");
+    let report = k7d::doctor::run();
+    let code = k7d::doctor::print_and_exit_code(&report);
+    if code != 0 {
+        std::process::exit(code);
+    }
+
+    let socket = socket_path();
+    let mut client = match k7d::control::Client::connect(&socket) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "quickstart: cannot connect to {socket}: {e}\n\
+                 start the daemon first (`sudo k7d` or `systemctl start k7d`),\n\
+                 or run `sudo ./scripts/quickstart.sh` to fetch + install + boot"
+            );
+            std::process::exit(1);
+        }
+    };
+    match client.call(&k7d::control::Request::Ping) {
+        Ok(k7d::control::Response::Pong { version }) => {
+            println!("quickstart: k7d {version} at {socket}");
+        }
+        Ok(other) => {
+            eprintln!("quickstart: ping: unexpected {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("quickstart: ping {socket}: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    let tree_id = format!("qs-{}", std::process::id());
+    match k7d::quickstart::run_busybox_demo(&mut client, &tree_id, 4, keep, None, None) {
+        Ok(clocks) => {
+            k7d::quickstart::print_clocks(&clocks);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("quickstart: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Put the snapshot-tree root on the reflink XFS and say so in the log
+/// .
+///
+/// Not fatal: a tree on ext4 still works, it just pays a full guest-RAM
+/// dump for every keyframe instead of cloning its ancestor's. The
+/// per-keyframe fallback is loud on its own, so the point of doing it
+/// here is that an operator reading the startup log knows which regime
+/// the node is in before the first fork.
+fn prepare_tree_root() {
+    // An operator who pointed `K7D_TREE_ROOT` somewhere specific owns
+    // that path; probe it and report, but never relocate it.
+    if let Ok(custom) = std::env::var("K7D_TREE_ROOT") {
+        match k7d::disks::assert_reflink_capable(std::path::Path::new(&custom)) {
+            Ok(()) => log::info!("tree root {custom} (K7D_TREE_ROOT) is reflink-capable"),
+            Err(e) => log::warn!(
+                "tree root {custom} (K7D_TREE_ROOT) is NOT reflink-capable ({e}) — every \
+                 snapshot-tree keyframe there costs a full guest-RAM dump "
+            ),
+        }
+        return;
+    }
+    if let Err(e) = k7d::disks::ensure_reflink_tree_root() {
+        log::warn!(
+            "could not put the snapshot-tree root on the reflink XFS ({e}) — keyframes \
+             will fall back to full guest-RAM dumps ; run \
+             `your node provisioning` on this node"
+        );
     }
 }
 
@@ -139,6 +235,11 @@ fn main() {
     if !reaped_jails.is_empty() {
         log::warn!("reaped stale net jails: {reaped_jails:?}");
     }
+    let reaped_tap_jails = k7d::netjail::clean_stale_tap_jails();
+    if !reaped_tap_jails.is_empty() {
+        log::warn!("reaped stale tap anti-spoof jails: {reaped_tap_jails:?}");
+    }
+    prepare_tree_root();
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Bridge the C signal handler's static flag into the Arc the serve

@@ -85,6 +85,9 @@ body {
   font-size: 15px; font-weight: 700; letter-spacing: 0.04em;
   color: var(--text); font-variant-numeric: tabular-nums; min-width: 96px; text-align: right;
 }
+.clock.guest {
+  min-width: 168px; font-size: 13px; color: var(--cyan);
+}
 
 /* ---------- incident timeline strip ---------- */
 
@@ -174,7 +177,7 @@ main {
 .node { cursor: pointer; transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.3s; }
 .node .box { stroke-width: 1.3; rx: 7; }
 .node .bar { rx: 2; }
-.node .lbl { fill: var(--text); font: 600 11.5px var(--mono); }
+.node .lbl { fill: var(--text); font: 600 13px var(--mono); }
 .node .meta { fill: var(--muted); font: 9.5px var(--mono); }
 .node .badge { font: 10px var(--mono); }
 
@@ -347,6 +350,11 @@ main {
 }
 .tile.prot h3 { color: var(--prot); }
 .tile .ms { color: var(--cyan); font-size: 10px; flex: none; }
+.tile .xn {
+  flex: none; font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  color: var(--cyan); border: 1px solid #1a3d42; background: rgba(83, 216, 232, 0.08);
+  border-radius: 999px; padding: 1px 7px;
+}
 .tile .verdict {
   font-size: 10.5px; font-weight: 700; border-radius: 4px; padding: 2px 7px;
   align-self: flex-start; letter-spacing: 0.03em;

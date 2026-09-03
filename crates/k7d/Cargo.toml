@@ -29,6 +29,9 @@ log.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+# Resume every paused VM even when a warp (or a test's assert) unwinds
+# mid-cluster — the referenced work/inc2.
+scopeguard = "=1.2.0"
 
 [features]
 default = []
@@ -44,3 +47,24 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [dev-dependencies]
 tempfile = "3"
 env_logger.workspace = true
+
+# the referenced work's two-arm time-warp benchmark. Its own target rather
+# than a test: one arm is ~10 minutes of guest time per run and it runs
+# three per arm from a fresh cluster, so `make check` must not pay for
+# it (`make remote-warp-bench`). `harness = false` because there is
+# nothing for libtest to schedule — the arms have to run in order, from
+# comparable node state.
+[[bench]]
+name = "warp_bench"
+path = "benches/warp_bench.rs"
+harness = false
+
+# the referenced work's dilation validation. Every test in it needs the
+# carried KVM patch (`utils/kvm-dilation`) loaded, and every other
+# spec's `remote-check` runs on stock modules — so it is not tested by
+# default, and `make test` skips it by name too. `make dilation-test`
+# (`cargo test -p k7d --test test_dilation`) is the way in.
+[[test]]
+name = "test_dilation"
+path = "tests/test_dilation.rs"
+test = false

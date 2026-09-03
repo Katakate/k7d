@@ -9,6 +9,8 @@ Profiles:
   max   — multi-wave cluster tree under a tight VM budget, plus a single-VM
           tree. This is the video profile: big git-graph, many clusters,
           many VMs, many forks, pressure bars going hot, then evict.
+  ubuntu-dilated — 3-node Ubuntu k3s source at dilation: 8, waves 6+4+4,
+          scored by a guest-time Deployment readiness gate .
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ sys.path.insert(0, str(HERE.parent / "cluster-tree-search"))
 
 from k7d_client import K7dClient  # noqa: E402
 import llm as k7view_llm  # noqa: E402
+import dilated as dilated_sc  # noqa: E402
 
 USE_LLM = False
 
@@ -356,6 +359,8 @@ def controller_decide(
 def wave_sizes(profile: str, branches: int, waves: int) -> list[int]:
     if profile == "smoke":
         return [branches]
+    if profile == "ubuntu-dilated":
+        return list(dilated_sc.DILATED_WAVES)
     sizes = [max(2, branches)]
     nxt = max(3, branches // 2)
     for _ in range(1, max(1, waves)):
@@ -1015,9 +1020,296 @@ def run_vm_tree(
     post(ingest, {"type": "run", "tree_id": tree_id, "phase": "idle"})
 
 
+def run_ubuntu_dilated_tree(
+    client: K7dClient,
+    ingest: str,
+    *,
+    tree_id: str,
+    sizes: list[int],
+    budget: dict[str, int],
+    pace_s: float,
+    log: dilated_sc.JsonlLog,
+) -> tuple[str, float]:
+    """3-wave Ubuntu k3s search at ×8. Tempo comes from guest readiness."""
+    post(
+        ingest,
+        {
+            "type": "run",
+            "tree_id": tree_id,
+            "phase": "booting",
+            "goal": "×8 dilated Ubuntu k3s — guest-time rollout search",
+        },
+    )
+    post(
+        ingest,
+        {
+            "type": "budget",
+            "tree_id": tree_id,
+            "budget": budget,
+            "memory_mb": 2048,
+        },
+    )
+    created = dilated_sc.create_ubuntu_source(
+        client,
+        tree_id=tree_id,
+        budget=budget,
+        dilation=dilated_sc.DILATION_FACTOR,
+        log=log,
+    )
+    root_id = created["root_id"]
+    cluster_vms = 3
+    image = created["pause_image"]
+    factors = dilated_sc.live_dilation_map(client, tree_id)
+    post(
+        ingest,
+        ingest_members_latency(
+            tree_id,
+            root_id,
+            None,
+            created.get("guest_cids") or [],
+            round(created["create_ms"], 1),
+            None,
+            cluster_vms,
+        )
+        + [
+            {
+                "type": "note",
+                "tree_id": tree_id,
+                "node_id": root_id,
+                "text": (
+                    f"Ubuntu k3s Ready at ×{dilated_sc.DILATION_FACTOR} "
+                    f"({created['create_ms']:.0f} ms boot, "
+                    f"sleep 8 → {created['sleep8_wall_s']:.2f}s wall)"
+                ),
+            },
+            {
+                "type": "beat",
+                "tree_id": tree_id,
+                "name": "ready",
+                "node_id": root_id,
+            },
+            {"type": "run", "tree_id": tree_id, "phase": "ready"},
+        ],
+    )
+    # Hold Ready so capture.py (--start-phase ready, 1 s poll) and the
+    # guest-clock chip can latch before wave 0. Not a rollout pace sleep.
+    time.sleep(3.0)
+    last_fork_ms = 0.0
+    winners: list[dict] = []
+    all_losers: list[dict] = []
+    source = root_id
+    fork_timeout = 300
+    for wave, n in enumerate(sizes):
+        if wave > 0:
+            parked = 0
+            states = node_states(client, tree_id)
+            for f in list(all_losers):
+                nid = f["node_id"]
+                if states.get(nid) != "live":
+                    continue
+                print(f"[scenario] suspend loser {nid} (headroom before wave {wave})")
+                try:
+                    client.tree_suspend(tree_id, nid)
+                    post(
+                        ingest,
+                        {
+                            "type": "note",
+                            "tree_id": tree_id,
+                            "node_id": nid,
+                            "text": "suspended — park RAM so the next wave can fork",
+                        },
+                    )
+                    parked += 1
+                    meta(
+                        ingest,
+                        tree_id,
+                        f"park {nid} before wave {wave}",
+                        action="suspend",
+                        node_id=nid,
+                    )
+                except RuntimeError as exc:
+                    print(f"[scenario] suspend {nid}: {exc}", file=sys.stderr)
+            log.write("park", wave=wave, parked=parked)
+            source = winners[-1]["node_id"] if winners else root_id
+            try:
+                prepare_source(client, ingest, tree_id, source, timeout=fork_timeout)
+            except RuntimeError as exc:
+                print(
+                    f"[scenario] prepare {source} failed: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+        labels = [f"w{wave}-rollout-{i}" for i in range(n)]
+        post(ingest, {"type": "run", "tree_id": tree_id, "phase": f"forking-wave-{wave}"})
+        meta(
+            ingest,
+            tree_id,
+            f"wave {wave}: fork {n} clusters from {source} at inherited ×8.",
+            action="fork",
+            node_id=source,
+        )
+        try:
+            forks, fork_ms = fork_wave(
+                client,
+                ingest,
+                tree_id,
+                source,
+                labels,
+                vm_count=cluster_vms,
+                role=f"wave{wave}",
+                timeout=fork_timeout,
+            )
+        except RuntimeError as exc:
+            print(f"[scenario] fork from {source} failed: {exc}", file=sys.stderr)
+            log.write("fork_error", wave=wave, source=source, error=str(exc))
+            continue
+        last_fork_ms = fork_ms
+        factors = dilated_sc.assert_live_dilation(
+            client, tree_id, dilated_sc.DILATION_FACTOR
+        )
+        log.write(
+            "fork",
+            wave=wave,
+            n=len(forks),
+            source=source,
+            fork_ms=round(fork_ms, 1),
+            live_dilation=factors,
+            usage=(client.tree_nodes(tree_id).get("usage") or {}),
+        )
+        print_depths(client, tree_id)
+        post(ingest, {"type": "run", "tree_id": tree_id, "phase": "scoring"})
+
+        def on_line(node_id: str, text: str) -> None:
+            post(
+                ingest,
+                {
+                    "type": "trace",
+                    "tree_id": tree_id,
+                    "node_id": node_id,
+                    "role": "tool",
+                    "text": text,
+                    "replace": True,
+                },
+            )
+
+        scores = dilated_sc.score_rollouts(
+            forks,
+            image,
+            tree_id=tree_id,
+            deploy_name=dilated_sc.deploy_name(wave),
+            settle_s=dilated_sc.FORK_SETTLE_WALL_S if wave >= 1 else 0.0,
+            on_line=on_line,
+        )
+        if not any(d.get("ready") for _r, _f, d in scores):
+            errors = [
+                f"{d.get('node_id')}: {d.get('error') or 'not Ready'}"
+                for _r, _f, d in scores
+            ]
+            raise RuntimeError(
+                f"wave {wave}: no branch reached Ready (guest-time rollout). "
+                + " | ".join(errors[:4])
+            )
+        for reward, f, detail in scores:
+            log.write("rollout", wave=wave, **detail)
+            post(
+                ingest,
+                {
+                    "type": "note",
+                    "tree_id": tree_id,
+                    "node_id": f["node_id"],
+                    "text": (
+                        f"rollout reward={reward:.2f} wall={detail.get('wall_s')}s "
+                        f"guest={detail.get('guest_s')}s ready={detail.get('ready')}"
+                    ),
+                },
+            )
+        if not scores:
+            continue
+        winner_reward, winner, _wdetail = scores[0]
+        try:
+            protect_winner(client, ingest, tree_id, winner, winner_reward)
+            winners.append(winner)
+            log.write("protect", wave=wave, node_id=winner["node_id"], reward=winner_reward)
+        except RuntimeError as exc:
+            print(f"[scenario] protect {winner['node_id']}: {exc}", file=sys.stderr)
+        protected = {winner["node_id"]}
+        all_losers.extend(f for _, f, _d in scores if f["node_id"] not in protected)
+        if wave >= 1:
+            print("[scenario] tree_auto_evict (24-VM budget)")
+            try:
+                evicted = client.tree_auto_evict(tree_id)
+                ids = evicted.get("evicted") or []
+                log.write("auto_evict", wave=wave, evicted=ids)
+                post(
+                    ingest,
+                    {
+                        "type": "note",
+                        "tree_id": tree_id,
+                        "node_id": source,
+                        "text": (
+                            f"auto-evict — {len(ids)} nodes"
+                            if ids
+                            else "auto-evict — already under budget"
+                        ),
+                    },
+                )
+                meta(
+                    ingest,
+                    tree_id,
+                    (
+                        f"auto-evict fired — {len(ids)} nodes over budget."
+                        if ids
+                        else "auto-evict: already under VM/RAM thresholds."
+                    ),
+                    action="auto_evict",
+                    node_id=source,
+                )
+            except RuntimeError as exc:
+                print(f"[scenario] auto_evict: {exc}", file=sys.stderr)
+        if pace_s > 0:
+            pace(min(pace_s, 0.6))
+
+    post(ingest, {"type": "run", "tree_id": tree_id, "phase": "wave-2-protect"})
+    pruned = 0
+    for f in all_losers:
+        if pruned >= 3:
+            break
+        nid = f["node_id"]
+        print(f"[scenario] prune loser {nid}")
+        try:
+            client.tree_prune(tree_id, nid)
+        except RuntimeError as exc:
+            print(f"[scenario] prune {nid}: {exc}", file=sys.stderr)
+            continue
+        post(
+            ingest,
+            {
+                "type": "note",
+                "tree_id": tree_id,
+                "node_id": nid,
+                "text": "pruned — dead rollout, reclaim RAM + disk",
+            },
+        )
+        pruned += 1
+        if pace_s > 0:
+            pace(min(pace_s, 0.6))
+    post(ingest, {"type": "run", "tree_id": tree_id, "phase": "idle"})
+    winner_id = winners[-1]["node_id"] if winners else root_id
+    log.write(
+        "done",
+        winner=winner_id,
+        last_fork_ms=round(last_fork_ms, 1),
+        live_dilation=dilated_sc.live_dilation_map(client, tree_id),
+        usage=(client.tree_nodes(tree_id).get("usage") or {}),
+    )
+    return winner_id, last_fork_ms
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--profile", choices=("smoke", "max"), default="smoke")
+    ap.add_argument(
+        "--profile", choices=("smoke", "max", "ubuntu-dilated"), default="smoke"
+    )
     ap.add_argument(
         "--video",
         action="store_true",
@@ -1043,17 +1335,34 @@ def main() -> int:
         default=None,
         help="stream OpenRouter into tiles + controller (default: on if a key is present)",
     )
+    ap.add_argument(
+        "--log",
+        default=None,
+        help="JSONL path (ubuntu-dilated default: k7d-dilated-tree.jsonl)",
+    )
     args = ap.parse_args()
     if args.video:
         args.profile = "max"
     if args.branches is None:
-        args.branches = 8 if args.profile == "max" else 4
+        args.branches = (
+            6 if args.profile == "ubuntu-dilated" else 8 if args.profile == "max" else 4
+        )
     if args.pace is None:
-        args.pace = 0.85 if args.profile == "max" else 1.6
+        args.pace = (
+            0.35
+            if args.profile == "ubuntu-dilated"
+            else 0.85 if args.profile == "max" else 1.6
+        )
     if args.vm_tree is None:
         args.vm_tree = args.profile == "max"
+    if args.profile == "ubuntu-dilated":
+        args.memory_mb = 2048
+        args.cluster_vms = 3
+        args.vm_tree = False
     global USE_LLM
-    if args.llm is None:
+    if args.profile == "ubuntu-dilated":
+        USE_LLM = False
+    elif args.llm is None:
         USE_LLM = k7view_llm.configured()
     else:
         USE_LLM = bool(args.llm)
@@ -1070,30 +1379,51 @@ def main() -> int:
     ingest = args.view.rstrip("/") + "/api/ingest"
     client = K7dClient()
     pong = client.ping()
+    log_path = None
+    if args.log:
+        log_path = Path(args.log)
+    elif args.profile == "ubuntu-dilated":
+        log_path = Path("k7d-dilated-tree.jsonl")
+    log = dilated_sc.JsonlLog(log_path)
     print(
         f"[scenario] k7d {pong.get('version')} tree={tree_id} "
         f"profile={args.profile} waves={sizes} llm={USE_LLM} "
-        f"model={k7view_llm.DEFAULT_MODEL if USE_LLM else 'canned'} view={args.view}"
+        f"model={k7view_llm.DEFAULT_MODEL if USE_LLM else 'canned'} view={args.view} "
+        f"log={log_path}"
     )
 
-    paths = resolve_guest_paths()
-    if args.profile == "max":
-        budget = pressure_budget(args.cluster_vms, sizes[0], args.memory_mb)
+    if args.profile == "ubuntu-dilated":
+        dilated_sc.require_patched_dilation()
+        budget = dilated_sc.dilated_budget()
+        winner, fork_ms = run_ubuntu_dilated_tree(
+            client,
+            ingest,
+            tree_id=tree_id,
+            sizes=sizes,
+            budget=budget,
+            pace_s=args.pace,
+            log=log,
+        )
     else:
-        budget = generous_budget(args.cluster_vms, args.branches)
-    hold = max(args.pace, 2.5 if args.profile == "max" else args.pace)
-
-    winner, fork_ms = _run_trees(
-        client,
-        ingest,
-        tree_id=tree_id,
-        paths=paths,
-        args=args,
-        sizes=sizes,
-        budget=budget,
-        hold=hold,
-    )
+        paths = resolve_guest_paths()
+        if args.profile == "max":
+            budget = pressure_budget(args.cluster_vms, sizes[0], args.memory_mb)
+        else:
+            budget = generous_budget(args.cluster_vms, args.branches)
+        hold = max(args.pace, 2.5 if args.profile == "max" else args.pace)
+        winner, fork_ms = _run_trees(
+            client,
+            ingest,
+            tree_id=tree_id,
+            paths=paths,
+            args=args,
+            sizes=sizes,
+            budget=budget,
+            hold=hold,
+        )
     boil = 16.0 if args.profile == "max" else 3.0
+    if args.profile == "ubuntu-dilated":
+        boil = 4.0
     if args.keep:
         print("[scenario] --keep: trees stay")
         try:
@@ -1115,6 +1445,7 @@ def main() -> int:
             print(f"[scenario] tree_drop {vm_tree_id}")
         except RuntimeError:
             pass
+    log.close()
     return 0
 
 

@@ -390,6 +390,60 @@ theorem k7dl_header_roundtrip_rust (pc : Std.U32) (ms : Std.U64) :
   · rcases e with got | v | ⟨a, b⟩ | ⟨a, b⟩ <;>
       simp [headerPost, hround] at hpost
 
+/-- Group E on the Rust code : the base identity round-trips
+through the header's trailing u64, and stamping it leaves what
+`k7dl_parse_header` reads untouched. The second half is the one that
+matters — a stamp that shifted `page_count` or `mem_size` would make a
+resumed node write its pages at indices the writer never meant. -/
+theorem k7dl_base_identity_roundtrip_rust (pc : Std.U32) (ms bi : Std.U64) :
+    ∃ hdr stamped, tree_model.k7dl_header_bytes pc ms = ok hdr
+      ∧ tree_model.k7dl_set_base_identity hdr bi = ok stamped
+      ∧ tree_model.k7dl_base_identity stamped = ok bi
+      ∧ tree_model.k7dl_parse_header stamped
+          = ok (core.result.Result.Ok (pc, ms)) := by
+  obtain ⟨hdr, hh, habs⟩ := spec_imp_exists (k7dl_header_bytes_equiv pc ms)
+  obtain ⟨stamped, hst, hstabs⟩ :=
+    spec_imp_exists (k7dl_set_base_identity_equiv hdr bi)
+  obtain ⟨out, hout, houtpost⟩ := spec_imp_exists (k7dl_base_identity_equiv stamped)
+  obtain ⟨r, hp, hpost⟩ := spec_imp_exists (k7dl_parse_header_equiv stamped)
+  have hstampedAbs : absBytes stamped
+      = K7dlCodec.setBaseIdentity (K7dlCodec.headerBytes pc.bv ms.bv) bi.bv := by
+    rw [hstabs, habs]
+  refine ⟨hdr, stamped, hh, hst, ?_, ?_⟩
+  · rw [hout]
+    refine congrArg _ ((uscalar_eq_iff_bv out bi).mpr (houtpost.trans ?_))
+    rw [hstampedAbs]
+    exact K7dlCodec.k7dl_base_identity_roundtrip pc.bv ms.bv bi.bv
+  · have hround : K7dlCodec.parseHeader (absBytes stamped) = .ok (pc.bv, ms.bv) := by
+      rw [hstampedAbs, K7dlCodec.k7dl_set_base_identity_preserves_header]
+      exact K7dlCodec.k7dl_header_roundtrip pc.bv ms.bv
+    rw [hp]
+    rcases r with ⟨pc', ms'⟩ | e
+    · simp only [headerPost] at hpost
+      rw [hround] at hpost
+      simp only [Except.ok.injEq, Prod.mk.injEq] at hpost
+      obtain ⟨h1, h2⟩ := hpost
+      rw [(uscalar_eq_iff_bv pc' pc).mpr h1.symm,
+        (uscalar_eq_iff_bv ms' ms).mpr h2.symm]
+    · rcases e with got | v | ⟨a, b⟩ | ⟨a, b⟩ <;>
+        simp [headerPost, hround] at hpost
+
+/-- Group E on the Rust code : the
+base-identity guard never panics, accepts a pack applied onto the
+generation it names, refuses two known generations that disagree, and
+still loads a pre-30b pack (identity 0 on either side). -/
+theorem k7dl_base_identity_ok_rust (pack base : Std.U64) :
+    ∃ r, tree_model.k7dl_base_identity_ok pack base = ok r
+      ∧ (pack.bv = base.bv → r = true)
+      ∧ ((pack.bv = 0#64 ∨ base.bv = 0#64) → r = true)
+      ∧ (pack.bv ≠ 0#64 → base.bv ≠ 0#64 → pack.bv ≠ base.bv → r = false) := by
+  obtain ⟨r, hp, hpost⟩ := spec_imp_exists (k7dl_base_identity_ok_equiv pack base)
+  refine ⟨r, hp, fun h => ?_, fun h => ?_, fun hp0 hb0 hne => ?_⟩
+  · rw [hpost, h]; exact K7dlCodec.baseIdentityOk_self base.bv
+  · rw [hpost]; exact K7dlCodec.baseIdentityOk_unknown pack.bv base.bv h
+  · rw [hpost]
+    exact K7dlCodec.baseIdentityOk_rejects_known_mismatch pack.bv base.bv hp0 hb0 hne
+
 /-- Group E on the Rust code: `k7dl_parse_entry ∘ k7dl_encode_entry`
 is the identity — neither half panics, and parsing returns the exact
 `(page_idx, page)` pair (page bytes included, via `absBytes`

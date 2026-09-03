@@ -1,0 +1,27 @@
+# k7d : unconfined-minus-vsock. `allow all` omits the
+# mount/dbus/unix classes — name them or k3s overlay and agent virtiofs
+# get EPERM (CHALLENGES #161). change_profile is required so runc can
+# attach a container profile. Path-attached to python3*; also the
+# target of k7-agent's change_profile and of k3s AppArmorProfile=.
+# CRI AppArmor is disabled (k7d-k3sconfig) so pods inherit this
+# profile: NNP cannot change_onexec to cri-containerd.apparmor.d
+# (CHALLENGES #166).
+abi <abi/4.0>,
+include <tunables/global>
+
+profile k7-deny-vsock /usr/bin/python3* flags=(attach_disconnected,mediate_deleted) {
+  allow all,
+  capability,
+  network,
+  mount,
+  umount,
+  remount,
+  pivot_root,
+  dbus,
+  unix,
+  signal,
+  ptrace,
+  userns,
+  change_profile,
+  deny network vsock,
+}

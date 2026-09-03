@@ -14,7 +14,7 @@
 //! agent protocol (vsock CIDs are a kernel-global namespace, so any
 //! host process can connect to a running VM's agent).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -307,6 +307,16 @@ pub struct VmConfig {
     /// Optional network attachment (bridge + TAP + pod netns).
     #[serde(default)]
     pub network: Option<NetConfig>,
+    /// Continuous time dilation : guest time runs this
+    /// many times faster than wall time, for the whole life of the VM.
+    /// Absent or 1 is stock. Every member of a cluster is created from
+    /// one `VmConfig`, so a cluster is dilated in lockstep by
+    /// construction — the same invariant `WarpClock` keeps for offsets.
+    ///
+    /// A host without the carried KVM patch fails VM creation instead
+    /// of running the guest at 1x.
+    #[serde(default)]
+    pub dilation: Option<u32>,
 }
 
 /// One **named persistent** data disk .
@@ -361,6 +371,7 @@ impl Default for VmConfig {
             data_disks: Vec::new(),
             sandbox_id: None,
             network: None,
+            dilation: None,
         }
     }
 }
@@ -371,6 +382,21 @@ fn default_memory_mb() -> u64 {
 
 fn default_vcpus() -> u32 {
     1
+}
+
+fn default_dilation_one() -> u32 {
+    1
+}
+
+/// the referenced work: `0` is never a factor. `None` inherits the source.
+fn validate_fork_dilation(dilation: Option<u32>) -> Result<Option<u32>, String> {
+    match dilation {
+        Some(0) => Err(
+            "dilation 0 is not a factor — omit the field to inherit the source's, or pass 1..=64"
+                .into(),
+        ),
+        other => Ok(other),
+    }
 }
 
 fn default_true() -> bool {
@@ -493,6 +519,10 @@ pub enum Request {
         /// `reattach_sandbox` (and `k7 pause` on the fork) work.
         #[serde(default)]
         sandbox_id: Option<String>,
+        /// Child dilation factor . `None` inherits the
+        /// source's (inc9). `0` is a loud error.
+        #[serde(default)]
+        dilation: Option<u32>,
     },
     /// Pause a VM (`k7 pause` for the k7d backend):
     /// vCPU threads are stopped and joined and device workers parked;
@@ -509,6 +539,88 @@ pub enum Request {
     ResumeVm {
         /// VM identifier from `create_vm`.
         vm_id: String,
+    },
+    /// Advance the guest-visible clock of every VM on one cluster
+    /// bridge by the same delta , so the guests' backoffs,
+    /// probe periods and lease TTLs behave as if `delta_ms` had passed.
+    ///
+    /// The whole cluster is paused for the write and resumed after it:
+    /// a uniform jump is what etcd heartbeats, lease TTLs and TLS skew
+    /// checks tolerate, a skewed one is not. Forward-only — the field is
+    /// unsigned and `0` is a loud error, never a no-op.
+    ///
+    /// Caller contract: no guest action may be in flight. An agent
+    /// `exec` running across the warp sees its guest's clock jump
+    /// mid-syscall; the caller (gym, test) gates warps on quiescence.
+    WarpClock {
+        /// Cluster bridge identity given to `create_vm` as
+        /// [`NetConfig::cluster_id`]. Every live VM on it is warped.
+        cluster_id: String,
+        /// Forward jump in milliseconds. Must be > 0.
+        delta_ms: u64,
+    },
+    /// Change the continuous dilation factor of every VM on one cluster
+    /// bridge , so a cluster that is running out of CPU
+    /// can be slowed back down without being restarted.
+    ///
+    /// The whole cluster is paused for the write and resumed after it,
+    /// and every member gets the *same* factor: an offset skew is
+    /// bounded, a rate skew is not. The kernel refuses the change while
+    /// any vCPU is runnable, which is why the pause is not optional.
+    ///
+    /// Lowering the factor is not a rewind — the guests keep every
+    /// nanosecond they have already been given (CHALLENGES #191); they
+    /// only stop accumulating them so fast. Raising is the same write
+    /// in the other direction, not a rewind either. `DilationPolicy`
+    /// never asks for a raise; `TrackingPolicy` does. The op itself
+    /// does not pick.
+    SetDilation {
+        /// Cluster bridge identity given to `create_vm` as
+        /// [`NetConfig::cluster_id`], or a `ClusterSnapshotTree` node
+        /// (`{tree_id}-{node_id}`, or `tree_id` for its root —
+        /// CHALLENGES #193). Every live VM on it changes rate.
+        cluster_id: String,
+        /// Guest nanoseconds per wall nanosecond, 1..=64. 1 is stock.
+        /// Needs the carried patch in `utils/kvm-dilation` above 1.
+        factor: u32,
+    },
+    /// Start, switch or stop the auto-warp policy loop on one cluster
+    /// : instead of being told "+90 s", the daemon
+    /// watches the cluster and deletes its idle wall time itself.
+    ///
+    /// Idempotent in the sense that matters: setting a mode replaces
+    /// whatever loop was running, and `off` stops it. The reply always
+    /// carries the counters, so `AutoWarp { mode: off }` is also how a
+    /// caller collects a finished run's accounting.
+    AutoWarp {
+        /// Cluster bridge identity given to `create_vm` as
+        /// [`NetConfig::cluster_id`]. Every live VM on it takes part.
+        cluster_id: String,
+        /// `off`, `jump` or `micro`.
+        mode: crate::autowarp::AutoWarpMode,
+    },
+    /// Read one cluster's auto-warp counters without changing its mode.
+    AutoWarpStatus {
+        /// Cluster to report on.
+        cluster_id: String,
+    },
+    /// Take or release the auto-warp hold on a cluster — the explicit
+    /// form of the referenced work's fifth safety check.
+    ///
+    /// Daemon ops need no hold: they all run under the VM registry
+    /// lock, which the policy loop takes for the whole of each cycle,
+    /// so no op can be in flight inside one. A caller driving a member
+    /// from *outside* the daemon — a gym `exec` straight over vsock —
+    /// is invisible to that lock and must say so, or its guest sees the
+    /// clock jump mid-syscall.
+    AutoWarpHold {
+        /// Cluster to hold.
+        cluster_id: String,
+        /// Who is holding, so a leaked hold names its owner. Releasing
+        /// a hold nobody took is an error, not a silent no-op.
+        holder: String,
+        /// `true` to take, `false` to release.
+        hold: bool,
     },
     /// Root a single-VM snapshot tree at a freshly booted VM.
     TreeCreate {
@@ -536,6 +648,12 @@ pub enum Request {
         /// Caller-supplied tree identity; generated when omitted.
         #[serde(default)]
         tree_id: Option<String>,
+        /// Egress posture for the tree's bridges .
+        /// Omitted = `Open` (the product default); forks inherit it.
+        /// RoCEv2/Soft-RoCE note: RDMA leaving the tree is UDP/4791 —
+        /// a `whitelist` policy that needs it must name port 4791.
+        #[serde(default)]
+        egress: Option<crate::netjail::EgressPolicy>,
     },
     /// Adopt live daemon-owned sandbox VMs + their shared
     /// [`ClusterNetwork`] as a [`ClusterSnapshotTree`] root.
@@ -564,6 +682,11 @@ pub enum Request {
         /// Caller-supplied tree identity; generated when omitted.
         #[serde(default)]
         tree_id: Option<String>,
+        /// Egress posture applied to the adopted bridge .
+        /// Omitted keeps the bridge's current posture (sandbox bridges
+        /// are born `Open`); forks inherit whatever is set here.
+        #[serde(default)]
+        egress: Option<crate::netjail::EgressPolicy>,
     },
     /// Fork a new branch from a live or suspended tree node.
     TreeFork {
@@ -573,6 +696,11 @@ pub enum Request {
         source_id: String,
         /// Human label for the new branch (also seeds its node id).
         label: String,
+        /// Child dilation factor . `None` inherits the
+        /// source's (inc9). A cluster applies one factor to every
+        /// member. `0` is a loud error.
+        #[serde(default)]
+        dilation: Option<u32>,
     },
     /// Fork N branches from the same source in one call.
     /// Single-VM trees share one dirty-bitmap capture; cluster trees
@@ -585,6 +713,10 @@ pub enum Request {
         /// One human label per new branch (also seeds each node id).
         /// Empty is a loud error — never a silent no-op.
         labels: Vec<String>,
+        /// One child factor for every branch in the batch
+        /// . `None` inherits the source's.
+        #[serde(default)]
+        dilation: Option<u32>,
     },
     /// Snapshot a live tree node so it can be a warm-fork source.
     ///
@@ -676,6 +808,9 @@ pub enum Request {
     /// answers, even with the pool disabled
     /// (`size: 0`).
     PoolStatus,
+    /// Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`,
+    /// cgroup v2. Same checks as `k7d doctor`. Does not create VMs.
+    Doctor,
 }
 
 /// One branch produced by [`Request::TreeForkBatch`].
@@ -693,6 +828,9 @@ pub struct TreeForkedBranch {
     /// dirty-bitmap capture.
     #[serde(default)]
     pub latency_ns: u64,
+    /// Child dilation factor after the fork .
+    #[serde(default = "default_dilation_one")]
+    pub dilation: u32,
 }
 
 /// Summary of one VM in a `list_vms` response.
@@ -815,6 +953,9 @@ pub enum Response {
         /// fork's prepare swap — echoed back so
         /// clients can assert it, not because it changes.
         source_guest_cid: u64,
+        /// Child dilation factor after the fork .
+        #[serde(default = "default_dilation_one")]
+        dilation: u32,
     },
     /// Reply to `tree_create` / `tree_create_cluster` / `tree_adopt_cluster`.
     TreeCreated {
@@ -842,6 +983,9 @@ pub enum Response {
         /// measurement; not stored in `tree.json`).
         #[serde(default)]
         latency_ns: u64,
+        /// Child dilation factor after the fork .
+        #[serde(default = "default_dilation_one")]
+        dilation: u32,
     },
     /// Reply to `tree_fork_batch`.
     TreeForkBatch {
@@ -860,11 +1004,68 @@ pub enum Response {
         /// `true` when this call wrote a new base snapshot. `false` when
         /// the node was already prepared (idempotent no-op).
         wrote_base: bool,
+        /// `true` when the keyframe was written **incrementally** —
+        /// `FICLONE` of the nearest ancestor's `memory.bin` plus this
+        /// node's dirty pages , costing O(divergence) instead
+        /// of O(guest RAM). `false` for a root, a virtiofs payload, an
+        /// idempotent no-op, or a loud fallback to the full dump because
+        /// the tree root is not on a reflink filesystem.
+        #[serde(default)]
+        wrote_base_incremental: bool,
+        /// Physical bytes the keyframe added to the filesystem — the
+        /// dirty set on the incremental path, the whole guest span on
+        /// the full one. The daemon reports it because nothing on the
+        /// host can measure it afterwards: a reflinked file's `stat`
+        /// reports its logical length and `st_blocks` counts extents it
+        /// only shares (CHALLENGES #152).
+        #[serde(default)]
+        base_disk_bytes: u64,
         /// Host wall time of the prepare (includes snapshot + restore
         /// when `wrote_base` is true).
         latency_ns: u64,
         /// Guest vsock CIDs after prepare (CID is preserved).
         guest_cids: Vec<u64>,
+    },
+    /// Reply to `warp_clock`.
+    Warped {
+        /// Cluster whose VMs moved.
+        cluster_id: String,
+        /// The VMs that were warped, in `vm_index` order. All of them
+        /// or none — a warp that fails on one member rolls that member
+        /// back and errors.
+        vm_ids: Vec<String>,
+        /// The delta every guest's clock advanced by.
+        delta_ms: u64,
+        /// Daemon-side wall time of pause-all → warp-all → resume-all
+        /// .
+        latency_ns: u64,
+    },
+    /// Reply to `set_dilation`.
+    DilationSet {
+        /// Cluster whose members changed rate.
+        cluster_id: String,
+        /// The VMs that were switched, in `vm_index` order. All of them
+        /// or none — a member that refuses the factor puts the ones
+        /// already switched back before the error is returned. Members
+        /// owned by a `ClusterSnapshotTree` have no registry VM id and
+        /// are reported positionally as `{cluster_id}#{index}`.
+        vm_ids: Vec<String>,
+        /// The factor every member now runs at.
+        factor: u32,
+        /// Daemon-side wall time of pause-all → set-all → resume-all.
+        latency_ns: u64,
+    },
+    /// Reply to `auto_warp`, `auto_warp_status` and `auto_warp_hold`.
+    AutoWarp {
+        /// Cluster the counters belong to.
+        cluster_id: String,
+        /// Mode now in force.
+        mode: crate::autowarp::AutoWarpMode,
+        /// Holders currently blocking the loop, in name order.
+        holders: Vec<String>,
+        /// Host-time counters of the loop (of the *last* loop, when
+        /// `mode` is `off`). All zero for a cluster that never ran one.
+        stats: crate::autowarp::AutoWarpStats,
     },
     /// Reply to `tree_resume`.
     TreeResumed {
@@ -892,6 +1093,12 @@ pub enum Response {
         /// payload. Not persisted in `tree.json`.
         #[serde(default)]
         live_guest_cids: HashMap<String, Vec<u64>>,
+        /// Time dilation factor of each live node (the referenced work; a
+        /// cluster's members all share one). Absent for nodes with no
+        /// live payload. The gym reads this to check a reused source
+        /// tree runs at the factor its config promises.
+        #[serde(default)]
+        live_dilation: HashMap<String, u32>,
     },
     /// Reply to `tree_list`.
     TreeList {
@@ -928,6 +1135,21 @@ pub enum Response {
         hits: u64,
         /// Pool-enabled `create_vm` requests not served from the pool.
         misses: u64,
+    },
+    /// Reply to `doctor`.
+    Doctor {
+        /// `/dev/kvm` is a character device.
+        kvm: bool,
+        /// `/dev/vhost-vsock` is a character device.
+        vhost_vsock: bool,
+        /// `/dev/net/tun` is a character device.
+        tun: bool,
+        /// Host is on the cgroup v2 unified hierarchy.
+        cgroup_v2: bool,
+        /// All four checks passed.
+        ok: bool,
+        /// One line per check (`ok`/`FAIL` + name + detail).
+        details: Vec<String>,
     },
     /// Generic success (e.g. `stop_vm`).
     Ok,
@@ -1021,27 +1243,48 @@ enum TreePayload {
 }
 
 impl TreePayload {
-    fn fork(&mut self, source_id: &String, label: &str) -> Result<String, String> {
+    fn live_cluster_members_mut(&mut self, node_id: &str) -> Option<&mut [crate::vm::Vm]> {
         match self {
-            Self::Single(t) => t.fork(source_id, label),
-            Self::Cluster(t) => t.fork(source_id, label),
+            Self::Cluster(t) => t.live_members_mut(node_id),
+            Self::Single(_) => None,
         }
+    }
+
+    fn fork(
+        &mut self,
+        source_id: &String,
+        label: &str,
+        dilation: Option<u32>,
+    ) -> Result<String, String> {
+        match self {
+            Self::Single(t) => t.fork_batch(source_id, &[label], dilation),
+            Self::Cluster(t) => t.fork_batch(source_id, &[label], dilation),
+        }
+        .map(|ids| ids.into_iter().next().expect("single fork"))
         .map_err(|e| format!("tree fork({source_id}, {label}): {e}"))
     }
 
-    fn fork_batch(&mut self, source_id: &String, labels: &[String]) -> Result<Vec<String>, String> {
+    fn fork_batch(
+        &mut self,
+        source_id: &String,
+        labels: &[String],
+        dilation: Option<u32>,
+    ) -> Result<Vec<String>, String> {
         if labels.is_empty() {
             return Err("tree_fork_batch: labels must be non-empty".to_string());
         }
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         match self {
-            Self::Single(t) => t.fork_batch(source_id, &refs),
-            Self::Cluster(t) => t.fork_batch(source_id, &refs),
+            Self::Single(t) => t.fork_batch(source_id, &refs, dilation),
+            Self::Cluster(t) => t.fork_batch(source_id, &refs, dilation),
         }
         .map_err(|e| format!("tree fork_batch({source_id}, {labels:?}): {e}"))
     }
 
-    fn prepare_fork_source(&mut self, node_id: &String) -> Result<bool, String> {
+    fn prepare_fork_source(
+        &mut self,
+        node_id: &String,
+    ) -> Result<crate::tree::PrepareOutcome, String> {
         match self {
             Self::Single(t) => t.prepare_fork_source(node_id),
             Self::Cluster(t) => t.prepare_fork_source(node_id),
@@ -1146,6 +1389,18 @@ impl TreePayload {
         }
     }
 
+    /// Time dilation factor of a node's live payload; `None` when it has
+    /// none. A cluster's members are built from one `VmConfig` and
+    /// forked from one state, so the first member speaks for all.
+    fn node_dilation(&self, node_id: &String) -> Option<u32> {
+        match self {
+            Self::Single(t) => t.get_vm(node_id).map(Vm::dilation),
+            Self::Cluster(t) => t
+                .get_payload(node_id)
+                .and_then(|p| p.members.first().map(Vm::dilation)),
+        }
+    }
+
     /// Per-member `fork_memory_is_full_copy` of a node's live members,
     /// ordered like [`Self::node_cids`]. Empty when the node has no
     /// live payload.
@@ -1193,11 +1448,17 @@ impl TreePayload {
     }
 
     fn node_list_response(&self) -> Response {
+        let nodes = self.list_nodes();
+        let live_dilation = nodes
+            .iter()
+            .filter_map(|n| self.node_dilation(&n.id).map(|d| (n.id.clone(), d)))
+            .collect();
         Response::TreeNodeList {
-            nodes: self.list_nodes(),
+            nodes,
             usage: self.usage().into(),
             budget: self.budget(),
             live_guest_cids: self.live_guest_cids(),
+            live_dilation,
         }
     }
 
@@ -1215,7 +1476,11 @@ impl TreePayload {
 
 /// The daemon's VM registry and request dispatcher.
 pub struct Daemon {
-    vms: Mutex<HashMap<String, VmEntry>>,
+    /// Live VMs. `Arc` because the auto-warp policy loop (spec
+    /// 34a-inc3) runs on its own thread and takes this same lock for
+    /// the whole of each cycle — that lock is what makes "no daemon op
+    /// is in flight against a member" true rather than hoped for.
+    vms: Arc<Mutex<HashMap<String, VmEntry>>>,
     /// Shared cluster bridges keyed by `cluster_id`, refcounted across
     /// VMs (this fixes the shared-bridge teardown
     /// race where the first pod deleted destroyed its peers' bridge).
@@ -1223,7 +1488,9 @@ pub struct Daemon {
     /// Snapshot trees keyed by `tree_id`. The
     /// lock is held for the duration of each tree mutation — tree ops
     /// need `&mut` and must not interleave on the same tree.
-    trees: Mutex<HashMap<String, TreePayload>>,
+    /// `Arc` so the auto-warp loop can see tree-owned clusters
+    /// (`tree_create_cluster` / fork children are not in `vms`).
+    trees: Arc<Mutex<HashMap<String, TreePayload>>>,
     /// `sandbox_id → vm_id` index for `lookup_sandbox` /
     /// `reattach_sandbox`. Mirrors the on-disk
     /// records under [`sandbox_root_dir`] so the hot path never walks
@@ -1234,7 +1501,69 @@ pub struct Daemon {
     pool: Option<Pool>,
     /// `tree_watch` subscribers. Dead senders are dropped on emit.
     watchers: Mutex<Vec<WatchSub>>,
+    /// Auto-warp policy loops, keyed by `cluster_id` .
+    auto_warps: Mutex<HashMap<String, AutoWarpLoop>>,
+    /// Auto-warp holds, keyed by `cluster_id`. Read by every cycle of
+    /// every loop, so it is its own lock and never nested inside
+    /// `vms` — a hold must be takeable while a cycle is running.
+    auto_warp_holds: Arc<Mutex<HashMap<String, BTreeSet<String>>>>,
     counter: AtomicU64,
+}
+
+/// One cluster's running auto-warp policy loop.
+///
+/// The counters are shared with the thread rather than owned by it, so
+/// `auto_warp_status` answers while the loop runs; they outlive a
+/// stopped loop so `AutoWarp { mode: off }` can report the run's
+/// accounting.
+struct AutoWarpLoop {
+    mode: crate::autowarp::AutoWarpMode,
+    stop: Arc<AtomicBool>,
+    counters: Arc<crate::autowarp::AutoWarpCounters>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AutoWarpLoop {
+    /// Signal the thread and wait for the cycle in flight to finish.
+    ///
+    /// Joining matters: a cycle holds the VM registry lock and may have
+    /// the whole cluster paused, so returning before it ends would let
+    /// a `stop_vm` race a pause the loop still owns.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("auto-warp: a policy loop thread panicked; its cluster may be paused");
+            }
+        }
+        self.mode = crate::autowarp::AutoWarpMode::Off;
+    }
+}
+
+/// Live tree-owned members of `cluster_id`.
+///
+/// Gym / `tree_create_cluster` children are `{tree_id}-{node_id}`.
+/// Reset / source clusters use `cluster_id == tree_id` (the live root).
+fn tree_cluster_members_mut<'a>(
+    trees: &'a mut HashMap<String, TreePayload>,
+    cluster_id: &str,
+) -> Option<&'a mut [crate::vm::Vm]> {
+    for (tid, tree) in trees.iter_mut() {
+        let node_id = if cluster_id == tid.as_str() {
+            "root"
+        } else if let Some(rest) = cluster_id.strip_prefix(tid.as_str()) {
+            match rest.strip_prefix('-') {
+                Some(n) => n,
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        if let Some(members) = tree.live_cluster_members_mut(node_id) {
+            return Some(members);
+        }
+    }
+    None
 }
 
 impl Default for Daemon {
@@ -1257,12 +1586,14 @@ impl Daemon {
     #[must_use]
     pub fn with_pool(pool: Option<Pool>) -> Self {
         Self {
-            vms: Mutex::new(HashMap::new()),
+            vms: Arc::new(Mutex::new(HashMap::new())),
             bridges: Mutex::new(HashMap::new()),
-            trees: Mutex::new(HashMap::new()),
+            trees: Arc::new(Mutex::new(HashMap::new())),
             sandboxes: Mutex::new(HashMap::new()),
             pool,
             watchers: Mutex::new(Vec::new()),
+            auto_warps: Mutex::new(HashMap::new()),
+            auto_warp_holds: Arc::new(Mutex::new(HashMap::new())),
             counter: AtomicU64::new(0),
         }
     }
@@ -1338,9 +1669,28 @@ impl Daemon {
             Request::DeleteDataDisk { id } => self.delete_data_disk(&id),
             Request::LookupSandbox { sandbox_id } => self.lookup_sandbox(&sandbox_id),
             Request::ReattachSandbox { sandbox_id } => self.reattach_sandbox(&sandbox_id),
-            Request::ForkVm { vm_id, sandbox_id } => self.fork_vm(&vm_id, sandbox_id),
+            Request::ForkVm {
+                vm_id,
+                sandbox_id,
+                dilation,
+            } => match validate_fork_dilation(dilation) {
+                Ok(d) => self.fork_vm(&vm_id, sandbox_id, d),
+                Err(message) => Response::Error { message },
+            },
             Request::PauseVm { vm_id } => self.pause_vm(&vm_id),
             Request::ResumeVm { vm_id } => self.resume_vm(&vm_id),
+            Request::WarpClock {
+                cluster_id,
+                delta_ms,
+            } => self.warp_clock(&cluster_id, delta_ms),
+            Request::SetDilation { cluster_id, factor } => self.set_dilation(&cluster_id, factor),
+            Request::AutoWarp { cluster_id, mode } => self.auto_warp(&cluster_id, mode),
+            Request::AutoWarpStatus { cluster_id } => self.auto_warp_status(&cluster_id),
+            Request::AutoWarpHold {
+                cluster_id,
+                holder,
+                hold,
+            } => self.auto_warp_hold(&cluster_id, &holder, hold),
             Request::TreeCreate {
                 config,
                 budget,
@@ -1351,35 +1701,43 @@ impl Daemon {
                 config,
                 budget,
                 tree_id,
-            } => self.tree_create_cluster(vm_count, &config, budget, tree_id),
+                egress,
+            } => self.tree_create_cluster(vm_count, &config, budget, tree_id, egress),
             Request::TreeAdoptCluster {
                 vm_ids,
                 budget,
                 tree_id,
-            } => self.tree_adopt_cluster(&vm_ids, budget, tree_id),
+                egress,
+            } => self.tree_adopt_cluster(&vm_ids, budget, tree_id, egress),
             Request::TreeFork {
                 tree_id,
                 source_id,
                 label,
+                dilation,
             } => {
-                let resp = self.with_tree(&tree_id, |t| {
-                    let start = Instant::now();
-                    match t.fork(&source_id, &label) {
-                        Ok(node_id) => {
-                            let latency_ns =
-                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                            let guest_cids = t.node_cids(&node_id);
-                            let fork_memory_full_copy = t.node_fork_full_copy(&node_id);
-                            Response::TreeForked {
-                                node_id,
-                                guest_cids,
-                                fork_memory_full_copy,
-                                latency_ns,
+                let resp = match validate_fork_dilation(dilation) {
+                    Err(message) => Response::Error { message },
+                    Ok(d) => self.with_tree(&tree_id, |t| {
+                        let start = Instant::now();
+                        match t.fork(&source_id, &label, d) {
+                            Ok(node_id) => {
+                                let latency_ns =
+                                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                                let guest_cids = t.node_cids(&node_id);
+                                let fork_memory_full_copy = t.node_fork_full_copy(&node_id);
+                                let dilation = t.node_dilation(&node_id).unwrap_or(1);
+                                Response::TreeForked {
+                                    node_id,
+                                    guest_cids,
+                                    fork_memory_full_copy,
+                                    latency_ns,
+                                    dilation,
+                                }
                             }
+                            Err(message) => Response::Error { message },
                         }
-                        Err(message) => Response::Error { message },
-                    }
-                });
+                    }),
+                };
                 self.emit_from_response(&tree_id, &resp);
                 resp
             }
@@ -1387,27 +1745,32 @@ impl Daemon {
                 tree_id,
                 source_id,
                 labels,
+                dilation,
             } => {
-                let resp = self.with_tree(&tree_id, |t| {
-                    let start = Instant::now();
-                    match t.fork_batch(&source_id, &labels) {
-                        Ok(node_ids) => {
-                            let latency_ns =
-                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                            let forks = node_ids
-                                .into_iter()
-                                .map(|node_id| TreeForkedBranch {
-                                    guest_cids: t.node_cids(&node_id),
-                                    fork_memory_full_copy: t.node_fork_full_copy(&node_id),
-                                    node_id,
-                                    latency_ns,
-                                })
-                                .collect();
-                            Response::TreeForkBatch { forks, latency_ns }
+                let resp = match validate_fork_dilation(dilation) {
+                    Err(message) => Response::Error { message },
+                    Ok(d) => self.with_tree(&tree_id, |t| {
+                        let start = Instant::now();
+                        match t.fork_batch(&source_id, &labels, d) {
+                            Ok(node_ids) => {
+                                let latency_ns =
+                                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                                let forks = node_ids
+                                    .into_iter()
+                                    .map(|node_id| TreeForkedBranch {
+                                        guest_cids: t.node_cids(&node_id),
+                                        fork_memory_full_copy: t.node_fork_full_copy(&node_id),
+                                        dilation: t.node_dilation(&node_id).unwrap_or(1),
+                                        node_id,
+                                        latency_ns,
+                                    })
+                                    .collect();
+                                Response::TreeForkBatch { forks, latency_ns }
+                            }
+                            Err(message) => Response::Error { message },
                         }
-                        Err(message) => Response::Error { message },
-                    }
-                });
+                    }),
+                };
                 self.emit_from_response(&tree_id, &resp);
                 resp
             }
@@ -1415,14 +1778,16 @@ impl Daemon {
                 let resp = self.with_tree(&tree_id, |t| {
                     let start = Instant::now();
                     match t.prepare_fork_source(&node_id) {
-                        Ok(wrote_base) => {
+                        Ok(outcome) => {
                             let latency_ns =
                                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                             Response::TreePrepared {
                                 guest_cids: t.node_cids(&node_id),
                                 latency_ns,
                                 node_id: node_id.clone(),
-                                wrote_base,
+                                wrote_base: outcome.wrote_base,
+                                wrote_base_incremental: outcome.incremental,
+                                base_disk_bytes: outcome.disk_bytes,
                             }
                         }
                         Err(message) => Response::Error { message },
@@ -1454,11 +1819,13 @@ impl Daemon {
                         Ok(node_id) => {
                             let latency_ns =
                                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            let dilation = t.node_dilation(&node_id).unwrap_or(1);
                             Response::TreeForked {
                                 guest_cids: t.node_cids(&node_id),
                                 fork_memory_full_copy: t.node_fork_full_copy(&node_id),
                                 node_id,
                                 latency_ns,
+                                dilation,
                             }
                         }
                         Err(message) => Response::Error { message },
@@ -1537,6 +1904,17 @@ impl Daemon {
             Request::TreeWatch { tree_id } => self.watch_snapshot(tree_id.as_deref()),
             Request::TreeDrop { tree_id } => self.tree_drop(&tree_id),
             Request::PoolStatus => self.pool_status(),
+            Request::Doctor => {
+                let report = crate::doctor::run();
+                Response::Doctor {
+                    kvm: report.kvm(),
+                    vhost_vsock: report.vhost_vsock(),
+                    tun: report.tun(),
+                    cgroup_v2: report.cgroup_v2(),
+                    ok: report.ok(),
+                    details: report.lines(),
+                }
+            }
         }
     }
 
@@ -1747,6 +2125,9 @@ impl Daemon {
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .vsock(config.vsock);
+        if let Some(n) = config.dilation {
+            builder = builder.dilation(n);
+        }
         if let Some(ref initrd) = artifacts.initrd {
             builder = builder.initrd(initrd);
         }
@@ -2022,7 +2403,12 @@ impl Daemon {
     /// source's vsock CID is preserved across prepare
     /// and echoed back as `source_guest_cid`.
     #[allow(clippy::too_many_lines)]
-    fn fork_vm(&self, vm_id: &str, fork_sandbox_id: Option<String>) -> Response {
+    fn fork_vm(
+        &self,
+        vm_id: &str,
+        fork_sandbox_id: Option<String>,
+        dilation: Option<u32>,
+    ) -> Response {
         let fork_id = self.mint_vm_id();
 
         let mut vms = self.vms.lock().unwrap();
@@ -2075,8 +2461,8 @@ impl Daemon {
                     entry.guest_cid
                 );
             }
-            let mut fork = match entry.vm.fork_warm(&fork_id) {
-                Ok(fork) => fork,
+            let mut fork = match entry.vm.fork_warm_batch(&[&fork_id], dilation) {
+                Ok(mut forks) => forks.pop().expect("single fork"),
                 Err(e) => {
                     return Response::Error {
                         message: format!("fork_warm({vm_id}): {e}"),
@@ -2114,6 +2500,7 @@ impl Daemon {
         };
         let guest_cid = fork.guest_cid();
         let vcpus = fork.vcpu_count();
+        let dilation = fork.dilation();
         vms.insert(
             fork_id.clone(),
             VmEntry {
@@ -2167,6 +2554,7 @@ impl Daemon {
             vm_id: fork_id,
             guest_cid,
             source_guest_cid,
+            dilation,
         }
     }
 
@@ -2206,27 +2594,410 @@ impl Daemon {
                 message: format!("resume({vm_id}): {e}"),
             };
         }
-        if let Some(cg) = &entry.cpu_cgroup {
-            let Some(tids) = entry.vm.vcpu_kernel_tids(Duration::from_secs(5)) else {
-                return Response::Error {
-                    message: format!(
-                        "resume({vm_id}): vCPU threads never published kernel TIDs — \
-                         cannot re-apply the CPU cap"
-                    ),
-                };
-            };
-            for tid in tids {
-                if let Err(e) = cg.add_thread(tid) {
-                    return Response::Error {
-                        message: format!(
-                            "resume({vm_id}): re-attach vCPU TID {tid} to CPU cgroup: {e}"
-                        ),
-                    };
-                }
-            }
+        if let Err(message) = Self::reattach_cpu_cgroup(entry, "resume", vm_id) {
+            return Response::Error { message };
         }
         log::info!("resumed {vm_id} (guest_cid={})", entry.guest_cid);
         Response::Ok
+    }
+
+    /// Put a resumed VM's **fresh** vCPU threads back into its CPU
+    /// cgroup. Every path that stops and restarts the run loop owes the
+    /// pod its CFS cap; `op` names the caller for the error message.
+    fn reattach_cpu_cgroup(entry: &VmEntry, op: &str, vm_id: &str) -> Result<(), String> {
+        let Some(cg) = &entry.cpu_cgroup else {
+            return Ok(());
+        };
+        let Some(tids) = entry.vm.vcpu_kernel_tids(Duration::from_secs(5)) else {
+            return Err(format!(
+                "{op}({vm_id}): vCPU threads never published kernel TIDs — \
+                 cannot re-apply the CPU cap"
+            ));
+        };
+        for tid in tids {
+            cg.add_thread(tid).map_err(|e| {
+                format!("{op}({vm_id}): re-attach vCPU TID {tid} to CPU cgroup: {e}")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Advance every VM on `cluster_id`'s guest clock by `delta_ms`,
+    /// atomically under pause .
+    ///
+    /// The registry lock is held across the whole cycle, so no VM on the
+    /// cluster can be stopped, forked or paused mid-warp.
+    fn warp_clock(&self, cluster_id: &str, delta_ms: u64) -> Response {
+        if delta_ms == 0 {
+            return Response::Error {
+                message: format!(
+                    "warp_clock({cluster_id}): delta_ms must be > 0 — a warp is \
+                     forward-only and never a silent no-op"
+                ),
+            };
+        }
+        let mut vms = self.vms.lock().unwrap();
+        let mut members: Vec<(&String, &mut VmEntry)> = vms
+            .iter_mut()
+            .filter(|(_, e)| e.cluster_id.as_deref() == Some(cluster_id))
+            .collect();
+        if members.is_empty() {
+            return Response::Error {
+                message: format!("warp_clock: no VM on cluster {cluster_id}"),
+            };
+        }
+        // `vm_index` order, so the reply reads like the cluster does.
+        members.sort_by(|a, b| (a.1.vm_index, a.0).cmp(&(b.1.vm_index, b.0)));
+        let vm_ids: Vec<String> = members.iter().map(|(id, _)| (*id).clone()).collect();
+
+        let mut targets: Vec<&mut crate::vm::Vm> =
+            members.iter_mut().map(|(_, e)| &mut e.vm).collect();
+        let latency =
+            match crate::vm::warp_clock_lockstep(&mut targets, Duration::from_millis(delta_ms)) {
+                Ok(latency) => latency,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("warp_clock({cluster_id}, +{delta_ms}ms): {e}"),
+                    }
+                }
+            };
+        drop(targets);
+
+        // Resumed VMs run on fresh vCPU threads; a CFS-capped member
+        // loses its cap unless they rejoin its cgroup.
+        for (vm_id, entry) in &members {
+            if let Err(message) = Self::reattach_cpu_cgroup(entry, "warp_clock", vm_id) {
+                return Response::Error { message };
+            }
+        }
+        log::info!(
+            "warped cluster {cluster_id} by {delta_ms}ms across {} VMs in {latency:?}",
+            vm_ids.len()
+        );
+        Response::Warped {
+            cluster_id: cluster_id.to_string(),
+            vm_ids,
+            delta_ms,
+            latency_ns: u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Change the dilation factor of every VM on `cluster_id`, atomically
+    /// under pause .
+    ///
+    /// Members come from the `CreateVm` registry *or* from the cluster
+    /// tree: `tree_create_cluster` / `tree_fork_batch` own their VMs
+    /// inside `ClusterSnapshotTree::live`, and a gym child that only
+    /// looked at the registry would report "no VM on cluster"
+    /// (CHALLENGES #193). Whichever lock the members live under is held
+    /// across the whole cycle, so nothing can stop or fork them mid-set.
+    fn set_dilation(&self, cluster_id: &str, factor: u32) -> Response {
+        if factor == 0 || factor > crate::vm::MAX_DILATION {
+            return Response::Error {
+                message: format!(
+                    "set_dilation({cluster_id}): factor {factor} is outside 1..={} — \
+                     the hardware TSC multiplier bounds it and the kernel never clamps",
+                    crate::vm::MAX_DILATION
+                ),
+            };
+        }
+
+        let mut vms = self.vms.lock().unwrap();
+        let mut members: Vec<(&String, &mut VmEntry)> = vms
+            .iter_mut()
+            .filter(|(_, e)| e.cluster_id.as_deref() == Some(cluster_id))
+            .collect();
+        if members.is_empty() {
+            drop(vms);
+            let mut trees = self.trees.lock().unwrap();
+            let Some(tree_members) = tree_cluster_members_mut(&mut trees, cluster_id) else {
+                return Response::Error {
+                    message: format!("set_dilation: no VM on cluster {cluster_id}"),
+                };
+            };
+            // Tree-owned VMs have no registry id, so they are reported
+            // positionally rather than under a name nothing can look up.
+            let vm_ids: Vec<String> = (0..tree_members.len())
+                .map(|i| format!("{cluster_id}#{i}"))
+                .collect();
+            let mut targets: Vec<&mut Vm> = tree_members.iter_mut().collect();
+            return match crate::vm::set_dilation_lockstep(&mut targets, factor) {
+                // Tree members have no CreateVm CFS cgroup to reattach.
+                Ok(latency) => Self::dilation_set(cluster_id, vm_ids, factor, latency),
+                Err(e) => Response::Error {
+                    message: format!("set_dilation({cluster_id}, x{factor}): {e}"),
+                },
+            };
+        }
+        // `vm_index` order, so the reply reads like the cluster does.
+        members.sort_by(|a, b| (a.1.vm_index, a.0).cmp(&(b.1.vm_index, b.0)));
+        let vm_ids: Vec<String> = members.iter().map(|(id, _)| (*id).clone()).collect();
+
+        let mut targets: Vec<&mut crate::vm::Vm> =
+            members.iter_mut().map(|(_, e)| &mut e.vm).collect();
+        let latency = match crate::vm::set_dilation_lockstep(&mut targets, factor) {
+            Ok(latency) => latency,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("set_dilation({cluster_id}, x{factor}): {e}"),
+                }
+            }
+        };
+        drop(targets);
+
+        // Resumed VMs run on fresh vCPU threads; a CFS-capped member
+        // loses its cap unless they rejoin its cgroup.
+        for (vm_id, entry) in &members {
+            if let Err(message) = Self::reattach_cpu_cgroup(entry, "set_dilation", vm_id) {
+                return Response::Error { message };
+            }
+        }
+        Self::dilation_set(cluster_id, vm_ids, factor, latency)
+    }
+
+    fn dilation_set(
+        cluster_id: &str,
+        vm_ids: Vec<String>,
+        factor: u32,
+        latency: Duration,
+    ) -> Response {
+        log::info!(
+            "set cluster {cluster_id} to dilation x{factor} across {} VMs in {latency:?}",
+            vm_ids.len()
+        );
+        Response::DilationSet {
+            cluster_id: cluster_id.to_string(),
+            vm_ids,
+            factor,
+            latency_ns: u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Start, switch or stop `cluster_id`'s auto-warp policy loop
+    /// .
+    ///
+    /// A mode change always stops the loop in flight first, and stopping
+    /// joins it: a cycle owns the registry lock and may have the whole
+    /// cluster paused, so returning early would let the next op race a
+    /// pause the loop still owns.
+    fn auto_warp(&self, cluster_id: &str, mode: crate::autowarp::AutoWarpMode) -> Response {
+        use crate::autowarp::{AutoWarpMode, Driver};
+
+        let mut loops = self.auto_warps.lock().unwrap();
+        if let Some(running) = loops.get_mut(cluster_id) {
+            running.stop();
+            log::info!("auto-warp: stopped the policy loop on cluster {cluster_id}");
+        }
+        if mode == AutoWarpMode::Off {
+            // The counters of the run that just ended are the reply:
+            // `off` is how a caller collects its accounting.
+            let stats = loops
+                .get(cluster_id)
+                .map(|l| l.counters.snapshot())
+                .unwrap_or_default();
+            return Response::AutoWarp {
+                cluster_id: cluster_id.to_string(),
+                mode: AutoWarpMode::Off,
+                holders: self.auto_warp_holders(cluster_id),
+                stats,
+            };
+        }
+        // A loop on a cluster with no VM would spin on `no_members`
+        // counters forever and look like a working policy.
+        // CreateVm members live in `vms`; gym / tree_create_cluster
+        // children live in `trees` under `{tree_id}-{node_id}`.
+        let in_registry = self
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .any(|e| e.cluster_id.as_deref() == Some(cluster_id));
+        let in_tree = {
+            let mut trees = self.trees.lock().unwrap();
+            tree_cluster_members_mut(&mut trees, cluster_id).is_some()
+        };
+        if !in_registry && !in_tree {
+            return Response::Error {
+                message: format!("auto_warp: no VM on cluster {cluster_id}"),
+            };
+        }
+
+        let mut driver = Driver::new(mode);
+        let counters = driver.counters();
+        let stop = Arc::new(AtomicBool::new(false));
+        let vms = Arc::clone(&self.vms);
+        let trees = Arc::clone(&self.trees);
+        let holds = Arc::clone(&self.auto_warp_holds);
+        let cluster = cluster_id.to_string();
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name(format!("k7d-autowarp-{cluster_id}"))
+                .spawn(move || {
+                    Self::auto_warp_loop(&vms, &trees, &holds, &cluster, &mut driver, &stop);
+                })
+        };
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("auto_warp({cluster_id}): spawning the policy loop: {e}"),
+                }
+            }
+        };
+        log::info!("auto-warp: {} mode on cluster {cluster_id}", mode.as_str());
+        loops.insert(
+            cluster_id.to_string(),
+            AutoWarpLoop {
+                mode,
+                stop,
+                counters: Arc::clone(&counters),
+                thread: Some(thread),
+            },
+        );
+        Response::AutoWarp {
+            cluster_id: cluster_id.to_string(),
+            mode,
+            holders: self.auto_warp_holders(cluster_id),
+            stats: counters.snapshot(),
+        }
+    }
+
+    /// The policy loop body. One cycle per iteration, each holding the
+    /// VM registry for its whole duration.
+    fn auto_warp_loop(
+        vms: &Mutex<HashMap<String, VmEntry>>,
+        trees: &Mutex<HashMap<String, TreePayload>>,
+        holds: &Mutex<HashMap<String, BTreeSet<String>>>,
+        cluster_id: &str,
+        driver: &mut crate::autowarp::Driver,
+        stop: &AtomicBool,
+    ) {
+        while !stop.load(Ordering::SeqCst) {
+            // Read the hold before taking the registry: a caller must be
+            // able to take one while a cycle is in flight, and the cycle
+            // it lands too late for is bounded by one cadence.
+            let in_flight = holds
+                .lock()
+                .unwrap()
+                .get(cluster_id)
+                .filter(|h| !h.is_empty())
+                .map(|h| {
+                    format!(
+                        "held by {} against cluster {cluster_id}",
+                        h.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                });
+
+            let cycle = {
+                let mut registry = vms.lock().unwrap();
+                let mut members: Vec<&mut VmEntry> = registry
+                    .values_mut()
+                    .filter(|e| e.cluster_id.as_deref() == Some(cluster_id))
+                    .collect();
+                if members.is_empty() {
+                    drop(registry);
+                    let mut trees = trees.lock().unwrap();
+                    let Some(members) = tree_cluster_members_mut(&mut trees, cluster_id) else {
+                        log::info!(
+                            "auto-warp: cluster {cluster_id} has no live VM left — stopping its loop"
+                        );
+                        break;
+                    };
+                    let mut targets: Vec<&mut Vm> = members.iter_mut().collect();
+                    driver.cycle(&mut targets, in_flight.as_deref())
+                } else {
+                    members.sort_by_key(|e| e.vm_index);
+                    let mut targets: Vec<&mut Vm> = members.iter_mut().map(|e| &mut e.vm).collect();
+                    let cycle = driver.cycle(&mut targets, in_flight.as_deref());
+                    drop(targets);
+                    // A resumed VM runs on fresh vCPU threads, and a
+                    // CFS-capped member loses its cap unless they rejoin
+                    // its cgroup — the same invariant `warp_clock` holds.
+                    if cycle.paused() {
+                        for entry in &members {
+                            if let Err(message) =
+                                Self::reattach_cpu_cgroup(entry, "auto_warp", cluster_id)
+                            {
+                                log::error!("auto-warp: {message}");
+                            }
+                        }
+                    }
+                    cycle
+                }
+            };
+            if let crate::autowarp::Cycle::Declined(d) = &cycle {
+                log::trace!("auto-warp({cluster_id}) declined: {}", d.detail);
+            }
+            driver.pace(&cycle);
+        }
+        log::info!(
+            "auto-warp: cluster {cluster_id} loop exiting; {:?}",
+            driver.stats()
+        );
+    }
+
+    /// Read one cluster's auto-warp mode, holds and counters.
+    fn auto_warp_status(&self, cluster_id: &str) -> Response {
+        let loops = self.auto_warps.lock().unwrap();
+        let (mode, stats) = loops.get(cluster_id).map_or_else(
+            || {
+                (
+                    crate::autowarp::AutoWarpMode::Off,
+                    crate::autowarp::AutoWarpStats::default(),
+                )
+            },
+            |l| (l.mode, l.counters.snapshot()),
+        );
+        Response::AutoWarp {
+            cluster_id: cluster_id.to_string(),
+            mode,
+            holders: self.auto_warp_holders(cluster_id),
+            stats,
+        }
+    }
+
+    /// Take or release the fifth safety check's hold.
+    fn auto_warp_hold(&self, cluster_id: &str, holder: &str, hold: bool) -> Response {
+        if holder.is_empty() {
+            return Response::Error {
+                message: "auto_warp_hold: an anonymous hold cannot be attributed when it \
+                          leaks — name the holder"
+                    .to_string(),
+            };
+        }
+        {
+            let mut holds = self.auto_warp_holds.lock().unwrap();
+            let taken = holds.entry(cluster_id.to_string()).or_default();
+            if hold {
+                if !taken.insert(holder.to_string()) {
+                    return Response::Error {
+                        message: format!(
+                            "auto_warp_hold: {holder} already holds cluster {cluster_id} — \
+                             a double take means one release will free it too early"
+                        ),
+                    };
+                }
+            } else if !taken.remove(holder) {
+                return Response::Error {
+                    message: format!(
+                        "auto_warp_hold: {holder} does not hold cluster {cluster_id} — \
+                         releasing a hold nobody took would unblock somebody else's warp"
+                    ),
+                };
+            }
+        }
+        self.auto_warp_status(cluster_id)
+    }
+
+    /// Current holders of `cluster_id`, in name order.
+    fn auto_warp_holders(&self, cluster_id: &str) -> Vec<String> {
+        self.auto_warp_holds
+            .lock()
+            .unwrap()
+            .get(cluster_id)
+            .map(|h| h.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Resolve kernel + optional initrd for a `CreateVm` / tree member.
@@ -2289,6 +3060,9 @@ impl Daemon {
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
             .vsock(config.vsock);
+        if let Some(n) = config.dilation {
+            builder = builder.dilation(n);
+        }
         if let Some(ref initrd) = artifacts.initrd {
             builder = builder.initrd(initrd);
         }
@@ -2448,7 +3222,15 @@ impl Daemon {
         vm_ids: &[String],
         budget: Option<TreeBudget>,
         tree_id: Option<String>,
+        egress: Option<crate::netjail::EgressPolicy>,
     ) -> Response {
+        if let Some(ref policy) = egress {
+            if let Err(e) = policy.validate() {
+                return Response::Error {
+                    message: format!("tree_adopt_cluster: {e}"),
+                };
+            }
+        }
         if vm_ids.is_empty() {
             return Response::Error {
                 message: "tree_adopt_cluster: vm_ids must be non-empty".to_string(),
@@ -2625,6 +3407,30 @@ impl Daemon {
             }
         };
 
+        // Apply the requested egress posture before anything becomes
+        // irreversible : sandbox bridges are born Open, and
+        // an adopt into a contained tree re-installs the jail ruleset
+        // atomically. On failure everything goes back where it was.
+        let mut bridge = bridge;
+        if let Some(policy) = egress {
+            if let Err(e) = bridge.set_egress(policy) {
+                let refcount = indexed.len();
+                self.bridges.lock().unwrap().insert(
+                    cluster_id.clone(),
+                    BridgeEntry {
+                        net: bridge,
+                        refcount,
+                    },
+                );
+                let back: Vec<(String, VmEntry)> =
+                    indexed.into_iter().map(|(_, id, e)| (id, e)).collect();
+                put_back(back);
+                return Response::Error {
+                    message: format!("tree_adopt_cluster: set_egress: {e}"),
+                };
+            }
+        }
+
         // Drop sandbox index + on-disk records: these VMs are no longer
         // reattachable as sandboxes (they're tree members).
         // StopVm on pod teardown then sees "no such VM", which the shim
@@ -2706,6 +3512,7 @@ impl Daemon {
         config: &VmConfig,
         budget: Option<TreeBudget>,
         tree_id: Option<String>,
+        egress: Option<crate::netjail::EgressPolicy>,
     ) -> Response {
         type BuiltCluster = (ClusterPayload, Vec<crate::api::AgentClient>);
         if vm_count == 0 {
@@ -2730,8 +3537,9 @@ impl Daemon {
         // TAPs, vCPUs) — no partial cluster leaks. The agent clients
         // stay open until after new_cluster's snapshots (see
         // boot_tree_member).
+        let egress = egress.unwrap_or_default();
         let build = || -> Result<BuiltCluster, String> {
-            let mut net = ClusterNetwork::create(&tree_id)
+            let mut net = ClusterNetwork::create_with_egress(&tree_id, egress.clone())
                 .map_err(|e| format!("ClusterNetwork::create({tree_id}): {e}"))?;
             let mut members = Vec::with_capacity(vm_count as usize);
             let mut agents = Vec::with_capacity(vm_count as usize);
@@ -3164,6 +3972,13 @@ impl Daemon {
         if let Some(ref pool) = self.pool {
             log::info!("shutdown: tearing down warm pool");
             pool.shutdown();
+        }
+        // Auto-warp loops next, and joined: a cycle in flight holds the
+        // registry lock with its cluster paused, so draining VMs under
+        // it would tear down a VM this daemon has stopped mid-pause.
+        for (cluster_id, mut policy) in self.auto_warps.lock().unwrap().drain() {
+            log::info!("shutdown: stopping the auto-warp loop on {cluster_id}");
+            policy.stop();
         }
         let drained: Vec<(String, VmEntry)> = self.vms.lock().unwrap().drain().collect();
         for (vm_id, entry) in drained {

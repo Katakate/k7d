@@ -19,6 +19,8 @@ pub mod tree_model;
 #[cfg(not(feature = "verif"))]
 pub mod api;
 #[cfg(not(feature = "verif"))]
+pub mod autowarp;
+#[cfg(not(feature = "verif"))]
 pub mod block;
 #[cfg(not(feature = "verif"))]
 pub mod cgroup;
@@ -31,7 +33,11 @@ pub mod control;
 #[cfg(not(feature = "verif"))]
 pub mod devices;
 #[cfg(not(feature = "verif"))]
+pub mod dilation;
+#[cfg(not(feature = "verif"))]
 pub mod disks;
+#[cfg(not(feature = "verif"))]
+pub mod doctor;
 #[cfg(not(feature = "verif"))]
 pub mod erofs;
 #[cfg(not(feature = "verif"))]
@@ -50,6 +56,8 @@ pub mod netns;
 pub mod network;
 #[cfg(not(feature = "verif"))]
 pub mod pool;
+#[cfg(not(feature = "verif"))]
+pub mod quickstart;
 #[cfg(not(feature = "verif"))]
 pub mod seccomp;
 #[cfg(not(feature = "verif"))]

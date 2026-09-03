@@ -78,18 +78,28 @@ class App:
         self._last_sig: tuple | None = None
 
     def _ingest_probe(self, items: list[dict[str, Any]]) -> None:
-        return
+        events: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                events.append(self.store.ingest(item))
+            except ValueError:
+                continue
+        if events:
+            self.emit(events)
 
     def _view_sig(self) -> tuple:
         parts: list[Any] = [self.store._seq, (self.store.run or {}).get("phase"), self.store.connected]
         for tid, slot in sorted(self.store.trees.items()):
             usage = slot.get("usage") or {}
+            clock = slot.get("guest_clock") or {}
             parts.append(
                 (
                     tid,
                     usage.get("live_vm_count"),
                     usage.get("disk_bytes"),
                     usage.get("live_ram_bytes"),
+                    clock.get("uptime_s"),
+                    tuple(sorted((slot.get("live_dilation") or {}).items())),
                 )
             )
             for nid, n in sorted((slot.get("nodes") or {}).items()):
@@ -125,6 +135,7 @@ class App:
                         usage=resp.get("usage") or t.get("usage"),
                         budget=resp.get("budget") or t.get("budget"),
                         live_guest_cids=resp.get("live_guest_cids"),
+                        live_dilation=resp.get("live_dilation"),
                     )
                 )
             for tid in list(self.store.trees):

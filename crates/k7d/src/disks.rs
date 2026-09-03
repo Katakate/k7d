@@ -25,6 +25,17 @@ pub const DISKS_DIR: &str = "/var/lib/k7d/disks";
 /// Default backing image for the loopback XFS behind [`DISKS_DIR`].
 pub const DISKS_IMAGE: &str = "/var/lib/k7d/disks.img";
 
+/// Where snapshot trees live on the reflink XFS: a subdirectory of
+/// [`DISKS_DIR`], so an incremental keyframe's `FICLONE` of its
+/// ancestor's `memory.bin` has source and destination on one
+/// reflink-capable filesystem . The node's root FS is ext4
+/// and cannot clone at all.
+pub const TREES_SUBDIR: &str = "trees";
+
+/// The conventional tree root the daemon and every test path use.
+/// [`ensure_reflink_tree_root`] makes this a symlink onto the XFS.
+pub const TREES_LINK: &str = "/var/lib/k7d/trees";
+
 /// Default size of the sparse XFS backing image: 96 GiB. Sparse — real
 /// disk usage grows with actual volume writes only.
 ///
@@ -578,6 +589,94 @@ pub fn ensure_loopback_xfs(
     );
     assert_reflink_capable(mount_point)?;
     grow_loopback_to(image, mount_point, size_bytes)
+}
+
+/// Put the snapshot-tree root on the reflink XFS .
+///
+/// Ensures the loopback XFS behind [`DISKS_DIR`] is mounted, creates
+/// `<DISKS_DIR>/trees` on it, and points [`TREES_LINK`] at that
+/// directory so every existing `/var/lib/k7d/trees/...` path lands on a
+/// filesystem where `FICLONE` works. Returns the directory trees
+/// actually live in.
+///
+/// Idempotent, and never moves data behind the operator's back: an
+/// existing **non-empty** real directory at [`TREES_LINK`] is left
+/// exactly where it is, with a loud warning — those trees keep working
+/// on ext4, they just pay a full dump per keyframe. An empty one is
+/// replaced by the symlink.
+///
+/// The node-reset script does the same provisioning before the daemon
+/// ever starts (`your node provisioning`); this is the
+/// programmatic equivalent for the daemon and the integration tests.
+pub fn ensure_reflink_tree_root() -> Result<PathBuf, DiskError> {
+    ensure_loopback_xfs(
+        Path::new(DISKS_IMAGE),
+        Path::new(DISKS_DIR),
+        DISKS_IMAGE_SIZE,
+    )?;
+    let target = Path::new(DISKS_DIR).join(TREES_SUBDIR);
+    std::fs::create_dir_all(&target).map_err(|e| io_err(&target, e))?;
+
+    let link = Path::new(TREES_LINK);
+    match std::fs::symlink_metadata(link) {
+        // Already a symlink: accept it if it points at the XFS, replace
+        // it if it points somewhere stale.
+        Ok(md) if md.file_type().is_symlink() => {
+            let current = std::fs::read_link(link).map_err(|e| io_err(link, e))?;
+            if current != target {
+                std::fs::remove_file(link).map_err(|e| io_err(link, e))?;
+                std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
+                log::info!(
+                    "disks: repointed {} from {} to the reflink XFS at {}",
+                    link.display(),
+                    current.display(),
+                    target.display()
+                );
+            }
+        }
+        Ok(_) => {
+            let empty = std::fs::read_dir(link)
+                .map_err(|e| io_err(link, e))?
+                .next()
+                .is_none();
+            if empty {
+                std::fs::remove_dir(link).map_err(|e| io_err(link, e))?;
+                std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
+                log::info!(
+                    "disks: moved the empty tree root {} onto the reflink XFS at {}",
+                    link.display(),
+                    target.display()
+                );
+            } else {
+                log::warn!(
+                    "disks: {} is a non-empty directory on {}, not the reflink XFS — \
+                     leaving it alone, but every snapshot-tree keyframe there costs a \
+                     FULL guest-RAM dump instead of O(divergence) . Move or \
+                     remove it and re-run `your node provisioning`.",
+                    link.display(),
+                    DISKS_DIR
+                );
+                return Ok(link.to_path_buf());
+            }
+        }
+        Err(_) => {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+            }
+            std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
+            log::info!(
+                "disks: tree root {} -> reflink XFS {}",
+                link.display(),
+                target.display()
+            );
+        }
+    }
+    assert_reflink_capable(&target)?;
+    log::info!(
+        "disks: snapshot-tree root {} is reflink-capable — incremental keyframes on",
+        target.display()
+    );
+    Ok(target)
 }
 
 /// Grow the loopback XFS at `mount_point` to `size_bytes` when its

@@ -1,0 +1,10 @@
+# KubeRay operator v1.7.0 (2026-08-20). Test helper fetches the Helm
+# chart tarball and refuses to template if the sha256 mismatches.
+# Operator image rewritten to digest. Operand is digest-pinned busybox
+# (not the multi-GB rayproject/ray image — this is the control plane
+# on mocks, not CUDA / not Ray Train).
+KUBERAY_VERSION=1.7.0
+CHART_URL=https://github.com/ray-project/kuberay-helm/releases/download/kuberay-operator-1.7.0/kuberay-operator-1.7.0.tgz
+CHART_SHA256=1a2a8087da487f9ff5c82f1a2bb227b2aff0acfd8d9a9249514db3daf61d0334
+IMAGE=quay.io/kuberay/operator:v1.7.0@sha256:4a779237ef1c5262a63840ccf42d0d67f0b74e911158fbcaee4478fb1560bce6
+OPERAND=docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662

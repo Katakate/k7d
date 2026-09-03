@@ -1,0 +1,54 @@
+# CPU-head RayCluster + one GPU-requesting worker on the 31a-inc1
+# fake nvidia.com/gpu fixture . Not CUDA, not Ray Train.
+#
+# KubeRay injects `ray start` and a wait-gcs-ready init container
+# unless we opt out: cluster annotation ray.io/overwrite-container-cmd
+# plus operator ENABLE_INIT_CONTAINER_INJECTION=false /
+# ENABLE_PROBES_INJECTION=false (CHALLENGES #157).
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: gpu-raycluster
+  namespace: default
+  annotations:
+    ray.io/overwrite-container-cmd: "true"
+spec:
+  rayVersion: "2.47.1"
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+            imagePullPolicy: IfNotPresent
+            command: ["sleep", "86400"]
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "64Mi"
+              limits:
+                cpu: "200m"
+                memory: "128Mi"
+  workerGroupSpecs:
+    - groupName: gpu-group
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+              imagePullPolicy: IfNotPresent
+              command: ["sleep", "86400"]
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"
+                  nvidia.com/gpu: "1"

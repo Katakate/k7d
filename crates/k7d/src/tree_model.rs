@@ -37,7 +37,8 @@
 //!   [`lru_live_victim`], [`subtree_isolated`],
 //!   [`lru_evictable_leaf_subtree`], [`auto_evict_ram`].
 //! - The pure half of the K7DL delta codec: [`k7dl_header_bytes`],
-//!   [`k7dl_parse_header`], [`k7dl_encode_entry`], [`k7dl_parse_entry`].
+//!   [`k7dl_parse_header`], [`k7dl_encode_entry`], [`k7dl_parse_entry`],
+//!   [`k7dl_base_identity_ok`].
 //! - The latency-budget model [`fork_warm_budget_ns`] (Group F).
 //!
 //! ## What does NOT live here (kept in `tree.rs` / `cluster_tree.rs`)
@@ -769,10 +770,19 @@ pub fn fork_warm_budget_ns(dirty_pages: u64) -> u64 {
 pub const K7DL_MAGIC: &[u8; 4] = b"K7DL";
 
 /// On-disk format version of a K7DL delta.
+///
+/// the referenced work spends the header's trailing `reserved` u64 on the **base
+/// identity** of the `memory.bin` the pack is a diff against
+/// (CHALLENGES #144) and does *not* bump this. That field was always
+/// written as zero and never read, so a pre-30b pack decodes as
+/// identity 0 -- which [`k7dl_base_identity_ok`] reads as "unknown",
+/// exactly right -- and a 30b pack still parses on an older binary.
+/// Bumping the version would have bought nothing and cost the Group E
+/// round-trip proof.
 pub const K7DL_VERSION: u32 = 1;
 
 /// Size in bytes of the K7DL header: `magic(4)` + `version(4)` +
-/// `page_count(4)` + `mem_size(8)` + `reserved(8)`.
+/// `page_count(4)` + `mem_size(8)` + `base_identity(8)`.
 pub const K7DL_HEADER_SIZE: usize = 4 + 4 + 4 + 8 + 8;
 
 /// Size in bytes of a single K7DL entry: `page_index(4)` + `page(4096)`.
@@ -836,10 +846,9 @@ impl DeltaError {
     }
 }
 
-/// Encode a K7DL header to its 28-byte little-endian wire form.
-///
-/// The reserved field is always zero. This is the inverse of
-/// [`k7dl_parse_header`].
+/// Encode a K7DL header to its 28-byte little-endian wire form, with a
+/// zero base identity. Inverse of [`k7dl_parse_header`]; stamp the
+/// identity on with [`k7dl_set_base_identity`].
 ///
 /// Verified: `k7dl_header_roundtrip_rust` in
 /// `verif/Verif/Equiv/Transfer.lean` (Group E, on the Aeneas
@@ -852,11 +861,65 @@ pub fn k7dl_header_bytes(page_count: u32, mem_size: u64) -> [u8; K7DL_HEADER_SIZ
     out[4..8].copy_from_slice(&K7DL_VERSION.to_le_bytes());
     out[8..12].copy_from_slice(&page_count.to_le_bytes());
     out[12..20].copy_from_slice(&mem_size.to_le_bytes());
-    // out[20..28] is the reserved u64; already zero.
     out
 }
 
-/// Decode a 28-byte K7DL header. Returns `(page_count, mem_size)` on success.
+/// Stamp `base_identity` into a header's trailing u64 — the generation
+/// of the `memory.bin` this pack is a diff against (the referenced work /
+/// CHALLENGES #144). 0 means "unknown".
+///
+/// Verified: `k7dl_base_identity_roundtrip_rust` in
+/// `verif/Verif/Equiv/Transfer.lean` (Group E) — stamping then reading
+/// returns the identity, and stamping leaves `page_count` / `mem_size`
+/// exactly as [`k7dl_parse_header`] saw them.
+#[must_use]
+pub fn k7dl_set_base_identity(
+    mut header: [u8; K7DL_HEADER_SIZE],
+    base_identity: u64,
+) -> [u8; K7DL_HEADER_SIZE] {
+    header[20..28].copy_from_slice(&base_identity.to_le_bytes());
+    header
+}
+
+/// Read the base identity out of a K7DL header. A pre-30b pack wrote
+/// zeros there, so it reads back as "unknown".
+///
+/// Verified: `k7dl_base_identity_roundtrip_rust` in
+/// `verif/Verif/Equiv/Transfer.lean` (Group E).
+#[must_use]
+pub fn k7dl_base_identity(header: &[u8; K7DL_HEADER_SIZE]) -> u64 {
+    u64::from_le_bytes([
+        header[20], header[21], header[22], header[23], header[24], header[25], header[26],
+        header[27],
+    ])
+}
+
+/// May a pack minted against `pack_identity` be applied onto a base
+/// whose identity is `base_identity`?
+///
+/// A zero on either side is "unknown, not mismatched": packs and
+/// `tree.json` files written before the referenced work carry no identity, and
+/// refusing them would turn a format bump into data loss. Two *known*
+/// identities that differ are the #144 skew — the caller must fail
+/// loud rather than apply a pack onto a base generation it never saw.
+///
+/// Verified: `k7dl_base_identity_ok_rust` in
+/// `verif/Verif/Equiv/Transfer.lean` (Group E).
+#[must_use]
+pub fn k7dl_base_identity_ok(pack_identity: u64, base_identity: u64) -> bool {
+    if pack_identity == 0 {
+        return true;
+    }
+    if base_identity == 0 {
+        return true;
+    }
+    pack_identity == base_identity
+}
+
+/// Decode a 28-byte K7DL header into `(page_count, mem_size)`. The
+/// base identity is a separate read ([`k7dl_base_identity`]) so this
+/// function -- and its Group E round-trip proof -- stayed put across
+/// the referenced work.
 ///
 /// Verified: `k7dl_parse_header_equiv` in `verif/Verif/Equiv/K7dl.lean`
 /// (Group E) — the Aeneas translation of this function computes
@@ -926,6 +989,31 @@ mod tests {
         let (pc, ms) = k7dl_parse_header(&bytes).unwrap();
         assert_eq!(pc, 7);
         assert_eq!(ms, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn k7dl_base_identity_rides_the_reserved_field() {
+        // Stamping the identity must not disturb what parse_header reads,
+        // and a header that was never stamped reads back as "unknown" --
+        // which is what every pre-30b pack on disk is.
+        let plain = k7dl_header_bytes(3, 4096);
+        assert_eq!(k7dl_base_identity(&plain), 0);
+        assert!(k7dl_base_identity_ok(k7dl_base_identity(&plain), 42));
+
+        let stamped = k7dl_set_base_identity(plain, 0x0dd0_1234);
+        assert_eq!(k7dl_base_identity(&stamped), 0x0dd0_1234);
+        assert_eq!(
+            k7dl_parse_header(&stamped).unwrap(),
+            k7dl_parse_header(&plain).unwrap()
+        );
+    }
+
+    #[test]
+    fn k7dl_base_identity_guard_rejects_only_known_mismatch() {
+        assert!(k7dl_base_identity_ok(7, 7));
+        assert!(k7dl_base_identity_ok(0, 7));
+        assert!(k7dl_base_identity_ok(7, 0));
+        assert!(!k7dl_base_identity_ok(7, 8));
     }
 
     #[test]
