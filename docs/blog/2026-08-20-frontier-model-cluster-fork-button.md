@@ -251,7 +251,8 @@ Any KVM box (the numbers above: bare-metal AMD Ryzen 5 3600, 64 GiB,
 NVMe, Ubuntu 24.04 guests). k7d listens on a Unix socket only.
 
 ```bash
-# deps for the MCP server + plots (Ubuntu 24.04 is PEP 668 - venv)
+# pinned helm v3.16.4 (Cilium/Tetragon) + MCP venv (Ubuntu 24.04 is PEP 668)
+make helm-pin
 make k7d-mcp-deps
 
 # CI arm - everything but the model, both comparison arms, JSONL out

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="400">
+<rect x="0" y="0" width="720" height="44" fill="#1b5e20"/>
+<text x="12" y="20" font-size="13" fill="#fff">LIVE GYM EVAL gym-20260827-relaysoak -- NOT A TRAINED POLICY</text>
+<text x="12" y="38" font-size="12" fill="#fff">Incident std(R) vs turn (relay soak, n=8 both arms, not GRPO)</text>
+<text x="12" y="200" font-size="11" transform="rotate(-90 12 200)">std(R)</text>
+<rect x="78.0" y="50.0" width="70.0" height="240.0" fill="#4c78a8"/>
+<text x="78.0" y="306" font-size="10">t1/fork</text>
+<text x="78.0" y="46.0" font-size="10">0.000179</text>
+<rect x="178.0" y="263.2" width="70.0" height="26.8" fill="#4c78a8"/>
+<text x="178.0" y="306" font-size="10">t2/fork</text>
+<text x="178.0" y="259.2" font-size="10">1.999e-05</text>
+<rect x="278.0" y="227.9" width="70.0" height="62.1" fill="#4c78a8"/>
+<text x="278.0" y="306" font-size="10">t3/fork</text>
+<text x="278.0" y="223.9" font-size="10">4.628e-05</text>
+<rect x="378.0" y="104.9" width="70.0" height="185.1" fill="#4c78a8"/>
+<text x="378.0" y="306" font-size="10">t1/reset</text>
+<text x="378.0" y="100.9" font-size="10">0.0001381</text>
+<rect x="478.0" y="272.5" width="70.0" height="17.5" fill="#4c78a8"/>
+<text x="478.0" y="306" font-size="10">t2/reset</text>
+<text x="478.0" y="268.5" font-size="10">1.304e-05</text>
+<rect x="578.0" y="274.2" width="70.0" height="15.8" fill="#4c78a8"/>
+<text x="578.0" y="306" font-size="10">t3/reset</text>
+<text x="578.0" y="270.2" font-size="10">1.177e-05</text>
+</svg>

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="400">
+<rect x="0" y="0" width="720" height="44" fill="#1b5e20"/>
+<text x="12" y="20" font-size="13" fill="#fff">LIVE GYM EVAL gym-20260823-tetra3 -- NOT A TRAINED POLICY</text>
+<text x="12" y="38" font-size="12" fill="#fff">Throughput + cost (€40/mo box ≈ $0.060/h); lease-to-score wall, no GPU</text>
+<text x="12" y="200" font-size="11" transform="rotate(-90 12 200)">value</text>
+<rect x="78.0" y="107.0" width="105.0" height="183.0" fill="#4c78a8"/>
+<text x="78.0" y="306" font-size="10">fork epm</text>
+<text x="78.0" y="103.0" font-size="10">2.356</text>
+<rect x="228.0" y="264.8" width="105.0" height="25.2" fill="#4c78a8"/>
+<text x="228.0" y="306" font-size="10">reset epm</text>
+<text x="228.0" y="260.8" font-size="10">0.325</text>
+<rect x="378.0" y="256.9" width="105.0" height="33.1" fill="#4c78a8"/>
+<text x="378.0" y="306" font-size="10">fork $/1k</text>
+<text x="378.0" y="252.9" font-size="10">0.4263</text>
+<rect x="528.0" y="50.0" width="105.0" height="240.0" fill="#4c78a8"/>
+<text x="528.0" y="306" font-size="10">reset $/1k</text>
+<text x="528.0" y="46.0" font-size="10">3.091</text>
+</svg>

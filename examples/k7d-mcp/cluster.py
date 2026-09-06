@@ -66,7 +66,7 @@ def ensure_helm() -> Path:
         return HELM_BIN
     raise RuntimeError(
         f"pinned helm {HELM_VERSION} missing at {HELM_BIN} "
-        "(25a-inc3 installs it at /usr/local/lib/k7d-helm/)"
+        "(run `make helm-pin`)"
     )
 
 

@@ -360,3 +360,26 @@ The fork is the product, not a Ray image pull. Reused
 `FORK_UBUNTU_K3S_CLUSTER_3VM` rather than adding a KubeRay-specific
 ceiling. `FORK_UBUNTU_NODE_1VM` and every minimal-guest budget are
 untouched.
+
+## Ubuntu Redis mid-write fork 
+
+Same 3-node Ubuntu k3s substrate, with `redis:7-alpine` (AOF on,
+128 MiB, pinned to `k7d-10-200-0-2`) and an `rinc` INCR loop on a
+different node. **No new constant** —
+`FORK_UBUNTU_K3S_CLUSTER_3VM` is reused. `FORK_UBUNTU_NODE_1VM`
+and every minimal-guest budget are untouched.
+
+Measured on an exclusive bare-metal node (2026-09-03, `<node-ip>`),
+cache-hit Ubuntu image:
+
+| Operation | Ceiling asserted | Typical | Test |
+|---|---|---|---|
+| Ubuntu k3s boot → 3 nodes Ready + adopt | 600 s (`BOOT_UBUNTU_K3S_CLUSTER_3NODE`) | **40.8 s** | `test_redis_midwrite_ubuntu_fork` |
+| Redis AOF + rinc Ready, `forkctr` ≥ 50 | 180 s wait in the harness | **~6 s** after source Ready | same |
+| Ubuntu Redis mid-write warm fork (3 × 2048 MB) | 1000 ms (`FORK_UBUNTU_K3S_CLUSTER_3VM`) | **575 ms** client / **568 ms** daemon (under the 1 s target) | same |
+| Harness wall (cache-hit) | 180 s | **84 s** harness / **99 s** cargo-test | same |
+
+The fork is the product, not a Redis image pull. Reused
+`FORK_UBUNTU_K3S_CLUSTER_3VM` rather than adding a Redis-specific
+ceiling. `FORK_UBUNTU_NODE_1VM` and every minimal-guest budget are
+untouched.

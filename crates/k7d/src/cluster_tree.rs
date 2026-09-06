@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::network::ClusterNetwork;
-use crate::snapshot::{self, VmState};
+use crate::snapshot;
 use crate::tree::{
     apply_delta, write_delta, AppliedDelta, NodeId, NodeInfo, PrepareOutcome, TreeError,
 };
@@ -208,6 +208,12 @@ pub struct ClusterSnapshotTree {
 }
 
 impl ClusterSnapshotTree {
+    /// Registry id — last component of the on-disk root, echoed in `tree.json`.
+    #[must_use]
+    pub fn tree_id(&self) -> &str {
+        &self.tree_id
+    }
+
     /// Live members of `node_id`, if that cluster is in RAM.
     ///
     /// Auto-warp  looks tree children up by
@@ -936,8 +942,7 @@ impl ClusterSnapshotTree {
             let base_member_dir = base_dir.join("members").join(i.to_string());
             let base_mem_path = base_member_dir.join("memory.bin");
 
-            let state_json = fs::read_to_string(member_dir.join("vm_state.json"))?;
-            let state: VmState = serde_json::from_str(&state_json)?;
+            let state = snapshot::load_vm_state(&member_dir)?;
 
             let mem_span = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
             let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_mem_path, mem_span)?;

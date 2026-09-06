@@ -804,6 +804,14 @@ pub enum Request {
         /// Tree identifier.
         tree_id: String,
     },
+    /// Re-open an on-disk cluster tree left by `tree_drop` or a daemon
+    /// crash . Nodes come back [`crate::tree::NodeState::Suspended`]
+    /// — live KVM is not resurrected. Fails loud if `tree.json` is
+    /// missing, unparseable, or the id is already in memory.
+    TreeOpen {
+        /// On-disk tree identity: `{tree_root_dir()}/{tree_id}/tree.json`.
+        tree_id: String,
+    },
     /// Report warm-pool sizing and hit/miss counters. Always
     /// answers, even with the pool disabled
     /// (`size: 0`).
@@ -1073,6 +1081,16 @@ pub enum Response {
         node_id: String,
         /// Fresh guest vsock CIDs of the resumed members.
         guest_cids: Vec<u64>,
+    },
+    /// Reply to `tree_open`.
+    TreeOpened {
+        /// Tree identifier.
+        tree_id: String,
+        /// Root node id (always `"root"` today).
+        root_id: String,
+        /// Every node's metadata. `open()` forces previously-Live nodes
+        /// to Suspended — the caller must `tree_resume` to go live.
+        nodes: Vec<NodeInfo>,
     },
     /// Reply to `tree_auto_evict`.
     TreeEvicted {
@@ -1652,6 +1670,54 @@ impl Daemon {
         }
     }
 
+    /// Startup scan of [`tree_root_dir`]: every subdirectory with a
+    /// parseable `tree.json` is [`ClusterSnapshotTree::open`]'d and
+    /// inserted as Suspended. Unparseable dirs are logged and left
+    /// alone (the operator may be mid-write). Already-registered ids
+    /// are skipped. Called from `main` after sandbox GC — **not** from
+    /// [`Daemon::new`], so in-process tests do not sweep `/var/lib/k7d/trees`.
+    pub fn rehydrate_trees_from_disk(&self) {
+        let root = tree_root_dir();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::error!("scan trees in {}: {e}", root.display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if !path.join("tree.json").is_file() {
+                continue;
+            }
+            match ClusterSnapshotTree::open(path.clone()) {
+                Ok(tree) => {
+                    let id = tree.tree_id().to_string();
+                    let n = tree.list_nodes().len();
+                    let mut trees = self.trees.lock().unwrap();
+                    if trees.contains_key(&id) {
+                        continue;
+                    }
+                    log::info!(
+                        "rehydrated tree {id} from {} ({n} nodes, Suspended)",
+                        path.display()
+                    );
+                    trees.insert(id, TreePayload::Cluster(tree));
+                }
+                Err(e) => {
+                    log::error!(
+                        "unparseable tree dir {}: {e}; leaving in place",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
     /// Dispatch a single request to its handler.
     #[allow(clippy::too_many_lines)]
     pub fn handle(&self, req: Request) -> Response {
@@ -1903,6 +1969,13 @@ impl Daemon {
             Request::TreeList => self.tree_list(),
             Request::TreeWatch { tree_id } => self.watch_snapshot(tree_id.as_deref()),
             Request::TreeDrop { tree_id } => self.tree_drop(&tree_id),
+            Request::TreeOpen { tree_id } => {
+                let resp = self.tree_open(&tree_id);
+                if matches!(resp, Response::TreeOpened { .. }) {
+                    self.emit_tree_event(&tree_id, "open", None, None);
+                }
+                resp
+            }
             Request::PoolStatus => self.pool_status(),
             Request::Doctor => {
                 let report = crate::doctor::run();
@@ -3678,6 +3751,49 @@ impl Daemon {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Re-open an on-disk cluster tree. See [`Request::TreeOpen`].
+    fn tree_open(&self, tree_id: &str) -> Response {
+        use std::collections::hash_map::Entry;
+        {
+            let trees = self.trees.lock().unwrap();
+            if trees.contains_key(tree_id) {
+                return Response::Error {
+                    message: format!("tree {tree_id} already registered"),
+                };
+            }
+        }
+        let root = tree_root_dir().join(tree_id);
+        let tree_json = root.join("tree.json");
+        if !tree_json.is_file() {
+            return Response::Error {
+                message: format!("tree.json missing at {}", tree_json.display()),
+            };
+        }
+        match ClusterSnapshotTree::open(root) {
+            Ok(tree) => {
+                let nodes: Vec<NodeInfo> = tree.list_nodes().into_iter().cloned().collect();
+                let mut trees = self.trees.lock().unwrap();
+                match trees.entry(tree_id.to_string()) {
+                    Entry::Occupied(_) => Response::Error {
+                        message: format!("tree {tree_id} already registered"),
+                    },
+                    Entry::Vacant(slot) => {
+                        slot.insert(TreePayload::Cluster(tree));
+                        log::info!("opened tree {tree_id} ({} nodes, Suspended)", nodes.len());
+                        Response::TreeOpened {
+                            tree_id: tree_id.to_string(),
+                            root_id: "root".to_string(),
+                            nodes,
+                        }
+                    }
+                }
+            }
+            Err(e) => Response::Error {
+                message: format!("tree_open({tree_id}): {e}"),
+            },
         }
     }
 

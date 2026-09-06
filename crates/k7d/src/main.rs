@@ -231,6 +231,12 @@ fn main() {
     // cgroup is harmless, but a stale nft table silently filters the
     // next bridge that reuses the name.
     k7d::cgroup::clean_stale_tree_cgroups();
+    // Re-open on-disk cluster trees a previous daemon left behind
+    // (kill -9 / crash). After cgroup GC so `open()` does not collide
+    // with a stale jail. Nodes come back Suspended — live KVM died
+    // with the process . Not in Daemon::new: in-process
+    // tests must not sweep /var/lib/k7d/trees.
+    daemon.rehydrate_trees_from_disk();
     let reaped_jails = k7d::netjail::clean_stale_jails();
     if !reaped_jails.is_empty() {
         log::warn!("reaped stale net jails: {reaped_jails:?}");

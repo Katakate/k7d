@@ -4,7 +4,7 @@
        remote-dilation-test remote-dilation-fork-test \
        remote-dilation-install remote-dilation-revert \
        paper \
-       k7d-mcp-deps k7d-mcp-test k7view-test \
+       helm-pin k7d-mcp-deps k7d-mcp-test k7view-test \
        miri fuzz kani kani-harness verif-gen verif-build \
        rsync remote-check remote-build remote-test-integration remote-bench \
        remote-warp-bench remote-warp-bench-dilated \
@@ -135,6 +135,11 @@ dilation-revert:
 # KVM) plus one Ubuntu Cilium+Tetragon smoke (needs the live daemon).
 # PEP 668: Ubuntu 24.04 refuses system-site pip. Keep the venv off
 # the rsync tree so --delete cannot wipe the wheels.
+# Pinned helm v3.16.4 at /usr/local/lib/k7d-helm/ — Cilium/Tetragon
+# on the Ubuntu gym / MCP path. Same pin as ubuntu_helm.rs. Root.
+helm-pin:
+	bash utils/install-helm.sh
+
 K7D_MCP_VENV := /var/lib/k7d/mcp-venv
 k7d-mcp-deps:
 	@if [ ! -x "$(K7D_MCP_VENV)/bin/python" ]; then \

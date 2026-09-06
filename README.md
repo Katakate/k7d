@@ -187,6 +187,10 @@ Tetragon clean.
 [Video](docs/assets/k7d-mcp-demo.mp4) ·
 [JSONL](docs/assets/k7d-mcp-demo.jsonl).
 Dashboard: [`examples/k7view/`](examples/k7view/).
+Reproduce on a KVM box: `sudo make helm-pin` (Cilium/Tetragon
+helm v3.16.4), then [`examples/k7d-mcp/`](examples/k7d-mcp/)
+and [`gym/`](gym/). First Ubuntu image:
+`guest/ubuntu/build-node-image.sh`.
 
 ## Using k7d for GRPO / agent tree search
 

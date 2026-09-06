@@ -1,0 +1,45 @@
+{
+  "usage": {
+    "idle": {
+      "shared_frac_t0": 0.8296642303466797,
+      "shared_frac_t30": 0.8296642303466797,
+      "n_samples": 3.0
+    },
+    "k8s": {
+      "shared_frac_t0": 0.754021962483724,
+      "shared_frac_t30": 0.754021962483724,
+      "n_samples": 3.0
+    },
+    "kafka": {
+      "shared_frac_t0": 0.5016930898030599,
+      "shared_frac_t30": 0.5016930898030599,
+      "n_samples": 3.0
+    }
+  },
+  "siblings": {
+    "idle": {
+      "n_samples": 3.0,
+      "parent_bytes_t0": 1319088128.0,
+      "child_bytes_t0": 1324027904.0,
+      "parent_bytes_last": 1536204800.0,
+      "child_bytes_last": 1542676480.0,
+      "t_last_s": 35.455968618392944
+    },
+    "k8s": {
+      "n_samples": 3.0,
+      "parent_bytes_t0": 1611988992.0,
+      "child_bytes_t0": 1633333248.0,
+      "parent_bytes_last": 1630744576.0,
+      "child_bytes_last": 1651896320.0,
+      "t_last_s": 35.74583029747009
+    },
+    "kafka": {
+      "n_samples": 3.0,
+      "parent_bytes_t0": 3217829888.0,
+      "child_bytes_t0": 3222888448.0,
+      "parent_bytes_last": 3225522176.0,
+      "child_bytes_last": 3229380608.0,
+      "t_last_s": 41.38165473937988
+    }
+  }
+}

@@ -12,6 +12,8 @@ kvm-bindings, vm-memory) do not compile on macOS or Windows. You need:
 - virtiofsd at `/usr/libexec/virtiofsd` (RW hostPath fallback only)
 - root (bridge / TAP / iptables setup in tests)
 - k3s, for the kubectl integration suite
+- pinned helm v3.16.4 for the Ubuntu gym / MCP Cilium+Tetragon path
+  (`make helm-pin` → `/usr/local/lib/k7d-helm/v3.16.4/helm`)
 
 ## Build & test on a Linux/KVM host
 
@@ -27,6 +29,22 @@ make test-integration   # kubectl / k3s suite
 ```
 
 Tests run with `--test-threads=1` to avoid vsock CID collisions.
+
+## Ubuntu gym and the MCP incident
+
+The gym (`gym/`) and `examples/k7d-mcp` bring up Ubuntu 3-node
+k3s+Cilium+Tetragon through `/run/k7d/k7d.sock`. They need the
+pinned helm, not whatever `helm` is on `$PATH`:
+
+```bash
+make helm-pin          # v3.16.4 → /usr/local/lib/k7d-helm/ (root)
+make k7d-mcp-deps      # PEP 668 venv for the MCP server
+# first Ubuntu image: guest/ubuntu/build-node-image.sh
+# (later runs hit /var/lib/k7d/disks/base-images)
+python3 examples/k7d-mcp/scenario_incident.py --policy scripted
+```
+
+See `gym/README.md` and `examples/k7d-mcp/README.md`.
 
 ## Remote development workflow (no local KVM)
 

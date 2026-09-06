@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-06
+
+The public tree now ships the gym and the carried KVM dilation patch.
+Ubuntu TreeFork hunts stay up across a daemon crash, a held apiserver
+session, and a Redis write in flight. Scenario packs get a scripted
+runtime.
+
+### Added
+
+- Public publish tree includes `gym/` and `utils/kvm-dilation/` (carried
+  KVM continuous ×N dilation patch plus install/revert).
+- `make helm-pin` installs the pinned helm v3.16.4 used by Ubuntu
+  Cilium/Tetragon bring-up.
+- Scenario pack format and a scripted gym runtime.
+- Held Ubuntu apiserver watch and ClusterIP TCP across TreeFork.
+- Rehydrate an Ubuntu tree after `k7d` is killed with SIGKILL.
+- Redis mid-write Ubuntu TreeFork hunt.
+
 ## [0.4.0] — 2026-09-03
 
 Guest time warp sits next to warm fork: a cluster can jump idle wall

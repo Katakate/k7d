@@ -44,6 +44,7 @@ struct DaemonGuard {
     child: Child,
     socket: PathBuf,
     sandbox_root: PathBuf,
+    tree_root: PathBuf,
 }
 
 impl Drop for DaemonGuard {
@@ -52,6 +53,7 @@ impl Drop for DaemonGuard {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_dir_all(&self.sandbox_root);
+        let _ = std::fs::remove_dir_all(&self.tree_root);
     }
 }
 
@@ -62,6 +64,7 @@ fn spawn_daemon(tag: &str, envs: &[(&str, &str)]) -> DaemonGuard {
     let pid = std::process::id();
     let socket = std::env::temp_dir().join(format!("k7d-pool-{tag}-{pid}.sock"));
     let sandbox_root = std::env::temp_dir().join(format!("k7d-pool-sandboxes-{tag}-{pid}"));
+    let tree_root = std::env::temp_dir().join(format!("k7d-pool-trees-{tag}-{pid}"));
     let _ = std::fs::remove_file(&socket);
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_k7d"));
@@ -70,7 +73,8 @@ fn spawn_daemon(tag: &str, envs: &[(&str, &str)]) -> DaemonGuard {
         .env("RUST_LOG", "info")
         .env("K7D_KERNEL", kernel_path())
         .env("K7D_INITRD", initrd_path())
-        .env("K7D_SANDBOX_ROOT", &sandbox_root);
+        .env("K7D_SANDBOX_ROOT", &sandbox_root)
+        .env("K7D_TREE_ROOT", &tree_root);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -79,6 +83,7 @@ fn spawn_daemon(tag: &str, envs: &[(&str, &str)]) -> DaemonGuard {
         child,
         socket,
         sandbox_root,
+        tree_root,
     };
 
     let deadline = Instant::now() + Duration::from_secs(10);

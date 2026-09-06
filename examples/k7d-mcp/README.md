@@ -33,6 +33,7 @@ export K7_NODE_IP="${K7_NODE_IP:?set K7_NODE_IP to the Ubuntu gym node}"
 unset K7_NODE_IPS
 
 # Ubuntu 24.04 is PEP 668 - use the node venv, not system pip
+make helm-pin          # pinned helm v3.16.4 → /usr/local/lib/k7d-helm/
 make k7d-mcp-deps
 # or: python3 -m venv /var/lib/k7d/mcp-venv && /var/lib/k7d/mcp-venv/bin/pip install -r examples/k7d-mcp/requirements.txt
 # edit mcp.cursor.json: K7D_TREE_ID + K7D_CERTS_DIR
@@ -48,9 +49,15 @@ Same server, same env. Use `mcp.claude.json` as the project
 `.mcp.json` (or merge the `mcpServers.k7d` block). stdio only - no
 remote transport, no auth.
 
+Cilium and Tetragon install through that pinned helm. A host
+`helm` of any other version is ignored. First Ubuntu image build is
+`guest/ubuntu/build-node-image.sh` (content-keyed cache under
+`/var/lib/k7d/disks/base-images`).
+
 ## Harness
 
 ```bash
+# needs a running k7d, make helm-pin, and the Ubuntu node image
 # CI: everything but the model
 python3 examples/k7d-mcp/scenario_incident.py --policy scripted --both-arms
 

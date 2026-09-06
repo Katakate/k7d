@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="624" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">
+<rect width="860" height="624" fill="#0f1115"/>
+<text x="16" y="22" fill="#e8e8e8" font-size="15">CoW shared vs diverged RAM after fork (tree usage.live_ram_bytes)</text>
+<text x="64" y="52" fill="#c8c8c8" font-size="13">idle</text>
+<rect x="64" y="64" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#4c9a4c" stroke-width="2" points="64.0,143.0 94.3,143.0 124.6,143.0 154.8,143.0 202.5,105.4 232.8,105.4 263.1,105.4 377.4,64.0 609.7,111.0 836.0,156.6"/>
+<polyline fill="none" stroke="#8fd18f" stroke-width="2" stroke-dasharray="5 3" points="64.0,200.0 94.3,200.0 124.6,200.0 154.8,200.0 202.5,180.6 232.8,180.6 263.1,180.6 377.4,165.0 609.7,175.0 836.0,186.4"/>
+<text x="828" y="52" fill="#aaa" text-anchor="end">shared 100% → 76%</text>
+<text x="64" y="212" fill="#888">0s</text>
+<text x="836" y="212" fill="#888" text-anchor="end">51s</text>
+<text x="8" y="72" fill="#888">14.32 GiB</text>
+<text x="64" y="232" fill="#c8c8c8" font-size="13">k8s</text>
+<rect x="64" y="244" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#2a6f97" stroke-width="2" points="64.0,288.9 100.1,288.9 136.2,288.9 301.6,244.0 562.5,289.5 836.0,334.9"/>
+<polyline fill="none" stroke="#89c2d9" stroke-width="2" stroke-dasharray="5 3" points="64.0,350.3 100.1,350.3 136.2,350.3 301.6,334.7 562.5,349.7 836.0,364.7"/>
+<text x="828" y="232" fill="#aaa" text-anchor="end">shared 75% → 75%</text>
+<text x="64" y="392" fill="#888">0s</text>
+<text x="836" y="392" fill="#888" text-anchor="end">43s</text>
+<text x="8" y="252" fill="#888">13.50 GiB</text>
+<text x="64" y="412" fill="#c8c8c8" font-size="13">kafka</text>
+<rect x="64" y="424" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#9b2226" stroke-width="2" points="64.0,469.1 95.8,469.1 127.5,469.1 345.2,424.0 577.9,469.4 836.0,514.8"/>
+<polyline fill="none" stroke="#e07a5f" stroke-width="2" stroke-dasharray="5 3" points="64.0,469.7 95.8,469.7 127.5,469.7 345.2,424.3 577.9,469.5 836.0,514.7"/>
+<text x="828" y="412" fill="#aaa" text-anchor="end">shared 50% → 50%</text>
+<text x="64" y="572" fill="#888">0s</text>
+<text x="836" y="572" fill="#888" text-anchor="end">49s</text>
+<text x="8" y="432" fill="#888">9.01 GiB</text>
+<text x="64" y="610" fill="#888"><tspan fill="#4c9a4c">━ shared</tspan>   <tspan fill="#8fd18f">┄ diverged (dirty pages)</tspan>   configured = live_vm_count × 2048 MiB</text>
+</svg>

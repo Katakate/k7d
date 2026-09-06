@@ -413,6 +413,47 @@ pub fn capture_vm_state(vm: &Vm) -> Result<VmState, SnapshotError> {
     })
 }
 
+/// Load resume state from a member snapshot directory.
+///
+/// Prefers `vm_state.json` (suspend + prepare after the referenced work).
+/// Older checkpoints only have the split files `cpu.json` /
+/// `devices.json` / `irqchip.json` / `metadata.json` — reconstruct
+/// rather than fail resume after a crash of a never-suspended tree.
+pub fn load_vm_state(snapshot_dir: &Path) -> Result<VmState, SnapshotError> {
+    let bundled = snapshot_dir.join("vm_state.json");
+    if bundled.is_file() {
+        let json = fs::read_to_string(&bundled)?;
+        return Ok(serde_json::from_str(&json)?);
+    }
+    let cpu_json = fs::read_to_string(snapshot_dir.join("cpu.json"))?;
+    let cpus: Vec<CpuState> = serde_json::from_str::<CpuStatesCompat>(&cpu_json)?.into();
+    let irqchip_path = snapshot_dir.join("irqchip.json");
+    if !irqchip_path.is_file() {
+        return Err(SnapshotError::Kvm(format!(
+            "resume state missing: {} has neither vm_state.json nor irqchip.json",
+            snapshot_dir.display()
+        )));
+    }
+    let irqchip: IrqChipState = serde_json::from_str(&fs::read_to_string(&irqchip_path)?)?;
+    let devices: Vec<MmioDeviceState> =
+        serde_json::from_str(&fs::read_to_string(snapshot_dir.join("devices.json"))?)?;
+    let meta: SnapshotMetadata =
+        serde_json::from_str(&fs::read_to_string(snapshot_dir.join("metadata.json"))?)?;
+    Ok(VmState {
+        cpus,
+        irqchip,
+        devices,
+        memory_size: meta.memory_size_bytes,
+        kernel_path: PathBuf::from(meta.kernel_path),
+        initrd_path: meta.initrd_path.map(PathBuf::from),
+        guest_cid: meta.guest_cid,
+        virtiofs_shares: Vec::new(),
+        block_devices: meta.block_devices,
+        kvmclock: meta.kvmclock,
+        dilation: meta.dilation,
+    })
+}
+
 impl From<&kvm_bindings::kvm_segment> for SegmentState {
     fn from(seg: &kvm_bindings::kvm_segment) -> Self {
         Self {
@@ -1207,6 +1248,15 @@ fn write_state_files(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> 
     };
     let metadata_json = serde_json::to_string_pretty(&metadata)?;
     fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
+
+    // `ClusterSnapshotTree::resume` reads `vm_state.json`. Suspend
+    // writes it; a live prepare/snapshot did not, so a kill -9 of a
+    // never-suspended tree could open the on-disk DAG and still fail
+    // resume . The VM is paused here — same contract
+    // as `capture_vm_state`.
+    let vm_state = capture_vm_state(vm)?;
+    let vm_state_json = serde_json::to_string(&vm_state)?;
+    fs::write(snapshot_dir.join("vm_state.json"), vm_state_json)?;
     Ok(())
 }
 

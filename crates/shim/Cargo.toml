@@ -9,7 +9,7 @@ name = "containerd-shim-k7-v1"
 path = "src/main.rs"
 
 [dependencies]
-k7d = { path = "../k7d", version = "=0.4.0" }
+k7d = { path = "../k7d", version = "=0.5.0" }
 containerd-shim = { version = "=0.10.0", features = ["async"] }
 containerd-shim-protos = { version = "=0.10.0", features = ["async"] }
 async-trait = "=0.1.88"

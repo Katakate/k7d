@@ -7176,6 +7176,252 @@ score, then diagnosing `exec_ok`).
 
 ---
 
+## 205. Redis mid-write "equal at the cut" is a GET race, not a torn AOF 
+
+**Symptom:** First `make remote-check` of `test_redis_midwrite` failed
+with `GET forkctr at cut src=71 child=70` immediately after a 619 ms
+CoW `tree_fork_batch`. The harness called it CHALLENGES #43/#79
+(blk/net DMA miss → child AOF older than the in-memory counter).
+
+**Root cause:** Both `rinc` loops resume from the same snapshotted
+integer and keep `INCR`ing every ~20 ms. Two `kubectl exec redis-cli
+GET`s are not simultaneous — one tick of kubectl jitter is
+`src = child + 1`, not a torn heap. A real AOF replay
+(`--appendfsync everysec`) would go *backwards* from the pre-fork
+GET (tens of increments) and Redis would have had to restart.
+
+**Wrong fix:** `CLIENT PAUSE WRITE` on both sides in parallel. The
+two pauses land tens of ms apart and freeze *different* prefixes
+(retry saw `src=73 child=63`). That made the skew worse.
+
+**Fix:** paired GET with no pause; `cut = min(src, child)`; fail
+only if `cut` is below the pre-fork GET. Isolation + child-rinc
+scale-to-0 + 2 s divergence still catch a leak. Spec fallback
+("child ≥ cut, then diverge") is the primary path.
+
+**Reference:** internal notes; CHALLENGES #43 / #79 (the class this
+is *not*).
+
+**Time lost:** ~25 min (first-run 71/70 plus the PAUSE mis-fix).
+
+---
+
+## 206. Child-only busybox pods stay Pending — image was pulled on the server only 
+
+**Symptom:** Source held watch + ClusterIP TCP survived `tree_fork_batch`
+(805 ms). Opening a *new* `hs-listen-child` Pod on the child hung in
+`Pending` for the 90 s wait. `wait_pod_running` last phase was
+`Pending`. Rust wall was already 148 s.
+
+**Root cause:** `k3s ctr images pull docker.io/library/busybox:1.36`
+ran only on the source server CID. The source listen/hold pods
+scheduled there (or pulled in time). The child's *new* Pod could
+land on an agent whose containerd never had the image. A post-fork
+image pull through the child's NAT did not finish inside the wait.
+This is a harness trap, not a k7d session bug — the held sockets
+had already done their job.
+
+**Fix:** Pin source listen/hold to `nodeName: k7d-10-200-0-2` and
+pull busybox only on that node. On the child, open the new
+ClusterIP session with `kubectl exec` into the already-Running
+copied pods (second `nc -l` + a new Service), not a fresh Pod.
+
+**Reference:** none (harness scheduling / image cache). Spec
+35a-inc3; CHALLENGES #42 (do not replace a held session with a new
+curl — the child *new* TCP is a separate assertion).
+
+**Time lost:** ~20 min (one live Ubuntu 3-node hunt + Pending wait).
+
+---
+
+## 207. `kubectl exec 'nc &'` hangs the vsock agent — inherited stdout 
+
+**Symptom:** After #206, the child's new ClusterIP session was started
+with `kubectl exec hs-listen -- sh -c '( sleep 3600 | nc -l -p 9377
+>> /tmp/tcp-9377 ) & echo LISTENING'`. `guest_kubectl` timed out at
+20 s on the child CID even though earlier `kubectl exec … cat
+/tmp/tcp-in` and `create configmap` on that same CID succeeded.
+
+**Root cause:** `kubectl exec` waits for the remote shell. The
+background `nc` inherited the exec's stdout, so the shell never
+exited and the vsock agent sat on `recv` until `timeout_s`. Same
+class as the L2 helper in `start_held_tcp_session` ("fully redirect
+stdio so Command::output() does not wait on inherited pipes") —
+#28 is the opposite polarity (`</dev/null` tears a *listen* down).
+
+**Fix:** Write `/tmp/hs-bg.sh` inside the pod and run
+`/tmp/hs-bg.sh </dev/null >/dev/null 2>&1 &` (the L2
+`start_held_tcp_session` pattern). A bare
+`( echo; sleep 3600 ) | nc … &` can leave `sleep` in the foreground
+under busybox ash (`A | B &` ≠ `(A | B) &`). Assert
+`LISTENING`/`CONNECTED` then poll the log file.
+
+**Reference:** `crates/k7d/tests/test_cluster_fork.rs`
+`start_held_tcp_session`; CHALLENGES #28.
+
+**Time lost:** ~15 min (one 76 s hunt).
+## 208. Four ways a scenario "worked" without working 
+
+**Symptom:** the first `verify-all` over the tier-1 pack passed 14 of
+22. The eight failures all reported the same thing —
+`mean(fixers)=0.600 < 0.8; gap 0.000` — and every fixer's
+`reference-fix.sh` exited **2**, which reads like a kubectl error.
+
+**Root cause:** four separate mistakes, three of them invisible from
+the outside.
+
+1. `verify.py` ran `reference-fix.sh` through `POST /env/{id}/act`
+   with the script text verbatim. The gym prepends the
+   `export K7S_*` prelude built from `params` before it runs a
+   scenario script; `act` does not. Under `set -eu` the first unset
+   `$K7S_DEPLOY` made **dash exit 2**, not kubectl. Only the four
+   `control-plane-down` scenarios passed, because they are the only
+   ones with no `params`.
+2. `kubectl rollout undo` cannot restore the image of a deployment in
+   a days-old fork source: the old ReplicaSets are long gone and
+   kubectl answers `no rollout history found`. A scenario's fix must
+   not depend on Kubernetes remembering the previous state — record
+   the value at inject time (here a `k7s-previous-image` annotation,
+   which `kubectl get deploy -o yaml` shows) so the fix is
+   discoverable rather than unknowable.
+3. `inject.sh` waited for "a Pending pod of this deployment". A pod
+   that is merely `ContainerCreating` also reports phase `Pending`,
+   so the wait returned before the fault was real. The wait now
+   requires `status.unavailableReplicas >= 1` *and* a Pending pod,
+   three polls running.
+4. Blinding was checked against `json.dumps(observation)`. The `/obs`
+   nodes blob carries `spec.unschedulable` and the taint list
+   whatever the tier is, so a cordon scenario could never satisfy
+   `must_not_match: unschedulable` — even though k7rl's renderer
+   drops both and the model cannot in fact see them. `must_match` and
+   `must_not_match` now run against the **rendered** observation
+   (k7rl's renderer, imported read-only). Blinding is a claim about
+   what the model reads.
+
+**Fix:** prelude in `verify.py` for both the fix and the decoy act;
+annotation-recorded previous image; the stronger inject wait; render
+before matching. All 22 scenarios verify after that.
+
+**Reference:** k7rl `k7rl/env/obs_render.py` (`_node_row` shows
+NAME/STATUS/ROLES/AGE/VERSION only).
+
+**Time lost:** ~1 h, most of it believing an exit code that came from
+the shell rather than the command.
+
+---
+
+## 209. `p_hit = 0.000` on all 20 scenarios looked like a broken sampler 
+
+**Symptom:** the first-turn prior over the tier-1 pack came back
+`p_hit=0.000 p_inv=1.000` for **every** scenario, to three decimals,
+on 200 samples at T=0.8. The stored samples for
+`control-plane-down/k3s-stopped` were 40 copies of the identical
+string `systemctl status k3s`. A sampler that returns one string 200
+times is the obvious reading, and K6 had measured `p_hit=0.570` on
+this very fault with the same code path.
+
+**Root cause:** nothing was broken. The K6 measurement used the
+*unblinded* observation, where `k3s.service: inactive` is printed and
+the model has a real choice between starting the unit and looking at
+it. A tier-1 scenario blinds that block, and then the first move is
+never in doubt: `systemctl status k3s` for the control-plane family,
+`kubectl describe pod <the Pending pod>` for the kubectl-level ones.
+Under the `exec` JSON grammar the token distribution for a short,
+obvious command is peaked enough to repeat verbatim. Scenarios where
+the choice *is* open did vary — `nodes-tainted/noexecute-traefik` has
+13 distinct commands in 40 samples.
+
+**Fix:** none to the tool — but the pack ships the two unblinded
+tier-0 references, and running them in the same batch is the control
+that settles it: `reference/kill-member-0` measured **0.580** against
+K6's 0.570, from a 31/9 split. Keep the control in every prior run.
+
+The real consequence is a spec change. `p_hit_turn1` cannot carry a
+*lower* bound for a blinded scenario, because the fix is a turn-2
+action by construction; the keep rule is the upper bound only (drop
+when `p_hit > 0.75`, i.e. the cause leaked back in), and whether a
+blinded scenario yields reward spread is a multi-turn solve rate that
+needs the gym in the loop rather than one turn against a fixture.
+
+**Reference:** k7rl `scripts/prior_hit_rate.py` (K6, turns=3,
+p_hit=0.570); `k7rl/env/classify.py`.
+
+**Time lost:** ~30 min, spent reading the sampler rather than the
+control that was already in the batch.
+
+---
+
+## 208. `kill -9` of k7d loses the in-memory tree; leftover adopt bridges steal 10.200.0.1 
+
+**Symptom:** A live Ubuntu 3-node tree has `tree.json` at
+`{K7D_TREE_ROOT}/{tree_id}/`. `kill -9` k7d (no `tree_drop`). After
+`systemctl start k7d`, `tree_list` is empty. Even after a manual
+reload of `tree.json`, `tree_resume` on `root` failed looking for
+`members/0/vm_state.json`. If resume got that far, the guest was
+unreachable — two bridges advertised `10.200.0.1/24`.
+
+**Root cause:** Three stacked gaps, not one.
+
+1. **No re-open path.** `ClusterSnapshotTree::open` already forces
+   Live → Suspended ("live payloads are NOT restored"). `TreeDrop`
+   documents that on-disk state "stays for later re-open". There was
+   no `Request::TreeOpen`, and `Daemon::new` started with an empty
+   `trees` HashMap. `tree_list` only sees in-memory trees. Sandbox
+   records have `clean_stale_sandbox_records` (11a-inc4 / #11);
+   trees had no equivalent scan.
+
+2. **`vm_state.json` was suspend-only.** `resume` read that file.
+   `prepare_fork_source` / `snapshot_vm` wrote `memory.bin` +
+   `cpu.json` / `devices.json` / `irqchip.json` / `metadata.json`
+   but not the bundled state. A never-suspended live tree therefore
+   could not resume after a crash even once `open()` ran.
+
+3. **Leftover-bridge trap.** `kill -9` skips `Drop`. TAP fds close
+   (no `IFF_PERSIST`) but the adopt bridge
+   (`k7_bridge_name(tree_id)`, `10.200.0.1/24`) stays. Resume
+   creates `{tree_id}-root` — a *different* name, also
+   `10.200.0.1/24`. Two gateways on one subnet blackhole the
+   restored guests. `Restart=on-failure` then races a new k7d
+   before the harness can delete *this* tree's leftover `k7-br-*`.
+   A global `cleanup_stale_k7_bridges` would wipe other agents'
+   trees.
+
+**Fix:** `Request::TreeOpen` + `Response::TreeOpened`; startup scan
+`Daemon::rehydrate_trees_from_disk` called from `main` (not
+`Daemon::new`) that `open`s every parseable `tree.json` as
+Suspended and leaves unparseable dirs in place. `write_state_files`
+now also writes `vm_state.json`; `load_vm_state` falls back to the
+split snapshot files for older checkpoints. The harness
+`systemctl kill -s KILL` then `systemctl stop` (so systemd does
+not restart onto leftover bridges), deletes only this `tree_id`'s
+bridges/TAP slaves, then `systemctl start`. Pre-crash-mark is
+stamped on the live sandbox VMs *before* adopt so the last
+keyframe contains it — kill -9 cannot resurrect live RAM.
+
+**Reference:** none (control-plane wiring). the referenced work;
+`ClusterSnapshotTree::open`; CHALLENGES #11 (sandbox reattach is a
+different surface).
+
+A fourth trap showed up only in `test_daemon_reattach_verifies_live_vm`:
+that test respawned k7d with `K7D_SANDBOX_ROOT` but **not**
+`K7D_TREE_ROOT`, then treated "sandbox record deleted" as "socket
+is bound". `clean_stale_sandbox_records` now runs *before*
+`rehydrate_trees_from_disk`, which (on the default
+`/var/lib/k7d/trees`) `open`s leftover Ubuntu trees and creates
+their `TreeCgroup`s. The record vanishes, the test connects, the
+socket is not there yet (`ENOENT`). Pin the tree root on every
+test-daemon spawn/respawn and wait for the socket; do not use the
+record sweep as a readiness proxy. A node with hundreds of leftover
+`/var/lib/k7d/trees/*` dirs makes the *systemd* k7d bind late too
+(`open` + `TreeCgroup::create` per parseable tree) — the harness
+waits 60 s for `/run/k7d/k7d.sock`, not 20.
+
+**Time lost:** design/read of resume + TAP/bridge leftover path
+before the hunt; the three gaps are what the increment exists to
+name. The respawn-vs-scan race cost one full `remote-check`.
+
+---
+
 ## Reference projects and what each taught us
 
 | Project | What we learned |

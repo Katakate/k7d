@@ -172,6 +172,9 @@ class K7dClient:
     def tree_drop(self, tree_id: str) -> dict[str, Any]:
         return self.call({"op": "tree_drop", "tree_id": tree_id})
 
+    def tree_open(self, tree_id: str) -> dict[str, Any]:
+        return self.call({"op": "tree_open", "tree_id": tree_id})
+
     def tree_nodes(self, tree_id: str) -> dict[str, Any]:
         return self.call({"op": "tree_nodes", "tree_id": tree_id})
 

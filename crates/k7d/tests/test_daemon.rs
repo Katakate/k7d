@@ -1200,6 +1200,123 @@ fn test_daemon_cluster_tree_fork() {
     drop(guard);
 }
 
+/// the referenced work: `tree_open` of a just-`tree_drop`ped cluster returns
+/// nodes Suspended. Missing / already-in-memory / unparseable are loud
+/// and never delete the on-disk dir.
+#[test]
+fn test_daemon_tree_open_after_drop() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+    let guard = spawn_daemon("topen");
+
+    let (tree_id, root_id, _) = match call(
+        &guard,
+        &Request::TreeCreateCluster {
+            vm_count: 1,
+            config: default_config(),
+            budget: None,
+            tree_id: Some("topen-drop".to_string()),
+            egress: None,
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            root_id,
+            guest_cids,
+        } => {
+            assert_eq!(guest_cids.len(), 1);
+            (tree_id, root_id, guest_cids)
+        }
+        other => panic!("unexpected tree_create_cluster response: {other:?}"),
+    };
+
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::TreeOpen {
+                tree_id: tree_id.clone(),
+            }
+        ),
+        Response::Error { .. }
+    ));
+
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::TreeDrop {
+                tree_id: tree_id.clone(),
+            }
+        ),
+        Response::Ok
+    ));
+    match call(&guard, &Request::TreeList) {
+        Response::TreeList { trees } => assert!(trees.is_empty(), "trees: {trees:?}"),
+        other => panic!("unexpected tree_list after drop: {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeOpen {
+            tree_id: tree_id.clone(),
+        },
+    ) {
+        Response::TreeOpened {
+            tree_id: opened,
+            root_id: rid,
+            nodes,
+        } => {
+            assert_eq!(opened, tree_id);
+            assert_eq!(rid, root_id);
+            assert!(!nodes.is_empty(), "opened tree has no nodes");
+            assert!(
+                nodes.iter().all(|n| n.state == NodeState::Suspended),
+                "open() must force Suspended, got {nodes:?}"
+            );
+        }
+        other => panic!("unexpected tree_open response: {other:?}"),
+    }
+
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::TreeOpen {
+                tree_id: "no-such-tree".to_string(),
+            }
+        ),
+        Response::Error { .. }
+    ));
+
+    let bad = guard.tree_root.join("bad-unparse");
+    std::fs::create_dir_all(&bad).expect("bad tree dir");
+    std::fs::write(bad.join("tree.json"), b"{not-json").expect("bad tree.json");
+    match call(
+        &guard,
+        &Request::TreeOpen {
+            tree_id: "bad-unparse".to_string(),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("tree_open")
+                    || message.contains("JSON")
+                    || message.contains("json"),
+                "unparseable open must be loud, got {message}"
+            );
+        }
+        other => panic!("unparseable tree_open: {other:?}"),
+    }
+    assert!(
+        bad.join("tree.json").is_file(),
+        "must not delete an unparseable tree dir"
+    );
+
+    assert!(matches!(
+        call(&guard, &Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
+    drop(guard);
+}
+
 /// `tree_adopt_cluster` — live sandbox VMs on one
 /// shared bridge become a cluster-tree root that can fork; validation
 /// failures leave the registry untouched.
@@ -1545,15 +1662,26 @@ fn test_daemon_reattach_verifies_live_vm() {
     );
 
     // Fresh daemon, same sandbox root: its startup scan must sweep the
-    // orphan (no VM in its registry can match).
+    // orphan (no VM in its registry can match). Pin K7D_TREE_ROOT so
+    // rehydrate_trees_from_disk does not open leftover trees under
+    // /var/lib/k7d/trees  and delay the bind past the
+    // record-sweep proxy this test used to treat as "ready".
     guard.child = Command::new(env!("CARGO_BIN_EXE_k7d"))
         .arg("--socket")
         .arg(guard.socket.as_os_str())
         .env("RUST_LOG", "info")
+        .env("K7D_TREE_ROOT", &guard.tree_root)
         .env("K7D_SANDBOX_ROOT", &guard.sandbox_root)
         .spawn()
         .expect("respawn k7d daemon");
     let deadline = Instant::now() + Duration::from_secs(10);
+    while !guard.socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "respawned daemon socket never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     while record_path.exists() {
         assert!(
             Instant::now() < deadline,

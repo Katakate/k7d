@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="624" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">
+<rect width="860" height="624" fill="#0f1115"/>
+<text x="16" y="22" fill="#e8e8e8" font-size="15">Sibling dirty after fork (parent vs child popcount vs memory.bin)</text>
+<text x="64" y="52" fill="#c8c8c8" font-size="13">idle</text>
+<rect x="64" y="64" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#4c9a4c" stroke-width="2" points="175.1,83.7 509.9,66.8 836.0,64.6"/>
+<polyline fill="none" stroke="#8fd18f" stroke-width="2" stroke-dasharray="5 3" points="175.1,83.3 509.9,65.8 836.0,64.0"/>
+<text x="828" y="52" fill="#aaa" text-anchor="end">parent 1.23→1.43  child 1.23→1.44 GiB</text>
+<text x="64" y="212" fill="#888">0s</text>
+<text x="836" y="212" fill="#888" text-anchor="end">35s</text>
+<text x="8" y="72" fill="#888">1.44 GiB</text>
+<text x="64" y="232" fill="#c8c8c8" font-size="13">k8s</text>
+<rect x="64" y="244" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#2a6f97" stroke-width="2" points="195.6,247.3 508.3,246.3 836.0,245.7"/>
+<polyline fill="none" stroke="#89c2d9" stroke-width="2" stroke-dasharray="5 3" points="195.6,245.5 508.3,245.5 836.0,244.0"/>
+<text x="828" y="232" fill="#aaa" text-anchor="end">parent 1.50→1.52  child 1.52→1.54 GiB</text>
+<text x="64" y="392" fill="#888">0s</text>
+<text x="836" y="392" fill="#888" text-anchor="end">36s</text>
+<text x="8" y="252" fill="#888">1.54 GiB</text>
+<text x="64" y="412" fill="#c8c8c8" font-size="13">kafka</text>
+<rect x="64" y="424" width="772" height="136" fill="#1a1d24" stroke="#333"/>
+<polyline fill="none" stroke="#9b2226" stroke-width="2" points="258.5,424.5 532.3,424.3 836.0,424.2"/>
+<polyline fill="none" stroke="#e07a5f" stroke-width="2" stroke-dasharray="5 3" points="258.5,424.3 532.3,424.2 836.0,424.0"/>
+<text x="828" y="412" fill="#aaa" text-anchor="end">parent 3.00→3.00  child 3.00→3.01 GiB</text>
+<text x="64" y="572" fill="#888">0s</text>
+<text x="836" y="572" fill="#888" text-anchor="end">41s</text>
+<text x="8" y="432" fill="#888">3.01 GiB</text>
+<text x="64" y="610" fill="#888"><tspan fill="#4c9a4c">━ parent (probe-fork + suspend)</tspan>   <tspan fill="#8fd18f">┄ child (one suspend per sibling)</tspan>   popcount vs the shared memory.bin — not XOR uniqueness</text>
+</svg>
