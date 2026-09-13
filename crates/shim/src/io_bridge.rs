@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use k7d::api::AgentClient;
+use k7d::guest::AgentEndpoint;
 use k7d::vsock::AGENT_VSOCK_PORT;
 
 /// Spawns a background thread that polls the agent for container output
@@ -18,7 +19,7 @@ use k7d::vsock::AGENT_VSOCK_PORT;
 /// Returns a handle that stops the bridge when dropped.
 pub fn start_output_bridge(
     container_name: String,
-    guest_cid: u64,
+    endpoint: AgentEndpoint,
     stdout_path: String,
     stderr_path: String,
 ) -> OutputBridge {
@@ -28,7 +29,7 @@ pub fn start_output_bridge(
     let handle = thread::spawn(move || {
         run_output_bridge(
             &container_name,
-            guest_cid,
+            &endpoint,
             &stdout_path,
             &stderr_path,
             &stop_clone,
@@ -55,7 +56,7 @@ impl Drop for OutputBridge {
 
 fn run_output_bridge(
     container_name: &str,
-    guest_cid: u64,
+    endpoint: &AgentEndpoint,
     stdout_path: &str,
     stderr_path: &str,
     stop: &AtomicBool,
@@ -95,7 +96,7 @@ fn run_output_bridge(
     let _ = stderr_offset;
 
     while !stop.load(Ordering::SeqCst) {
-        let Ok(mut agent) = AgentClient::connect_vsock(guest_cid, Duration::from_secs(2)) else {
+        let Ok(mut agent) = AgentClient::connect_endpoint(endpoint, Duration::from_secs(2)) else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };

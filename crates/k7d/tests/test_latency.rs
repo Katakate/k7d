@@ -375,7 +375,7 @@ fn test_latency_virtiofs_write() {
     vm.shutdown();
 }
 
-/// Chunk 2b.2: `PodVolumes::prepare` must come in under
+/// `PodVolumes::prepare` must come in under
 /// [`latency::POD_VOLUMES_SETUP`] for a typical pod (handful of
 /// kubelet volumes).
 ///

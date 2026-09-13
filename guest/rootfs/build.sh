@@ -49,7 +49,7 @@ done
 # VM_BOOT_TO_AGENT budget. Every k7d VM would pay that so that one test
 # could run `tc`. The Dockerfile here defines the image, and
 # crates/k7d/tests/test_kernel_features.rs hands it to its guest over
-# virtiofs. 24a-inc2's node rootfs is where this userspace belongs for
+# virtiofs. The node rootfs is where this userspace belongs for
 # real.
 #
 # runc is NOT included in the initramfs — it's loaded via virtiofs

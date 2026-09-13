@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""28a: fork-under-load correctness + usage sampling. Ubuntu only.
+"""Fork-under-load correctness + usage sampling. Ubuntu only.
 
 Talks to `/run/k7d/k7d.sock`. Never boots Vm in-process, never
 tree_create_cluster / INNER3 / K7D_KERNEL. Zero new k7d primitives.
@@ -913,7 +913,7 @@ def run_idle(cluster: Cluster, samples: list[dict[str, Any]], sample_s: float, i
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--out", type=Path, default=Path("/tmp/k7-28a"))
+    p.add_argument("--out", type=Path, default=Path("/tmp/k7-ful"))
     p.add_argument("--sample-s", type=float, default=SAMPLE_S_DEFAULT)
     p.add_argument("--interval-s", type=float, default=INTERVAL_S_DEFAULT)
     p.add_argument("--tree-id", default="")
@@ -925,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = parse_args(argv)
     ns.out.mkdir(parents=True, exist_ok=True)
-    tree_id = ns.tree_id or f"ful-28a-{os.getpid()}"
+    tree_id = ns.tree_id or f"ful-{os.getpid()}"
     client = K7dClient()
     client.ping()
     cluster = Cluster(client, tree_id)

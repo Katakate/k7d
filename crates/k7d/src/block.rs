@@ -33,14 +33,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::network::{
-    get_avail_desc, mark_dirty, put_used_desc, read_used_idx, VirtqDesc, VIRTQ_DESC_F_NEXT,
-    VIRTQ_DESC_F_WRITE,
+use crate::network::{get_avail_desc, mark_dirty, put_used_desc, read_used_idx};
+use crate::virtio_mmio::{
+    wait_for_park, NotQuiescent, ValidatedQueue, VirtioBackend, VirtqueueState, UNPARK_POLL,
 };
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState, PARK_POLL, UNPARK_POLL};
+
+/// Metadata of one descriptor in a request chain. Re-exported from the
+/// transport: the geometry type and the chain walker own this shape
+/// now, and the fuzz target still reaches it at `block::DescMeta`.
+pub use crate::virtio_mmio::DescMeta;
 
 /// Virtio device-type ID for block devices.
 pub const VIRTIO_ID_BLOCK: u32 = 2;
@@ -70,19 +73,6 @@ pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 // --- Pure request-parsing layer (fuzzed + Kani-verified) ---
-
-/// Metadata of one descriptor in a request chain, as read from the guest's
-/// descriptor table: guest-physical address, length, and whether the buffer
-/// is device-writable (`VIRTQ_DESC_F_WRITE`).
-#[derive(Clone, Copy, Debug)]
-pub struct DescMeta {
-    /// Guest-physical address of the buffer.
-    pub addr: u64,
-    /// Buffer length in bytes.
-    pub len: u32,
-    /// Device-writable (`VIRTQ_DESC_F_WRITE`).
-    pub write: bool,
-}
 
 /// Split of a validated request chain: header, data range, status byte.
 #[derive(Debug)]
@@ -210,6 +200,9 @@ pub struct BlockBackend {
     /// True while the worker is parked in the paused state (or exited) —
     /// i.e. no more guest-memory writes will happen until unpause.
     parked: Arc<AtomicBool>,
+    /// Test-only: when true, `wait_quiescent` ignores `parked` and waits
+    /// out the 200 ms deadline (the wedged-worker test).
+    hold_park: Arc<AtomicBool>,
     /// Pages this device wrote through the host mapping (device DMA).
     /// Merged into the warm-fork dirty delta; KVM's dirty log cannot see
     /// these writes.
@@ -267,6 +260,7 @@ impl BlockBackend {
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             parked: Arc::new(AtomicBool::new(true)),
+            hold_park: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(dirty),
             idx_seed: 0,
         })
@@ -279,11 +273,21 @@ impl BlockBackend {
     /// (CHALLENGES.md #27): the guest driver's ring state survived in
     /// memory, so restarting the worker at 0 would re-process serviced
     /// descriptors and corrupt the used ring.
-    pub fn seed_indices_from_guest(&mut self, queues: &[VirtqueueState]) {
-        if let Some(q) = queues.first() {
-            self.idx_seed = read_used_idx(self.mem_addr, q);
-            log::info!("virtio-blk seed index from guest: {}", self.idx_seed);
+    pub fn seed_indices_from_guest(&mut self, queues: &[VirtqueueState]) -> Result<(), String> {
+        let Some(q) = queues.first() else {
+            return Err("virtio-blk needs one queue to seed from".to_string());
+        };
+        if !q.ready {
+            // Nothing was ever completed on a queue the driver never
+            // readied, so 0 is the truth, not a fallback.
+            self.idx_seed = 0;
+            return Ok(());
         }
+        let vq = ValidatedQueue::new(q, self.mem_addr, self.mem_size)
+            .map_err(|e| format!("virtio-blk queue geometry: {e}"))?;
+        self.idx_seed = read_used_idx(&vq);
+        log::info!("virtio-blk seed index from guest: {}", self.idx_seed);
+        Ok(())
     }
 
     /// Stop the worker thread. Must be called before guest memory is freed.
@@ -332,6 +336,10 @@ impl VirtioBackend for BlockBackend {
         BLK_QUEUE_SIZE
     }
 
+    fn guest_mapping(&self) -> (u64, u64) {
+        (self.mem_addr, self.mem_size)
+    }
+
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         // virtio_blk_config: capacity in 512-byte sectors (u64 LE) at
         // offset 0. Nothing else is advertised.
@@ -371,25 +379,23 @@ impl VirtioBackend for BlockBackend {
         }
     }
 
-    fn wait_quiescent(&self) {
+    fn wait_quiescent(&self) -> Result<(), NotQuiescent> {
         if self.worker.is_none() {
-            return;
+            return Ok(());
         }
         // 200 ms > the worker's 100 ms poll. A stuck scratch-disk IO
         // already will not park; waiting 2 s then proceeding (the old
         // bound) just blew `FORK_INNER_K3S_CLUSTER_3VM` (CHALLENGES #162).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while !self.parked.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= deadline {
-                log::warn!(
-                    "virtio-blk ({}): worker did not park within 200ms — fork dirty \
-                     delta may miss in-flight device DMA",
-                    self.host_path.display()
-                );
-                return;
-            }
-            std::thread::sleep(PARK_POLL);
-        }
+        wait_for_park(
+            &self.parked,
+            &self.running,
+            self.hold_park.load(Ordering::SeqCst),
+            || format!("virtio-blk ({})", self.host_path.display()),
+        )
+    }
+
+    fn hold_park_for_test(&self, hold: bool) {
+        self.hold_park.store(hold, Ordering::SeqCst);
     }
 
     fn is_quiescent(&self) -> bool {
@@ -414,9 +420,8 @@ impl VirtioBackend for BlockBackend {
         if !q.ready {
             return Err("virtio-blk queue not ready".to_string());
         }
-        if q.size == 0 {
-            return Err("virtio-blk queue size is 0".to_string());
-        }
+        let vq = ValidatedQueue::new(q, self.mem_addr, self.mem_size)
+            .map_err(|e| format!("virtio-blk queue geometry: {e}"))?;
 
         let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
         let worker_kick = kick.try_clone().map_err(|e| format!("dup kick: {e}"))?;
@@ -426,9 +431,7 @@ impl VirtioBackend for BlockBackend {
             file: Arc::clone(&self.file),
             readonly: self.readonly,
             capacity_sectors: self.capacity_sectors,
-            mem_base: self.mem_addr,
-            mem_size: self.mem_size,
-            q: q.clone(),
+            vq,
             irq: worker_irq,
             kick: worker_kick,
             running: Arc::clone(&self.running),
@@ -476,9 +479,9 @@ struct WorkerCtx {
     file: Arc<File>,
     readonly: bool,
     capacity_sectors: u64,
-    mem_base: u64,
-    mem_size: u64,
-    q: VirtqueueState,
+    /// Geometry of the single request queue, checked against guest RAM at
+    /// activation — the worker never re-derives a host address itself.
+    vq: ValidatedQueue,
     irq: EventFd,
     kick: EventFd,
     running: Arc<AtomicBool>,
@@ -584,7 +587,7 @@ fn process_queue(ctx: &WorkerCtx, last_avail: &mut u16, last_used: &mut u16) {
         if ctx.paused.load(Ordering::SeqCst) {
             return;
         }
-        let Some(head) = get_avail_desc(ctx.mem_base, &ctx.q, last_avail) else {
+        let Some(head) = get_avail_desc(&ctx.vq, last_avail) else {
             return;
         };
         let Some(used_len) = handle_request(ctx, head) else {
@@ -599,13 +602,12 @@ fn process_queue(ctx: &WorkerCtx, last_avail: &mut u16, last_used: &mut u16) {
             *last_avail = last_avail.wrapping_sub(1);
             return;
         };
-        let slot = u64::from(*last_used % ctx.q.size);
-        put_used_desc(ctx.mem_base, &ctx.q, last_used, head, used_len);
+        let slot_gpa = ctx.vq.used_ring_gpa(*last_used);
+        put_used_desc(&ctx.vq, last_used, head, used_len);
         // The used-ring entry + idx are device writes into guest memory —
         // record them or the fork's driver sees a stale ring.
-        let used_gpa = ctx.q.used_addr.raw_value();
-        mark_dirty(&ctx.dirty, used_gpa + 4 + slot * 8, 8);
-        mark_dirty(&ctx.dirty, used_gpa + 2, 2);
+        mark_dirty(&ctx.dirty, slot_gpa, 8);
+        mark_dirty(&ctx.dirty, ctx.vq.used_idx_gpa(), 2);
         let _ = ctx.irq.write(1);
     }
 }
@@ -616,34 +618,19 @@ fn process_queue(ctx: &WorkerCtx, last_avail: &mut u16, last_used: &mut u16) {
 /// buffers, including the status byte. `None` when the pause signal cut
 /// the request short and it must be replayed rather than completed.
 fn handle_request(ctx: &WorkerCtx, head: u16) -> Option<u32> {
-    // Walk the descriptor chain, bounded by the queue size (we do not
-    // advertise VIRTIO_F_INDIRECT_DESC, so a longer chain is malformed).
-    let desc_base = ctx.mem_base + ctx.q.desc_addr.raw_value();
-    let mut descs: Vec<DescMeta> = Vec::with_capacity(4);
-    let mut idx = head;
-    loop {
-        if idx >= ctx.q.size || descs.len() >= ctx.q.size as usize {
-            log::error!("virtio-blk: malformed descriptor chain (idx={idx})");
+    // Walk the descriptor chain with the shared walker: bounded by the
+    // queue size (we do not advertise VIRTIO_F_INDIRECT_DESC, so a longer
+    // chain is malformed) and bounds-checked against guest RAM.
+    let mut chain: Vec<DescMeta> = Vec::with_capacity(4);
+    let descs = match ctx.vq.walk_chain(head, &mut chain) {
+        Ok(descs) => descs,
+        Err(e) => {
+            log::error!("virtio-blk: malformed descriptor chain (head={head}): {e}");
             return Some(0);
         }
-        // SAFETY: idx < q.size, so the pointer stays within the descriptor
-        // table in guest RAM, which the mapping keeps valid.
-        let d: VirtqDesc = unsafe {
-            std::ptr::read_volatile((desc_base + u64::from(idx) * 16) as *const VirtqDesc)
-        };
-        descs.push(DescMeta {
-            addr: d.addr,
-            len: d.len,
-            write: d.flags & VIRTQ_DESC_F_WRITE != 0,
-        });
-        if d.flags & VIRTQ_DESC_F_NEXT != 0 {
-            idx = d.next;
-        } else {
-            break;
-        }
-    }
+    };
 
-    let layout = match validate_request_layout(&descs, ctx.mem_size) {
+    let layout = match validate_request_layout(descs, ctx.vq.mem_span()) {
         Ok(l) => l,
         Err(e) => {
             log::error!("virtio-blk: rejecting malformed request: {e}");
@@ -656,7 +643,7 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> Option<u32> {
     // len >= 16; the source range lies within guest RAM.
     unsafe {
         std::ptr::copy_nonoverlapping(
-            (ctx.mem_base + layout.header.addr) as *const u8,
+            (ctx.vq.mem_base() + layout.header.addr) as *const u8,
             header.as_mut_ptr(),
             16,
         );
@@ -669,7 +656,7 @@ fn handle_request(ctx: &WorkerCtx, head: u16) -> Option<u32> {
     // SAFETY: layout.status was bounds-checked against mem_size with
     // len >= 1; the destination lies within guest RAM.
     unsafe {
-        std::ptr::write_volatile((ctx.mem_base + layout.status.addr) as *mut u8, status);
+        std::ptr::write_volatile((ctx.vq.mem_base() + layout.status.addr) as *mut u8, status);
     }
     mark_dirty(&ctx.dirty, layout.status.addr, 1);
     used_len += 1; // status byte
@@ -710,7 +697,7 @@ fn execute_request(
                 // before the mapping is released).
                 let buf = unsafe {
                     std::slice::from_raw_parts_mut(
-                        (ctx.mem_base + d.addr) as *mut u8,
+                        (ctx.vq.mem_base() + d.addr) as *mut u8,
                         d.len as usize,
                     )
                 };
@@ -749,7 +736,10 @@ fn execute_request(
                 // SAFETY: d was bounds-checked against mem_size; the range
                 // lies within guest RAM, which outlives the worker.
                 let buf = unsafe {
-                    std::slice::from_raw_parts((ctx.mem_base + d.addr) as *const u8, d.len as usize)
+                    std::slice::from_raw_parts(
+                        (ctx.vq.mem_base() + d.addr) as *const u8,
+                        d.len as usize,
+                    )
                 };
                 if let Err(e) = write_all_at_unless_paused(ctx, buf, file_off) {
                     if io_aborted_for_pause(ctx, &e) {

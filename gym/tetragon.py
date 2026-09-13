@@ -30,7 +30,7 @@ TETRAGON_CHART = "1.7.0"
 # Reset n=8: member 0's guests already pulled the chart; member 1's
 # three new VMs pull under host load. 180s left agents=1 operator=0.
 TETRAGON_READY_S = 600
-# 25a-inc4 pin. Agents ImagePullBackOff on quay via shared host NAT;
+# Image pin. Agents ImagePullBackOff on quay via shared host NAT;
 # quay-pull on the server guest, host-relay the export onto agents.
 TETRAGON_IMAGES = (
     "quay.io/cilium/tetragon:v1.7.0",
@@ -44,7 +44,7 @@ TETRAGON_NS = "kube-system"
 TETRAGON_SELECTOR = "app.kubernetes.io/name=tetragon"
 EXPORT_CONTAINER = "export-stdout"
 PROCESS_KINDS = ("process_kprobe", "process_lsm", "process_exec", "process_exit")
-# 25a-inc4: pin to 10.200.0.3 so IfNotPresent hits the source pull.
+# Pin to 10.200.0.3 so IfNotPresent hits the source pull.
 BUSYBOX = "docker.io/library/busybox:1.36.1"
 INJECT_NODE = "k7d-10-200-0-3"
 
@@ -305,7 +305,7 @@ def tetragon_pod_names(
             time.sleep(retry_s)
     if last is None:
         raise RuntimeError(f"tetragon pods never listed via {bridge}")
-    # Keep TetragonProbeError so a dead API scores 0 (27a-inc3),
+    # Keep TetragonProbeError so a dead API scores 0,
     # not a wrapped RuntimeError that 502s the lease.
     raise last
 
@@ -573,7 +573,7 @@ def pull_tetragon_images(
     Reset n=8: member 0's kubelet wins the host NAT; member 1's agents
     stay ImagePullBackOff for the 600s Ready ceiling. One quay client
     per cluster, then host-relay the ctr-export. No airgap tar, no
-    `imagePullPolicy: Never` (25a-inc4).
+    `imagePullPolicy: Never`.
     """
     import agent
 
@@ -644,7 +644,7 @@ def create_inject_pod(
     guest_ip: str = "10.200.0.2",
     ceiling_s: float = 360,
 ) -> None:
-    """POST a pinned busybox pod (25a-inc4). Host touch does not kprobe."""
+    """POST a pinned busybox pod. Host touch does not kprobe."""
     code, body, err = curl_api(
         bridge,
         "/api/v1/namespaces/default/pods",
@@ -699,7 +699,7 @@ def wait_path_events(
 ) -> str:
     """Poll until export-stdout shows the kprobe for `path`.
 
-    `ceiling_s` is a timeout, not a sleep. 25a-inc4 child inject
+    `ceiling_s` is a timeout, not a sleep. A measured child inject
     was 455 ms; 30 s is loud-fail slack, not a 90 s wait.
     """
     deadline = time.monotonic() + ceiling_s

@@ -484,7 +484,7 @@ fn test_container_exec_pty_protocol() {
 
     // Handshake against a nonexistent container fails loudly.
     let err = AgentClient::connect_pty_exec(
-        cid,
+        &k7d::guest::AgentEndpoint::Vsock { cid },
         Duration::from_secs(10),
         "ghost",
         "pty-ghost",
@@ -497,7 +497,7 @@ fn test_container_exec_pty_protocol() {
 
     // ── Session 1: window size, resize, Ctrl+C, exit code ──
     let mut s = AgentClient::connect_pty_exec(
-        cid,
+        &k7d::guest::AgentEndpoint::Vsock { cid },
         Duration::from_secs(10),
         "sandbox",
         "pty-1",
@@ -543,7 +543,7 @@ fn test_container_exec_pty_protocol() {
 
     // ── Session 2: detach (eof) hangs the session up ──
     let mut s2 = AgentClient::connect_pty_exec(
-        cid,
+        &k7d::guest::AgentEndpoint::Vsock { cid },
         Duration::from_secs(10),
         "sandbox",
         "pty-2",
@@ -572,7 +572,7 @@ fn test_container_exec_pty_protocol() {
     let mut sessions = Vec::new();
     for i in 0..3u16 {
         let s = AgentClient::connect_pty_exec(
-            cid,
+            &k7d::guest::AgentEndpoint::Vsock { cid },
             Duration::from_secs(10),
             "sandbox",
             &format!("pty-conc-{i}"),

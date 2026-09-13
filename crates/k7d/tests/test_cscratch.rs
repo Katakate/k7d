@@ -141,7 +141,7 @@ fn push_bundle(agent: &mut AgentClient, dir_name: &str, k8s_name: &str) -> Strin
 
 fn make_scratch(tag: &str, size_bytes: u64) -> ScratchDisk {
     ScratchDisk::create(
-        &format!("test-19c-{tag}-{}", std::process::id()),
+        &format!("test-cscratch-{tag}-{}", std::process::id()),
         size_bytes,
     )
     .expect("provision scratch image on the reflink loopback XFS")

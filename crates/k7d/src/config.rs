@@ -173,6 +173,8 @@ mod resolve_vm_guest_tests {
 /// | `K7D_POOL_SIZE` | `0` (pool disabled) | target number of idle warm VMs |
 /// | `K7D_POOL_MEMORY_MB` | `256` | template VM RAM in MiB |
 /// | `K7D_POOL_VCPUS` | `1` | template VM vCPU count |
+/// | `K7D_POOL_BACKEND` | `native` | `native`, `firecracker`, or a mixed
+/// split `native:N,firecracker:M` (N+M must equal `K7D_POOL_SIZE`) |
 ///
 /// Kernel/initrd are resolved exactly like `VmConfig` does (env
 /// `K7D_KERNEL` / `K7D_INITRD`) — a loud error when the pool is
@@ -191,6 +193,10 @@ pub struct PoolConfig {
     pub kernel: String,
     /// Initramfs the template boots.
     pub initrd: String,
+    /// How many idle native VMs to keep. `size == native_size + fc_size`.
+    pub native_size: usize,
+    /// How many idle Firecracker VMs to keep.
+    pub fc_size: usize,
 }
 
 impl PoolConfig {
@@ -234,12 +240,85 @@ impl PoolConfig {
         }
         let (kernel, initrd) = resolve_guest_paths(None, None)
             .map_err(|e| format!("pool enabled (K7D_POOL_SIZE={size}) but {e}"))?;
+        let backend_spec = match std::env::var("K7D_POOL_BACKEND") {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => "native".to_string(),
+            Err(e) => return Err(format!("read K7D_POOL_BACKEND: {e}")),
+        };
+        let (native_size, fc_size) = parse_pool_backend(&backend_spec, size)?;
         Ok(Some(Self {
             size,
             memory_mb,
             vcpus,
             kernel,
             initrd,
+            native_size,
+            fc_size,
         }))
+    }
+}
+
+/// Parse `K7D_POOL_BACKEND`: `native`, `firecracker`, or
+/// `native:N,firecracker:M` (order either way; N+M must equal `size`).
+pub fn parse_pool_backend(spec: &str, size: usize) -> Result<(usize, usize), String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("native") {
+        return Ok((size, 0));
+    }
+    if spec.eq_ignore_ascii_case("firecracker") {
+        return Ok((0, size));
+    }
+    let mut native: Option<usize> = None;
+    let mut fc: Option<usize> = None;
+    for part in spec.split(',') {
+        let part = part.trim();
+        let Some((name, n)) = part.split_once(':') else {
+            return Err(format!(
+                "malformed K7D_POOL_BACKEND {spec:?}: expected native | firecracker | \
+                 native:N,firecracker:M"
+            ));
+        };
+        let n: usize = n
+            .trim()
+            .parse()
+            .map_err(|e| format!("malformed K7D_POOL_BACKEND count in {part:?}: {e}"))?;
+        match name.trim() {
+            "native" if native.is_none() => native = Some(n),
+            "firecracker" if fc.is_none() => fc = Some(n),
+            other => {
+                return Err(format!(
+                    "malformed K7D_POOL_BACKEND {spec:?}: unknown or duplicate engine {other:?}"
+                ))
+            }
+        }
+    }
+    let native = native.unwrap_or(0);
+    let fc = fc.unwrap_or(0);
+    if native.saturating_add(fc) != size {
+        return Err(format!(
+            "K7D_POOL_BACKEND split native:{native}+firecracker:{fc} != K7D_POOL_SIZE {size}"
+        ));
+    }
+    Ok((native, fc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pool_backend;
+
+    #[test]
+    fn pool_backend_native_and_firecracker() {
+        assert_eq!(parse_pool_backend("native", 4).unwrap(), (4, 0));
+        assert_eq!(parse_pool_backend("firecracker", 3).unwrap(), (0, 3));
+        assert_eq!(
+            parse_pool_backend("native:2,firecracker:1", 3).unwrap(),
+            (2, 1)
+        );
+        assert_eq!(
+            parse_pool_backend("firecracker:1,native:2", 3).unwrap(),
+            (2, 1)
+        );
+        assert!(parse_pool_backend("native:1,firecracker:1", 3).is_err());
+        assert!(parse_pool_backend("kvm", 1).is_err());
     }
 }

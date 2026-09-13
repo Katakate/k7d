@@ -9,7 +9,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::virtio_mmio::{VirtioBackend, VirtqueueState};
@@ -39,7 +38,7 @@ const VHOST_USER_F_PROTOCOL_FEATURES: u64 = 1 << 30;
 const VIRTIOFSD_PATH: &str = "/usr/libexec/virtiofsd";
 
 /// Sandbox mode virtiofsd is spawned with when `K7D_VIRTIOFSD_SANDBOX`
-/// is unset .
+/// is unset.
 ///
 /// `chroot`, not virtiofsd's own `namespace` default: the namespace
 /// sandbox unshares a mount namespace, and k7d bind-mounts per-volume
@@ -69,6 +68,9 @@ fn sandbox_mode() -> Result<String, String> {
 pub struct VirtiofsdProcess {
     child: Child,
     socket_path: PathBuf,
+    /// Share root we bind-mounted read-only before spawn (`readonly:
+    /// true`). Umounted in [`Drop`] after the child is killed.
+    ro_bind: Option<PathBuf>,
 }
 
 impl VirtiofsdProcess {
@@ -88,14 +90,12 @@ impl VirtiofsdProcess {
     /// VFS-level `MS_RDONLY` bounces any write attempt back with
     /// `EROFS` before it reaches virtiofsd.
     ///
-    /// The host-side "belt-and-suspenders" `--readonly` flag does
-    /// not exist in the rust-vmm virtiofsd we ship (≥1.7 removed
-    /// it). When that flag becomes available again — or if we
-    /// switch to a virtiofsd build that supports `--readonly` via
-    /// some other knob (e.g. the legacy `-o ro` compat option) —
-    /// this is the place to wire it up. We accept the `readonly`
-    /// argument now so callers don't need to change later and so
-    /// the host already records the intent in its logs.
+    /// Host-side RO is enforced by bind-mounting the share root onto
+    /// itself and remounting it `MS_RDONLY` *before* virtiofsd
+    /// chroots into it. The shipped virtiofsd has no
+    /// `--readonly` flag (≥1.7 removed it); the VFS-level remount is
+    /// what makes a compromised guest agent hit `EROFS` instead of
+    /// writing through. The in-guest `mount -o ro` stays as well.
     pub fn spawn_with_options(
         host_dir: &Path,
         socket_path: &Path,
@@ -111,7 +111,7 @@ impl VirtiofsdProcess {
             .arg(tag)
             .arg("--cache")
             .arg("never")
-            // the referenced work layer 1: the share is parsed by guest-controlled
+            // The share is parsed by guest-controlled
             // FUSE traffic, so the daemon that serves it is jailed. The
             // seccomp action is spelled out next to the sandbox mode —
             // they are one decision, and a future virtiofsd default
@@ -131,15 +131,38 @@ impl VirtiofsdProcess {
             // over /cri). One superblock per share restores kubelet-like
             // emptyDir semantics.
             .arg("--no-announce-submounts");
-        if readonly {
-            log::debug!(
-                "virtiofsd tag={tag}: caller requested readonly; \
-                 enforcement is in-guest (mount -o ro) only on this virtiofsd version"
-            );
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn virtiofsd: {e}"))?;
+        let ro_bind = if readonly {
+            let created = crate::volumes::remount_share_readonly(host_dir).map_err(|e| {
+                format!(
+                    "host RO remount of virtiofs share {}: {e}",
+                    host_dir.display()
+                )
+            })?;
+            if created {
+                log::info!(
+                    "virtiofsd tag={tag}: share {} remounted MS_RDONLY on the host",
+                    host_dir.display()
+                );
+                Some(host_dir.to_path_buf())
+            } else {
+                log::debug!(
+                    "virtiofsd tag={tag}: share {} already MS_RDONLY; not stacking a bind",
+                    host_dir.display()
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(ref p) = ro_bind {
+                    let _ = crate::volumes::umount_path(p);
+                }
+                return Err(format!("failed to spawn virtiofsd: {e}"));
+            }
+        };
 
         // Wait for the socket to appear. The
         // deadline lives in `crate::latency` (single source of truth)
@@ -150,6 +173,11 @@ impl VirtiofsdProcess {
         let deadline = std::time::Instant::now() + wait;
         while !socket_path.exists() {
             if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(ref p) = ro_bind {
+                    let _ = crate::volumes::umount_path(p);
+                }
                 return Err(format!(
                     "virtiofsd socket did not appear within {}s",
                     wait.as_secs()
@@ -161,11 +189,12 @@ impl VirtiofsdProcess {
         Ok(Self {
             child,
             socket_path: socket_path.to_path_buf(),
+            ro_bind,
         })
     }
 
     /// PID of the virtiofsd child, so a tree can put its helpers in the
-    /// tree's cgroup jail .
+    /// tree's cgroup jail.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -176,6 +205,14 @@ impl Drop for VirtiofsdProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(ref path) = self.ro_bind {
+            if let Err(e) = crate::volumes::umount_path(path) {
+                log::warn!(
+                    "virtiofsd drop: umount RO share {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
         let _ = std::fs::remove_file(&self.socket_path);
         // The per-VM socket dir (see vm.rs) empties out when the last
         // share's socket is removed; remove_dir refuses non-empty dirs
@@ -634,6 +671,20 @@ impl VirtioFsBackend {
 }
 
 impl VirtioFsBackend {
+    /// Validate one queue's geometry against a guest mapping before its
+    /// addresses are handed to the vhost-user daemon, which DMAs into
+    /// them (`docs/bug-candidates.md` #44's class, one process further
+    /// out).
+    fn validated(
+        &self,
+        q: &VirtqueueState,
+        index: usize,
+        mem_base: u64,
+    ) -> Result<crate::virtio_mmio::ValidatedQueue, String> {
+        crate::virtio_mmio::ValidatedQueue::new(q, mem_base, self.mem_size)
+            .map_err(|e| format!("virtiofs queue {index} geometry: {e}"))
+    }
+
     /// Restore-time activation: like [`VirtioBackend::activate`], but the
     /// guest driver finished feature negotiation and queue setup long ago
     /// (the memory image was forked from a running VM), so each vring
@@ -657,26 +708,30 @@ impl VirtioFsBackend {
 
         let mut kick_evts = Vec::new();
         for (idx, q) in queues.iter().enumerate() {
-            if !q.ready || q.size == 0 {
+            if !q.ready {
                 continue;
             }
             let i = idx as u32;
+            let vq = self.validated(q, idx, self.mem_host_addr)?;
+            // The rings are programmed against this device's own mapping,
+            // but `used.idx` is read out of the fork's `MAP_PRIVATE` view.
+            let read_vq = self.validated(q, idx, guest_mem_host_addr)?;
             let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
 
-            client.set_vring_num(i, u32::from(q.size))?;
+            client.set_vring_num(i, u32::from(vq.size()))?;
             client.set_vring_addr(
                 i,
-                q.desc_addr.raw_value(),
-                q.used_addr.raw_value(),
-                q.avail_addr.raw_value(),
+                vq.desc_ring().0,
+                vq.used_ring_span().0,
+                vq.avail_ring_span().0,
                 self.mem_host_addr,
             )?;
             // Resume reading the avail ring where the old daemon's
             // completions stopped (used ring layout: flags u16, idx u16).
-            let used_idx_addr = (guest_mem_host_addr + q.used_addr.raw_value() + 2) as *const u16;
-            // SAFETY: used_idx_addr points into the fork's guest memory
-            // mapping, which the caller owns and which outlives this call.
-            let used_idx = unsafe { std::ptr::read_volatile(used_idx_addr) };
+            // SAFETY: `used_idx` is the idx field of a ring this geometry
+            // placed inside the fork's guest memory mapping, which the
+            // caller owns and which outlives this call.
+            let used_idx = unsafe { std::ptr::read_volatile(read_vq.used_idx().cast_const()) };
             client.set_vring_base(i, u32::from(used_idx))?;
             client.set_vring_call(i, irq_evt.as_raw_fd())?;
             client.set_vring_kick(i, kick.as_raw_fd())?;
@@ -717,6 +772,10 @@ impl VirtioBackend for VirtioFsBackend {
 
     fn max_queue_size(&self) -> u16 {
         FS_QUEUE_SIZE
+    }
+
+    fn guest_mapping(&self) -> (u64, u64) {
+        (self.mem_host_addr, self.mem_size)
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -762,19 +821,20 @@ impl VirtioBackend for VirtioFsBackend {
 
         let mut kick_evts = Vec::new();
         for (idx, q) in queues.iter().enumerate() {
-            if !q.ready || q.size == 0 {
+            if !q.ready {
                 continue;
             }
             let i = idx as u32;
+            let vq = self.validated(q, idx, self.mem_host_addr)?;
 
             let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
 
-            client.set_vring_num(i, q.size as u32)?;
+            client.set_vring_num(i, u32::from(vq.size()))?;
             client.set_vring_addr(
                 i,
-                q.desc_addr.raw_value(),
-                q.used_addr.raw_value(),
-                q.avail_addr.raw_value(),
+                vq.desc_ring().0,
+                vq.used_ring_span().0,
+                vq.avail_ring_span().0,
                 self.mem_host_addr,
             )?;
             client.set_vring_base(i, 0)?;

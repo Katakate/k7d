@@ -1,4 +1,4 @@
-# k7d : unconfined-minus-vsock. `allow all` omits the
+# k7d: unconfined-minus-vsock. `allow all` omits the
 # mount/dbus/unix classes — name them or k3s overlay and agent virtiofs
 # get EPERM (CHALLENGES #161). change_profile is required so runc can
 # attach a container profile. Path-attached to python3*; also the

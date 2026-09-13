@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,25 @@ enum Request {
 pub struct PongResponse {
     /// Agent version.
     pub version: String,
+    /// Supervised guest services. Empty on older agents.
+    #[serde(default)]
+    pub services: Vec<ServiceInfo>,
+}
+
+/// One supervised guest service reported on `Pong`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceInfo {
+    /// Service name (`docker`).
+    pub name: String,
+    /// Supervisor pid, or 0 if none.
+    #[serde(default)]
+    pub pid: u32,
+    /// Ready probe passed (overlay2 for docker).
+    #[serde(default)]
+    pub ready: bool,
+    /// Supervisor restart count.
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 /// Exec result from agent.
@@ -164,7 +183,11 @@ pub struct ContainerWaitResponse {
 #[serde(tag = "type")]
 enum RawResponse {
     #[serde(rename = "pong")]
-    Pong { version: String },
+    Pong {
+        version: String,
+        #[serde(default)]
+        services: Vec<ServiceInfo>,
+    },
     #[serde(rename = "exec_result")]
     ExecResult {
         #[allow(dead_code)]
@@ -239,6 +262,12 @@ enum RawResponse {
     MountBlkResult { ok: bool, error: String },
 }
 
+/// Largest legitimate agent response is a `read_file` payload (base64
+/// of a guest file). 64 MiB is well above any file we currently serve
+/// and still a hard cap so a compromised guest cannot force unbounded
+/// host allocation.
+pub const MAX_AGENT_LINE_BYTES: usize = 64 << 20;
+
 /// Errors from agent communication.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -252,6 +281,10 @@ pub enum AgentError {
     Timeout,
     #[error("agent returned error: {0}")]
     Remote(String),
+    /// Guest sent a line longer than [`MAX_AGENT_LINE_BYTES`]. The
+    /// session is poisoned — framing is lost.
+    #[error("agent response line exceeded {bytes} bytes")]
+    Oversized { bytes: usize },
 }
 
 /// Transport-agnostic send/receive for the agent.
@@ -266,14 +299,46 @@ enum Transport {
         read_file: std::fs::File,
         write_file: std::fs::File,
     },
+    /// Firecracker's vsock Unix-socket proxy. Byte-identical
+    /// to [`Transport::Vsock`] once the `CONNECT`/`OK` handshake is
+    /// done; it is a separate variant so a failure names the transport
+    /// the VM actually has.
+    FcUds {
+        read_file: std::fs::File,
+        write_file: std::fs::File,
+        /// Where to redial. Firecracker resets every vsock connection
+        /// at each `PUT /snapshot/create`, so a client
+        /// of a fork source sees EOF once per fork and reconnects.
+        uds_path: std::path::PathBuf,
+        port: u32,
+    },
 }
+
+/// Redials an FC vsock proxy after the EOF a snapshot causes: how many
+/// times one request is retried before the error is the caller's.
+const FC_RECONNECT_ATTEMPTS: usize = 3;
+/// How long each redial waits for the guest agent to accept again.
+const FC_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A connection to the guest agent.
 pub struct AgentClient {
     transport: Transport,
+    /// Bytes received past a newline, or a partial line. Needed once
+    /// `read_response_line` reads in chunks instead of one byte at a time.
+    leftover: Vec<u8>,
+    /// Times an FC vsock proxy was redialled after a snapshot reset.
+    fc_reconnects: u32,
 }
 
 impl AgentClient {
+    /// How many times this client transparently redialled a Firecracker
+    /// vsock proxy after the guest was snapshotted — what a test uses to
+    /// prove the reset happened *and* was survived.
+    #[must_use]
+    pub fn fc_reconnects(&self) -> u32 {
+        self.fc_reconnects
+    }
+
     /// Create an agent client over the COM2 serial pipe.
     pub fn new(
         agent_serial: Arc<Mutex<PipeSerialDevice>>,
@@ -295,11 +360,43 @@ impl AgentClient {
                 agent_serial,
                 read_file,
             },
+            leftover: Vec::new(),
+            fc_reconnects: 0,
         })
     }
 
+    /// Connect to the agent however this guest's backend publishes it.
+    ///
+    /// The one call every client should use: a shim, or the daemon's
+    /// own reattach liveness probe, knows which sandbox it wants and
+    /// not which VMM booted it. `AF_VSOCK` for native guests,
+    /// Firecracker's vsock-UDS proxy for jailed ones.
+    pub fn connect_endpoint(
+        endpoint: &crate::guest::AgentEndpoint,
+        timeout: Duration,
+    ) -> Result<Self, AgentError> {
+        match endpoint {
+            crate::guest::AgentEndpoint::Vsock { cid } => Self::connect_vsock(*cid, timeout),
+            crate::guest::AgentEndpoint::FcUds { path } => {
+                Self::connect_fc_uds(std::path::Path::new(path), AGENT_VSOCK_PORT, timeout)
+            }
+        }
+    }
+
     /// Connect to the agent via `AF_VSOCK`.
+    ///
+    /// CIDs 0–2 are hypervisor / local / host — never a guest. Firecracker
+    /// VMs publish `guest_cid = 0` (`NO_HOST_CID`) plus `FcUds`; dialling
+    /// that over `AF_VSOCK` hangs in a blocking `connect()` with no timeout
+    /// (k7-forked CHALLENGES #15). Fail loud instead of waiting on kubelet's
+    /// exec deadline.
     pub fn connect_vsock(guest_cid: u64, timeout: Duration) -> Result<Self, AgentError> {
+        if guest_cid < crate::vsock::DEFAULT_GUEST_CID {
+            return Err(AgentError::Remote(format!(
+                "refusing AF_VSOCK CID {guest_cid}: CIDs 0–2 are hypervisor/local/host, \
+                 never a guest — Firecracker guests must be dialled via FcUds"
+            )));
+        }
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
@@ -378,7 +475,108 @@ impl AgentClient {
                 read_file,
                 write_file,
             },
+            leftover: Vec::new(),
+            fc_reconnects: 0,
         })
+    }
+
+    /// Connect to the agent through Firecracker's vsock Unix socket.
+    ///
+    /// Firecracker multiplexes guest vsock ports over one host UDS: the
+    /// host connects to `uds_path`, sends `CONNECT <port>\n`, and gets
+    /// `OK <host-side port>\n` back once the guest has accepted. If
+    /// nothing is listening on that guest port, Firecracker closes the
+    /// connection instead of answering — which is exactly what a VM
+    /// whose agent has not come up yet looks like, so the whole
+    /// handshake is retried until `timeout`.
+    pub fn connect_fc_uds(
+        uds_path: &std::path::Path,
+        port: u32,
+        timeout: Duration,
+    ) -> Result<Self, AgentError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::try_fc_uds_connect(uds_path, port) {
+                Ok(client) => return Ok(client),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn try_fc_uds_connect(uds_path: &std::path::Path, port: u32) -> Result<Self, AgentError> {
+        let mut stream = std::os::unix::net::UnixStream::connect(uds_path)?;
+        // Same 1s receive timeout as the vsock transport: the read loops
+        // treat `WouldBlock` as "poll again until the deadline", and a
+        // guest that stops answering must not wedge the caller forever.
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
+        stream.flush()?;
+
+        // Read exactly the handshake line — one byte at a time, because
+        // anything read past the newline belongs to the agent's NDJSON
+        // stream and there is nowhere to put it back.
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    return Err(AgentError::Remote(format!(
+                        "firecracker closed the vsock proxy at {}: nothing is listening \
+                         on guest port {port}",
+                        uds_path.display()
+                    )))
+                }
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => line.push(byte[0]),
+                Err(e) => return Err(AgentError::Io(e)),
+            }
+            if line.len() > 64 {
+                return Err(AgentError::Remote(
+                    "firecracker vsock handshake line is too long".to_string(),
+                ));
+            }
+        }
+        let reply = String::from_utf8_lossy(&line).trim().to_string();
+        if !reply.starts_with("OK ") {
+            return Err(AgentError::Remote(format!(
+                "firecracker vsock handshake answered {reply:?}, wanted \"OK <port>\""
+            )));
+        }
+
+        let read_file = std::fs::File::from(std::os::unix::io::OwnedFd::from(stream));
+        let write_file = read_file.try_clone()?;
+        Ok(Self {
+            transport: Transport::FcUds {
+                read_file,
+                write_file,
+                uds_path: uds_path.to_path_buf(),
+                port,
+            },
+            leftover: Vec::new(),
+            fc_reconnects: 0,
+        })
+    }
+
+    /// Redial an FC vsock proxy in place. `None` for other transports.
+    fn reconnect_fc(&mut self) -> Option<Result<(), AgentError>> {
+        let Transport::FcUds { uds_path, port, .. } = &self.transport else {
+            return None;
+        };
+        let (uds_path, port) = (uds_path.clone(), *port);
+        log::info!(
+            "agent: vsock proxy {} closed (snapshot reset) — reconnecting",
+            uds_path.display()
+        );
+        Some(
+            Self::connect_fc_uds(&uds_path, port, FC_RECONNECT_TIMEOUT).map(|fresh| {
+                self.transport = fresh.transport;
+                self.leftover.clear();
+                self.fc_reconnects += 1;
+            }),
+        )
     }
 
     fn send_bytes(&mut self, data: &[u8]) {
@@ -395,66 +593,64 @@ impl AgentClient {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            Transport::Vsock { write_file, .. } => {
+            Transport::Vsock { write_file, .. } | Transport::FcUds { write_file, .. } => {
                 let _ = write_file.write_all(data);
             }
         }
     }
 
     fn read_response_line(&mut self, timeout: Duration) -> Result<String, AgentError> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut line = Vec::new();
-        let mut buf = [0u8; 1];
-
-        let read_file = match &mut self.transport {
-            Transport::Serial { read_file, .. } => read_file as &mut dyn Read,
-            Transport::Vsock { read_file, .. } => read_file as &mut dyn Read,
-        };
-
-        loop {
-            match read_file.read(&mut buf) {
-                Ok(0) | Err(_) if std::time::Instant::now() >= deadline => {
-                    return Err(AgentError::Timeout);
-                }
-                Ok(0) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Ok(1) => {
-                    if buf[0] == b'\n' {
-                        return String::from_utf8(line).map_err(|_| {
-                            AgentError::Io(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "invalid utf8",
-                            ))
-                        });
-                    }
-                    line.push(buf[0]);
-                }
-                Ok(_) => unreachable!(),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(AgentError::Timeout);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(AgentError::Io(e)),
+        let deadline = Instant::now() + timeout;
+        // On Firecracker's proxy `read` returning 0 is the peer
+        // hanging up, which is exactly what a snapshot of this guest
+        // does to every connection — waiting the deadline out on it
+        // would turn every fork into a 30 s stall for the parent's
+        // clients. The other transports keep their poll-to-deadline
+        // behaviour (and the `Timeout` their callers match on).
+        let (read_file, eof_fatal) = match &mut self.transport {
+            Transport::Serial { read_file, .. } | Transport::Vsock { read_file, .. } => {
+                (read_file as &mut dyn Read, false)
             }
-        }
+            Transport::FcUds { read_file, .. } => (read_file as &mut dyn Read, true),
+        };
+        read_capped_line(read_file, &mut self.leftover, Some(deadline), eof_fatal)
     }
 
+    /// One request/response round trip. On an FC vsock proxy, an EOF
+    /// (the reset Firecracker sends at every snapshot of this guest) is
+    /// answered by redialling and **re-sending the request**, up to
+    /// [`FC_RECONNECT_ATTEMPTS`] times; a request that was mid-flight
+    /// when the source was snapshotted is therefore delivered twice if
+    /// the agent got the first copy. k7d only snapshots a guest while
+    /// no daemon request is in flight against it, so that case is a
+    /// client racing its own fork, which the spec accepts.
     fn send_request(&mut self, req: &Request) -> Result<RawResponse, AgentError> {
         let mut json = serde_json::to_string(req)?;
         json.push('\n');
-        self.send_bytes(json.as_bytes());
-        let line = self.read_response_line(Duration::from_secs(30))?;
-        let resp: RawResponse = serde_json::from_str(line.trim())?;
-        Ok(resp)
+        let mut attempts = 0;
+        loop {
+            self.send_bytes(json.as_bytes());
+            match self.read_response_line(Duration::from_secs(30)) {
+                Ok(line) => return Ok(serde_json::from_str(line.trim())?),
+                Err(AgentError::Io(e))
+                    if e.kind() == io::ErrorKind::UnexpectedEof
+                        && attempts < FC_RECONNECT_ATTEMPTS =>
+                {
+                    let Some(reconnected) = self.reconnect_fc() else {
+                        return Err(AgentError::Io(e));
+                    };
+                    reconnected?;
+                    attempts += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Ping the agent and get version info.
     pub fn ping(&mut self) -> Result<PongResponse, AgentError> {
         match self.send_request(&Request::Ping)? {
-            RawResponse::Pong { version } => Ok(PongResponse { version }),
+            RawResponse::Pong { version, services } => Ok(PongResponse { version, services }),
             _ => Err(AgentError::UnexpectedResponse),
         }
     }
@@ -754,13 +950,17 @@ impl AgentClient {
     }
 
     /// Open a dedicated PTY exec session (interactive
-    /// `kubectl exec -it`). Establishes its own vsock connection,
-    /// performs the `container_exec_pty` handshake, and returns the
-    /// streaming session. Vsock only — PTY exec is not supported over
-    /// the serial fallback transport.
+    /// `kubectl exec -it`). Establishes its own connection to the
+    /// guest, performs the `container_exec_pty` handshake, and returns
+    /// the streaming session.
+    ///
+    /// Needs a socket transport (`AF_VSOCK` or Firecracker's vsock
+    /// UDS), because the session splits the connection into an
+    /// independent reader and writer; the serial fallback multiplexes
+    /// one FIFO and cannot.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_pty_exec(
-        guest_cid: u64,
+        endpoint: &crate::guest::AgentEndpoint,
         timeout: Duration,
         name: &str,
         exec_id: &str,
@@ -769,14 +969,19 @@ impl AgentClient {
         rows: u16,
         cols: u16,
     ) -> Result<PtyExecSession, AgentError> {
-        let client = Self::connect_vsock(guest_cid, timeout)?;
-        let Transport::Vsock {
+        let client = Self::connect_endpoint(endpoint, timeout)?;
+        let (Transport::Vsock {
             read_file,
             mut write_file,
-        } = client.transport
+        }
+        | Transport::FcUds {
+            read_file,
+            mut write_file,
+            ..
+        }) = client.transport
         else {
             return Err(AgentError::Remote(
-                "PTY exec requires the vsock transport".to_string(),
+                "PTY exec requires a socket transport".to_string(),
             ));
         };
 
@@ -962,15 +1167,10 @@ impl PtyExecSession {
     /// Read one complete line from the stream, preserving partial data
     /// across timeouts.
     fn read_line(&mut self) -> Result<String, AgentError> {
+        if let Some(line) = take_complete_line(&mut self.pending)? {
+            return Ok(line);
+        }
         loop {
-            if let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-                let rest = self.pending.split_off(pos + 1);
-                let mut line_bytes = std::mem::replace(&mut self.pending, rest);
-                line_bytes.pop(); // trailing '\n'
-                return String::from_utf8(line_bytes).map_err(|_| {
-                    AgentError::Io(io::Error::new(io::ErrorKind::InvalidData, "invalid utf8"))
-                });
-            }
             let mut buf = [0u8; 8192];
             match self.read.read(&mut buf) {
                 Ok(0) => {
@@ -979,7 +1179,13 @@ impl PtyExecSession {
                         "PTY exec stream closed by agent",
                     )));
                 }
-                Ok(n) => self.pending.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    if append_capped(&mut self.pending, &buf[..n])? {
+                        if let Some(line) = take_complete_line(&mut self.pending)? {
+                            return Ok(line);
+                        }
+                    }
+                }
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1010,6 +1216,113 @@ impl PtyExecSession {
                 }
                 PtyStreamMsg::Exit { code } => return Ok(PtyEvent::Exit(code)),
             }
+        }
+    }
+}
+
+/// Pull a newline-terminated line out of `pending` if one is complete.
+/// The line itself is never longer than [`MAX_AGENT_LINE_BYTES`].
+fn take_complete_line(pending: &mut Vec<u8>) -> Result<Option<String>, AgentError> {
+    let Some(pos) = pending.iter().position(|&b| b == b'\n') else {
+        if pending.len() > MAX_AGENT_LINE_BYTES {
+            pending.clear();
+            return Err(AgentError::Oversized {
+                bytes: MAX_AGENT_LINE_BYTES,
+            });
+        }
+        return Ok(None);
+    };
+    if pos > MAX_AGENT_LINE_BYTES {
+        pending.clear();
+        return Err(AgentError::Oversized {
+            bytes: MAX_AGENT_LINE_BYTES,
+        });
+    }
+    let rest = pending.split_off(pos + 1);
+    let mut line = std::mem::replace(pending, rest);
+    line.pop();
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| AgentError::Io(io::Error::new(io::ErrorKind::InvalidData, "invalid utf8")))
+}
+
+/// Append `chunk` without letting the current line grow past the cap.
+/// Leftover after a newline stays in `pending` for the next call.
+/// Returns whether `chunk` contained a newline (caller must not rescan
+/// `pending` on every chunk — that is O(n²) on a 64 MiB flood).
+fn append_capped(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<bool, AgentError> {
+    if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+        if pending.len() + nl > MAX_AGENT_LINE_BYTES {
+            pending.clear();
+            return Err(AgentError::Oversized {
+                bytes: MAX_AGENT_LINE_BYTES,
+            });
+        }
+        pending.extend_from_slice(chunk);
+        return Ok(true);
+    }
+    if pending.len() + chunk.len() > MAX_AGENT_LINE_BYTES {
+        pending.clear();
+        return Err(AgentError::Oversized {
+            bytes: MAX_AGENT_LINE_BYTES,
+        });
+    }
+    pending.extend_from_slice(chunk);
+    Ok(false)
+}
+
+/// Chunked, capped line read. `deadline` is the poll loop used by
+/// `read_response_line` (serial / vsock). `Ok(0)` is unexpected EOF
+/// when `eof_fatal` is set or there is no deadline (the PTY path
+/// handles that itself); otherwise it is polled until the deadline.
+fn read_capped_line(
+    reader: &mut dyn Read,
+    pending: &mut Vec<u8>,
+    deadline: Option<Instant>,
+    eof_fatal: bool,
+) -> Result<String, AgentError> {
+    const CHUNK: usize = 8192;
+    if let Some(line) = take_complete_line(pending)? {
+        return Ok(line);
+    }
+    loop {
+        let mut buf = [0u8; CHUNK];
+        match reader.read(&mut buf) {
+            Ok(0) if !eof_fatal && deadline.is_some_and(|d| Instant::now() >= d) => {
+                return Err(AgentError::Timeout);
+            }
+            Ok(0) if !eof_fatal && deadline.is_some() => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(0) => {
+                return Err(AgentError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "agent stream closed",
+                )));
+            }
+            Ok(n) => {
+                if append_capped(pending, &buf[..n])? {
+                    if let Some(line) = take_complete_line(pending)? {
+                        return Ok(line);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(AgentError::Timeout);
+                }
+                if deadline.is_none() {
+                    return Err(AgentError::Timeout);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
+                return Err(AgentError::Timeout);
+            }
+            Err(e) => return Err(AgentError::Io(e)),
         }
     }
 }
@@ -1071,4 +1384,92 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Generates `remaining` bytes of `x` without storing them.
+    struct RepeatByte {
+        remaining: usize,
+    }
+
+    impl Read for RepeatByte {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(b'x');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn connect_vsock_refuses_hypervisor_local_host_cids() {
+        for cid in [0_u64, 1, 2] {
+            let started = Instant::now();
+            let err = match AgentClient::connect_vsock(cid, Duration::from_secs(30)) {
+                Err(e) => e,
+                Ok(_) => panic!("CIDs 0–2 must fail immediately, not hang in connect()"),
+            };
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "CID {cid} took {:?}; a blocking vsock connect would hang",
+                started.elapsed()
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("CID {cid}")) && msg.contains("FcUds"),
+                "CID {cid} error should name the cid and FcUds, got {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_capped_line_rejects_100mib_without_newline() {
+        let mut pending = Vec::new();
+        let err = read_capped_line(
+            &mut RepeatByte {
+                remaining: 100 << 20,
+            },
+            &mut pending,
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        )
+        .expect_err("100 MiB without a newline must not succeed");
+        assert!(
+            matches!(err, AgentError::Oversized { bytes } if bytes == MAX_AGENT_LINE_BYTES),
+            "expected Oversized at the cap, got {err:?}"
+        );
+        assert!(
+            pending.len() <= MAX_AGENT_LINE_BYTES,
+            "peak pending {} exceeded the cap",
+            pending.len()
+        );
+    }
+
+    #[test]
+    fn read_capped_line_accepts_8mib_read_file() {
+        let payload = vec![b'A'; 8 << 20];
+        let b64 = base64_encode(&payload);
+        let mut line =
+            format!(r#"{{"type":"read_file_result","ok":true,"data":"{b64}","error":""}}"#);
+        line.push('\n');
+        let mut pending = Vec::new();
+        let got = read_capped_line(
+            &mut Cursor::new(line.into_bytes()),
+            &mut pending,
+            Some(Instant::now() + Duration::from_secs(5)),
+            false,
+        )
+        .expect("8 MiB read_file line must fit under the cap");
+        match serde_json::from_str::<RawResponse>(got.trim()).expect("parse") {
+            RawResponse::ReadFileResult { ok: true, data, .. } => {
+                let decoded = base64_decode(&data).expect("base64");
+                assert_eq!(decoded, payload);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
 }

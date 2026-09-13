@@ -1,4 +1,4 @@
-//! the referenced work: gym-router sticky groups, Ubuntu admission, drain.
+//! Gym-router sticky groups, Ubuntu admission, drain.
 //!
 //! Two stub gym processes + `gym/router.py`. The router never talks to
 //! `/run/k7d/k7d.sock` and never forks — stubs implement the frozen

@@ -295,3 +295,66 @@ fn test_block_device_warm_fork_rw_requires_reflink() {
 
     source.shutdown();
 }
+
+#[test]
+fn test_fork_full_dump_when_nonquiescent_virtio_blk() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempfile::tempdir().unwrap();
+    let img = make_ext4_image(dir.path(), "wedge.img", 16);
+    let mut source = build_vm_with_block(&img, true);
+    source.start().unwrap();
+    let _ = source
+        .connect_agent(Duration::from_secs(90))
+        .expect("initial agent connect");
+
+    source
+        .prepare_fork_source()
+        .expect("prepare while workers can park");
+    let _ = source
+        .connect_agent(Duration::from_secs(30))
+        .expect("reconnect after prepare_fork_source");
+
+    let before = k7d::virtio_mmio::fork_nonquiescent_counts();
+    source.hold_virtio_workers_for_test(true);
+    let mut dumped = source
+        .fork_warm("wedged-blk")
+        .expect("missed park must fall back to a full dump, not refuse");
+    source.hold_virtio_workers_for_test(false);
+
+    assert!(
+        dumped.fork_memory_is_full_copy(),
+        "non-quiescent fork must take the memfd full-dump path"
+    );
+    let after = k7d::virtio_mmio::fork_nonquiescent_counts();
+    assert!(
+        after.virtio_blk > before.virtio_blk,
+        "counter must increment: before={before:?} after={after:?}"
+    );
+
+    dumped.start().unwrap();
+    let mut dump_agent = dumped
+        .connect_agent(Duration::from_secs(30))
+        .expect("full-dump child reachable");
+    dump_agent.ping().unwrap();
+    dumped.shutdown();
+
+    // Source stays up; a later fork with the wedge off is CoW again.
+    let mut agent = source
+        .connect_agent(Duration::from_secs(30))
+        .expect("source agent after full-dump fork");
+    let alive = agent.exec(&["echo", "still-alive"]).unwrap();
+    assert_eq!(alive.stdout.trim(), "still-alive");
+
+    let mut forked = source
+        .fork_warm("after-wedge")
+        .expect("healthy fork after the wedge is lifted");
+    assert!(!forked.fork_memory_is_full_copy());
+    forked.start().unwrap();
+    let mut fork_agent = forked
+        .connect_agent(Duration::from_secs(30))
+        .expect("fork after wedge");
+    fork_agent.ping().unwrap();
+    forked.shutdown();
+    source.shutdown();
+}

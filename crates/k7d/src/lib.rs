@@ -41,7 +41,11 @@ pub mod doctor;
 #[cfg(not(feature = "verif"))]
 pub mod erofs;
 #[cfg(not(feature = "verif"))]
+pub mod fc;
+#[cfg(not(feature = "verif"))]
 pub mod fork;
+#[cfg(not(feature = "verif"))]
+pub mod guest;
 #[cfg(not(feature = "verif"))]
 pub mod latency;
 #[cfg(not(feature = "verif"))]

@@ -1,7 +1,7 @@
-//! TrainJob / Kubeflow Trainer on the 31a-inc1 fake GPU fixture, then
-//! a warm fork .
+//! TrainJob / Kubeflow Trainer on the fake GPU fixture, then
+//! a warm fork.
 //!
-//! JobSet (inc2 pin) plus digest-pinned Trainer v2.2.1, a custom
+//! JobSet (pinned) plus digest-pinned Trainer v2.2.1, a custom
 //! busybox TrainingRuntime (PlainML — not torch, not CUDA), and a
 //! 2-worker TrainJob each requesting `nvidia.com/gpu: 1`. Workers
 //! rendezvous over Trainer/JobSet DNS and stay Running so the fork
@@ -243,7 +243,7 @@ fn pin_trainer_manifests(text: &str) -> String {
     assert!(
         !text.contains("jobset-controller-manager")
             && !text.contains("registry.k8s.io/jobset/jobset"),
-        "templated Trainer chart installed JobSet — keep the inc2 \
+        "templated Trainer chart installed JobSet — keep the pinned \
          jobset-system pin and set jobset.install=false"
     );
     assert!(
@@ -744,9 +744,7 @@ fn test_ubuntu_ml_trainjob_gpu_fork() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

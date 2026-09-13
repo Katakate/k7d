@@ -1,4 +1,4 @@
-"""Red-as-foothold unit tests (26a-inc11) — mocked exec/curl, no KVM.
+"""Red-as-foothold unit tests — mocked exec/curl, no KVM.
 
 Proves: red acts execute as the granted foothold (SA token, not admin
 creds — loud if admin used); the no-egress assertion fires when the

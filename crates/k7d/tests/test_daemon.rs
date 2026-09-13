@@ -14,9 +14,10 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k7d::api::AgentClient;
@@ -36,8 +37,10 @@ fn workspace_path(relative: &str) -> PathBuf {
 struct DaemonGuard {
     child: Child,
     socket: PathBuf,
+    socket_dir: PathBuf,
     tree_root: PathBuf,
     sandbox_root: PathBuf,
+    log_path: Option<PathBuf>,
 }
 
 impl Drop for DaemonGuard {
@@ -45,33 +48,53 @@ impl Drop for DaemonGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
         // Tree state (base.mem checkpoints are 256 MiB each) — reclaim.
         let _ = std::fs::remove_dir_all(&self.tree_root);
         let _ = std::fs::remove_dir_all(&self.sandbox_root);
+        if let Some(ref log) = self.log_path {
+            let _ = std::fs::remove_file(log);
+        }
     }
 }
 
 /// Spawn a fresh daemon on a per-test socket and wait for it to bind.
 fn spawn_daemon(tag: &str) -> DaemonGuard {
+    spawn_daemon_env(tag, &[], false)
+}
+
+/// Like [`spawn_daemon`], with extra env and optional stderr capture.
+fn spawn_daemon_env(tag: &str, extra: &[(&str, &str)], capture_log: bool) -> DaemonGuard {
     let pid = std::process::id();
-    let socket = std::env::temp_dir().join(format!("k7d-test-{tag}-{pid}.sock"));
+    let socket_dir = std::env::temp_dir().join(format!("k7d-test-{tag}-{pid}"));
+    let _ = std::fs::remove_dir_all(&socket_dir);
+    std::fs::create_dir_all(&socket_dir).expect("create socket parent");
+    let socket = socket_dir.join("k7d.sock");
     let tree_root = std::env::temp_dir().join(format!("k7d-test-trees-{tag}-{pid}"));
     let sandbox_root = std::env::temp_dir().join(format!("k7d-test-sandboxes-{tag}-{pid}"));
-    let _ = std::fs::remove_file(&socket);
+    let log_path = capture_log.then(|| socket_dir.join("k7d.log"));
 
-    let child = Command::new(env!("CARGO_BIN_EXE_k7d"))
-        .arg("--socket")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_k7d"));
+    cmd.arg("--socket")
         .arg(&socket)
         .env("RUST_LOG", "info")
         .env("K7D_TREE_ROOT", &tree_root)
-        .env("K7D_SANDBOX_ROOT", &sandbox_root)
-        .spawn()
-        .expect("spawn k7d daemon");
+        .env("K7D_SANDBOX_ROOT", &sandbox_root);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    if let Some(ref log) = log_path {
+        cmd.stderr(std::fs::File::create(log).expect("daemon log"));
+        cmd.stdout(Stdio::null());
+    }
+    let child = cmd.spawn().expect("spawn k7d daemon");
     let guard = DaemonGuard {
         child,
         socket,
+        socket_dir,
         tree_root,
         sandbox_root,
+        log_path,
     };
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -177,12 +200,93 @@ fn test_second_daemon_refuses_a_live_socket() {
     }
 }
 
+/// Control socket is `0660`, parent `0750`. `K7D_ALLOWED_UIDS` excluding
+/// this process refuses the connection and logs it; without the env,
+/// root (k7's Python client path) still works.
+#[test]
+fn test_control_socket_mode_and_allowed_uids() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let allowed = spawn_daemon("sockmode");
+    let sock_mode = std::fs::metadata(&allowed.socket)
+        .expect("socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(sock_mode, 0o660, "socket must be 0660, got {sock_mode:o}");
+    let parent_mode = std::fs::metadata(&allowed.socket_dir)
+        .expect("parent metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        parent_mode, 0o750,
+        "socket parent must be 0750, got {parent_mode:o}"
+    );
+    match call(&allowed, &Request::Ping) {
+        Response::Pong { .. } => {}
+        other => panic!("root must still connect without an allowlist, got {other:?}"),
+    }
+    drop(allowed);
+
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { libc::getuid() };
+    let other = if me == 0 { 1 } else { 0 };
+    let denied = spawn_daemon_env(
+        "sockdeny",
+        &[("K7D_ALLOWED_UIDS", &other.to_string())],
+        true,
+    );
+    // Accept may succeed and then the daemon drops the stream, or
+    // connect itself fails. Either is a refusal (`call` and `connect`
+    // have different error types, so they cannot share `and_then`).
+    let refused = match Client::connect(denied.socket.to_str().expect("utf8")) {
+        Ok(mut c) => c.call(&Request::Ping).is_err(),
+        Err(_) => true,
+    };
+    assert!(
+        refused,
+        "uid {me} must be refused when allowlist is {other}"
+    );
+    let log_path = denied.log_path.as_ref().expect("captured log");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut log = String::new();
+    loop {
+        log = std::fs::read_to_string(log_path).unwrap_or_default();
+        if log.contains("K7D_ALLOWED_UIDS") || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        log.contains("K7D_ALLOWED_UIDS") && log.contains(&format!("uid={me}")),
+        "refusal must be logged with the peer uid, got: {log}"
+    );
+    drop(denied);
+}
+
 fn bridge_exists(name: &str) -> bool {
     Command::new("ip")
         .args(["link", "show", name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Host TAP/TUN names (`ip -o link show type tun`). Used to assert a
+/// failed CNI attach did not leak the TAP `acquire_network` created.
+fn tun_names() -> Vec<String> {
+    let out = Command::new("ip")
+        .args(["-o", "link", "show", "type", "tun"])
+        .output()
+        .expect("ip link show type tun");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .map(|n| n.trim_end_matches(':').to_string())
+        })
+        .collect()
 }
 
 #[test]
@@ -192,7 +296,7 @@ fn test_daemon_vm_lifecycle_and_cross_process_agent() {
 
     // Ping.
     match call(&guard, &Request::Ping) {
-        Response::Pong { version } => assert_eq!(version, env!("CARGO_PKG_VERSION")),
+        Response::Pong { version, .. } => assert_eq!(version, env!("CARGO_PKG_VERSION")),
         other => panic!("unexpected ping response: {other:?}"),
     }
 
@@ -344,7 +448,75 @@ fn test_daemon_bridge_refcount_across_vms() {
     drop(guard);
 }
 
-/// The `warp_clock` op : every VM on one cluster bridge
+/// A requested CNI attach that cannot complete must fail `create_vm`
+/// (bug-candidates #38). The VM must not boot on the
+/// host bridge with an IP kubelet never programmed.
+#[test]
+fn test_daemon_bogus_pod_netns_fails_create_loud() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cluster_id = format!("n{}", std::process::id() % 99_999_999);
+    let bridge = format!("k7-br-{cluster_id}");
+    // Residue from a crashed previous run of *this* test only —
+    // do not sweep other `k7-br-*` (bug-candidates #64).
+    if bridge_exists(&bridge) {
+        let _ = Command::new("ip")
+            .args(["link", "delete", &bridge])
+            .status();
+    }
+    assert!(
+        !bridge_exists(&bridge),
+        "stale {bridge} present before test"
+    );
+
+    let guard = spawn_daemon("cnifl");
+    let taps_before = tun_names();
+    let mut config = default_config();
+    config.network = Some(NetConfig {
+        cluster_id,
+        vm_index: None,
+        pod_netns: Some("/var/run/netns/does-not-exist".to_string()),
+    });
+
+    match call(&guard, &Request::CreateVm { config }) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("CNI attach"),
+                "error must name the CNI attach, not a missing kernel: {message}"
+            );
+            assert!(
+                message.contains("does-not-exist"),
+                "error must name the bogus netns path: {message}"
+            );
+            assert!(
+                !message.to_lowercase().contains("kernel"),
+                "must not look like a kernel-path error: {message}"
+            );
+        }
+        other => panic!("bogus pod_netns must not create a VM: {other:?}"),
+    }
+
+    match call(&guard, &Request::ListVms) {
+        Response::VmList { vms } => {
+            assert!(vms.is_empty(), "failed CNI attach left a VM: {vms:?}");
+        }
+        other => panic!("unexpected list_vms response: {other:?}"),
+    }
+    assert!(
+        !bridge_exists(&bridge),
+        "{bridge} must not survive a failed CNI attach"
+    );
+    let leftover: Vec<_> = tun_names()
+        .into_iter()
+        .filter(|n| !taps_before.contains(n))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "leftover TAP after failed CNI attach: {leftover:?}"
+    );
+    drop(guard);
+}
+
+/// The `warp_clock` op: every VM on one cluster bridge
 /// gets the same forward jump, under pause, in one call.
 ///
 /// The mechanism's correctness on a real workload is
@@ -442,7 +614,7 @@ fn test_daemon_warp_clock_moves_every_vm_on_a_cluster() {
             );
             assert!(latency_ns > 0, "the daemon must report its own latency");
             eprintln!(
-                "MEASUREMENT 34a-inc2 daemon warp_clock 2 VMs: {:.1}ms",
+                "MEASUREMENT daemon warp_clock 2 VMs: {:.1}ms",
                 latency_ns as f64 / 1e6
             );
         }
@@ -492,7 +664,7 @@ fn guest_exec(cid: u64, argv: &[&str]) -> String {
     out.stdout.trim().to_string()
 }
 
-/// `create_vm` with a **named persistent** data disk :
+/// `create_vm` with a **named persistent** data disk:
 /// the agent mounts it, `stop_vm` retains the image, `delete_data_disk`
 /// refuses while a live VM holds it, and a tree payload cannot have one.
 ///
@@ -679,6 +851,7 @@ fn test_daemon_tree_lifecycle() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => {
             assert_eq!(guest_cids.len(), 1, "single-VM tree has one member");
             (tree_id, root_id, guest_cids[0])
@@ -901,6 +1074,7 @@ fn test_daemon_tree_rl_verbs() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => (tree_id, root_id, guest_cids[0]),
         other => panic!("unexpected tree_create response: {other:?}"),
     };
@@ -929,7 +1103,9 @@ fn test_daemon_tree_rl_verbs() {
             dilation: None,
         },
     ) {
-        Response::TreeForkBatch { forks, latency_ns } => {
+        Response::TreeForkBatch {
+            forks, latency_ns, ..
+        } => {
             assert!(
                 latency_ns > 0,
                 "tree_fork_batch must report latency_ns, got {latency_ns}"
@@ -1063,6 +1239,7 @@ fn test_daemon_cluster_tree_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => (tree_id, root_id, guest_cids),
         other => panic!("unexpected tree_create_cluster response: {other:?}"),
     };
@@ -1084,6 +1261,7 @@ fn test_daemon_cluster_tree_fork() {
             fork_memory_full_copy,
             latency_ns,
             dilation,
+            ..
         } => {
             assert_eq!(dilation, 1, "undilated source forks at 1");
             assert!(
@@ -1200,7 +1378,7 @@ fn test_daemon_cluster_tree_fork() {
     drop(guard);
 }
 
-/// the referenced work: `tree_open` of a just-`tree_drop`ped cluster returns
+/// `tree_open` of a just-`tree_drop`ped cluster returns
 /// nodes Suspended. Missing / already-in-memory / unparseable are loud
 /// and never delete the on-disk dir.
 #[test]
@@ -1223,6 +1401,7 @@ fn test_daemon_tree_open_after_drop() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => {
             assert_eq!(guest_cids.len(), 1);
             (tree_id, root_id, guest_cids)
@@ -1391,6 +1570,7 @@ fn test_daemon_tree_adopt_cluster() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => (tree_id, root_id, guest_cids),
         other => panic!("unexpected tree_adopt_cluster response: {other:?}"),
     };
@@ -1611,6 +1791,8 @@ fn test_daemon_reattach_verifies_live_vm() {
         sandbox_id: "sb-ghost".to_string(),
         vm_id: "vm-99999-42".to_string(),
         guest_cid: 4242,
+        backend: k7d::guest::Backend::Native,
+        agent_endpoint: Some(k7d::guest::AgentEndpoint::Vsock { cid: 4242 }),
         vcpus: 1,
         cpu_quota: None,
         cpu_period: None,
@@ -1664,7 +1846,7 @@ fn test_daemon_reattach_verifies_live_vm() {
     // Fresh daemon, same sandbox root: its startup scan must sweep the
     // orphan (no VM in its registry can match). Pin K7D_TREE_ROOT so
     // rehydrate_trees_from_disk does not open leftover trees under
-    // /var/lib/k7d/trees  and delay the bind past the
+    // /var/lib/k7d/trees and delay the bind past the
     // record-sweep proxy this test used to treat as "ready".
     guard.child = Command::new(env!("CARGO_BIN_EXE_k7d"))
         .arg("--socket")
@@ -1721,6 +1903,7 @@ fn test_daemon_tree_watch() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => {
             assert_eq!(guest_cids.len(), 1);
             (tree_id, root_id, guest_cids[0])
@@ -1786,6 +1969,7 @@ fn test_daemon_tree_watch() {
             op,
             node_id: ev_node,
             latency_ns: ev_lat,
+            ..
         } => {
             assert_eq!(tid, "watch-tree");
             assert_eq!(op, "fork");
@@ -1837,7 +2021,9 @@ fn test_doctor_cli_does_not_start_a_daemon() {
     );
 }
 
-/// The `doctor` control verb reports the same four host checks.
+/// The `doctor` control verb reports the same four host checks, plus
+/// the advisory Firecracker section that must not change
+/// `ok`.
 #[test]
 fn test_doctor_verb_reports_host() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1849,6 +2035,7 @@ fn test_doctor_verb_reports_host() {
             tun,
             cgroup_v2,
             ok,
+            fc_fork_mode,
             details,
         } => {
             assert!(kvm, "kvm");
@@ -1856,7 +2043,18 @@ fn test_doctor_verb_reports_host() {
             assert!(tun, "tun");
             assert!(cgroup_v2, "cgroup_v2");
             assert!(ok, "ok");
-            assert_eq!(details.len(), 4, "{details:?}");
+            let expected_mode =
+                std::env::var("K7D_FC_FORK_SNAPSHOT").unwrap_or_else(|_| "diff".to_string());
+            assert_eq!(fc_fork_mode, expected_mode, "FC fork mode");
+            let host: Vec<&String> = details.iter().filter(|d| !d.contains("  fc_")).collect();
+            assert_eq!(host.len(), 4, "{details:?}");
+            // A node with no Firecracker installed is still a healthy
+            // node, so the backend's lines are reported but never
+            // decide `ok`.
+            assert!(
+                details.iter().any(|d| d.contains("  fc_firecracker  ")),
+                "doctor must report the Firecracker backend: {details:?}"
+            );
         }
         other => panic!("unexpected doctor response: {other:?}"),
     }
@@ -1901,7 +2099,7 @@ fn test_quickstart_busybox_four_forks() {
     k7d::quickstart::print_clocks(&clocks);
 }
 
-/// the referenced work on stock modules: `dilation: Some(8)` is refused
+/// On stock modules: `dilation: Some(8)` is refused
 /// naming the patch, `Some(0)` is refused, `None` / `Some(1)` inherit
 /// the undilated source.
 #[test]
@@ -1921,6 +2119,7 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         } => (tree_id, root_id, guest_cids[0]),
         other => panic!("unexpected tree_create: {other:?}"),
     };

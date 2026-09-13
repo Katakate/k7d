@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use k7d::tree::{NodeState, SnapshotTree, TreeBudget};
+use k7d::tree::{NodeState, SnapshotTree, TreeBudget, TreeError};
 use k7d::vm::Vm;
 
 mod common;
@@ -129,7 +129,7 @@ fn test_tree_fork_from_child() {
 
     // Graph depth 2 under `max_chain_depth: 1` must succeed —
     // `max_chain_depth` caps the restore chain (delta hops to the nearest
-    // checkpoint), NOT tree-graph depth (the referenced work regression guard:
+    // checkpoint), NOT tree-graph depth (regression guard:
     // a naive graph-depth check would fail this fork).
     assert_eq!(default_budget().max_chain_depth, 1);
     let grand = tree.fork(&child, "grand").unwrap();
@@ -143,6 +143,8 @@ fn test_tree_fork_from_child() {
     );
     assert!(tree
         .get_vm(&child)
+        .unwrap()
+        .as_native()
         .unwrap()
         .fork_source_base_path()
         .is_some());
@@ -183,7 +185,12 @@ fn test_tree_fork_from_grandchild_without_prepare() {
             "{id} must inherit, not own a keyframe"
         );
         assert!(
-            tree.get_vm(id).unwrap().fork_source_base_path().is_some(),
+            tree.get_vm(id)
+                .unwrap()
+                .as_native()
+                .unwrap()
+                .fork_source_base_path()
+                .is_some(),
             "{id} must be forkable against the ancestor file"
         );
     }
@@ -198,13 +205,15 @@ fn test_tree_fork_from_grandchild_without_prepare() {
     assert!(tree
         .get_vm(&great)
         .unwrap()
+        .as_native()
+        .unwrap()
         .fork_source_base_path()
         .is_some());
 
     tree.prune(&root_id).unwrap();
 }
 
-/// the referenced work: `prepare_fork_source` must check the disk budget BEFORE
+/// `prepare_fork_source` must check the disk budget BEFORE
 /// writing a new `memory.bin`, failing loud (`BudgetExhausted`) when there
 /// is no headroom and nothing evictable — not silently blowing
 /// `max_disk_bytes` until the next auto_evict.
@@ -360,7 +369,7 @@ fn test_tree_protection() {
     let a = tree.fork(&root, "a").unwrap(); // budget now full: root + a
     tree.protect(&a);
 
-    // Forking b needs headroom for 1 incoming VM : fork_batch
+    // Forking b needs headroom for 1 incoming VM: fork_batch
     // evicts BEFORE forking, exempting the source (root). The only candidate
     // is "a", which is protected → deterministic loud BudgetExhausted; the
     // fork must NOT silently overshoot max_live_vms.
@@ -498,7 +507,7 @@ fn test_tree_delta_format_roundtrip() {
         "a rejected pack must not have written anything"
     );
 
-    // Identity 0 on either side is pre-30b metadata: it loads.
+    // Identity 0 on either side is legacy metadata: it loads.
     let legacy = dir.path().join("legacy.pack");
     write_delta(&legacy, &bitmap, src_addr, mem_size, 0).unwrap();
     let mut dst0 = vec![0u8; mem_size as usize];
@@ -560,7 +569,9 @@ fn test_tree_fork_of_fork_with_rw_disk() {
 
     let disk_of = |tree: &SnapshotTree, id: &String| {
         let vm = tree.get_vm(id).expect("live vm");
-        vm.block_devices()
+        vm.as_native()
+            .unwrap()
+            .block_devices()
             .first()
             .expect("has a block device")
             .host_path
@@ -595,11 +606,46 @@ fn test_tree_fork_of_fork_with_rw_disk() {
     tree.prune(&grand).expect("prune suspended child");
     assert!(parked2.iter().all(|d| !d.exists()), "prune must reap");
 
+    // Disk-tier eviction of a suspended fork child must reap parked
+    // clones too (bug-candidates #52). Resume of an Evicted node still
+    // fails — evicted ≠ suspended.
+    let victim = tree
+        .fork(&child, "evict-victim")
+        .expect("fork victim for disk eviction");
+    tree.suspend(&victim).expect("suspend for eviction");
+    let parked3 = tree.get_node(&victim).unwrap().parked_disk_dirs.clone();
+    assert!(
+        !parked3.is_empty(),
+        "suspended victim must park its RW disk-clone dir"
+    );
+    assert!(parked3.iter().all(|d| d.exists()));
+    let mut disk_budget = tree.budget();
+    disk_budget.max_disk_bytes = tree.usage().disk_bytes.saturating_sub(1);
+    tree.set_budget(disk_budget);
+    tree.auto_evict().expect("disk-tier eviction");
+    let info = tree.get_node(&victim).unwrap();
+    assert_eq!(info.state, NodeState::Evicted);
+    assert!(
+        info.parked_disk_dirs.is_empty(),
+        "evicted record must clear parked_disk_dirs"
+    );
+    assert!(
+        parked3.iter().all(|d| !d.exists()),
+        "evict must reap parked dirs"
+    );
+    let err = tree
+        .resume(&victim)
+        .expect_err("resume of an evicted node must fail");
+    assert!(
+        matches!(err, TreeError::BadState(_, NodeState::Evicted, _)),
+        "resume of evicted must fail as BadState, got {err}"
+    );
+
     tree.prune(&root_id).expect("prune");
     let _ = std::fs::remove_file(&img);
 }
 
-// --- the referenced work: reflink keyframes -------------------------------------
+// --- reflink keyframes -------------------------------------
 
 /// The 4 KiB page the marker tests write into, chosen well past the
 /// kernel's own text so a stale clone shows up as the *old* bytes rather
@@ -636,8 +682,8 @@ fn live_root_tree(dir: &std::path::Path, budget: TreeBudget) -> (SnapshotTree, S
     (tree, root)
 }
 
-/// the referenced work: a child's keyframe is a `FICLONE` of its parent's plus its
-/// dirty pages — same guest state, a fraction of the disk.
+/// A child's keyframe is a `FICLONE` of its parent's plus its dirty
+/// pages — same guest state, a fraction of the disk.
 #[test]
 fn test_tree_prepare_incremental() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -684,7 +730,7 @@ fn test_tree_prepare_incremental() {
         .join(&child)
         .join("memory.bin");
     let span = std::fs::metadata(&child_mem).unwrap().len();
-    eprintln!("30b: incremental keyframe grew the XFS by {grew} B of a {span} B span");
+    eprintln!("incremental keyframe grew the XFS by {grew} B of a {span} B span");
     assert!(
         grew < span / 2,
         "an incremental keyframe must share its ancestor's extents: the \
@@ -692,7 +738,7 @@ fn test_tree_prepare_incremental() {
     );
 
     // The tree's disk budget must count that physical cost, not the
-    // logical length  — otherwise auto-evict fires on paper.
+    // logical length — otherwise auto-evict fires on paper.
     let recorded = tree.get_node(&child).unwrap().base_disk_bytes;
     assert!(
         recorded.is_some_and(|b| b < span / 2),
@@ -703,7 +749,7 @@ fn test_tree_prepare_incremental() {
     tree.prune(&root).unwrap();
 }
 
-/// the referenced work / CHALLENGES #101 class: the `TRANSPORT_RESET` the snapshot
+/// CHALLENGES #101 class: the `TRANSPORT_RESET` the snapshot
 /// injects is a *host* write into guest RAM that KVM's dirty log cannot
 /// see. An incremental keyframe that patched only the KVM-visible dirt
 /// would ship its ancestor's stale vsock event ring, and the guest
@@ -744,7 +790,7 @@ fn test_keyframe_includes_vsock_reset() {
     tree.prune(&root).unwrap();
 }
 
-/// the referenced work: the fallback is loud and complete, never silent.
+/// The full-dump fallback is loud and complete, never silent.
 ///
 /// A tree on ext4 (the node's root FS, where `tempfile::tempdir()`
 /// lands) cannot `FICLONE`, so every keyframe must be a full dump —
@@ -781,7 +827,7 @@ fn test_tree_prepare_falls_back_on_non_reflink_fs() {
     tree.prune(&root).unwrap();
 }
 
-/// the referenced work §4: N incremental keyframes must fit a `max_disk_bytes`
+/// N incremental keyframes must fit a `max_disk_bytes`
 /// that N full dumps would blow.
 ///
 /// The budget counts `base_disk_bytes` (what the keyframe physically
@@ -875,13 +921,13 @@ fn test_suspend_resume_suspend_is_complete() {
     tree.prune(&root).unwrap();
 }
 
-/// CHALLENGES #152 / the referenced work: a `delta.pack` names the base generation
+/// CHALLENGES #152: a `delta.pack` names the base generation
 /// it was diffed against, and a resume onto a different generation fails
 /// loud.
 ///
 /// Two halves. First: a resumed checkpoint keeps `fork_source_base_path`
 /// and `has_base_snapshot`, so a later fork reuses that file instead of
-/// writing a new keyframe under suspended descendants. the referenced work stopped
+/// writing a new keyframe under suspended descendants. The daemon stopped
 /// auto-preparing on `fork_batch`, so mid is prepared **explicitly** —
 /// otherwise the leaf pack names the root generation and this test
 /// asserts `mid.base_identity != 0` against 0. Then the backstop: when
@@ -894,7 +940,7 @@ fn test_resume_rejects_stale_base() {
 
     let mid = tree.fork(&root, "mid").unwrap();
     tree.prepare_fork_source(&mid)
-        .expect("explicit prepare so mid owns a keyframe ");
+        .expect("explicit prepare so mid owns a keyframe");
     let leaf = tree.fork(&mid, "leaf").unwrap();
     let mid_gen = tree.get_node(&mid).unwrap().base_identity;
     assert_ne!(mid_gen, 0, "a prepared node must carry a base generation");
@@ -907,7 +953,12 @@ fn test_resume_rejects_stale_base() {
     // its existing keyframe instead of minting a new generation under
     // the suspended leaf.
     assert!(
-        tree.get_vm(&mid).unwrap().fork_source_base_path().is_some(),
+        tree.get_vm(&mid)
+            .unwrap()
+            .as_native()
+            .unwrap()
+            .fork_source_base_path()
+            .is_some(),
         "a resumed checkpoint must keep its fork_source_base_path \
          (CHALLENGES #144)"
     );

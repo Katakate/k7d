@@ -147,14 +147,14 @@ pub const FORK_CLUSTER_WARM_BATCH_8: Duration = Duration::from_secs(2);
 pub const FORK_INNER_K3S_CLUSTER_3VM: Duration = Duration::from_millis(1_000);
 
 /// Warm-fork the 3-VM inner-k3s cluster with Argo CD core + in-cluster
-/// git + a synced Application . Dirtier than the shared
+/// git + a synced Application. Dirtier than the shared
 /// [`FORK_INNER_K3S_CLUSTER_3VM`] 1 s ceiling — do not widen that one.
 /// Enforced by `test_inner_k3s_argocd_gitops_fork`.
 pub const FORK_INNER_K3S_CLUSTER_3VM_ARGOCD: Duration = Duration::from_millis(2_000);
 
 /// Warm-fork one 2 GB Ubuntu 24.04 bare-VM node — stock distro rootfs
 /// on ext4/virtio-blk with systemd as PID 1, so both the memory `CoW`
-/// and a `FICLONE` reflink of the root disk . A different
+/// and a `FICLONE` reflink of the root disk. A different
 /// substrate from the busybox guest behind [`FORK_WARM`]: 2 GB instead
 /// of 256 MB and a distro's worth of dirty pages between prepare and
 /// fork. Measured ~118 ms; ceiling at 2×.
@@ -162,8 +162,8 @@ pub const FORK_INNER_K3S_CLUSTER_3VM_ARGOCD: Duration = Duration::from_millis(2_
 pub const FORK_UBUNTU_NODE_1VM: Duration = Duration::from_millis(250);
 
 /// 3 Ubuntu 24.04 nodes (2 GB / 2 vCPU each) boot systemd + k3s to
-/// three `Ready` nodes on one bridge . Hang-detection
-/// ceiling, not a 2× budget — same rationale as inc1's 120 s
+/// three `Ready` nodes on one bridge. Hang-detection
+/// ceiling, not a 2× budget — same rationale as the single-node 120 s
 /// boot-to-agent. Measured ~39–42 s exclusive (2026-08-19); userspace
 /// (k3s + airgap import) dominates. Do not reuse boot ceilings from
 /// `test_ubuntu_guest.rs`.
@@ -194,7 +194,7 @@ pub const SUSPEND_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 /// from `vm_state.json`. projects ~40 ms; ceiling at 750 ms.
 pub const RESUME_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 
-/// Lockstep guest-clock warp of a 3-VM cluster .
+/// Lockstep guest-clock warp of a 3-VM cluster.
 ///
 /// The daemon's `WarpClock` op end to end: pause all three members,
 /// then per member one `KVM_GET_CLOCK` + `KVM_SET_CLOCK` and, per vCPU,
@@ -210,17 +210,17 @@ pub const RESUME_CLUSTER_TREE_3VM: Duration = Duration::from_millis(750);
 /// Enforced by `test_warp_clock_moves_a_live_cluster_in_lockstep`.
 pub const WARP_CLUSTER_3VM: Duration = Duration::from_millis(250);
 
-/// Incremental keyframe for a 3-VM Ubuntu cluster child .
+/// Incremental keyframe for a 3-VM Ubuntu cluster child.
 ///
 /// `prepare_fork_source` on a tree child whose ancestor already has a
 /// keyframe on the same reflink filesystem: per member a pause, the
 /// dirty merge, an `FICLONE` of the ancestor's `memory.bin`, a `pwrite`
 /// per run of dirty pages, `rename`, and the restore-swap. The clone is
 /// metadata-only, so the cost is the divergence, not the 6 GiB of guest
-/// RAM the root's full dump moves (7.327 s, the referenced work Result).
+/// RAM the root's full dump moves (7.327 s, measured).
 ///
-/// Measured on the 3x2 GiB Ubuntu cluster at the 28a divergence levels
-/// after 30 s of divergence : idle 0.73 s, k8s 0.85 s,
+/// Measured on the 3x2 GiB Ubuntu cluster at the same divergence levels
+/// after 30 s of divergence: idle 0.73 s, k8s 0.85 s,
 /// kafka 2.26 s — against 6.4 s for the root's full dump of the same
 /// cluster. The ceiling is ~2x the worst level. Enforced by
 /// `test_keyframe_cost_ubuntu_divergence_levels`.
@@ -243,7 +243,7 @@ pub const DAEMON_TREE_FORK: Duration = Duration::from_millis(500);
 /// VM shutdown (signal vCPU thread + join).
 pub const VM_SHUTDOWN: Duration = Duration::from_millis(5);
 
-/// Chunk 2b.2 — per-pod kubelet-volume setup time.
+/// Per-pod kubelet-volume setup time.
 ///
 /// Bounds the host-side work [`crate::volumes::PodVolumes::prepare`]
 /// does at sandbox `Create`: enumerate the kubelet pod dir, classify

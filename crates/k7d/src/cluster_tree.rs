@@ -53,10 +53,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::guest::{
+    native_vms_mut, pause_fc_parallel, pause_skew_ns, resume_fc_parallel, Backend, Guest,
+};
 use crate::network::ClusterNetwork;
 use crate::snapshot;
 use crate::tree::{
-    apply_delta, write_delta, AppliedDelta, NodeId, NodeInfo, PrepareOutcome, TreeError,
+    apply_delta, reap_dir_contents, write_delta, AppliedDelta, NodeId, NodeInfo, PrepareOutcome,
+    TreeError,
 };
 use crate::tree_model::{self, NodeState, PayloadKind, TreeBudget, TreeUsage};
 use crate::vm::Vm;
@@ -73,7 +77,7 @@ pub struct ClusterPayload {
     pub network: ClusterNetwork,
     /// Cluster members in stable order. The index in this `Vec` is the
     /// `vm_index` used for `add_tap_at` and recorded in `cluster.json`.
-    pub members: Vec<Vm>,
+    pub members: Vec<Guest>,
 }
 
 impl ClusterPayload {
@@ -88,15 +92,23 @@ impl ClusterPayload {
     /// dirty bitmaps).
     #[must_use]
     pub fn est_ram_bytes(&self) -> u64 {
-        self.members
-            .iter()
-            .map(|vm| {
-                vm.accumulated_dirty_pages()
-                    .unwrap_or(0)
-                    .saturating_mul(4096)
-            })
-            .sum()
+        self.members.iter().map(Guest::est_private_bytes).sum()
     }
+}
+
+fn cluster_backend(members: &[Guest]) -> Result<Backend, TreeError> {
+    let backend = members
+        .first()
+        .map(Guest::backend)
+        .ok_or_else(|| TreeError::InvalidDelta("empty cluster".into()))?;
+    if members.iter().any(|g| g.backend() != backend) {
+        return Err(TreeError::InvalidDelta(
+            "ClusterSnapshotTree::new_cluster: mixed-backend cluster \
+             (every member must be native or every member firecracker)"
+                .into(),
+        ));
+    }
+    Ok(backend)
 }
 
 /// On-disk topology record for one cluster node — written into
@@ -111,8 +123,8 @@ pub struct ClusterTopology {
     pub subnet_base: [u8; 4],
     /// Per-member topology entries in `vm_index` order.
     pub members: Vec<ClusterTopologyMember>,
-    /// The tree's egress posture . Serde-defaulted so
-    /// pre-29b `cluster.json` files load as `Open`, which is exactly
+    /// The tree's egress posture. Serde-defaulted so
+    /// legacy `cluster.json` files load as `Open`, which is exactly
     /// the behaviour they were written under.
     #[serde(default)]
     pub egress: crate::netjail::EgressPolicy,
@@ -193,18 +205,21 @@ pub struct ClusterSnapshotTree {
     /// For each live node: the node whose per-member `memory.bin` files
     /// its VMs are `MAP_PRIVATE` mappings of, and the generation of that
     /// keyframe. See [`crate::tree::SnapshotTree`]'s field of the same
-    /// name — an incremental keyframe  is only sound against
+    /// name — an incremental keyframe is only sound against
     /// the exact generation the payload was materialized from.
     cow_base: HashMap<NodeId, (NodeId, u64)>,
-    /// Whether this tree's storage can `FICLONE` . Probed
+    /// Whether this tree's storage can `FICLONE`. Probed
     /// once at construction — the disk budget projects a keyframe's cost
     /// before writing it, so it has to know which regime it is in. See
     /// `SnapshotTree`'s field of the same name.
     reflink_root: bool,
-    /// This tree's cgroup jail . `None` only when
+    /// This tree's cgroup jail. `None` only when
     /// `K7D_TREE_CGROUP=off`. Declared after `live` so a node's VMs
     /// (and their threads) are gone before the cgroup is removed.
     jail: Option<crate::cgroup::TreeCgroup>,
+    /// Last cluster-fork pause skew (`max − min` pause-completion
+    /// timestamps). Native lockstep forks leave this `None`.
+    last_pause_skew_ns: Option<u64>,
 }
 
 impl ClusterSnapshotTree {
@@ -216,11 +231,17 @@ impl ClusterSnapshotTree {
 
     /// Live members of `node_id`, if that cluster is in RAM.
     ///
-    /// Auto-warp  looks tree children up by
+    /// Auto-warp looks tree children up by
     /// `{tree_id}-{node_id}` because `tree_create_cluster` never
     /// inserts members into the daemon's `CreateVm` registry.
-    pub fn live_members_mut(&mut self, node_id: &str) -> Option<&mut [Vm]> {
+    pub fn live_members_mut(&mut self, node_id: &str) -> Option<&mut [Guest]> {
         self.live.get_mut(node_id).map(|p| p.members.as_mut_slice())
+    }
+
+    /// Last Firecracker cluster-fork pause skew, if one was measured.
+    #[must_use]
+    pub fn last_pause_skew_ns(&self) -> Option<u64> {
+        self.last_pause_skew_ns
     }
 
     /// Put every VM of a live cluster node into the tree's cgroup jail.
@@ -233,7 +254,10 @@ impl ClusterSnapshotTree {
             .get(node_id)
             .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
         for vm in &payload.members {
-            jail.add_vm(vm)?;
+            if matches!(vm, Guest::Firecracker(_)) {
+                continue;
+            }
+            jail.add_vm(vm.as_native()?)?;
         }
         Ok(())
     }
@@ -255,6 +279,7 @@ impl ClusterSnapshotTree {
                 "ClusterSnapshotTree::new_cluster: empty cluster".into(),
             ));
         }
+        let backend = cluster_backend(&root.members)?;
 
         fs::create_dir_all(root_dir.join("nodes"))?;
         let root_dir_for_probe = root_dir.clone();
@@ -285,20 +310,32 @@ impl ClusterSnapshotTree {
 
         let mut root = root;
 
-        // Prepare every member as a warm-fork source. After this, each
-        // member has its own base.mem + cpu.json under members/{i}/.
+        // Prepare every member as a warm-fork source.
+        let mut root_span = 0u64;
         for (i, vm) in root.members.iter_mut().enumerate() {
             let member_dir = root_node_dir.join("members").join(i.to_string());
             fs::create_dir_all(&member_dir)?;
-            // Cluster adoption knowingly accepts full-memfd
-            // forks for virtiofs-backed members — the explicit slow-fork
-            // opt-in requires (loud warn per member).
-            if !vm.virtiofs_shares().is_empty() {
-                vm.allow_slow_fork();
+            match vm {
+                Guest::Firecracker(fc) => {
+                    let report = fc
+                        .prepare_fork_source()
+                        .map_err(|e| TreeError::Firecracker(e.to_string()))?;
+                    root_span = root_span.saturating_add(report.diff_bytes);
+                }
+                Guest::Native(_) => {
+                    if !vm.virtiofs_shares().is_empty() {
+                        vm.as_native_mut()?.allow_slow_fork();
+                    }
+                    vm.as_native_mut()?.prepare_fork_source_in(&member_dir)?;
+                }
             }
-            vm.prepare_fork_source_in(&member_dir)?;
         }
-        let root_span: u64 = root.members.iter().map(Vm::mem_span).sum();
+        if backend == Backend::Native {
+            root_span = 0;
+            for vm in &root.members {
+                root_span = root_span.saturating_add(vm.as_native()?.mem_span());
+            }
+        }
 
         // Write cluster.json describing the bridge topology.
         let topology = topology_from_network(&root.network);
@@ -344,6 +381,7 @@ impl ClusterSnapshotTree {
             cow_base: HashMap::new(),
             reflink_root: crate::tree::probe_reflink_root(&root_dir_for_probe),
             jail,
+            last_pause_skew_ns: None,
         };
         tree.jail_payload(&root_id)?;
         tree.save_metadata()?;
@@ -355,9 +393,13 @@ impl ClusterSnapshotTree {
     /// carry no daemon `vm_id`). Returns the owning node id alongside
     /// the VM.
     #[must_use]
-    pub fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Vm)> {
+    pub fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Guest)> {
         for (node_id, payload) in &self.live {
-            if let Some(vm) = payload.members.iter().find(|vm| vm.guest_cid() == cid) {
+            if let Some(vm) = payload
+                .members
+                .iter()
+                .find(|vm| vm.guest_cid() == Some(cid))
+            {
                 return Some((node_id.as_str(), vm));
             }
         }
@@ -372,17 +414,29 @@ impl ClusterSnapshotTree {
     /// Write a new keyframe only when no ancestor file exists, or when
     /// any member has virtiofs shares (FUSE DMA is invisible to the
     /// dirty log).
+    fn is_fc(&self, node_id: &NodeId) -> bool {
+        self.live.get(node_id).is_some_and(|p| {
+            !p.members.is_empty()
+                && p.members
+                    .iter()
+                    .all(|g| g.backend() == Backend::Firecracker)
+        })
+    }
+
     fn ensure_forkable(&mut self, source_id: &NodeId) -> Result<(), TreeError> {
+        if self.is_fc(source_id) {
+            return Ok(());
+        }
         let (already, virtiofs) = {
             let source = self
                 .live
                 .get(source_id)
                 .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
             (
-                source
-                    .members
-                    .iter()
-                    .all(|vm| vm.fork_source_base_path().is_some()),
+                source.members.iter().all(|vm| {
+                    vm.as_native()
+                        .is_ok_and(|n| n.fork_source_base_path().is_some())
+                }),
                 source
                     .members
                     .iter()
@@ -401,7 +455,7 @@ impl ClusterSnapshotTree {
                         .get_mut(source_id)
                         .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
                     for (i, vm) in source.members.iter_mut().enumerate() {
-                        if vm.fork_source_base_path().is_some() {
+                        if vm.as_native()?.fork_source_base_path().is_some() {
                             continue;
                         }
                         let mem = dir.join("members").join(i.to_string()).join("memory.bin");
@@ -412,12 +466,12 @@ impl ClusterSnapshotTree {
                                 mem.display()
                             )));
                         }
-                        let dirty = vm.accumulated_dirty_pages().unwrap_or(0);
+                        let dirty = vm.as_native()?.accumulated_dirty_pages().unwrap_or(0);
                         log::info!(
                             "cluster_tree: inherit {ckpt}/members/{i}/memory.bin on {source_id} \
                              ({dirty} dirty pages, no new keyframe)"
                         );
-                        vm.set_fork_source_base_path(mem);
+                        vm.as_native_mut()?.set_fork_source_base_path(mem);
                     }
                     return Ok(());
                 }
@@ -431,24 +485,30 @@ impl ClusterSnapshotTree {
     /// against *this* node's per-member `memory.bin` (dirty set reset).
     ///
     /// Root members are prepared at [`Self::new_cluster`]. In-tree
-    /// children inherit an ancestor path at fork  and are not
+    /// children inherit an ancestor path at fork and are not
     /// checkpoints until this runs. Idempotent on `has_base_snapshot` —
     /// an inherited `fork_source_base_path` is not a keyframe this node
     /// owns (CHALLENGES.md #59, #182).
     ///
     /// A child whose members still map their source's keyframes takes
-    /// the **incremental** path per member  — this is the GRPO
+    /// the **incremental** path per member — this is the GRPO
     /// path, where a generation's keyframe would otherwise cost
     /// `N × guest RAM`.
     pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
         self.ensure_live(node_id)?;
+        // Firecracker: a point is a file children load, so re-take whenever
+        // the guest has dirtied anything — not idempotent on
+        // `has_base_snapshot` the way the native path is.
+        if self.is_fc(node_id) {
+            return self.prepare_fork_source_fc(node_id);
+        }
         if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
             return Ok(PrepareOutcome::already_prepared());
         }
         let node_dir = self.node_dir(node_id);
         let ancestor_dir = self.cow_base_keyframe_dir(node_id);
         // Make disk headroom for the per-member keyframes BEFORE writing
-        // them  — `usage()` only sees the files after the
+        // them — `usage()` only sees the files after the
         // fact, so without this the writes silently blow `max_disk_bytes`
         // until the next auto_evict. On the incremental path the
         // projection is the members' dirty estimate, not their spans.
@@ -457,17 +517,18 @@ impl ClusterSnapshotTree {
                 .live
                 .get(node_id)
                 .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-            let projected: u64 = source
-                .members
-                .iter()
-                .map(|vm| {
-                    if ancestor_dir.is_some() {
-                        vm.accumulated_dirty_pages().unwrap_or(0) * 4096
+            let projected: u64 = {
+                let mut total = 0u64;
+                for vm in &source.members {
+                    let native = vm.as_native()?;
+                    total = total.saturating_add(if ancestor_dir.is_some() {
+                        native.accumulated_dirty_pages().unwrap_or(0) * 4096
                     } else {
-                        vm.mem_span()
-                    }
-                })
-                .sum();
+                        native.mem_span()
+                    });
+                }
+                total
+            };
             if projected > 0 {
                 self.evict_disk_for_incoming(projected)?;
             }
@@ -487,20 +548,49 @@ impl ClusterSnapshotTree {
             let member_dir = node_dir.join("members").join(i.to_string());
             fs::create_dir_all(&member_dir)?;
             if !vm.virtiofs_shares().is_empty() {
-                vm.allow_slow_fork();
+                vm.as_native_mut()?.allow_slow_fork();
             }
             let ancestor_mem = ancestor_dir
                 .as_ref()
                 .map(|d| d.join("members").join(i.to_string()).join("memory.bin"))
                 .filter(|p| p.is_file());
+            let native = vm.as_native_mut()?;
             let prepared = if let Some(ancestor) = &ancestor_mem {
-                vm.prepare_fork_source_incremental_in(&member_dir, ancestor)?
+                native.prepare_fork_source_incremental_in(&member_dir, ancestor)?
             } else {
-                let span = vm.mem_span();
-                crate::vm::PreparedBase::full(vm.prepare_fork_source_in(&member_dir)?, span)
+                let span = native.mem_span();
+                crate::vm::PreparedBase::full(native.prepare_fork_source_in(&member_dir)?, span)
             };
             incremental &= prepared.incremental;
             disk_bytes = disk_bytes.saturating_add(prepared.disk_bytes);
+        }
+        let identity = self.mint_base_identity();
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.has_base_snapshot = true;
+            info.base_identity = identity;
+            info.base_disk_bytes = Some(disk_bytes);
+            touch(info);
+        }
+        self.save_metadata()?;
+        Ok(PrepareOutcome {
+            wrote_base: true,
+            incremental,
+            disk_bytes,
+        })
+    }
+
+    fn prepare_fork_source_fc(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
+        let source = self
+            .live
+            .get_mut(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        log::info!("cluster_tree: prepare_fork_source({node_id}) firecracker");
+        let mut incremental = true;
+        let mut disk_bytes: u64 = 0;
+        for vm in &mut source.members {
+            let report = vm.as_fc_mut()?.prepare_fork_source()?;
+            incremental &= report.incremental;
+            disk_bytes = disk_bytes.saturating_add(report.diff_bytes);
         }
         let identity = self.mint_base_identity();
         if let Some(info) = self.nodes.get_mut(node_id) {
@@ -593,7 +683,7 @@ impl ClusterSnapshotTree {
             ));
         }
         self.ensure_live(source_id)?;
-        // Make headroom for the incoming forks (the referenced work / CHALLENGES
+        // Make headroom for the incoming forks (CHALLENGES
         // #115): each label clones the whole cluster, so `labels.len() ×
         // vm_count(source)` new live VMs are about to exist. Suspend LRU
         // non-protected nodes until they fit, exempting the source; fail
@@ -608,6 +698,9 @@ impl ClusterSnapshotTree {
         let t0 = Instant::now();
         self.evict_for_incoming(source_id, incoming)?;
         self.ensure_live(source_id)?;
+        if self.is_fc(source_id) {
+            return self.fork_batch_fc(source_id, labels, dilation, t0);
+        }
         // In-tree forks inherit the ancestor keyframe + dirty bitmap.
         // Do not write a new memory.bin (that restore-swap is the 23s
         // mid-tree tax). Prepare only when there is no ancestor file.
@@ -651,9 +744,9 @@ impl ClusterSnapshotTree {
             })
             .collect();
 
-        let mut sources_view: Vec<(&mut Vm, u32)> = source
-            .members
-            .iter_mut()
+        let natives = native_vms_mut(&mut source.members)?;
+        let mut sources_view: Vec<(&mut Vm, u32)> = natives
+            .into_iter()
             .enumerate()
             .map(|(i, v)| (v, u32::try_from(i).unwrap_or(u32::MAX)))
             .collect();
@@ -675,16 +768,17 @@ impl ClusterSnapshotTree {
         // Snapshot source bitmaps AFTER the batch (updated in place during
         // pause/capture) so each child seeds deltas covering pre-fork dirty
         // pages — mirrors single-VM `tree.rs::fork_batch`.
-        let source_bitmaps: Vec<Vec<u64>> = source
-            .members
-            .iter()
-            .map(|vm| vm.accumulated_dirty_bitmap().unwrap_or_default())
-            .collect();
-        let source_bases: Vec<Option<PathBuf>> = source
-            .members
-            .iter()
-            .map(|vm| vm.fork_source_base_path().map(std::path::Path::to_path_buf))
-            .collect();
+        let mut source_bitmaps = Vec::with_capacity(source.members.len());
+        let mut source_bases = Vec::with_capacity(source.members.len());
+        for vm in &source.members {
+            let native = vm.as_native()?;
+            source_bitmaps.push(native.accumulated_dirty_bitmap().unwrap_or_default());
+            source_bases.push(
+                native
+                    .fork_source_base_path()
+                    .map(std::path::Path::to_path_buf),
+            );
+        }
         let cow_ancestor = self.nearest_checkpoint(source_id)?;
         // Hand the source back before starting forks so a later `start`
         // failure cannot strand the live map without the root cluster.
@@ -697,19 +791,22 @@ impl ClusterSnapshotTree {
         {
             let mut fork_payload = ClusterPayload {
                 network: fork_net,
-                members: fork_vms,
+                members: fork_vms.into_iter().map(Guest::from).collect(),
             };
             // Dirty log *before* start: enable_dirty_tracking pauses a
             // running VM and wait_quiescent can sit on virtio-blk/net
-            // for up to 2 s each (CHALLENGES #162). The child is still
+            // for up to 200 ms each (CHALLENGES #162). The child is still
             // stopped here, so the ioctl is just a slot re-register.
             for (i, vm) in fork_payload.members.iter_mut().enumerate() {
-                vm.enable_dirty_tracking()?;
-                if let Some(seed) = source_bitmaps.get(i) {
-                    vm.seed_accumulated_dirty(seed)?;
-                }
-                if let Some(Some(base)) = source_bases.get(i) {
-                    vm.set_fork_source_base_path(base.clone());
+                {
+                    let native = vm.as_native_mut()?;
+                    native.enable_dirty_tracking()?;
+                    if let Some(seed) = source_bitmaps.get(i) {
+                        native.seed_accumulated_dirty(seed)?;
+                    }
+                    if let Some(Some(base)) = source_bases.get(i) {
+                        native.set_fork_source_base_path(base.clone());
+                    }
                 }
                 vm.start()?;
             }
@@ -762,10 +859,12 @@ impl ClusterSnapshotTree {
                 "fork_batch child {id} has no checkpoint ancestor"
             );
             debug_assert!(
-                self.live.get(id).is_some_and(|p| p
-                    .members
-                    .iter()
-                    .all(|vm| vm.fork_source_base_path().is_some())),
+                self.live.get(id).is_some_and(|p| {
+                    p.members.iter().all(|vm| {
+                        vm.as_native()
+                            .is_ok_and(|n| n.fork_source_base_path().is_some())
+                    })
+                }),
                 "fork_batch child {id} is not forkable"
             );
         }
@@ -780,6 +879,142 @@ impl ClusterSnapshotTree {
         Ok(new_ids)
     }
 
+    /// Firecracker cluster fork: parallel pause with per-member
+    /// timestamps, Diff/apply/restore-point/disk-reflink per member,
+    /// parallel resume, children on `{tree_id}-{node_id}` via
+    /// `network_overrides`. `pause_skew_ns` is max−min pause Instant.
+    #[allow(clippy::too_many_lines)]
+    fn fork_batch_fc(
+        &mut self,
+        source_id: &NodeId,
+        labels: &[&str],
+        dilation: Option<u32>,
+        t0: Instant,
+    ) -> Result<Vec<NodeId>, TreeError> {
+        if dilation.is_some() {
+            return Err(TreeError::Firecracker(
+                "time dilation is not supported on Firecracker nodes".into(),
+            ));
+        }
+        let mut source = self.live.remove(source_id).ok_or_else(|| {
+            TreeError::InvalidDelta(format!("fork_batch_fc: source {source_id} vanished"))
+        })?;
+        let timestamps = match pause_fc_parallel(&mut source.members) {
+            Ok(ts) => ts,
+            Err(e) => {
+                let _ = resume_fc_parallel(&mut source.members);
+                self.live.insert(source_id.clone(), source);
+                return Err(e.into());
+            }
+        };
+        let pause_skew_ns = pause_skew_ns(&timestamps);
+        self.last_pause_skew_ns = Some(pause_skew_ns);
+        for member in &mut source.members {
+            if let Err(e) = member.as_fc_mut()?.prepare_fork_source() {
+                let _ = resume_fc_parallel(&mut source.members);
+                self.live.insert(source_id.clone(), source);
+                return Err(e.into());
+            }
+        }
+        if let Err(e) = resume_fc_parallel(&mut source.members) {
+            self.live.insert(source_id.clone(), source);
+            return Err(e.into());
+        }
+        self.live.insert(source_id.clone(), source);
+
+        let new_ids: Vec<NodeId> = labels.iter().map(|label| self.mint_id(label)).collect();
+        for id in &new_ids {
+            self.mint_pure_id(id);
+        }
+
+        let mut children: Vec<(NodeId, ClusterPayload)> = Vec::new();
+        for new_id in &new_ids {
+            match self.materialize_fc_child(source_id, new_id) {
+                Ok(payload) => children.push((new_id.clone(), payload)),
+                Err(e) => {
+                    drop(children);
+                    return Err(e);
+                }
+            }
+        }
+
+        let now = now_unix();
+        let source_disk = self
+            .nodes
+            .get(source_id)
+            .and_then(|n| n.base_disk_bytes)
+            .unwrap_or(0);
+        for ((new_id, payload), label) in children.into_iter().zip(labels.iter()) {
+            let new_node_dir = self.node_dir(&new_id);
+            fs::create_dir_all(&new_node_dir)?;
+            fs::write(new_node_dir.join("kind"), b"cluster")?;
+            let topology = topology_from_network(&payload.network);
+            write_cluster_topology(&new_node_dir.join("cluster.json"), &topology)?;
+            let info = NodeInfo {
+                id: new_id.clone(),
+                parent: Some(source_id.clone()),
+                children: Vec::new(),
+                state: NodeState::Live,
+                dirty_page_count: 0,
+                has_base_snapshot: true,
+                label: (*label).to_string(),
+                created_at_unix: now,
+                last_active_at_unix: now,
+                protected: false,
+                kind: PayloadKind::Cluster,
+                vm_count: payload.vm_count(),
+                parked_disk_dirs: Vec::new(),
+                base_identity: 0,
+                base_disk_bytes: Some(source_disk),
+            };
+            self.nodes.insert(new_id.clone(), info);
+            self.live.insert(new_id.clone(), payload);
+            self.jail_payload(&new_id)?;
+            if let Some(src_info) = self.nodes.get_mut(source_id) {
+                src_info.children.push(new_id.clone());
+                touch(src_info);
+            }
+        }
+        self.save_metadata()?;
+        self.evict_post_fork(source_id, &new_ids)?;
+        log::info!(
+            "cluster_tree fork_batch_fc: pause_skew_ns={pause_skew_ns} elapsed={:?}",
+            t0.elapsed()
+        );
+        Ok(new_ids)
+    }
+
+    fn materialize_fc_child(
+        &self,
+        source_id: &NodeId,
+        new_id: &NodeId,
+    ) -> Result<ClusterPayload, TreeError> {
+        let source = self.live.get(source_id).ok_or_else(|| {
+            TreeError::InvalidDelta(format!("materialize_fc_child: source {source_id} gone"))
+        })?;
+        let bridge = format!("{}-{new_id}", self.tree_id);
+        let mut fork_net = ClusterNetwork::fork_from(&source.network, &bridge).map_err(|e| {
+            TreeError::Fork(crate::fork::ForkError::Reflink(format!(
+                "ClusterNetwork::fork_from({bridge}): {e}"
+            )))
+        })?;
+        let mut members = Vec::with_capacity(source.members.len());
+        for (i, src) in source.members.iter().enumerate() {
+            let idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let tap = fork_net.add_tap_at(idx).map_err(|e| {
+                TreeError::Fork(crate::fork::ForkError::Reflink(format!(
+                    "add_tap_at({idx}) on {bridge}: {e}"
+                )))
+            })?;
+            let child = src.as_fc()?.spawn_child(Some(tap))?;
+            members.push(Guest::from(child));
+        }
+        Ok(ClusterPayload {
+            network: fork_net,
+            members,
+        })
+    }
+
     /// Suspend a live cluster: per-member delta + state captured, bridge
     /// torn down, RAM freed.
     ///
@@ -788,6 +1023,9 @@ impl ClusterSnapshotTree {
     /// tracking, so `delta.pack` would silently miss device DMA and the
     /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        if self.is_fc(node_id) {
+            return self.suspend_fc(node_id);
+        }
         if let Some(p) = self.live.get(node_id) {
             if p.members.iter().any(|vm| !vm.virtiofs_shares().is_empty()) {
                 return Err(TreeError::InvalidDelta(format!(
@@ -821,11 +1059,12 @@ impl ClusterSnapshotTree {
             fs::create_dir_all(&member_dir)?;
 
             vm.pause()?;
-            let bitmap = vm.get_and_accumulate_dirty()?.to_vec();
-            let state = snapshot::capture_vm_state(vm)?;
-            let src_mem = vm.mem_host_addr();
-            // Deltas index pages of the guest physical span, not of RAM (19a).
-            let mem_size = vm.mem_span();
+            let native = vm.as_native_mut()?;
+            let bitmap = native.get_and_accumulate_dirty()?.to_vec();
+            let state = snapshot::capture_vm_state(native)?;
+            let src_mem = native.mem_host_addr();
+            // Deltas index pages of the guest physical span, not of RAM.
+            let mem_size = native.mem_span();
 
             let dirty_pages = write_delta(
                 &member_dir.join("delta.pack"),
@@ -848,11 +1087,12 @@ impl ClusterSnapshotTree {
         // and each member's `vm_state.json` records their paths for
         // resume's reflink. Park ownership on the node record before
         // dropping the payload (CHALLENGES.md #130).
-        let parked: Vec<PathBuf> = payload
-            .members
-            .iter_mut()
-            .filter_map(Vm::take_fork_state_dir)
-            .collect();
+        let mut parked = Vec::new();
+        for vm in &mut payload.members {
+            if let Some(dir) = vm.as_native_mut()?.take_fork_state_dir() {
+                parked.push(dir);
+            }
+        }
 
         // Drop the payload — Vm::Drop closes KVM fds + munmaps memory;
         // ClusterNetwork::Drop tears down the bridge + iptables rules.
@@ -873,6 +1113,48 @@ impl ClusterSnapshotTree {
         Ok(())
     }
 
+    /// Firecracker suspend: parallel pause, Full snapshot into each
+    /// `members/{i}/`, then drop the payload (processes, chroots, bridge).
+    /// Resume re-stages from the exported files.
+    fn suspend_fc(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        let mut payload = self
+            .live
+            .remove(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        if let Err(e) = pause_fc_parallel(&mut payload.members) {
+            let _ = resume_fc_parallel(&mut payload.members);
+            self.live.insert(node_id.clone(), payload);
+            return Err(e.into());
+        }
+        let node_dir = self.node_dir(node_id);
+        fs::create_dir_all(&node_dir)?;
+        fs::write(node_dir.join("kind"), b"cluster")?;
+        let mut exported = 0u64;
+        for (i, vm) in payload.members.iter_mut().enumerate() {
+            let member_dir = node_dir.join("members").join(i.to_string());
+            if let Err(e) = vm.snapshot(&member_dir) {
+                let _ = resume_fc_parallel(&mut payload.members);
+                self.live.insert(node_id.clone(), payload);
+                return Err(e.into());
+            }
+            exported = exported.saturating_add(crate::fc::exported_snapshot_bytes(&member_dir));
+        }
+        let topology = topology_from_network(&payload.network);
+        write_cluster_topology(&node_dir.join("cluster.json"), &topology)?;
+        drop(payload);
+        self.cow_base.remove(node_id);
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.state = NodeState::Suspended;
+            info.dirty_page_count = 0;
+            info.parked_disk_dirs = Vec::new();
+            info.base_disk_bytes = Some(exported);
+            touch(info);
+        }
+        self.save_metadata()?;
+        log::info!("cluster_tree: suspended Firecracker '{node_id}' ({exported} bytes exported)");
+        Ok(())
+    }
+
     /// Resume a suspended cluster: bridge re-created with the recorded
     /// per-VM identity tuples, every member restored from
     /// `members/{i}/delta.pack` + the nearest checkpoint ancestor's
@@ -890,6 +1172,15 @@ impl ClusterSnapshotTree {
             ));
         }
         let vm_count_for_node = info.vm_count;
+        let node_dir = self.node_dir(node_id);
+        if node_dir
+            .join("members")
+            .join("0")
+            .join(crate::fc::SUSPEND_META)
+            .is_file()
+        {
+            return self.resume_fc(node_id, vm_count_for_node);
+        }
 
         // One delta.pack per member onto the nearest checkpoint. In-tree
         // inherit means unprepared hops are not extra packs.
@@ -910,7 +1201,7 @@ impl ClusterSnapshotTree {
         let topology = read_cluster_topology(&node_dir.join("cluster.json"))?;
 
         // Recreate the bridge with the recorded subnet + per-VM identity
-        // and the persisted egress posture (the referenced work: a contained tree
+        // and the persisted egress posture (a contained tree
         // must not resume Open).
         let bridge_label = format!("{}-{}", self.tree_id, node_id);
         let mut net = ClusterNetwork::create_with_egress(&bridge_label, topology.egress.clone())
@@ -929,7 +1220,7 @@ impl ClusterSnapshotTree {
             .map_or(0, |info| info.base_identity);
 
         let n = topology.members.len();
-        let mut members: Vec<Vm> = Vec::with_capacity(n);
+        let mut members: Vec<Guest> = Vec::with_capacity(n);
         for (i, member_topo) in topology.members.iter().enumerate() {
             let _tap = net.add_tap_at(member_topo.vm_index).map_err(|e| {
                 TreeError::Fork(crate::fork::ForkError::Reflink(format!(
@@ -971,9 +1262,9 @@ impl ClusterSnapshotTree {
             vm.seed_accumulated_dirty(&applied.bitmap)?;
             // Always a MAP_PRIVATE of the nearest checkpoint file.
             // Inherited children keep has_base_snapshot=false so an
-            // explicit prepare still writes (CHALLENGES #144 / the referenced work).
+            // explicit prepare still writes (CHALLENGES #144).
             vm.set_fork_source_base_path(base_mem_path.clone());
-            members.push(vm);
+            members.push(Guest::from(vm));
         }
 
         let payload = ClusterPayload {
@@ -995,6 +1286,47 @@ impl ClusterSnapshotTree {
         }
         self.save_metadata()?;
         log::info!("cluster_tree: resumed '{node_id}'");
+        Ok(())
+    }
+
+    fn resume_fc(&mut self, node_id: &NodeId, vm_count: u32) -> Result<(), TreeError> {
+        self.evict_for_incoming_no_exempt(vm_count as usize)?;
+        let node_dir = self.node_dir(node_id);
+        let topology = read_cluster_topology(&node_dir.join("cluster.json"))?;
+        let bridge_label = format!("{}-{node_id}", self.tree_id);
+        let mut net = ClusterNetwork::create_with_egress(&bridge_label, topology.egress.clone())
+            .map_err(|e| {
+                TreeError::Fork(crate::fork::ForkError::Reflink(format!(
+                    "ClusterNetwork::create resume fc: {e}"
+                )))
+            })?;
+        let mut members = Vec::with_capacity(topology.members.len());
+        for (i, member_topo) in topology.members.iter().enumerate() {
+            let tap = net.add_tap_at(member_topo.vm_index).map_err(|e| {
+                TreeError::Fork(crate::fork::ForkError::Reflink(format!(
+                    "add_tap_at({}) on fc resume: {e}",
+                    member_topo.vm_index
+                )))
+            })?;
+            let member_dir = node_dir.join("members").join(i.to_string());
+            let fc = crate::fc::FcVm::load_exported(&member_dir, Some(tap))
+                .map_err(|e| TreeError::Firecracker(e.to_string()))?;
+            members.push(Guest::from(fc));
+        }
+        self.live.insert(
+            node_id.clone(),
+            ClusterPayload {
+                network: net,
+                members,
+            },
+        );
+        self.jail_payload(node_id)?;
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.state = NodeState::Live;
+            touch(info);
+        }
+        self.save_metadata()?;
+        log::info!("cluster_tree: resumed Firecracker '{node_id}'");
         Ok(())
     }
 
@@ -1069,7 +1401,7 @@ impl ClusterSnapshotTree {
             // `base_disk_bytes` is the Σ over members of what the
             // keyframes physically cost — for reflinked members that is
             // far below their logical length, and `st_blocks` would
-            // still report the shared extents .
+            // still report the shared extents.
             match info.base_disk_bytes {
                 Some(recorded) => disk_bytes = disk_bytes.saturating_add(recorded),
                 None => {
@@ -1292,8 +1624,12 @@ impl ClusterSnapshotTree {
                 ] {
                     let _ = fs::remove_file(member.join(f));
                 }
+                // Leftovers prune would have dropped with remove_dir_all of
+                // the member dir: FC `vmstate` / `fc.json` / `disk-*`.
+                reap_dir_contents(&member);
             }
             let _ = fs::remove_file(dir.join("cluster.json"));
+            reap_dir_contents(&dir);
             if let Some(info) = self.nodes.get_mut(&id) {
                 info.state = NodeState::Evicted;
                 info.has_base_snapshot = false;
@@ -1301,6 +1637,13 @@ impl ClusterSnapshotTree {
                 // no generation any pack may still claim.
                 info.base_disk_bytes = None;
                 info.base_identity = 0;
+                // Suspend parks RW disk-clone dirs on the record (see
+                // `suspend`); eviction must reap them the way prune does
+                // or usage() reports the space free while XFS still holds
+                // the clones (bug-candidates #52 / CHALLENGES #130).
+                for parked in std::mem::take(&mut info.parked_disk_dirs) {
+                    let _ = fs::remove_dir_all(&parked);
+                }
                 touch(info);
             }
             evicted.push(id);
@@ -1438,6 +1781,7 @@ impl ClusterSnapshotTree {
             cow_base: HashMap::new(),
             reflink_root: crate::tree::probe_reflink_root(&root_dir_for_probe),
             jail,
+            last_pause_skew_ns: None,
         })
     }
 
@@ -1465,12 +1809,11 @@ impl ClusterSnapshotTree {
 
     /// Unprepared hops between `node_id` (inclusive) and its nearest
     /// `has_base_snapshot` ancestor. Resume applies **one** pack per
-    /// member onto that ancestor ; hop-count is not a
-    /// correctness cap. 0 for a checkpoint. Not tree-graph depth
-    /// .
+    /// member onto that ancestor; hop-count is not a
+    /// correctness cap. 0 for a checkpoint. Not tree-graph depth.
     ///
     /// The walk itself is the verified pure function
-    /// [`tree_model::restore_chain_depth`] ; this wrapper only
+    /// [`tree_model::restore_chain_depth`]; this wrapper only
     /// builds the model view and maps `None` (no checkpoint ancestor —
     /// corrupt tree metadata) to a loud error.
     fn restore_chain_depth(&mut self, node_id: &NodeId) -> Result<usize, TreeError> {

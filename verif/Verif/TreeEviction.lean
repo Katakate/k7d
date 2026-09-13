@@ -139,7 +139,7 @@ theorem ancestor_ids_fuel_never_truncates (t : TreeModel) (hwf : WellFormed t)
   unfold satAdd U64_MAX at *
   omega
 
--- ## Restore-chain depth (mirrors `restore_chain_depth`, the referenced work)
+-- ## Restore-chain depth (mirrors `restore_chain_depth`)
 
 /-- The fuel-bounded walk inside `tree_model::restore_chain_depth`: one
 parent hop per fuel unit, counting non-checkpoint nodes until the first
@@ -175,7 +175,7 @@ theorem one_le_usize_max : 1 ≤ USIZE_MAX := by
   unfold USIZE_MAX
   rcases System.Platform.numBits_eq with h | h <;> rw [h] <;> norm_num
 
-/-- the referenced work: a checkpoint node's restore chain is 0 — resume reads
+/-- A checkpoint node's restore chain is 0 — resume reads
 its own `memory.bin` and applies no deltas. -/
 theorem restore_chain_depth_checkpoint (t : TreeModel) (id : Nat)
     (n : NodeInfo) (hl : lookup t id = some n) (hb : n.hasBase = true) :
@@ -186,7 +186,7 @@ theorem restore_chain_depth_checkpoint (t : TreeModel) (id : Nat)
   rw [hk]
   simp [restoreChainWalk, hl, hb]
 
-/-- the referenced work, the load-bearing distinction: a non-checkpoint node
+/-- The load-bearing distinction: a non-checkpoint node
 whose *parent* is a checkpoint has restore chain exactly 1 — however
 deep it sits in the tree graph. `root → child → grandchild` is graph
 depth 2, yet the grandchild's restore chain is 1 once the child was

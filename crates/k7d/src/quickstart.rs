@@ -67,7 +67,9 @@ fn parse_batch(
     client: &mut Client,
 ) -> Result<(Vec<TreeForkedBranch>, u64), String> {
     match resp {
-        Response::TreeForkBatch { forks, latency_ns } => {
+        Response::TreeForkBatch {
+            forks, latency_ns, ..
+        } => {
             if forks.len() != branches {
                 drop_tree(client, tree_id);
                 return Err(format!(

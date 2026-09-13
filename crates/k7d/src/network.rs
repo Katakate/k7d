@@ -8,10 +8,15 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState, PARK_POLL, UNPARK_POLL};
+use crate::virtio_mmio::{
+    wait_for_park, DescMeta, NotQuiescent, ValidatedQueue, VirtioBackend, VirtqueueState,
+    UNPARK_POLL,
+};
+
+#[cfg(test)]
+use crate::virtio_mmio::{VirtqDesc, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 
 const VIRTIO_ID_NET: u32 = 1;
 const NET_NUM_QUEUES: usize = 2; // RX + TX
@@ -21,6 +26,15 @@ const NET_QUEUE_SIZE: u16 = 256;
 const TUNSETIFF: libc::c_ulong = 0x4004_54CA;
 const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54D0;
 const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54D8;
+/// `_IOW('T', 203, int)` — keep the device after the last fd closes,
+/// so an out-of-process VMM can claim it by name.
+const TUNSETPERSIST: libc::c_ulong = 0x4004_54CB;
+/// `TUNSETOWNER` / `TUNSETGROUP` — the uid/gid allowed to attach to a
+/// persistent TAP without `CAP_NET_ADMIN`. Jailed Firecracker has
+/// neither the capability nor a way to get it, so without these its
+/// `TUNSETIFF` comes back `EPERM`.
+const TUNSETOWNER: libc::c_ulong = 0x4004_54CC;
+const TUNSETGROUP: libc::c_ulong = 0x4004_54CE;
 
 // Virtio net feature bits
 const VIRTIO_NET_F_CSUM: u64 = 1 << 0;
@@ -74,13 +88,14 @@ struct Ifreq {
 }
 
 /// A TAP device attached to a bridge.
+#[derive(Debug)]
 pub struct TapDevice {
     fd: RawFd,
     name: String,
     mac: [u8; 6],
     guest_ip: Ipv4Addr,
     vm_index: u32,
-    /// Per-TAP L2 anti-spoof chain . `None` only when
+    /// Per-TAP L2 anti-spoof chain. `None` only when
     /// `K7D_NET_JAIL=off`. Dropping it deletes the netdev table; the
     /// struct's own `Drop` (close fd, delete link) runs first, and
     /// `delete table` tolerates the device already being gone.
@@ -95,7 +110,7 @@ impl TapDevice {
     /// `vm_index` without colliding on the kernel-side interface name.
     pub fn create(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
         let mut tap = Self::create_unpinned(bridge_name, vm_index)?;
-        // Per-TAP L2 anti-spoof : the MAC/IP identity is
+        // Per-TAP L2 anti-spoof: the MAC/IP identity is
         // assigned right here, so this is where the pin goes on. All
         // bridges share 10.200.0.0/24 and forks reuse guest IPs — the
         // pin must be per-TAP, never a global source-IP set.
@@ -234,7 +249,7 @@ impl TapDevice {
     }
 
     /// Whether the host side of this TAP has a frame queued for the
-    /// guest .
+    /// guest (the fourth safety check).
     ///
     /// Read-only and non-destructive: `poll` with a zero timeout tells
     /// us the bridge has handed the TAP something the VMM has not yet
@@ -242,6 +257,12 @@ impl TapDevice {
     /// guest-to-bridge direction needs no separate check — a frame the
     /// guest handed over shows up as an undrained virtio-net TX queue.
     pub fn has_pending_frame(&self) -> Result<bool, String> {
+        if self.fd < 0 {
+            return Err(format!(
+                "TAP {} was released to an external VMM; k7d has no descriptor to poll",
+                self.name
+            ));
+        }
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,
@@ -265,6 +286,63 @@ impl TapDevice {
     #[must_use]
     pub fn guest_ip(&self) -> Ipv4Addr {
         self.guest_ip
+    }
+
+    /// Hand this TAP to an out-of-process VMM.
+    ///
+    /// Gives the device to `uid`, marks it `IFF_PERSIST` and closes
+    /// k7d's descriptor, so Firecracker can claim it by name. All three
+    /// are required: a TAP with no owning fd disappears unless it is
+    /// persistent; a single-queue TAP that k7d still holds answers a
+    /// second `TUNSETIFF` with `EBUSY`; and attaching to a TAP one does
+    /// not own needs `CAP_NET_ADMIN`, which is exactly what the jailer
+    /// took away. Everything else about the device — its bridge
+    /// membership, its MAC/IP anti-spoof pin, and its
+    /// deletion by [`Drop`] — is unchanged, which is what lets
+    /// [`ClusterNetwork::attach_to_pod_netns`] move it after boot: that
+    /// works by interface name, not by descriptor.
+    pub fn detach_for_vmm(&mut self, uid: u32) -> Result<(), String> {
+        if self.fd < 0 {
+            return Ok(());
+        }
+        for (ioctl, label) in [(TUNSETOWNER, "TUNSETOWNER"), (TUNSETGROUP, "TUNSETGROUP")] {
+            // SAFETY: `self.fd` is this TAP's own live TUN fd; both
+            // ioctls take an integer argument and touch no memory.
+            if unsafe { libc::ioctl(self.fd, ioctl, libc::c_ulong::from(uid)) } < 0 {
+                return Err(format!(
+                    "{label}({uid}) on {}: {}",
+                    self.name,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        // SAFETY: `self.fd` is this TAP's own live TUN fd; TUNSETPERSIST
+        // takes an integer argument and touches no memory.
+        if unsafe { libc::ioctl(self.fd, TUNSETPERSIST, 1 as libc::c_ulong) } < 0 {
+            return Err(format!(
+                "TUNSETPERSIST on {}: {}",
+                self.name,
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fd is valid and owned by this struct; it is marked
+        // gone immediately after so nothing closes or polls it twice.
+        unsafe { libc::close(self.fd) };
+        self.fd = -1;
+        log::info!(
+            "TAP {} persisted, owned by {uid}:{uid} and released for an external VMM",
+            self.name
+        );
+        Ok(())
+    }
+
+    /// Whether k7d still holds this TAP's descriptor. `false` after
+    /// [`Self::detach_for_vmm`] — the frame-level helpers
+    /// ([`Self::fd`], [`Self::has_pending_frame`]) have no fd to work
+    /// with then, and the VMM that does is another process.
+    #[must_use]
+    pub fn is_owned(&self) -> bool {
+        self.fd >= 0
     }
 
     /// Get the per-bridge VM index that determined this TAP's IP and MAC.
@@ -330,7 +408,12 @@ mod bridge_name_tests {
 
     #[test]
     fn desc_chain_writable_len_sums_write_descs() {
-        let mem = [
+        // 32 KiB of guest RAM: an 8-descriptor table at GPA 0, the avail
+        // and used rings after it, and two writable buffers at 0x1000 and
+        // 0x2000 that the chain hands the device.
+        let span = 32 * 1024;
+        let mut mem = vec![0u8; span as usize];
+        let descs = [
             VirtqDesc {
                 addr: 0x1000,
                 len: 2048,
@@ -344,16 +427,28 @@ mod bridge_name_tests {
                 next: 0,
             },
         ];
+        for (i, d) in descs.iter().enumerate() {
+            let at = i * 16;
+            mem[at..at + 8].copy_from_slice(&d.addr.to_le_bytes());
+            mem[at + 8..at + 12].copy_from_slice(&d.len.to_le_bytes());
+            mem[at + 12..at + 14].copy_from_slice(&d.flags.to_le_bytes());
+            mem[at + 14..at + 16].copy_from_slice(&d.next.to_le_bytes());
+        }
         let q = crate::virtio_mmio::VirtqueueState {
             max_size: 8,
             size: 8,
             ready: true,
             desc_addr: vm_memory::GuestAddress(0),
-            avail_addr: vm_memory::GuestAddress(0),
-            used_addr: vm_memory::GuestAddress(0),
+            avail_addr: vm_memory::GuestAddress(0x80),
+            used_addr: vm_memory::GuestAddress(0x200),
         };
-        let base = mem.as_ptr() as u64;
-        assert_eq!(super::desc_chain_writable_len(base, &q, 0), 3072);
+        let vq = crate::virtio_mmio::ValidatedQueue::new(&q, mem.as_ptr() as u64, span)
+            .expect("geometry");
+        let mut chain = Vec::new();
+        assert_eq!(
+            super::desc_chain_writable_len(&vq, 0, &mut chain).expect("walk"),
+            3072
+        );
     }
 
     fn fold(mut sum: u32) -> u16 {
@@ -461,8 +556,12 @@ mod bridge_name_tests {
 
 impl Drop for TapDevice {
     fn drop(&mut self) {
-        // SAFETY: fd is valid; closing TAP device.
-        unsafe { libc::close(self.fd) };
+        if self.fd >= 0 {
+            // SAFETY: fd is valid; closing TAP device.
+            unsafe { libc::close(self.fd) };
+        }
+        // `ip link delete` removes the device whether or not it was
+        // marked persistent for an external VMM.
         let _ = Command::new("ip")
             .args(["link", "delete", &self.name])
             .output();
@@ -508,11 +607,11 @@ pub struct ClusterNetwork {
     /// VM identities allocated on this bridge, keyed by `vm_index`. Lets a
     /// forked cluster look up "what IP/MAC did source VM N have?".
     entries: HashMap<u32, VmNetworkEntry>,
-    /// This bridge's nftables jail . `None` only when
+    /// This bridge's nftables jail. `None` only when
     /// `K7D_NET_JAIL=off`. Dropping it deletes the table, which is why
     /// it is a field rather than a side effect of `create`.
     jail: Option<crate::netjail::TreeNetJail>,
-    /// This tree's egress posture . Forks inherit it via
+    /// This tree's egress posture. Forks inherit it via
     /// [`ClusterNetwork::fork_from`]; suspend/resume persists it in
     /// `cluster.json`.
     egress: crate::netjail::EgressPolicy,
@@ -533,9 +632,9 @@ impl ClusterNetwork {
         Self::create_with_egress(cluster_id, crate::netjail::EgressPolicy::default())
     }
 
-    /// [`ClusterNetwork::create`] with an explicit egress policy
-    /// . `create` delegates here with the `Open` default,
-    /// which is byte-identical to pre-29b behaviour.
+    /// [`ClusterNetwork::create`] with an explicit egress policy.
+    /// `create` delegates here with the `Open` default,
+    /// which is byte-identical to legacy behaviour.
     pub fn create_with_egress(
         cluster_id: &str,
         egress: crate::netjail::EgressPolicy,
@@ -631,7 +730,7 @@ impl ClusterNetwork {
         // The FORWARD ACCEPT rules above make this bridge reachable from
         // every other `k7-br-*` on the node. The jail (evaluated one
         // priority ahead of them) is what stops one tree from routing
-        // into another's guests, and  owns the egress and
+        // into another's guests, and owns the egress and
         // guest→host input decisions — see `crate::netjail`.
         let jail = crate::netjail::TreeNetJail::install(
             &bridge_name,
@@ -659,7 +758,7 @@ impl ClusterNetwork {
     }
 
     /// Replace this bridge's egress policy, atomically re-installing
-    /// the jail ruleset (the referenced work: `tree_adopt_cluster` may adopt a
+    /// the jail ruleset (`tree_adopt_cluster` may adopt a
     /// bridge born `Open` into a tree with a stricter posture). When
     /// `K7D_NET_JAIL=off` the policy is recorded but nothing is
     /// enforced — same contract as `create`.
@@ -746,7 +845,7 @@ impl ClusterNetwork {
     /// indices at once, pinning every TAP's anti-spoof in a single
     /// `nft` transaction — the fork path's per-cluster host-net cost is
     /// dominated by `nft` process spawns, so the batch keeps the
-    /// 50-cluster fork budget honest . Returns the TAPs in
+    /// 50-cluster fork budget honest. Returns the TAPs in
     /// `indices` order; on any failure every TAP created so far is
     /// dropped (link + netdev table teardown via `Drop`).
     pub fn add_taps_at(&mut self, indices: &[u32]) -> Result<Vec<TapDevice>, String> {
@@ -826,7 +925,7 @@ impl ClusterNetwork {
     /// guest IP and MAC, so the forked guests see identical network state
     /// while the two bridges stay isolated at L2.
     pub fn fork_from(source: &Self, fork_cluster_id: &str) -> Result<Self, String> {
-        // Fork inherits the source's egress posture : a
+        // Fork inherits the source's egress posture: a
         // contained tree must not mint an Open child.
         let mut fork = Self::create_with_egress(fork_cluster_id, source.egress.clone())?;
         // We do **not** allocate the TAPs here: TAP ownership is one-per-VM,
@@ -1139,7 +1238,7 @@ impl ClusterNetwork {
         // iptables rules first (best-effort: -D may fail if rule wasn't there).
         let bridge = self.bridge_name.as_str();
         // The jail names this device; a table left behind would filter
-        // the next bridge that reuses the name .
+        // the next bridge that reuses the name.
         if let Some(jail) = &self.jail {
             if let Err(e) = jail.remove() {
                 log::error!("remove net jail for {bridge}: {e}");
@@ -1630,10 +1729,10 @@ fn install_bridge_forward_rules(bridge: &str) -> Result<(), String> {
     ensure_iptables(None, &["FORWARD", "-i", bridge, "-j", "ACCEPT"])?;
     ensure_iptables(None, &["FORWARD", "-o", bridge, "-j", "ACCEPT"])?;
     // The jail's `input` chain (priority filter - 1, `crate::netjail`)
-    // owns the guest→host decision since the referenced work — an unconditional
+    // owns the guest→host decision — an unconditional
     // iptables `INPUT -i <bridge> -j ACCEPT` here would sit AFTER the
     // jail (which is fine) but also document a hole that no longer
-    // exists. Drain any copy a pre-29b daemon left behind so long-lived
+    // exists. Drain any copy a legacy daemon left behind so long-lived
     // nodes converge; the loop handles historical duplicates.
     while delete_iptables(None, &["INPUT", "-i", bridge, "-j", "ACCEPT"]).is_ok() {}
     ensure_iptables(None, &["OUTPUT", "-o", bridge, "-j", "ACCEPT"])?;
@@ -1760,18 +1859,6 @@ struct VirtioNetConfig {
 // Shared with `crate::block` (the userspace virtio-blk backend reuses the
 // same split-ring plumbing).
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct VirtqDesc {
-    pub(crate) addr: u64,
-    pub(crate) len: u32,
-    pub(crate) flags: u16,
-    pub(crate) next: u16,
-}
-
-pub(crate) const VIRTQ_DESC_F_NEXT: u16 = 1;
-pub(crate) const VIRTQ_DESC_F_WRITE: u16 = 2;
-
 const PAGE_SIZE: u64 = 4096;
 
 /// Mark the pages covering guest-physical range `[gpa, gpa + len)` dirty in
@@ -1800,6 +1887,7 @@ pub(crate) fn mark_dirty(dirty: &[std::sync::atomic::AtomicU64], gpa: u64, len: 
 pub struct TapNetBackend {
     mac: [u8; 6],
     mem_addr: u64,
+    mem_size: u64,
     tap_fd: RawFd,
     acked_features: u64,
     tx_kick: Option<EventFd>,
@@ -1812,6 +1900,9 @@ pub struct TapNetBackend {
     /// this the fork memcpy can race a mid-flight used-ring update and hand
     /// the fork a torn ring (CHALLENGES.md #79).
     parked: Arc<AtomicBool>,
+    /// Test-only: when true, `wait_quiescent` ignores `parked` and waits
+    /// out the 200 ms deadline.
+    hold_park: Arc<AtomicBool>,
     /// Pages this device wrote through the host mapping (RX payloads,
     /// used-ring entries + idx). Merged into the warm-fork dirty delta;
     /// KVM's dirty log cannot see these writes (CHALLENGES.md #79).
@@ -1835,6 +1926,7 @@ impl TapNetBackend {
         Self {
             mac,
             mem_addr,
+            mem_size,
             tap_fd,
             acked_features: 0,
             tx_kick: None,
@@ -1842,6 +1934,7 @@ impl TapNetBackend {
             running: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             parked: Arc::new(AtomicBool::new(true)),
+            hold_park: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(dirty),
             rx_idx_seed: 0,
             tx_idx_seed: 0,
@@ -1857,17 +1950,32 @@ impl TapNetBackend {
     /// Both `last_avail` and `last_used` are seeded to `used.idx` so pending
     /// available-but-not-yet-used descriptors (avail.idx > used.idx) are still
     /// drained after the worker starts.
-    pub fn seed_indices_from_guest(&mut self, queues: &[VirtqueueState]) {
+    pub fn seed_indices_from_guest(&mut self, queues: &[VirtqueueState]) -> Result<(), String> {
         if queues.len() < 2 {
-            return;
+            return Err(format!(
+                "virtio-net needs RX + TX queues to seed from, got {}",
+                queues.len()
+            ));
         }
-        self.rx_idx_seed = read_used_idx(self.mem_addr, &queues[0]);
-        self.tx_idx_seed = read_used_idx(self.mem_addr, &queues[1]);
+        self.rx_idx_seed = self.seed_from(&queues[0], "RX")?;
+        self.tx_idx_seed = self.seed_from(&queues[1], "TX")?;
         log::info!(
             "virtio-net seed indices from guest: rx={} tx={}",
             self.rx_idx_seed,
             self.tx_idx_seed
         );
+        Ok(())
+    }
+
+    /// The guest's `used.idx` on one queue, or 0 for a queue the driver
+    /// never readied (nothing was ever completed on it).
+    fn seed_from(&self, q: &VirtqueueState, label: &str) -> Result<u16, String> {
+        if !q.ready {
+            return Ok(0);
+        }
+        let vq = ValidatedQueue::new(q, self.mem_addr, self.mem_size)
+            .map_err(|e| format!("virtio-net {label} queue geometry: {e}"))?;
+        Ok(read_used_idx(&vq))
     }
 }
 
@@ -1890,6 +1998,10 @@ impl VirtioBackend for TapNetBackend {
 
     fn max_queue_size(&self) -> u16 {
         NET_QUEUE_SIZE
+    }
+
+    fn guest_mapping(&self) -> (u64, u64) {
+        (self.mem_addr, self.mem_size)
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -1934,23 +2046,27 @@ impl VirtioBackend for TapNetBackend {
         }
     }
 
-    fn wait_quiescent(&self) {
+    fn wait_quiescent(&self) -> Result<(), NotQuiescent> {
         if self.worker.is_none() {
-            return;
+            return Ok(());
         }
         // Same bound as virtio-blk: above the 100 ms poll, far below the
         // 1 s cluster-fork budget (CHALLENGES #162).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while !self.parked.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= deadline {
-                log::warn!(
-                    "virtio-net: worker did not park within 200ms — fork memory \
-                     capture may race in-flight ring writes"
-                );
-                return;
-            }
-            std::thread::sleep(PARK_POLL);
-        }
+        wait_for_park(
+            &self.parked,
+            &self.running,
+            self.hold_park.load(Ordering::SeqCst),
+            || {
+                format!(
+                    "virtio-net mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+                )
+            },
+        )
+    }
+
+    fn hold_park_for_test(&self, hold: bool) {
+        self.hold_park.store(hold, Ordering::SeqCst);
     }
 
     fn is_quiescent(&self) -> bool {
@@ -1974,17 +2090,21 @@ impl VirtioBackend for TapNetBackend {
             return Err("need at least 2 queues (RX + TX)".to_string());
         }
 
-        let rx_q = queues[0].clone();
-        let tx_q = queues[1].clone();
-
-        if !rx_q.ready || !tx_q.ready {
+        if !queues[0].ready || !queues[1].ready {
             return Err("queues not ready".to_string());
         }
+        // The worker only ever sees geometry that fits in the guest's own
+        // RAM: a hostile `QUEUE_NUM` / ring GPA fails activation here
+        // rather than becoming an out-of-bounds host write on the first
+        // frame (`docs/bug-candidates.md` #40, #42).
+        let rx_q = ValidatedQueue::new(&queues[0], self.mem_addr, self.mem_size)
+            .map_err(|e| format!("virtio-net RX queue geometry: {e}"))?;
+        let tx_q = ValidatedQueue::new(&queues[1], self.mem_addr, self.mem_size)
+            .map_err(|e| format!("virtio-net TX queue geometry: {e}"))?;
 
         let tx_kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
         let tx_kick_fd = tx_kick.as_raw_fd();
 
-        let mem_addr = self.mem_addr;
         let tap_fd = self.tap_fd;
         let irq_fd = irq_evt.as_raw_fd();
         let running = Arc::clone(&self.running);
@@ -2019,7 +2139,6 @@ impl VirtioBackend for TapNetBackend {
                 worker_tap_fd,
                 worker_irq_fd,
                 worker_tx_kick_fd,
-                mem_addr,
                 &rx_q,
                 &tx_q,
                 &running,
@@ -2094,29 +2213,10 @@ impl Drop for TapNetBackend {
 }
 
 /// Read guest `used.idx` (offset +2 in `{flags:u16, idx:u16, ring[]}`).
-pub(crate) fn read_used_idx(mem_base: u64, q: &VirtqueueState) -> u16 {
-    if !q.ready || q.used_addr.raw_value() == 0 {
-        return 0;
-    }
-    let used_base = mem_base + q.used_addr.raw_value();
-    // SAFETY: used_base + 2 points at the idx field in guest RAM (memfd-backed).
-    unsafe { std::ptr::read_volatile((used_base + 2) as *const u16) }
-}
-
-/// Read guest `avail.idx` (offset +2 in `{flags:u16, idx:u16, ring[]}`).
-///
-/// Paired with [`read_used_idx`] by the auto-warp safety predicate
-/// : on a queue the driver fills with requests, the two
-/// being equal is the #79 "nothing in flight" handshake.
-pub(crate) fn read_avail_idx(mem_base: u64, q: &VirtqueueState) -> u16 {
-    if !q.ready || q.avail_addr.raw_value() == 0 {
-        return 0;
-    }
-    let avail_base = mem_base + q.avail_addr.raw_value();
-    // SAFETY: avail_base + 2 points at the idx field in guest RAM, in the
-    // caller's live mapping; the caller has paused the vCPUs and parked
-    // the device workers, so nothing is writing it.
-    unsafe { std::ptr::read_volatile((avail_base + 2) as *const u16) }
+pub(crate) fn read_used_idx(q: &ValidatedQueue) -> u16 {
+    // SAFETY: `used_idx` is the idx field of a ring this geometry placed
+    // inside the caller's live guest mapping (memfd-backed).
+    unsafe { std::ptr::read_volatile(q.used_idx().cast_const()) }
 }
 
 /// Worker thread: poll TAP for RX, poll `tx_kick` for TX, process virtqueues.
@@ -2125,9 +2225,8 @@ fn net_worker(
     tap_fd: RawFd,
     irq_fd: RawFd,
     tx_kick_fd: RawFd,
-    mem_base: u64,
-    rx_q: &VirtqueueState,
-    tx_q: &VirtqueueState,
+    rx_q: &ValidatedQueue,
+    tx_q: &ValidatedQueue,
     running: &AtomicBool,
     paused: &AtomicBool,
     parked: &AtomicBool,
@@ -2142,6 +2241,8 @@ fn net_worker(
     let mut tx_last_used = tx_idx_seed;
 
     let mut pkt_buf = vec![0u8; 65536];
+    // Reused by every chain walk so the RX/TX path allocates nothing.
+    let mut chain: Vec<DescMeta> = Vec::with_capacity(4);
 
     // Small delay to let the guest driver finish initializing
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2198,10 +2299,10 @@ fn net_worker(
                 let pkt_len = n as usize;
                 if !rx_deliver_merged(
                     &mut pkt_buf[..pkt_len],
-                    mem_base,
                     rx_q,
                     &mut rx_last_avail,
                     &mut rx_last_used,
+                    &mut chain,
                     dirty,
                     irq_fd,
                 ) {
@@ -2220,8 +2321,8 @@ fn net_worker(
                 libc::read(tx_kick_fd, (&raw mut val).cast::<libc::c_void>(), 8);
             }
 
-            while let Some(desc_idx) = get_avail_desc(mem_base, tx_q, &mut tx_last_avail) {
-                let len = read_from_desc_chain(mem_base, tx_q, desc_idx, &mut pkt_buf);
+            while let Some(desc_idx) = get_avail_desc(tx_q, &mut tx_last_avail) {
+                let len = read_from_desc_chain(tx_q, desc_idx, &mut pkt_buf, &mut chain);
                 if len > 0 {
                     if let Err(e) = prepare_guest_tx(&mut pkt_buf[..len]) {
                         log::error!("virtio-net TX dropped ({e}) — refusing a broken TAP write");
@@ -2240,11 +2341,10 @@ fn net_worker(
                         }
                     }
                 }
-                let slot = u64::from(tx_last_used % tx_q.size);
-                put_used_desc(mem_base, tx_q, &mut tx_last_used, desc_idx, 0);
-                let used_gpa = tx_q.used_addr.raw_value();
-                mark_dirty(dirty, used_gpa + 4 + slot * 8, 8);
-                mark_dirty(dirty, used_gpa + 2, 2);
+                let slot_gpa = tx_q.used_ring_gpa(tx_last_used);
+                put_used_desc(tx_q, &mut tx_last_used, desc_idx, 0);
+                mark_dirty(dirty, slot_gpa, 8);
+                mark_dirty(dirty, tx_q.used_idx_gpa(), 2);
                 signal_irq(irq_fd);
             }
         }
@@ -2328,21 +2428,18 @@ fn signal_irq(irq_fd: RawFd) {
 }
 
 /// Get the next available descriptor index from the avail ring.
-pub(crate) fn get_avail_desc(
-    mem_base: u64,
-    q: &VirtqueueState,
-    last_avail: &mut u16,
-) -> Option<u16> {
-    let avail_base = mem_base + q.avail_addr.raw_value();
-    // avail ring layout: flags(u16), idx(u16), ring[size](u16 each)
-    // SAFETY: avail_base points to valid guest memory (memfd-backed).
-    let avail_idx = unsafe { std::ptr::read_volatile((avail_base + 2) as *const u16) };
+///
+/// The index is whatever the guest wrote — [`ValidatedQueue::walk_chain`]
+/// is what refuses one that is not a descriptor of this queue.
+pub(crate) fn get_avail_desc(q: &ValidatedQueue, last_avail: &mut u16) -> Option<u16> {
+    // SAFETY: the pointer addresses the avail ring's idx field, which this
+    // geometry placed inside the live guest mapping (memfd-backed).
+    let avail_idx = unsafe { std::ptr::read_volatile(q.avail_idx()) };
     if *last_avail == avail_idx {
         return None;
     }
-    let ring_offset = 4 + (*last_avail % q.size) as u64 * 2;
-    // SAFETY: ring entry is within the avail ring in guest memory.
-    let desc_idx = unsafe { std::ptr::read_volatile((avail_base + ring_offset) as *const u16) };
+    // SAFETY: `avail_ring` wraps into the same validated ring.
+    let desc_idx = unsafe { std::ptr::read_volatile(q.avail_ring(*last_avail)) };
     *last_avail = last_avail.wrapping_add(1);
     Some(desc_idx)
 }
@@ -2359,12 +2456,13 @@ const MAX_RX_MERGE: usize = 128;
 /// count. `used.idx` is published once after every fragment is written
 /// so the guest never observes a partial merge. Returns `false` if the
 /// guest has no RX buffers (caller should stop draining the TAP).
+#[allow(clippy::too_many_arguments)]
 fn rx_deliver_merged(
     pkt: &mut [u8],
-    mem_base: u64,
-    rx_q: &VirtqueueState,
+    rx_q: &ValidatedQueue,
     rx_last_avail: &mut u16,
     rx_last_used: &mut u16,
+    chain: &mut Vec<DescMeta>,
     dirty: &[std::sync::atomic::AtomicU64],
     irq_fd: RawFd,
 ) -> bool {
@@ -2384,11 +2482,18 @@ fn rx_deliver_merged(
             );
             return true;
         }
-        let Some(idx) = get_avail_desc(mem_base, rx_q, rx_last_avail) else {
+        let Some(idx) = get_avail_desc(rx_q, rx_last_avail) else {
             *rx_last_avail = avail_at_start;
             return false;
         };
-        let cap = desc_chain_writable_len(mem_base, rx_q, idx);
+        let cap = match desc_chain_writable_len(rx_q, idx, chain) {
+            Ok(cap) => cap,
+            Err(e) => {
+                *rx_last_avail = avail_at_start;
+                log::error!("RX desc chain {idx} refused: {e}");
+                return false;
+            }
+        };
         if cap == 0 {
             *rx_last_avail = avail_at_start;
             log::error!("RX desc chain {idx} has zero writable length");
@@ -2407,126 +2512,116 @@ fn rx_deliver_merged(
     }
 
     let mut offset = 0usize;
-    let used_gpa = rx_q.used_addr.raw_value();
     for i in 0..n_chains {
         let chunk = (pkt_len - offset).min(caps[i]);
-        let written = write_to_desc_chain(
-            mem_base,
+        let written = match write_to_desc_chain(
             rx_q,
             chains[i],
             &pkt[offset..offset + chunk],
+            chain,
             dirty,
-        );
+        ) {
+            Ok(written) => written,
+            Err(e) => {
+                // The same chain validated a moment ago on the same
+                // paused-free path, so this is a guest rewriting its
+                // table under us: stop, do not complete it.
+                log::error!("RX desc chain {} refused mid-merge: {e}", chains[i]);
+                return false;
+            }
+        };
         if written != chunk {
             log::error!(
                 "RX desc chain {} wrote {written} of {chunk} (CHALLENGES.md #117)",
                 chains[i]
             );
         }
-        let slot = u64::from(*rx_last_used % rx_q.size);
-        write_used_elem(mem_base, rx_q, rx_last_used, chains[i], written as u32);
-        mark_dirty(dirty, used_gpa + 4 + slot * 8, 8);
+        let slot_gpa = rx_q.used_ring_gpa(*rx_last_used);
+        write_used_elem(rx_q, rx_last_used, chains[i], written as u32);
+        mark_dirty(dirty, slot_gpa, 8);
         offset += written;
     }
-    publish_used_idx(mem_base, rx_q, *rx_last_used);
-    mark_dirty(dirty, used_gpa + 2, 2);
+    publish_used_idx(rx_q, *rx_last_used);
+    mark_dirty(dirty, rx_q.used_idx_gpa(), 2);
     signal_irq(irq_fd);
     true
 }
 
 /// Sum of writable descriptor lengths in one chain.
-fn desc_chain_writable_len(mem_base: u64, q: &VirtqueueState, first_desc: u16) -> usize {
-    let desc_base = mem_base + q.desc_addr.raw_value();
-    let mut desc_idx = first_desc;
-    let mut total = 0usize;
-    // Bound the walk: a corrupt NEXT loop must not hang the net worker.
-    for _ in 0..q.size {
-        // SAFETY: desc_base + idx*16 points to a valid VirtqDesc in guest memory.
-        let desc: VirtqDesc = unsafe {
-            std::ptr::read_volatile((desc_base + u64::from(desc_idx) * 16) as *const VirtqDesc)
-        };
-        if desc.flags & VIRTQ_DESC_F_WRITE != 0 && desc.addr != 0 {
-            total += desc.len as usize;
-        }
-        if desc.flags & VIRTQ_DESC_F_NEXT == 0 {
-            break;
-        }
-        desc_idx = desc.next;
-    }
-    total
+fn desc_chain_writable_len(
+    q: &ValidatedQueue,
+    first_desc: u16,
+    chain: &mut Vec<DescMeta>,
+) -> Result<usize, crate::virtio_mmio::DescChainError> {
+    let descs = q.walk_chain(first_desc, chain)?;
+    Ok(descs
+        .iter()
+        .filter(|d| d.write && d.addr != 0)
+        .map(|d| d.len as usize)
+        .sum())
 }
 
 /// Write data to a descriptor chain (for RX: TAP -> guest), recording every
 /// written page in the device-DMA dirty bitmap. Returns bytes copied.
 fn write_to_desc_chain(
-    mem_base: u64,
-    q: &VirtqueueState,
+    q: &ValidatedQueue,
     first_desc: u16,
     data: &[u8],
+    chain: &mut Vec<DescMeta>,
     dirty: &[std::sync::atomic::AtomicU64],
-) -> usize {
-    let desc_base = mem_base + q.desc_addr.raw_value();
-    let mut desc_idx = first_desc;
+) -> Result<usize, crate::virtio_mmio::DescChainError> {
+    let descs = q.walk_chain(first_desc, chain)?;
     let mut offset = 0usize;
-
-    loop {
-        // SAFETY: desc_base + idx*16 points to a valid VirtqDesc in guest memory.
-        let desc: VirtqDesc = unsafe {
-            std::ptr::read_volatile((desc_base + u64::from(desc_idx) * 16) as *const VirtqDesc)
-        };
-
-        if desc.flags & VIRTQ_DESC_F_WRITE != 0 && desc.addr != 0 {
-            let copy_len = (data.len() - offset).min(desc.len as usize);
-            // SAFETY: mem_base + desc.addr points to guest memory (memfd-backed);
-            // desc.addr is a GPA within guest RAM.
-            unsafe {
-                let dst = (mem_base + desc.addr) as *mut u8;
-                std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), dst, copy_len);
-            }
-            mark_dirty(dirty, desc.addr, copy_len as u64);
-            offset += copy_len;
-        }
-
-        if desc.flags & VIRTQ_DESC_F_NEXT != 0 && offset < data.len() {
-            desc_idx = desc.next;
-        } else {
+    for d in descs {
+        if offset >= data.len() {
             break;
         }
+        if !d.write || d.addr == 0 {
+            continue;
+        }
+        let copy_len = (data.len() - offset).min(d.len as usize);
+        // SAFETY: `walk_chain` checked `addr + len` against the guest's RAM
+        // span, and `copy_len <= d.len`, so the destination lies inside the
+        // live guest mapping (memfd-backed) which outlives the worker.
+        unsafe {
+            let dst = (q.mem_base() + d.addr) as *mut u8;
+            std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), dst, copy_len);
+        }
+        mark_dirty(dirty, d.addr, copy_len as u64);
+        offset += copy_len;
     }
-    offset
+    Ok(offset)
 }
 
 /// Read data from a descriptor chain (for TX: guest -> TAP).
 fn read_from_desc_chain(
-    mem_base: u64,
-    q: &VirtqueueState,
+    q: &ValidatedQueue,
     first_desc: u16,
     buf: &mut [u8],
+    chain: &mut Vec<DescMeta>,
 ) -> usize {
-    let desc_base = mem_base + q.desc_addr.raw_value();
-    let mut desc_idx = first_desc;
-    let mut offset = 0usize;
-
-    loop {
-        // SAFETY: desc_base + idx*16 points to a valid VirtqDesc in guest memory.
-        let desc: VirtqDesc = unsafe {
-            std::ptr::read_volatile((desc_base + u64::from(desc_idx) * 16) as *const VirtqDesc)
-        };
-
-        if desc.flags & VIRTQ_DESC_F_WRITE == 0 && desc.addr != 0 {
-            let copy_len = (buf.len() - offset).min(desc.len as usize);
-            // SAFETY: mem_base + desc.addr points to guest memory (memfd-backed);
-            // desc.addr is a GPA within guest RAM.
-            unsafe {
-                let src = (mem_base + desc.addr) as *const u8;
-                std::ptr::copy_nonoverlapping(src, buf[offset..].as_mut_ptr(), copy_len);
-            }
-            offset += copy_len;
+    let descs = match q.walk_chain(first_desc, chain) {
+        Ok(descs) => descs,
+        Err(e) => {
+            log::error!("TX desc chain {first_desc} refused: {e}");
+            return 0;
         }
-
-        if desc.flags & VIRTQ_DESC_F_NEXT != 0 {
-            desc_idx = desc.next;
-        } else {
+    };
+    let mut offset = 0usize;
+    for d in descs {
+        if d.write || d.addr == 0 {
+            continue;
+        }
+        let copy_len = (buf.len() - offset).min(d.len as usize);
+        // SAFETY: `walk_chain` checked `addr + len` against the guest's RAM
+        // span, and `copy_len <= d.len`, so the source lies inside the live
+        // guest mapping (memfd-backed) which outlives the worker.
+        unsafe {
+            let src = (q.mem_base() + d.addr) as *const u8;
+            std::ptr::copy_nonoverlapping(src, buf[offset..].as_mut_ptr(), copy_len);
+        }
+        offset += copy_len;
+        if offset == buf.len() {
             break;
         }
     }
@@ -2537,41 +2632,27 @@ fn read_from_desc_chain(
 /// publish `used.idx` — call [`publish_used_idx`] after the last
 /// element of a multi-buffer RX packet so the guest never observes a
 /// partial `MRG_RXBUF` merge.
-fn write_used_elem(
-    mem_base: u64,
-    q: &VirtqueueState,
-    last_used: &mut u16,
-    desc_idx: u16,
-    len: u32,
-) {
-    let used_base = mem_base + q.used_addr.raw_value();
-    // used ring layout: flags(u16), idx(u16), ring[size]({id:u32, len:u32}) each
-    let ring_offset = 4 + (*last_used % q.size) as u64 * 8;
-    // SAFETY: used ring entry is within guest memory.
+fn write_used_elem(q: &ValidatedQueue, last_used: &mut u16, desc_idx: u16, len: u32) {
+    // SAFETY: `used_ring` wraps into the used ring this geometry placed
+    // inside the live guest mapping; the element is `{id:u32, len:u32}`
+    // and both words are inside the validated span.
     unsafe {
-        let entry_ptr = (used_base + ring_offset) as *mut u32;
+        let entry_ptr = q.used_ring(*last_used);
         std::ptr::write_volatile(entry_ptr, u32::from(desc_idx));
         std::ptr::write_volatile(entry_ptr.add(1), len);
     }
     *last_used = last_used.wrapping_add(1);
 }
 
-fn publish_used_idx(mem_base: u64, q: &VirtqueueState, last_used: u16) {
-    let used_base = mem_base + q.used_addr.raw_value();
-    // SAFETY: used_base + 2 points to the idx field.
+fn publish_used_idx(q: &ValidatedQueue, last_used: u16) {
+    // SAFETY: `used_idx` is the idx field of the validated used ring.
     unsafe {
-        std::ptr::write_volatile((used_base + 2) as *mut u16, last_used);
+        std::ptr::write_volatile(q.used_idx(), last_used);
     }
 }
 
 /// Put a descriptor in the used ring and publish `used.idx`.
-pub(crate) fn put_used_desc(
-    mem_base: u64,
-    q: &VirtqueueState,
-    last_used: &mut u16,
-    desc_idx: u16,
-    len: u32,
-) {
-    write_used_elem(mem_base, q, last_used, desc_idx, len);
-    publish_used_idx(mem_base, q, *last_used);
+pub(crate) fn put_used_desc(q: &ValidatedQueue, last_used: &mut u16, desc_idx: u16, len: u32) {
+    write_used_elem(q, last_used, desc_idx, len);
+    publish_used_idx(q, *last_used);
 }

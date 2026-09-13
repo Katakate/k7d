@@ -1,4 +1,4 @@
-"""27a-inc2 plot stats + render from SYNTHETIC fixture JSONL. No KVM.
+"""Plot stats + render from SYNTHETIC fixture JSONL. No KVM.
 
 These rows are invented. They are not a GRPO run. See gym/plots/README.md.
 """

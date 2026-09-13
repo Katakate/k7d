@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use k7d::cluster_tree::{ClusterPayload, ClusterSnapshotTree};
+use k7d::guest::Guest;
 use k7d::network::ClusterNetwork;
-use k7d::tree::{NodeState, TreeBudget};
+use k7d::tree::{NodeState, TreeBudget, TreeError};
 use k7d::vm::Vm;
 
 mod common;
@@ -28,7 +29,7 @@ fn build_cluster(label: &str, n: usize) -> ClusterPayload {
     let kernel = workspace_path("guest/kernel/vmlinux");
     let initrd = workspace_path("guest/rootfs/initramfs.cpio.gz");
     let mut net = ClusterNetwork::create(label).expect("bridge");
-    let mut members: Vec<Vm> = Vec::with_capacity(n);
+    let mut members: Vec<Guest> = Vec::with_capacity(n);
     for _ in 0..n {
         let tap = net.add_tap().expect("tap");
         let mut vm = Vm::builder()
@@ -44,7 +45,7 @@ fn build_cluster(label: &str, n: usize) -> ClusterPayload {
         let _ = vm
             .connect_agent(Duration::from_secs(90))
             .expect("agent ready");
-        members.push(vm);
+        members.push(Guest::from(vm));
     }
     ClusterPayload {
         network: net,
@@ -72,7 +73,7 @@ fn build_cluster_with_rw_disks(label: &str, n: usize) -> (ClusterPayload, Vec<Pa
     let kernel = workspace_path("guest/kernel/vmlinux");
     let initrd = workspace_path("guest/rootfs/initramfs.cpio.gz");
     let mut net = ClusterNetwork::create(label).expect("bridge");
-    let mut members: Vec<Vm> = Vec::with_capacity(n);
+    let mut members: Vec<Guest> = Vec::with_capacity(n);
     let mut images: Vec<PathBuf> = Vec::with_capacity(n);
     for i in 0..n {
         let img =
@@ -94,7 +95,7 @@ fn build_cluster_with_rw_disks(label: &str, n: usize) -> (ClusterPayload, Vec<Pa
         let _ = vm
             .connect_agent(Duration::from_secs(90))
             .expect("agent ready");
-        members.push(vm);
+        members.push(Guest::from(vm));
     }
     (
         ClusterPayload {
@@ -112,6 +113,8 @@ fn assert_member_disks_exist(tree: &ClusterSnapshotTree, id: &String) {
     let payload = tree.get_payload(id).expect("live payload");
     for (i, vm) in payload.members.iter().enumerate() {
         let path = &vm
+            .as_native()
+            .unwrap()
             .block_devices()
             .first()
             .unwrap_or_else(|| panic!("{id}/{i} has no block device"))
@@ -232,7 +235,7 @@ fn test_cluster_tree_fork_from_child() {
         .expect("child live")
         .members
         .iter()
-        .all(|vm| vm.fork_source_base_path().is_some()));
+        .all(|vm| vm.as_native().unwrap().fork_source_base_path().is_some()));
 
     tree.suspend(&grand).expect("suspend grand");
     tree.resume(&grand).expect("resume grand");
@@ -361,7 +364,7 @@ fn test_cluster_tree_fork_batch_50() {
         assert_eq!(payload.members.len(), 3);
         for vm in &payload.members {
             assert!(
-                !vm.fork_memory_is_full_copy(),
+                !vm.as_native().unwrap().fork_memory_is_full_copy(),
                 "batch fork {id} member must be CoW"
             );
         }
@@ -439,7 +442,7 @@ fn test_cluster_tree_auto_evict_lru() {
     tree.prune(&root_id).expect("prune");
 }
 
-/// the referenced work / CHALLENGES #115: `fork_batch` must make headroom for the
+/// CHALLENGES #115: `fork_batch` must make headroom for the
 /// incoming forks (`labels.len() × vm_count`) instead of hanging on the
 /// control socket or silently exceeding `max_live_vms`. With the budget
 /// full, forking from a child suspends the LRU non-source node (root) and
@@ -633,13 +636,56 @@ fn test_cluster_tree_fork_of_fork_with_rw_disks() {
         );
     }
 
+    // Disk-tier eviction of a suspended fork child must reap parked
+    // member disks too (bug-candidates #52). Resume of an Evicted node
+    // still fails — evicted ≠ suspended. Suspend `great` (already a
+    // leaf with RW disks) rather than forking another cluster: the
+    // live budget is already full.
+    tree.suspend(&great).expect("suspend for eviction");
+    let parked_evict = tree.get_node(&great).unwrap().parked_disk_dirs.clone();
+    assert!(
+        !parked_evict.is_empty(),
+        "suspended victim must park its RW disk-clone dirs"
+    );
+    for dir in &parked_evict {
+        assert!(
+            dir.exists(),
+            "parked disk dir {} deleted at suspend",
+            dir.display()
+        );
+    }
+    let mut disk_budget = tree.budget();
+    disk_budget.max_disk_bytes = tree.usage().disk_bytes.saturating_sub(1);
+    tree.set_budget(disk_budget);
+    tree.auto_evict().expect("disk-tier eviction");
+    let info = tree.get_node(&great).unwrap();
+    assert_eq!(info.state, NodeState::Evicted);
+    assert!(
+        info.parked_disk_dirs.is_empty(),
+        "evicted record must clear parked_disk_dirs"
+    );
+    for dir in &parked_evict {
+        assert!(
+            !dir.exists(),
+            "evict must reap the parked dir {}",
+            dir.display()
+        );
+    }
+    let err = tree
+        .resume(&great)
+        .expect_err("resume of an evicted node must fail");
+    assert!(
+        matches!(err, TreeError::BadState(_, NodeState::Evicted, _)),
+        "resume of evicted must fail as BadState, got {err}"
+    );
+
     tree.prune(&root_id).expect("prune");
     for img in &root_images {
         let _ = std::fs::remove_file(img);
     }
 }
 
-/// the referenced work on the cluster tree: preparing a cluster child clones each
+/// Reflink keyframes on the cluster tree: preparing a cluster child clones each
 /// member's keyframe from that member's own ancestor keyframe.
 ///
 /// This is the shape GRPO actually runs — a generation is N cluster
@@ -707,7 +753,7 @@ fn test_cluster_tree_prepare_incremental() {
         })
         .sum();
     eprintln!(
-        "30b cluster: prepare {:?}, XFS grew {grew} B of a {span} B cluster keyframe",
+        "cluster: prepare {:?}, XFS grew {grew} B of a {span} B cluster keyframe",
         elapsed
     );
     assert!(

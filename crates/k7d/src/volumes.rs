@@ -41,7 +41,7 @@
 //!    `source` from the host path to the corresponding in-VM
 //!    virtiofs path. Mounts that don't have a matching host source
 //!    in the [`MountRewriteMap`] (e.g. hostPath, /etc/resolv.conf)
-//!    are still stripped by the existing shim logic — chunk 2b
+//!    are still stripped by the existing shim logic — a later pass
 //!    extends the map to cover those.
 //!
 //! 4. On sandbox Delete, [`PodVolumes::cleanup`] unmounts the per-
@@ -49,6 +49,8 @@
 //!    but non-fatal — kubelet GCs the pod dir anyway.
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -81,8 +83,8 @@ const VM_MOUNT_RW: &str = "/mnt/pod-volumes-rw";
 
 /// Container-side destinations the shim's per-workload `Create`
 /// pass auto-bind-mounts from the host into the per-pod scratch
-/// tree..1 — these are the kubelet/CRI-generated
-/// system files every container expects to see (the chunk-2a
+/// tree. These are the kubelet/CRI-generated
+/// system files every container expects to see (the
 /// kubelet-volume scan doesn't cover them because their sources
 /// aren't under `<pod-dir>/volumes/`):
 ///
@@ -102,14 +104,14 @@ const VM_MOUNT_RW: &str = "/mnt/pod-volumes-rw";
 /// The list deliberately stops at three. `/dev/termination-log`
 /// (where kubelet expects the container to write its last gasp on
 /// exit) and `/dev/shm` are deferred — they're host-path bind
-/// mounts at unusual destinations that the chunk-2a strip pass
+/// mounts at unusual destinations that the strip pass
 /// happily drops without any container caring on the boot path.
 /// We can grow the whitelist when a real workload needs them.
 pub const ETC_FILE_WHITELIST: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/etc/hostname"];
 
 /// Path prefixes whose bind-mount sources are kubelet / containerd
 /// CRI-generated state and **not** user-supplied `hostPath` volumes.
-/// Chunk 2b.2's `hostPath` enumerator uses this list to filter
+/// The `hostPath` enumerator uses this list to filter
 /// workload mounts down to the actual user `hostPath` entries.
 ///
 /// Anything else under `/var/lib/kubelet/pods/<uid>/` is either:
@@ -129,7 +131,7 @@ pub const ETC_FILE_WHITELIST: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/et
 ///   [`PodVolumes::add_hostpath_mounts_for_workload`] short-circuits
 ///   them at the `rewrites.translate` check before reaching
 ///   [`is_cri_internal_source`].
-/// - `etc-hosts` — already in the rewrite map from chunk 2b.1's
+/// - `etc-hosts` — already in the rewrite map from the
 ///   etc-files whitelist.
 /// - Under `containers/<name>/<id>` — kubelet's termination-log,
 ///   intentionally dropped (no container we've seen cares about
@@ -180,6 +182,48 @@ pub enum VolumeError {
     },
     #[error("erofs volume image: {0}")]
     Erofs(#[from] crate::erofs::ErofsError),
+    #[error(
+        "hostPath placeholder {name} already exists — refusing to reuse a guest-visible entry"
+    )]
+    PlaceholderExists {
+        /// Final path component under the share root.
+        name: String,
+    },
+    #[error("placeholder name {name:?} is not a single path component")]
+    InvalidPlaceholderName {
+        /// Rejected name (contained `/`, or was `.` / `..` / empty).
+        name: String,
+    },
+    #[error("hostPath placeholder {name} failed verification: {reason}")]
+    PlaceholderVerify {
+        /// Final path component under the share root.
+        name: String,
+        /// Why the fstatat check rejected the entry.
+        reason: String,
+    },
+}
+
+/// Daemon / shim env that fails Create for any pod that would take the
+/// virtiofs hostPath fallback. Hardened and Firecracker
+/// profiles set this; the default block/erofs path is unaffected.
+pub const DENY_VIRTIOFS_FALLBACK_ENV: &str = "K7D_DENY_VIRTIOFS_FALLBACK";
+
+/// Create-failure message when [`DENY_VIRTIOFS_FALLBACK_ENV`] is `1`.
+pub const DENY_VIRTIOFS_FALLBACK_MSG: &str =
+    "hostPath / unsupported PVC volumes are disabled on this node (K7D_DENY_VIRTIOFS_FALLBACK)";
+
+/// Whether [`DENY_VIRTIOFS_FALLBACK_ENV`] is set to `1`.
+///
+/// Unset or `0` → allow the fallback. Any other non-empty value is a
+/// loud error (no silent "treat as off").
+pub fn virtiofs_fallback_denied() -> Result<bool, String> {
+    match std::env::var(DENY_VIRTIOFS_FALLBACK_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v.is_empty() || v == "0" => Ok(false),
+        Ok(v) => Err(format!("{DENY_VIRTIOFS_FALLBACK_ENV}={v:?} is not 0 or 1")),
+        Err(e) => Err(format!("read {DENY_VIRTIOFS_FALLBACK_ENV}: {e}")),
+    }
 }
 
 /// Maps host source paths (as they appear in the kubelet-set OCI
@@ -200,7 +244,7 @@ pub struct MountRewriteMap {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RewriteTarget {
     in_vm: PathBuf,
-    #[allow(dead_code)] // chunk 2b uses this to enforce :ro at mount time
+    #[allow(dead_code)] // used to enforce :ro at mount time
     readonly: bool,
 }
 
@@ -310,6 +354,12 @@ pub struct PodVolumes {
     pub host_volumes_ro: PathBuf,
     /// Our per-pod read-write scratch tree on the host.
     pub host_volumes_rw: PathBuf,
+    /// `O_PATH | O_DIRECTORY | O_NOFOLLOW` fd for [`Self::host_volumes_ro`].
+    /// Every create/mkdir/open/unlink under that tree is relative to
+    /// this fd (guest-planted symlinks cannot escape).
+    share_fd_ro: OwnedFd,
+    /// Same as [`Self::share_fd_ro`] for the RW share.
+    share_fd_rw: OwnedFd,
     /// Bind-mount destinations we created and need to unmount on
     /// cleanup. One entry per kubelet volume directory we found.
     /// Stored as full paths under `host_volumes_{ro,rw}/`.
@@ -335,7 +385,7 @@ pub struct RewriteSummary {
     /// source wasn't in the rewrite map). Kept for logging — the
     /// existing strip logic in `task.rs` still removes them, this
     /// just records what would have been kept if we'd known about
-    /// them. Chunk 2b extends the rewrite map to cover hostPath and
+    /// them. A later pass extends the rewrite map to cover hostPath and
     /// `/etc/{resolv.conf,hosts}` sources so this list shrinks.
     pub stripped: Vec<PathBuf>,
 }
@@ -377,21 +427,9 @@ impl PodVolumes {
     pub fn prepare(pod_uid: Option<&str>, sandbox_id: &str) -> Result<Self, VolumeError> {
         let name = pod_uid.unwrap_or(sandbox_id);
         let pod_root = PathBuf::from(HOST_PODS_BASE).join(name);
-        let host_volumes_ro = pod_root.join("volumes-ro");
-        let host_volumes_rw = pod_root.join("volumes-rw");
-        std::fs::create_dir_all(&host_volumes_ro)?;
-        std::fs::create_dir_all(&host_volumes_rw)?;
-
-        let mut pv = Self {
-            pod_uid: pod_uid.map(str::to_string),
-            kubelet_volumes_dir: None,
-            host_volumes_ro,
-            host_volumes_rw,
-            bind_destinations: Vec::new(),
-            rewrites: MountRewriteMap::default(),
-            vm_root_ro: PathBuf::from(VM_MOUNT_RO),
-            vm_root_rw: PathBuf::from(VM_MOUNT_RW),
-        };
+        let mut pv =
+            Self::from_scratch_dirs(pod_root.join("volumes-ro"), pod_root.join("volumes-rw"))?;
+        pv.pod_uid = pod_uid.map(str::to_string);
 
         if let Some(uid) = pod_uid {
             let kubelet_dir = PathBuf::from("/var/lib/kubelet/pods")
@@ -410,6 +448,34 @@ impl PodVolumes {
         }
 
         Ok(pv)
+    }
+
+    /// Create the RO / RW scratch trees, open an `O_PATH` fd on each,
+    /// and return a [`PodVolumes`] with an empty rewrite map.
+    ///
+    /// Used by [`Self::prepare`] and by tests that construct a
+    /// scratch tree outside `/var/lib/k7d/pods`.
+    #[allow(clippy::similar_names)]
+    pub fn from_scratch_dirs(
+        host_volumes_ro: PathBuf,
+        host_volumes_rw: PathBuf,
+    ) -> Result<Self, VolumeError> {
+        std::fs::create_dir_all(&host_volumes_ro)?;
+        std::fs::create_dir_all(&host_volumes_rw)?;
+        let share_fd_ro = open_share_root(&host_volumes_ro)?;
+        let share_fd_rw = open_share_root(&host_volumes_rw)?;
+        Ok(Self {
+            pod_uid: None,
+            kubelet_volumes_dir: None,
+            host_volumes_ro,
+            host_volumes_rw,
+            share_fd_ro,
+            share_fd_rw,
+            bind_destinations: Vec::new(),
+            rewrites: MountRewriteMap::default(),
+            vm_root_ro: PathBuf::from(VM_MOUNT_RO),
+            vm_root_rw: PathBuf::from(VM_MOUNT_RW),
+        })
     }
 
     /// Override the in-VM mount roots for the RO / RW shares
@@ -437,7 +503,7 @@ impl PodVolumes {
             if class.is_none() {
                 log::debug!(
                     "PodVolumes: skipping unknown kubelet plugin {plugin_str:?} \
-                     (will be added in chunk 2b)"
+                     (not yet handled)"
                 );
                 continue;
             }
@@ -459,15 +525,17 @@ impl PodVolumes {
                 // collisions across plugins that happen to share a
                 // volume name (rare but possible).
                 let dest_name = format!("{}-{vol_name}", class.synthetic_prefix());
-                let dest_root = if class.is_readonly() {
-                    &self.host_volumes_ro
+                let (dest_root, root_fd) = if class.is_readonly() {
+                    (&self.host_volumes_ro, &self.share_fd_ro)
                 } else {
-                    &self.host_volumes_rw
+                    (&self.host_volumes_rw, &self.share_fd_rw)
                 };
+                let dest_fd = create_placeholder(root_fd, &dest_name, PlaceholderKind::Dir)?;
+                if let Err(e) = bind_mount_into_fd(&vol_path, &dest_fd) {
+                    let _ = unlinkat_name(root_fd, &dest_name, true);
+                    return Err(e);
+                }
                 let dest = dest_root.join(&dest_name);
-                std::fs::create_dir_all(&dest)?;
-
-                bind_mount(&vol_path, &dest)?;
                 self.bind_destinations.push(dest.clone());
 
                 let in_vm_root = if class.is_readonly() {
@@ -576,23 +644,12 @@ impl PodVolumes {
                 .and_then(|n| n.to_str())
                 .unwrap_or("file");
             let dest_name = format!("_etc-{leaf}");
-            let dest = self.host_volumes_ro.join(&dest_name);
-            // `mount --bind src dst` requires `dst` to exist
-            // and be the same kind (file → file). `touch`
-            // before binding. A failure here is a real error on
-            // a mount we committed to wiring — fail loud.
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&dest)?;
-            if let Err(e) = bind_mount(&src_path, &dest) {
-                // Remove the empty placeholder we just created
-                // so a retry has a clean slate, then fail loud:
-                // the bind we committed to is required.
-                let _ = std::fs::remove_file(&dest);
+            let dest_fd = create_placeholder(&self.share_fd_ro, &dest_name, PlaceholderKind::File)?;
+            if let Err(e) = bind_mount_into_fd(&src_path, &dest_fd) {
+                let _ = unlinkat_name(&self.share_fd_ro, &dest_name, false);
                 return Err(e);
             }
+            let dest = self.host_volumes_ro.join(&dest_name);
             self.bind_destinations.push(dest.clone());
             let in_vm = self.vm_root_ro.join(&dest_name);
             self.rewrites.insert(src_path.clone(), in_vm.clone(), true);
@@ -613,13 +670,13 @@ impl PodVolumes {
     /// have no kubelet pre-materialization step — the user gives
     /// Kubernetes an arbitrary host path in `pod.spec.volumes[].
     /// hostPath.path`, and kubelet just emits an OCI bind mount
-    /// with that path as `source`. There's nothing for chunk 2a's
+    /// with that path as `source`. There's nothing for the
     /// kubelet-volume scanner to find under
     /// `/var/lib/kubelet/pods/<uid>/volumes/` for these.
     ///
     /// At workload `Create` time we walk the OCI `mounts[]` looking
     /// for bind entries whose source is **not** in the rewrite map
-    /// (chunk 2a kubelet-volume + chunk 2b.1 etc-files cases) and
+    /// (kubelet-volume + etc-files cases) and
     /// **not** under a CRI-internal path prefix (etc-hosts /
     /// resolv.conf / hostname / termination-log / shm — those have
     /// either been handled earlier or are intentionally dropped).
@@ -670,40 +727,25 @@ impl PodVolumes {
                 source: src,
                 readonly,
             } = m;
-            let dest_name = format!("_hostpath-{}", flatten_path_for_scratch(&src));
-            let dest_root = if readonly {
-                &self.host_volumes_ro
+            let dest_name = hostpath_placeholder_name(&src);
+            let (dest_root, root_fd) = if readonly {
+                (&self.host_volumes_ro, &self.share_fd_ro)
             } else {
-                &self.host_volumes_rw
+                (&self.host_volumes_rw, &self.share_fd_rw)
             };
-            let dest = dest_root.join(&dest_name);
-
-            // Match source kind. is_file() / is_dir() follow
-            // symlinks, which matches `mount --bind`'s view.
+            // Source kind follows symlinks, matching `mount --bind`.
             let src_is_file = src.is_file();
-            let prepared = if src_is_file {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(&dest)
-                    .map(|_| ())
+            let kind = if src_is_file {
+                PlaceholderKind::File
             } else {
-                std::fs::create_dir_all(&dest)
+                PlaceholderKind::Dir
             };
-            // Preparing the bind target is required for a mount we
-            // committed to wiring — fail loud on error.
-            prepared?;
-            if let Err(e) = bind_mount(&src, &dest) {
-                // Roll back the placeholder so a retry has a clean
-                // slate, then fail loud.
-                if src_is_file {
-                    let _ = std::fs::remove_file(&dest);
-                } else {
-                    let _ = std::fs::remove_dir(&dest);
-                }
+            let dest_fd = create_placeholder(root_fd, &dest_name, kind)?;
+            if let Err(e) = bind_mount_into_fd(&src, &dest_fd) {
+                let _ = unlinkat_name(root_fd, &dest_name, !src_is_file);
                 return Err(e);
             }
+            let dest = dest_root.join(&dest_name);
             self.bind_destinations.push(dest.clone());
             let in_vm_root = if readonly {
                 self.vm_root_ro.clone()
@@ -731,8 +773,23 @@ impl PodVolumes {
     /// so a stray bind mount eventually becomes invisible anyway.
     pub fn cleanup(mut self) {
         for dest in self.bind_destinations.drain(..) {
-            if let Err(e) = umount(&dest) {
+            if let Err(e) = umount_path(&dest) {
                 log::warn!("PodVolumes::cleanup: umount {} failed: {e}", dest.display());
+            }
+            let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let root_fd = if dest.starts_with(&self.host_volumes_ro) {
+                &self.share_fd_ro
+            } else {
+                &self.share_fd_rw
+            };
+            let is_dir = is_dir_at(root_fd, name).unwrap_or(false);
+            if let Err(e) = unlinkat_name(root_fd, name, is_dir) {
+                log::debug!(
+                    "PodVolumes::cleanup: unlinkat {name} under {}: {e}",
+                    dest.display()
+                );
             }
         }
         if let Some(parent) = self.host_volumes_ro.parent() {
@@ -912,34 +969,303 @@ fn is_likely_bind_mount(mount: &serde_json::Value) -> bool {
     false
 }
 
-/// `mount --bind <src> <dst>` via the `mount(8)` CLI, surfacing
-/// stderr as a structured error.
+/// Placeholder name under a fallback share for a hostPath source
+/// (`_hostpath-<16 hex chars>`). A single path component — never
+/// `.` / `..` / a slash — so it is safe to pass to `mkdirat` /
+/// `openat` relative to the share-root fd.
+#[must_use]
+pub fn hostpath_placeholder_name(src: &Path) -> String {
+    format!("_hostpath-{}", flatten_path_for_scratch(src))
+}
+
+/// Bind-mount `path` onto itself and remount it read-only.
 ///
-/// We shell out instead of calling `libc::mount` directly because
-/// `mount(8)` already handles the bookkeeping for non-root cases,
-/// shared/private propagation defaults, and `SELinux` labelling that
-/// our test infrastructure relies on.
-fn bind_mount(src: &Path, dst: &Path) -> Result<(), VolumeError> {
-    // Route through the pidfd-based run helper instead of
-    // `Command::output()`: under sustained shim load Tokio's
-    // SIGCHLD reaper races `waitpid(pid)` and returns `ECHILD`
-    // (`io: No child processes (os error 10)`), causing every
-    // bind to fail spuriously. See `crate::netns::run_capture`
-    // for the full story.
-    let (status, _stdout, stderr) = crate::netns::run_capture(
-        "mount",
-        &["--bind", &src.to_string_lossy(), &dst.to_string_lossy()],
-    )
-    .map_err(|e| VolumeError::Mount {
-        what: src.to_path_buf(),
-        dst: dst.to_path_buf(),
-        stderr: format!("run_capture mount: {e}"),
-    })?;
-    if !status.success() {
+/// Returns `true` when this call created the bind (the caller must
+/// [`umount_path`] later). `false` if the path was already `ST_RDONLY`
+/// — a virtiofs fork respawns virtiofsd against the same host dir the
+/// source remounted, and must not stack a second bind / steal the
+/// umount. virtiofsd has no `--readonly`; this is the host-side
+/// `EROFS`.
+pub fn remount_share_readonly(path: &Path) -> Result<bool, VolumeError> {
+    if share_is_readonly(path)? {
+        return Ok(false);
+    }
+    let c = cstr_path(path)?;
+    // SAFETY: `c` is a valid CString that outlives both mount calls.
+    let rc = unsafe {
+        libc::mount(
+            c.as_ptr(),
+            c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(VolumeError::Mount {
+            what: path.to_path_buf(),
+            dst: path.to_path_buf(),
+            stderr: format!("MS_BIND self: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: same `c`; remount applies MS_RDONLY to the bind we just made.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = umount_path(path);
+        return Err(VolumeError::Mount {
+            what: path.to_path_buf(),
+            dst: path.to_path_buf(),
+            stderr: format!("MS_REMOUNT|MS_RDONLY: {err}"),
+        });
+    }
+    Ok(true)
+}
+
+fn share_is_readonly(path: &Path) -> Result<bool, VolumeError> {
+    let c = cstr_path(path)?;
+    // SAFETY: all-zero `statvfs` is a valid initial value.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` outlives the call; `st` is a live statvfs.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(st.f_flag & libc::ST_RDONLY != 0)
+}
+
+/// `umount(2)` `path`. Public so tests can undo [`remount_share_readonly`].
+pub fn umount_path(path: &Path) -> Result<(), VolumeError> {
+    let c = cstr_path(path)?;
+    // SAFETY: `c` is a valid CString that outlives the call.
+    let rc = unsafe { libc::umount2(c.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(VolumeError::Mount {
+            what: PathBuf::new(),
+            dst: path.to_path_buf(),
+            stderr: format!("umount2: {}", std::io::Error::last_os_error()),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PlaceholderKind {
+    Dir,
+    File,
+}
+
+fn cstr(s: &str) -> Result<CString, VolumeError> {
+    CString::new(s)
+        .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))
+}
+
+fn cstr_path(p: &Path) -> Result<CString, VolumeError> {
+    CString::new(p.as_os_str().as_encoded_bytes())
+        .map_err(|e| VolumeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))
+}
+
+fn validate_placeholder_name(name: &str) -> Result<(), VolumeError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(VolumeError::InvalidPlaceholderName {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn open_share_root(path: &Path) -> Result<OwnedFd, VolumeError> {
+    let c = cstr_path(path)?;
+    // SAFETY: `c` is a valid CString; flags request a directory O_PATH
+    // fd that does not follow a final symlink.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` is a freshly opened descriptor we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fd_stat(fd: &OwnedFd) -> Result<libc::stat, VolumeError> {
+    // SAFETY: an all-zero `stat` is a valid initial value; the kernel
+    // overwrites every field on success.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live descriptor; `st` is a live stat buffer.
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &raw mut st) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(st)
+}
+
+fn exist_or_io(name: &str) -> VolumeError {
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        VolumeError::PlaceholderExists {
+            name: name.to_string(),
+        }
+    } else {
+        VolumeError::Io(err)
+    }
+}
+
+fn create_placeholder(
+    root_fd: &OwnedFd,
+    name: &str,
+    kind: PlaceholderKind,
+) -> Result<OwnedFd, VolumeError> {
+    validate_placeholder_name(name)?;
+    let cname = cstr(name)?;
+    match kind {
+        PlaceholderKind::Dir => {
+            // SAFETY: `root_fd` is the share-root directory; `cname` is
+            // a single component (validated above).
+            let rc = unsafe { libc::mkdirat(root_fd.as_raw_fd(), cname.as_ptr(), 0o755) };
+            if rc != 0 {
+                return Err(exist_or_io(name));
+            }
+        }
+        PlaceholderKind::File => {
+            // SAFETY: same fd + single-component name; O_EXCL|O_NOFOLLOW
+            // refuse an existing dentry (including a guest symlink).
+            let fd = unsafe {
+                libc::openat(
+                    root_fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_WRONLY
+                        | libc::O_CLOEXEC,
+                    0o644,
+                )
+            };
+            if fd < 0 {
+                return Err(exist_or_io(name));
+            }
+            // SAFETY: `fd` is the O_WRONLY fd we just created; drop it
+            // so the verify open is a fresh O_PATH.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+    }
+    // SAFETY: `root_fd` + `cname` still name the entry we just created;
+    // O_NOFOLLOW fails if a guest swapped it for a symlink in the window.
+    let dest_fd = unsafe {
+        libc::openat(
+            root_fd.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dest_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `dest_fd` is a freshly opened descriptor we now own.
+    let dest_fd = unsafe { OwnedFd::from_raw_fd(dest_fd) };
+    verify_placeholder(root_fd, &dest_fd, kind, name)?;
+    Ok(dest_fd)
+}
+
+fn verify_placeholder(
+    root_fd: &OwnedFd,
+    dest_fd: &OwnedFd,
+    kind: PlaceholderKind,
+    name: &str,
+) -> Result<(), VolumeError> {
+    let root = fd_stat(root_fd)?;
+    let dest = fd_stat(dest_fd)?;
+    let mode = dest.st_mode & libc::S_IFMT;
+    let expect = match kind {
+        PlaceholderKind::Dir => libc::S_IFDIR,
+        PlaceholderKind::File => libc::S_IFREG,
+    };
+    if mode != expect {
+        return Err(VolumeError::PlaceholderVerify {
+            name: name.to_string(),
+            reason: format!("st_mode {mode:#o} is not the expected {expect:#o}"),
+        });
+    }
+    if dest.st_dev != root.st_dev {
+        return Err(VolumeError::PlaceholderVerify {
+            name: name.to_string(),
+            reason: format!(
+                "st_dev {} != share-root st_dev {} (refusing a mount point)",
+                dest.st_dev, root.st_dev
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn is_dir_at(root_fd: &OwnedFd, name: &str) -> Result<bool, VolumeError> {
+    validate_placeholder_name(name)?;
+    let cname = cstr(name)?;
+    // SAFETY: all-zero `stat` is valid; kernel fills it on success.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `root_fd` is the share root; `cname` is a single
+    // component; AT_SYMLINK_NOFOLLOW does not follow a guest symlink.
+    let rc = unsafe {
+        libc::fstatat(
+            root_fd.as_raw_fd(),
+            cname.as_ptr(),
+            &raw mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+}
+
+fn unlinkat_name(root_fd: &OwnedFd, name: &str, is_dir: bool) -> Result<(), VolumeError> {
+    validate_placeholder_name(name)?;
+    let cname = cstr(name)?;
+    let flag = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: `root_fd` is the share root; `cname` is a single component.
+    let rc = unsafe { libc::unlinkat(root_fd.as_raw_fd(), cname.as_ptr(), flag) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Bind-mount `src` onto the inode referred to by `dest_fd` via
+/// `/proc/self/fd/N`. The destination path is never looked up, so a
+/// guest that swaps the dentry for a symlink after we opened the fd
+/// cannot redirect the mount.
+fn bind_mount_into_fd(src: &Path, dest_fd: &OwnedFd) -> Result<(), VolumeError> {
+    let dest = format!("/proc/self/fd/{}", dest_fd.as_raw_fd());
+    let src_c = cstr_path(src)?;
+    let dest_c = cstr(&dest)?;
+    // SAFETY: both CStrings outlive the call; dest is our O_PATH fd.
+    let rc = unsafe {
+        libc::mount(
+            src_c.as_ptr(),
+            dest_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
         return Err(VolumeError::Mount {
             what: src.to_path_buf(),
-            dst: dst.to_path_buf(),
-            stderr: stderr.trim().to_string(),
+            dst: PathBuf::from(dest),
+            stderr: format!("MS_BIND via fd: {}", std::io::Error::last_os_error()),
         });
     }
     Ok(())
@@ -947,7 +1273,7 @@ fn bind_mount(src: &Path, dst: &Path) -> Result<(), VolumeError> {
 
 /// Whether `src` is a path we know belongs to kubelet / containerd
 /// CRI runtime state (and is therefore NOT a user-supplied
-/// `hostPath` mount that chunk 2b.2 should bind into the scratch
+/// `hostPath` mount that the enumerator should bind into the scratch
 /// tree).
 ///
 /// Carve-outs (user-facing storage that LOOKS CRI-internal by the
@@ -1015,24 +1341,6 @@ fn wait_for_source(src: &Path) -> bool {
         }
     }
     src.exists()
-}
-
-fn umount(dst: &Path) -> Result<(), VolumeError> {
-    // pidfd-based wait — see `bind_mount` for why.
-    let (status, _stdout, stderr) = crate::netns::run_capture("umount", &[&dst.to_string_lossy()])
-        .map_err(|e| VolumeError::Mount {
-            what: PathBuf::new(),
-            dst: dst.to_path_buf(),
-            stderr: format!("run_capture umount: {e}"),
-        })?;
-    if !status.success() {
-        return Err(VolumeError::Mount {
-            what: PathBuf::new(),
-            dst: dst.to_path_buf(),
-            stderr: stderr.trim().to_string(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1218,7 +1526,7 @@ mod tests {
     #[test]
     fn cri_internal_source_classifies_kubelet_and_k3s_paths() {
         // Genuine CRI internals — `etc-hosts` is handled separately
-        // by the etc-files whitelist (chunk 2b.1), `containers/.../`
+        // by the etc-files whitelist, `containers/.../`
         // is kubelet's termination-log dir that nothing useful binds.
         assert!(is_cri_internal_source(Path::new(
             "/var/lib/kubelet/pods/abc/etc-hosts"
@@ -1306,44 +1614,17 @@ mod tests {
     /// Build a `PodVolumes` rooted at `root` without going through
     /// `prepare` (which would scan kubelet dirs). Used by fail-loud
     /// wiring tests.
-    #[allow(clippy::similar_names)]
     fn pod_volumes_at(root: &Path) -> PodVolumes {
-        let host_volumes_ro = root.join("volumes-ro");
-        let host_volumes_rw = root.join("volumes-rw");
-        std::fs::create_dir_all(&host_volumes_ro).unwrap();
-        std::fs::create_dir_all(&host_volumes_rw).unwrap();
-        PodVolumes {
-            pod_uid: None,
-            kubelet_volumes_dir: None,
-            host_volumes_ro,
-            host_volumes_rw,
-            bind_destinations: Vec::new(),
-            rewrites: MountRewriteMap::default(),
-            vm_root_ro: PathBuf::from(VM_MOUNT_RO),
-            vm_root_rw: PathBuf::from(VM_MOUNT_RW),
-        }
+        PodVolumes::from_scratch_dirs(root.join("volumes-ro"), root.join("volumes-rw")).unwrap()
     }
 
     #[test]
-    fn add_etc_files_touch_failure_is_err() {
-        // Fail-loud: a `touch` failure on a
-        // whitelisted etc-file we committed to wiring must return
-        // `Err`, not warn-and-continue. Force the failure by rooting
-        // the RO scratch tree underneath a regular file so creating
-        // the bind placeholder hits ENOTDIR.
+    fn add_etc_files_existing_placeholder_is_err() {
+        // Fail-loud: an existing guest-visible entry at the etc-file
+        // placeholder is never reused.
         let tmp = unique_test_dir();
-        let not_a_dir = tmp.join("not-a-dir");
-        std::fs::write(&not_a_dir, b"x").unwrap();
-        let mut pv = PodVolumes {
-            pod_uid: None,
-            kubelet_volumes_dir: None,
-            host_volumes_ro: not_a_dir.join("ro"),
-            host_volumes_rw: tmp.join("rw"),
-            bind_destinations: Vec::new(),
-            rewrites: MountRewriteMap::default(),
-            vm_root_ro: PathBuf::from(VM_MOUNT_RO),
-            vm_root_rw: PathBuf::from(VM_MOUNT_RW),
-        };
+        let mut pv = pod_volumes_at(&tmp);
+        std::fs::write(pv.host_volumes_ro.join("_etc-resolv.conf"), b"x").unwrap();
         let spec = json!({
             "mounts": [
                 {
@@ -1356,8 +1637,8 @@ mod tests {
         });
         let err = pv.add_etc_files_for_workload(&spec).unwrap_err();
         assert!(
-            matches!(err, VolumeError::Io(_)),
-            "touch failure must surface as Io error, got {err:?}"
+            matches!(err, VolumeError::PlaceholderExists { ref name } if name == "_etc-resolv.conf"),
+            "existing placeholder must surface as PlaceholderExists, got {err:?}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1602,5 +1883,28 @@ mod tests {
         assert_ne!(a, b, "must differ for different inputs");
         assert_eq!(a.len(), 16, "16-hex-char output");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        let name = hostpath_placeholder_name(Path::new("/tmp/a"));
+        assert_eq!(name, format!("_hostpath-{a}"));
+        assert!(!name.contains('/'));
+        assert_ne!(name, ".");
+        assert_ne!(name, "..");
+    }
+
+    #[test]
+    fn virtiofs_fallback_denied_is_strict() {
+        let key = DENY_VIRTIOFS_FALLBACK_ENV;
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(!virtiofs_fallback_denied().unwrap());
+        std::env::set_var(key, "1");
+        assert!(virtiofs_fallback_denied().unwrap());
+        std::env::set_var(key, "0");
+        assert!(!virtiofs_fallback_denied().unwrap());
+        std::env::set_var(key, "yes");
+        assert!(virtiofs_fallback_denied().is_err());
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

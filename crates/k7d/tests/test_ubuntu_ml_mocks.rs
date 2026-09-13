@@ -1,5 +1,5 @@
-//! Fake `nvidia.com/gpu` + dcgm-exporter-shaped scrape on a 25a-inc2
-//! Ubuntu flannel cluster, then a warm fork .
+//! Fake `nvidia.com/gpu` + dcgm-exporter-shaped scrape on an
+//! Ubuntu flannel cluster, then a warm fork.
 //!
 //! Mock only — not CUDA, not DeepSpeed, not GPU Operator, not VFIO.
 //! Reuses `bring_up_cluster` (Flannel) and `FORK_UBUNTU_K3S_CLUSTER_3VM`.
@@ -91,7 +91,7 @@ fn test_ubuntu_ml_mocks_gpu_dcgm_fork() {
         ds.contains(K3S_DEVICE_PLUGIN_DIR) && ds.contains(KUBELET_DEVICE_PLUGIN_DIR),
         "device-plugin DaemonSet must mount both kubelet device-plugin dirs \
          ({KUBELET_DEVICE_PLUGIN_DIR} is live on k3s v1.32.5; {K3S_DEVICE_PLUGIN_DIR} \
-         is the spec-31a name — CHALLENGES #146)"
+         is the fixture name — CHALLENGES #146)"
     );
     assert!(
         ds.contains("PLUGIN_SOCK_DIR"),
@@ -182,9 +182,7 @@ fn test_ubuntu_ml_mocks_gpu_dcgm_fork() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

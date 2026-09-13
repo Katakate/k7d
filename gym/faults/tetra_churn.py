@@ -1,4 +1,4 @@
-"""Tetragon multi-path churn (26a-inc7). Ubuntu + keep_apiserver only.
+"""Tetragon multi-path churn. Ubuntu + keep_apiserver only.
 
 kill-member-0 + one fd_install path is a 0.8/1.0 bit. This injects
 several `/tmp/k7d-tetra-churn-*` files from one pinned busybox pod

@@ -1,7 +1,7 @@
-//! the referenced work — the cluster's idle wall time, deleted without being
+//! The cluster's idle wall time, deleted without being
 //! asked.
 //!
-//! Inc2 could be *told* "+90 s". This is the policy that decides it: a
+//! `warp_clock` could be *told* "+90 s". This is the policy that decides it: a
 //! loop that pauses every member of a cluster, establishes that the
 //! whole thing is idle, works out when the next thing was going to
 //! happen, and jumps to just before it — all inside one pause, because
@@ -14,7 +14,7 @@
 //!    300 s crash-loop backoff restarts after far less than 300 s of
 //!    *wall* time while the cluster's own timestamps still say it
 //!    waited the full five minutes — and no node goes `NotReady`, which
-//!    is what the 30 s single-jump cap is for. inc2 measured a +90 s
+//!    is what the 30 s single-jump cap is for. We measured a +90 s
 //!    warp taking every agent `NotReady` for ~9 s; a policy that did
 //!    that in every idle window would be a fault injector, not a
 //!    speedup.
@@ -22,16 +22,16 @@
 //!    Fixed 50 ms quantum at 20 Hz, no idleness claimed: the pause is
 //!    the atomicity and lateness is bounded by the quantum. The honest
 //!    assertion is that guest time outruns wall time — *not* that work
-//!    goes faster. inc0 bounds the useful part at 1.11× in the busy
+//!    goes faster. The clock survey bounds the useful part at 1.11× in the busy
 //!    phase, and a clock ratio is not a throughput ratio.
 //!
 //! What is deliberately *not* asserted is that the policy warps often.
-//! Declining is always correct, and inc3's predicate declines on things
+//! Declining is always correct, and the predicate declines on things
 //! this suite cannot arrange (a frame on a TAP, an interrupt caught
 //! mid-injection, a PIT one-shot whose expiry KVM will not export). So
 //! the decline histogram is printed as a MEASUREMENT on every run: when
 //! a compression assertion fails, that table is the reason, and it is
-//! the input to inc4/inc5 rather than something to tune the predicate
+//! the input to dilation rather than something to tune the predicate
 //! against.
 
 mod common;
@@ -65,7 +65,7 @@ const CAP_MIN: i64 = 240;
 
 /// The spec's headline: ~300 s of guest backoff for under 150 s of wall
 /// time. Half the guest time is a 2× floor on the compression, which is
-/// well inside inc0's 3.59× ceiling for the backoff-wait phase.
+/// well inside the survey's 3.59× ceiling for the backoff-wait phase.
 const BACKOFF_WALL_CEILING: Duration = Duration::from_secs(150);
 
 /// Wall time the whole walk to a capped backoff may take. The guest has
@@ -75,11 +75,11 @@ const BACKOFF_WALL_CEILING: Duration = Duration::from_secs(150);
 /// test gives up and prints the schedule it actually saw.
 const WALK_WALL_CEILING: Duration = Duration::from_secs(900);
 
-/// Fraction of guest time inc0 measured the 3-node cluster all-idle in
+/// Fraction of guest time the survey measured the 3-node cluster all-idle in
 /// the backoff-wait phase. The compression ceiling follows from it —
 /// idle time is the only time there is to delete — so a run that beats
 /// `1/(1 − ALL_IDLE_WAITING)` has not found a faster policy, it has an
-/// accounting bug. inc0's own measured bound was 3.59×; this is the
+/// accounting bug. The survey's own measured bound was 3.59×; this is the
 /// arithmetic ceiling it sits under.
 const ALL_IDLE_WAITING: f64 = 0.734;
 
@@ -98,7 +98,7 @@ const PUMP_SLICE: Duration = Duration::from_secs(4);
 
 /// Poll node readiness every this many slices. Once per slice would
 /// double the `kubectl` time; a node that has gone `NotReady` because a
-/// jump expired its lease stays that way for seconds (inc2 measured
+/// jump expired its lease stays that way for seconds (measured
 /// ~9 s), so it cannot hide between checks.
 const READY_EVERY: u32 = 3;
 
@@ -150,7 +150,7 @@ fn pump(cluster: &mut UbuntuCluster, driver: &mut Driver, slice: Duration) -> Pu
     out
 }
 
-/// Print the counters the way the bench (inc5) will read them.
+/// Print the counters the way the dilation bench will read them.
 fn report(tag: &str, stats: &AutoWarpStats, pumped: &Pumped, wall: Duration) {
     let declines = if stats.declines.is_empty() {
         "none".to_string()
@@ -175,7 +175,7 @@ fn report(tag: &str, stats: &AutoWarpStats, pumped: &Pumped, wall: Duration) {
         }
     };
     eprintln!(
-        "MEASUREMENT 34a-inc3 {tag}: {} cycles, {} warps, +{:.1}s guest added over {:?} wall, \
+        "MEASUREMENT {tag}: {} cycles, {} warps, +{:.1}s guest added over {:?} wall, \
          widest jump {:?}, {:.1}ms paused ({:.2}× guest per paused ns), \
          mean cycle {:.0}µs = pause {:.0} + decide {:.0} + warp {:.0} + resume {:.0}µs, \
          pause = freeze {:.0} + stop-vcpus {:.0} ({:.1} signals/cycle) \
@@ -214,7 +214,7 @@ fn report(tag: &str, stats: &AutoWarpStats, pumped: &Pumped, wall: Duration) {
     assert!(
         pumped.widest <= MAX_JUMP,
         "{tag}: a single jump was {:?}, over the {MAX_JUMP:?} cap — a jump past the 40 s \
-         node lease takes every agent NotReady (inc2 measured ~9 s of it)",
+         node lease takes every agent NotReady (measured ~9 s of it)",
         pumped.widest
     );
 }
@@ -243,7 +243,7 @@ impl Backoff {
 
 /// The backoff schedule as observed, for a failure message. The point
 /// of printing it is that this test does not assume it: the first run of
-/// inc3 asserted against the nominal 10/20/40/80/160/300 by counting
+/// We assert against the nominal 10/20/40/80/160/300 by counting
 /// restarts and measured an 81 s window it believed was the 300 s cap
 /// (`CHALLENGES.md` #184).
 fn schedule_table(windows: &[Backoff]) -> String {
@@ -319,7 +319,7 @@ fn walk_backoffs(
                 added: window.added,
             };
             eprintln!(
-                "MEASUREMENT 34a-inc3 backoff window to restart {}: {}s of guest time in \
+                "MEASUREMENT backoff window to restart {}: {}s of guest time in \
                  {:.1}s of wall time ({:.2}×), policy added {:.1}s over {} cycles",
                 backoff.restart,
                 backoff.guest,
@@ -391,7 +391,7 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
 
     // The preconditions the whole increment rests on, asserted before
     // any clock moves: the guest reads the clock k7d owns, arms the
-    // LAPIC one-shot (not the deadline MSR inc0 found always zero), and
+    // LAPIC one-shot (not the deadline MSR the survey found always zero), and
     // runs no NTP client to fight a 20 Hz policy loop.
     {
         let mut agents = [
@@ -404,8 +404,8 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
             let broadcast = check_clockevent(agent, whose[i]);
             check_no_ntp_client(agent, whose[i]);
             eprintln!(
-                "MEASUREMENT 34a-inc3 {} tick_broadcast device: {broadcast} \
-                 (the timer inc3's predicate declines on when KVM will not export its expiry)",
+                "MEASUREMENT {} tick_broadcast device: {broadcast} \
+                 (the timer the predicate declines on when KVM will not export its expiry)",
                 whose[i]
             );
         }
@@ -434,7 +434,7 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
     for (i, node) in after.iter().enumerate() {
         let monotonic = node[1] - before[i][1];
         eprintln!(
-            "MEASUREMENT 34a-inc3 jump {} over {walk_wall:?} of wall time: monotonic \
+            "MEASUREMENT jump {} over {walk_wall:?} of wall time: monotonic \
              +{monotonic:.1}s ({:.2}×), realtime +{:.1}s, policy asked for +{:.1}s",
             whose[i],
             monotonic / walk_wall.as_secs_f64(),
@@ -443,7 +443,7 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
         );
     }
     eprintln!(
-        "MEASUREMENT 34a-inc3 observed backoff schedule (nominal {BACKOFF_SCHEDULE:?}):\n  {}",
+        "MEASUREMENT observed backoff schedule (nominal {BACKOFF_SCHEDULE:?}):\n  {}",
         schedule_table(&windows)
     );
 
@@ -472,8 +472,8 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
 
     let ceiling = 1.0 / (1.0 - ALL_IDLE_WAITING);
     eprintln!(
-        "MEASUREMENT 34a-inc3 jump-mode compression: {}s of guest backoff in {:?} of wall \
-         time = {:.2}× (inc0's idleness ceiling {ceiling:.2}×, measured bound 3.59×)",
+        "MEASUREMENT jump-mode compression: {}s of guest backoff in {:?} of wall \
+         time = {:.2}× (idleness ceiling {ceiling:.2}×, measured bound 3.59×)",
         capped.guest,
         capped.wall,
         capped.ratio()
@@ -488,7 +488,7 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
     );
     assert!(
         capped.ratio() <= ceiling,
-        "{:.2}× beats the {ceiling:.2}× that inc0's {:.1}% all-idle fraction allows — \
+        "{:.2}× beats the {ceiling:.2}× that the {:.1}% all-idle fraction allows — \
          idle time is the only time there is to delete, so this is an accounting bug, not a \
          faster policy",
         capped.ratio(),
@@ -584,7 +584,7 @@ fn test_auto_warp_micro_outruns_wall_time_on_a_busy_cluster() {
         let monotonic = node[1] - before[i][1];
         let realtime = node[0] - before[i][0];
         eprintln!(
-            "MEASUREMENT 34a-inc3 micro {} over {wall:?} of wall time: monotonic +{monotonic:.1}s \
+            "MEASUREMENT micro {} over {wall:?} of wall time: monotonic +{monotonic:.1}s \
              ({:.2}×), realtime +{realtime:.1}s",
             whose[i],
             monotonic / wall.as_secs_f64()
@@ -617,7 +617,7 @@ fn test_auto_warp_micro_outruns_wall_time_on_a_busy_cluster() {
 /// who never took it.
 ///
 /// The loop itself is exercised against real VMs by the two tests
-/// above; what is checked here is the wiring a caller (the gym, inc5)
+/// above; what is checked here is the wiring a caller (the gym)
 /// actually touches, including the failure modes that would otherwise
 /// be silent.
 #[test]

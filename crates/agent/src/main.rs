@@ -11,6 +11,7 @@
 mod container;
 mod exec;
 mod health;
+mod service;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader};
@@ -21,6 +22,7 @@ use std::thread;
 
 use container::ContainerManager;
 use serde::{Deserialize, Serialize};
+use service::{ServiceStatus, Supervisor};
 
 const AGENT_VERSION: &str = "0.1.0";
 const SERIAL_DEVICE: &str = "/dev/ttyS1";
@@ -106,7 +108,10 @@ enum Request {
 #[serde(tag = "type")]
 enum Response {
     #[serde(rename = "pong")]
-    Pong { version: String },
+    Pong {
+        version: String,
+        services: Vec<PongService>,
+    },
     #[serde(rename = "exec_result")]
     ExecResult {
         id: String,
@@ -173,6 +178,25 @@ enum Response {
     MountBlkResult { ok: bool, error: String },
 }
 
+#[derive(Debug, Serialize)]
+struct PongService {
+    name: String,
+    pid: u32,
+    ready: bool,
+    restarts: u32,
+}
+
+impl From<ServiceStatus> for PongService {
+    fn from(s: ServiceStatus) -> Self {
+        Self {
+            name: s.name,
+            pid: s.pid,
+            ready: s.ready,
+            restarts: s.restarts,
+        }
+    }
+}
+
 pub(crate) fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -233,10 +257,19 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn handle_request(req: Request, containers: &ContainerManager) -> Response {
+fn handle_request(
+    req: Request,
+    containers: &ContainerManager,
+    supervisor: &Supervisor,
+) -> Response {
     match req {
         Request::Ping => Response::Pong {
             version: AGENT_VERSION.to_string(),
+            services: supervisor
+                .status()
+                .into_iter()
+                .map(PongService::from)
+                .collect(),
         },
         Request::Exec { id, args } => {
             if args.is_empty() {
@@ -295,16 +328,26 @@ fn handle_request(req: Request, containers: &ContainerManager) -> Response {
                 error: format!("{e}"),
             },
         },
-        Request::ContainerStart { name, bundle } => match containers.start(&name, &bundle) {
-            Ok(()) => Response::ContainerStartResult {
-                ok: true,
-                error: String::new(),
-            },
-            Err(e) => Response::ContainerStartResult {
-                ok: false,
-                error: e,
-            },
-        },
+        Request::ContainerStart { name, bundle } => {
+            if supervisor.watches_docker() {
+                if let Err(e) = supervisor.wait_ready(std::time::Duration::from_secs(60)) {
+                    return Response::ContainerStartResult {
+                        ok: false,
+                        error: format!("docker not ready: {e}"),
+                    };
+                }
+            }
+            match containers.start(&name, &bundle) {
+                Ok(()) => Response::ContainerStartResult {
+                    ok: true,
+                    error: String::new(),
+                },
+                Err(e) => Response::ContainerStartResult {
+                    ok: false,
+                    error: e,
+                },
+            }
+        }
         Request::ContainerExecPty { .. } => {
             unreachable!("container_exec_pty is handled by the connection loop")
         }
@@ -507,8 +550,12 @@ fn mount_blk_request(device: &str, fstype: &str, mountpoint: &str, ro: bool) -> 
     Ok(())
 }
 
-fn handle_connection<R, W>(read: R, mut write: W, containers: &ContainerManager)
-where
+fn handle_connection<R, W>(
+    read: R,
+    mut write: W,
+    containers: &ContainerManager,
+    supervisor: &Supervisor,
+) where
     R: std::io::Read,
     W: std::io::Write + Send + 'static,
 {
@@ -560,7 +607,7 @@ where
             );
             return;
         }
-        let resp = handle_request(req, containers);
+        let resp = handle_request(req, containers, supervisor);
         let mut resp_json = serde_json::to_string(&resp).unwrap();
         resp_json.push('\n');
         if write.write_all(resp_json.as_bytes()).is_err() {
@@ -569,7 +616,10 @@ where
     }
 }
 
-fn try_vsock_listener(containers: &Arc<ContainerManager>) -> Result<(), std::io::Error> {
+fn try_vsock_listener(
+    containers: &Arc<ContainerManager>,
+    supervisor: &Arc<Supervisor>,
+) -> Result<(), std::io::Error> {
     // SAFETY: creating an AF_VSOCK stream socket; no preconditions.
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -624,20 +674,24 @@ fn try_vsock_listener(containers: &Arc<ContainerManager>) -> Result<(), std::io:
         let read_file = unsafe { std::fs::File::from_raw_fd(client_fd) };
         let write_file = read_file.try_clone().unwrap();
         let cm = Arc::clone(containers);
+        let sup = Arc::clone(supervisor);
         thread::spawn(move || {
-            handle_connection(read_file, write_file, &cm);
+            handle_connection(read_file, write_file, &cm, &sup);
             eprintln!("k7-agent: vsock connection closed");
         });
     }
 }
 
-fn run_serial_listener(containers: &ContainerManager) -> std::io::Result<()> {
+fn run_serial_listener(
+    containers: &ContainerManager,
+    supervisor: &Supervisor,
+) -> std::io::Result<()> {
     eprintln!("k7-agent v{AGENT_VERSION}: opening {SERIAL_DEVICE}");
     let read_file = File::open(SERIAL_DEVICE)?;
     let write_file = OpenOptions::new().write(true).open(SERIAL_DEVICE)?;
     eprintln!("k7-agent: listening on {SERIAL_DEVICE}");
 
-    handle_connection(read_file, write_file, containers);
+    handle_connection(read_file, write_file, containers, supervisor);
     Ok(())
 }
 
@@ -931,11 +985,16 @@ fn main() {
     try_mkdir_dirs();
 
     let containers = Arc::new(ContainerManager::new());
+    let supervisor = Supervisor::new();
+    if Supervisor::docker_enabled() {
+        eprintln!("k7-agent: k7d.docker=1 — supervising dockerd");
+        supervisor.start_docker();
+    }
 
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let has_vsock_device = cmdline.contains("virtio_mmio.device=");
     match if has_vsock_device {
-        try_vsock_listener(&containers)
+        try_vsock_listener(&containers, &supervisor)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -945,7 +1004,7 @@ fn main() {
         Ok(()) => {}
         Err(e) => {
             eprintln!("k7-agent: vsock unavailable ({e}), falling back to serial");
-            if let Err(e) = run_serial_listener(&containers) {
+            if let Err(e) = run_serial_listener(&containers, &supervisor) {
                 eprintln!("k7-agent: serial listener failed: {e}");
                 std::process::exit(1);
             }

@@ -1,19 +1,19 @@
-//! Adaptive dilation factor : when to stop asking
+//! Adaptive dilation factor: when to stop asking
 //! a cluster to run 8× faster than the host can feed it, and — if the
 //! caller wants it — when to ask again after the load goes away.
 //!
-//! the referenced work swept the factor and found the fidelity cost is a
+//! A sweep of the factor found the fidelity cost is a
 //! curve, not a cliff: compression is exactly N through 16, while extra
 //! liveness-probe failures go 0 / 0 / 0 / 3 / 19 / 32 and in-guest churn
 //! rounds collapse 110 → 7 across N ∈ {1, 2, 4, 8, 12, 16}. The reading
 //! that moved *with* the damage, and the only one available from the
 //! host without asking the guest anything, is busy-phase **mean awake
 //! vCPUs**: 2.71 → 3.41 → 4.67 → 5.20 → 5.00 → 6.00 of 6. At 6 of 6
-//! there is no idle left to sell, and inc0's `n_cpus / mean_awake`
+//! there is no idle left to sell, and the survey's `n_cpus / mean_awake`
 //! ceiling has fallen to 1.0×.
 //!
 //! So the signal is [`crate::vm::Vm::sample_time_state`] — the same
-//! per-vCPU `KVM_GET_MP_STATE` reading inc0's survey used — and not
+//! per-vCPU `KVM_GET_MP_STATE` reading that survey used — and not
 //! probe failures. Probe failures are a *consequence*: by the time the
 //! kubelet has recorded them the episode has already lost fidelity, and
 //! they arrive through the guest's API server, which is exactly the
@@ -23,7 +23,7 @@
 //! Two types, because "never raise" and "track both ways" are different
 //! claims, not a flag on one claim:
 //!
-//! - [`DilationPolicy`] (inc8) starts at 8 and drops 8 → 4 → 2 → 1 when
+//! - [`DilationPolicy`] starts at 8 and drops 8 → 4 → 2 → 1 when
 //!   the cluster is saturated. **Never raises.** A factor that goes up
 //!   and down turns the guest's clock rate into a function of host load,
 //!   and every guest-time measurement in the episode — a probe period, a
@@ -31,19 +31,19 @@
 //!   measurement from another episode. Dropping is already a fidelity
 //!   event; the honest version of it is monotone, once per rung, and
 //!   reported. There is no method that increases the factor.
-//! - [`TrackingPolicy`] (inc9) uses the same ladder and the same drop
+//! - [`TrackingPolicy`] uses the same ladder and the same drop
 //!   threshold, and *also* raises when the cluster is quiet again. The
 //!   deadband between the two thresholds is load-bearing: one threshold
 //!   chatters. Whether that trade is worth it is a measurement, not a
-//!   default — see the referenced work's four-policy table.
+//!   default — see the four-policy table.
 //!
 //! Applying a decision is [`crate::control::Request::SetDilation`].
 //! This module only decides, and it is deliberately not wired into the
-//! gym: the referenced work's `dilate` mode stays create-time N=8.
+//! gym: the `dilate` mode stays create-time N=8.
 
 use crate::vm::TimeSample;
 
-/// The rungs, highest first. inc6's operating point is the first and its
+/// The rungs, highest first. The sweep's operating point is the first and its
 /// knee (N=12) is deliberately not here: this ladder is what the sweep
 /// licenses as *comfortable*, and a policy that can only descend should
 /// not start above the point three runs per N called comfortable.
@@ -51,7 +51,7 @@ pub const LADDER: [u32; 4] = [8, 4, 2, 1];
 
 /// Saturated: this fraction of the cluster's vCPUs awake, or more.
 ///
-/// 0.8 of 6 is 4.8 awake, which sits between inc6's N=4 reading (4.67)
+/// 0.8 of 6 is 4.8 awake, which sits between the sweep's N=4 reading (4.67)
 /// and its N=8 one (5.20) — i.e. between the last factor that was
 /// essentially free and the first that showed a cost. It is a threshold
 /// on a measured curve, not a tuned constant, and it is here rather than
@@ -62,7 +62,7 @@ pub const SATURATED: f64 = 0.8;
 /// Quiet enough to climb one rung: this fraction of the cluster's vCPUs
 /// awake, or less. [`TrackingPolicy`] only.
 ///
-/// 0.45 of 6 is 2.7 awake, which is inc6's N=1 busy-phase mean (2.71).
+/// 0.45 of 6 is 2.7 awake, which is the sweep's N=1 busy-phase mean (2.71).
 /// An idle cluster (no burner) sits well below it. Together with
 /// [`SATURATED`] this is a deadband, not two names for one line: a
 /// single threshold chatters as the cluster hovers around it.
@@ -71,7 +71,7 @@ pub const QUIET: f64 = 0.45;
 /// Observations a decision rests on. One observation is one cluster-wide
 /// pause, so a single staggered wakeup can put every vCPU in `RUNNING`
 /// for one sample; three is the floor against spending a rung on that.
-/// It is not a measured constant — inc6 recorded 2–24 samples per run
+/// It is not a measured constant — the sweep recorded 2–24 samples per run
 /// depending on N — which is why it is a constructor argument.
 pub const WINDOW: usize = 3;
 
@@ -96,7 +96,7 @@ pub enum Verdict {
     Hold,
 }
 
-/// The adaptive-factor policy for one episode .
+/// The adaptive-factor policy for one episode.
 ///
 /// One instance per episode. It is monotone by construction — there is
 /// no method that raises the factor — so "never raise mid-episode" is a
@@ -213,7 +213,7 @@ impl DilationPolicy {
     }
 }
 
-/// The bidirectional policy : drop on saturation, raise
+/// The bidirectional policy: drop on saturation, raise
 /// on quiet, hold the deadband.
 ///
 /// One instance per episode. One rung per closed window, same ladder as
@@ -357,7 +357,7 @@ fn awake_cpus(samples: &[TimeSample]) -> (usize, usize) {
 mod tests {
     use super::{DilationPolicy, TrackingPolicy, Verdict, LADDER, QUIET, SATURATED, WINDOW};
 
-    /// The ladder is what inc6's sweep licensed, in descending order.
+    /// The ladder is what the N sweep licensed, in descending order.
     #[test]
     fn ladder_descends_from_the_operating_point() {
         assert_eq!(LADDER, [8, 4, 2, 1]);
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(p.factor(), 4);
     }
 
-    /// 0.8 of 6 is 4.8 awake: inc6's N=4 reading (4.67) has headroom,
+    /// 0.8 of 6 is 4.8 awake: the sweep's N=4 reading (4.67) has headroom,
     /// its N=8 one (5.20) does not.
     #[test]
     fn the_threshold_sits_between_inc6_n4_and_n8() {

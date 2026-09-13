@@ -18,7 +18,7 @@ from faults.relay import Relay
 from faults.scripted import ScriptedFault, registry as scenario_registry
 from faults.tetra_churn import TetraChurn
 
-# The scripted family (27a-inc1): the catalog key is `scripted` and the
+# The scripted family: the catalog key is `scripted` and the
 # scenario id picks the directory. One entry, not one per scenario, so
 # the pack can grow without a k7d change.
 SCRIPTED_ID = "scripted"
@@ -52,7 +52,7 @@ _INSTANCES = (
 )
 CATALOG: dict[str, Any] = {f.id: f for f in _INSTANCES}
 
-# Free-form GRPO (26a-inc13): every member sees the same simple
+# Free-form GRPO: every member sees the same simple
 # incident. Catalog relays stay on incident/selfplay.
 GRPO_FAULTS = frozenset(
     {"kill-member-0", "partition-member-0", "none", SCRIPTED_ID}

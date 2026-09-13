@@ -1,5 +1,5 @@
-# CPU-head RayCluster + one GPU-requesting worker on the 31a-inc1
-# fake nvidia.com/gpu fixture . Not CUDA, not Ray Train.
+# CPU-head RayCluster + one GPU-requesting worker on the
+# fake nvidia.com/gpu fixture. Not CUDA, not Ray Train.
 #
 # KubeRay injects `ray start` and a wait-gcs-ready init container
 # unless we opt out: cluster annotation ray.io/overwrite-container-cmd

@@ -8,15 +8,22 @@
 //! * the pool refills in the background after an acquire;
 //! * an incompatible request cold-boots (`pooled: false`) and still
 //!   works;
+//! * dilation other than 1× and a non-empty `data_disks` miss the
+//!   pool (bug-candidates #2);
+//! * FC + dilation is `deny_fc_unsupported`, not a pooled undilated VM;
 //! * a daemon without `K7D_POOL_SIZE` has no pool and cold-boots
 //!   everything, exactly as it did before the pool existed.
+
+mod common;
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use k7d::api::AgentClient;
-use k7d::control::{Client, Request, Response, VmConfig};
+use k7d::control::{Client, DataDiskConfig, Request, Response, VmConfig};
+use k7d::disks::MIN_DATA_DISK_SIZE;
+use k7d::guest::Backend;
 
 fn workspace_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,8 +56,27 @@ struct DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // SIGTERM so the daemon's serve loop exits and `shutdown_all`
+        // drops the warm pool (template + idle). SIGKILL leaked
+        // jailed FC pool VMs (CHALLENGES #223, #226).
+        let pid = self.child.id();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_dir_all(&self.sandbox_root);
         let _ = std::fs::remove_dir_all(&self.tree_root);
@@ -365,5 +391,113 @@ fn test_pool_disabled_by_default() {
     );
 
     stop_vm(&guard, vm_id);
+    drop(guard);
+}
+
+/// `dilation: Some(10)` on an otherwise compatible request must miss
+/// the pool. Native cold-boot may succeed (dilation module present) or
+/// error (module absent) — either is fine; the assertion is not pooled.
+#[test]
+fn test_pool_miss_on_dilation() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("dilate", &[("K7D_POOL_SIZE", "1")]);
+    wait_for_idle(&guard, 1);
+
+    let mut config = pool_config();
+    config.dilation = Some(10);
+    match call(&guard, &Request::CreateVm { config }) {
+        Response::VmCreated { vm_id, pooled, .. } => {
+            assert!(!pooled, "dilation != 1 must not be served from the pool");
+            stop_vm(&guard, vm_id);
+        }
+        Response::Error { message } => {
+            eprintln!("dilation cold-boot error (module absent is fine): {message}");
+        }
+        other => panic!("unexpected create_vm response: {other:?}"),
+    }
+
+    let (_, idle, hits, misses) = pool_status(&guard);
+    assert_eq!(idle, 1, "the idle warm VM must not have been consumed");
+    assert_eq!(hits, 0);
+    assert_eq!(misses, 1, "the dilated request counts as a miss");
+    drop(guard);
+}
+
+/// A named data disk on an otherwise compatible request must miss the
+/// pool (the template has no disks). Cold-boot succeeds; then
+/// `stop_vm` + `delete_data_disk` so the node does not leak the image.
+#[test]
+fn test_pool_miss_on_data_disks() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("datadisk", &[("K7D_POOL_SIZE", "1")]);
+    wait_for_idle(&guard, 1);
+
+    let id = format!("pool-inc2-{}", std::process::id());
+    let image = k7d::disks::data_disk_path(&id);
+    let _ = std::fs::remove_file(&image);
+
+    let mut config = pool_config();
+    config.data_disks = vec![DataDiskConfig {
+        id: id.clone(),
+        size_bytes: MIN_DATA_DISK_SIZE,
+        guest_mount: "/run/k7d/data".into(),
+    }];
+    let (vm_id, guest_cid, pooled) = create_vm(&guard, config);
+    assert!(
+        !pooled,
+        "a data_disks request must not be served from the pool"
+    );
+    ping_agent(guest_cid);
+
+    let (_, idle, hits, misses) = pool_status(&guard);
+    assert_eq!(idle, 1, "the idle warm VM must not have been consumed");
+    assert_eq!(hits, 0);
+    assert_eq!(misses, 1, "the data_disks request counts as a miss");
+
+    stop_vm(&guard, vm_id);
+    match call(&guard, &Request::DeleteDataDisk { id }) {
+        Response::Ok => {}
+        other => panic!("delete_data_disk after stop_vm must succeed, got {other:?}"),
+    }
+    assert!(
+        !image.exists(),
+        "delete_data_disk must remove {}",
+        image.display()
+    );
+    drop(guard);
+}
+
+/// FC + `dilation: Some(10)` against a Firecracker pool must miss and
+/// surface `deny_fc_unsupported` — never a pooled undilated VM.
+#[test]
+fn test_fc_pool_dilation_is_deny_not_pooled() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    common::ensure_firecracker_installed();
+    let guard = spawn_daemon(
+        "fcdil",
+        &[("K7D_POOL_SIZE", "1"), ("K7D_POOL_BACKEND", "firecracker")],
+    );
+    wait_for_idle(&guard, 1);
+
+    let mut config = pool_config();
+    config.backend = Backend::Firecracker;
+    config.dilation = Some(10);
+    match call(&guard, &Request::CreateVm { config }) {
+        Response::Error { message } => {
+            assert_eq!(
+                message, "dilation is not supported on backend Firecracker",
+                "cold path must be deny_fc_unsupported, not a generic boot error"
+            );
+        }
+        Response::VmCreated { pooled, vm_id, .. } => {
+            panic!("FC+dilation must not create a VM (pooled={pooled}, vm_id={vm_id})");
+        }
+        other => panic!("unexpected create_vm response: {other:?}"),
+    }
+
+    let (_, idle, hits, misses) = pool_status(&guard);
+    assert_eq!(idle, 1, "the idle FC warm VM must not have been consumed");
+    assert_eq!(hits, 0);
+    assert_eq!(misses, 1);
     drop(guard);
 }

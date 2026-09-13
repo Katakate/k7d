@@ -14,7 +14,7 @@ WantedBy=multi-user.target
 Type=notify
 KillMode=process
 Delegate=yes
-# 29b-inc2: named deny-vsock profile. Do not put this in service.d —
+# Named deny-vsock profile. Do not put this in service.d —
 # that confines apparmor.service before profiles load (CHALLENGES #161).
 # Pods inherit this profile; CRI AppArmor is off so runc does not
 # change_onexec under no_new_privs (CHALLENGES #166).

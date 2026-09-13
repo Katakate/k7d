@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """What an incremental keyframe costs at the idle / k8s / kafka divergence levels.
 
-Brings up one Ubuntu 3x2 GiB cluster, then for each of the 28a
+Brings up one Ubuntu 3x2 GiB cluster, then for each of the three
 workloads (idle / k8s / kafka):
 
-  1. install that workload on the *source* cluster, the way 28a does --
+  1. install that workload on the *source* cluster, the way fork-under-load does --
      a broker deployed fresh inside a fork has to pull its image through
      the fork's NAT and does not come up inside any sane ceiling,
   2. fork a child off the prepared root,
@@ -23,7 +23,7 @@ guests keep writing to their own CoW disks throughout.
 
 The baseline to compare against is the root's own keyframe, written by
 `tree_adopt_cluster`: root has no ancestor to clone, so all three
-members go out in full -- the 7.327 s / 6 GiB the 28a Result measured.
+members go out in full -- the 7.327 s / 6 GiB we measured.
 
 Talks only to `/run/k7d/k7d.sock`. No new k7d primitives.
 """
@@ -105,16 +105,16 @@ def install_idle(cluster: Cluster) -> None:
 
 
 def install_k8s(cluster: Cluster) -> None:
-    """28a's k8s level: the churn target lives on the source."""
+    """k8s level: the churn target lives on the source."""
     deploy_churn(cluster.server_cid)
 
 
 def install_kafka(cluster: Cluster) -> None:
-    """28a's ceiling: a broker, deployed on the source and forked warm.
+    """Ceiling: a broker, deployed on the source and forked warm.
 
     Deployed here rather than in the child because the image pull and
     broker start take longer inside a fresh fork than any ceiling this
-    harness is willing to wait; 28a forks a *running* broker too.
+    harness is willing to wait; fork-under-load forks a *running* broker too.
     """
     apply_yaml(cluster.server_cid, KAFKA_YAML, "kafka")
     wait_kafka(cluster.server_cid)
@@ -126,7 +126,7 @@ def diverge_idle(view: Cluster, seconds: float) -> None:
 
 
 def diverge_k8s(view: Cluster, seconds: float) -> None:
-    """28a's k8s level: a churning inner control plane."""
+    """k8s level: a churning inner control plane."""
     stop = threading.Event()
 
     def churn() -> None:
@@ -158,7 +158,7 @@ def diverge_k8s(view: Cluster, seconds: float) -> None:
 
 
 def diverge_kafka(view: Cluster, seconds: float) -> None:
-    """28a's ceiling: keep producing into the forked broker."""
+    """Ceiling: keep producing into the forked broker."""
     deadline = time.monotonic() + seconds
     n = 0
     while time.monotonic() < deadline:
@@ -242,7 +242,7 @@ def measure(cluster: Cluster, workload: str, seconds: float) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--tree-id", default=f"kf-30b-{os.getpid()}")
+    p.add_argument("--tree-id", default=f"kf-{os.getpid()}")
     p.add_argument("--diverge-s", type=float, default=30.0)
     p.add_argument("--workloads", default="idle,k8s,kafka")
     return p.parse_args(argv)

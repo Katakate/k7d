@@ -398,7 +398,7 @@ class TestLiveUbuntuFork(unittest.TestCase):
         code, lease = _json(
             "POST",
             f"{base}/lease",
-            {"fault_id": "none", "n": 1, "group_id": "inc12-live", "ttl_s": 180},
+            {"fault_id": "none", "n": 1, "group_id": "g1-live", "ttl_s": 180},
             timeout_s=180,
         )
         self.assertEqual(code, 200, lease)

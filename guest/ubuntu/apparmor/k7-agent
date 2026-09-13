@@ -1,4 +1,4 @@
-# k7d : the agent may create AF_VSOCK. `allow all` does
+# k7d: the agent may create AF_VSOCK. `allow all` does
 # not include dbus/unix/mount (CHALLENGES #161). `px` conflicts with
 # allow-all's implicit ix. Workload probes change_profile via aa-exec.
 abi <abi/4.0>,

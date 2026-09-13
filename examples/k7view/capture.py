@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screen-capture k7view into an mp4 .
+"""Screen-capture k7view into an mp4.
 
 Runs on the workstation that can reach the k7view URL (use an SSH
 tunnel to the gym node: `ssh -N -L 7475:127.0.0.1:7474 root@$K7_NODE_IP`).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the five 27a-inc2 GRPO plots from episode JSONL.
+"""Render the five GRPO plots from episode JSONL.
 
 *****************************************************************************
 FAKE BY DEFAULT. THIS SCRIPT DOES NOT TRAIN ANYTHING.
@@ -453,7 +453,7 @@ def plot_selfplay_std_vs_turn(
 ) -> dict[str, Any]:
     """Within-group std(R) vs turn for one self-play role, fork vs reset,
     equal n. Not GRPO. Signed reward (blue = R(soak_clean),
-    red = R(not soak_clean)), same soak judge (26a-inc11)."""
+    red = R(not soak_clean)), same soak judge."""
     sp = selfplay_std_vs_turn(rows, role)
     n = sp["n"]
     kind, run_id, ekind = _kind(selfplay_role_rows(rows, role))

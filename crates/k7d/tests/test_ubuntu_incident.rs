@@ -1,4 +1,4 @@
-//! Inspect-battery proof for the `relay` incident .
+//! Inspect-battery proof for the `relay` incident.
 //!
 //! The point of this test is the *information structure*, not a fork.
 //! A competent agent inspects the whole guest before it forks, so an
@@ -202,7 +202,7 @@ fn wait_units_dormant(server: &mut AgentClient, units: &[&str]) {
     }
 }
 
-/// the referenced work success criterion: the pre-delete inspect dump must
+/// Success criterion: the pre-delete inspect dump must
 /// not name layers 2+, and a delete of layer 1 alone must bring the
 /// miner back on the soak.
 #[test]

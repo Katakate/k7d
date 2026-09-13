@@ -18,7 +18,7 @@ Type=simple
 # on a virtio-mmio-only machine; /etc/modules-load.d/k7d.conf loads it,
 # and this is the belt-and-braces for a boot where that raced.
 ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport
-# 29b-inc2: the AppArmor vsock jail must be enforcing before the
+# The AppArmor vsock jail must be enforcing before the
 # agent listens. A missing profile is a silent hole, not a warning.
 ExecStartPre=/usr/local/sbin/k7d-vsock-apparmor-check
 ExecStart=/usr/local/bin/k7-agent

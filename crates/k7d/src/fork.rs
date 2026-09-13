@@ -16,7 +16,9 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::devices::{create_serial_device_with_trigger, PipeSerialDevice, SerialTrigger};
 use crate::network::{ClusterNetwork, TapDevice, TapNetBackend};
 use crate::snapshot::{CpuState, KvmClockState, SnapshotError, VmState};
-use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, VirtioBackend, VIRTIO_ID_VSOCK};
+use crate::virtio_mmio::{
+    restore_queues, MmioDevice, MmioDeviceRegistry, VirtioBackend, VIRTIO_ID_VSOCK,
+};
 use crate::vm::{Vm, VmError};
 use crate::vsock::VhostVsockBackend;
 
@@ -415,18 +417,7 @@ fn restore_vm_inner(
                 .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
 
             // Pre-activate with saved queue state and correct vring base indices.
-            let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                .queues
-                .iter()
-                .map(|qs| crate::virtio_mmio::VirtqueueState {
-                    max_size: qs.size,
-                    size: qs.size,
-                    ready: qs.ready,
-                    desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                    avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                    used_addr: vm_memory::GuestAddress(qs.used_addr),
-                })
-                .collect();
+            let queues = restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
             vsock_backend
                 .activate_with_bases(&queues, &irq_evt, mem_host_addr)
                 .map_err(|e| RestoreError::Kvm(format!("vsock activate: {e}")))?;
@@ -458,24 +449,14 @@ fn restore_vm_inner(
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
             let irq_evt = Arc::new(irq_evt);
 
-            let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                .queues
-                .iter()
-                .map(|qs| crate::virtio_mmio::VirtqueueState {
-                    max_size: qs.size,
-                    size: qs.size,
-                    ready: qs.ready,
-                    desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                    avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                    used_addr: vm_memory::GuestAddress(qs.used_addr),
-                })
-                .collect();
-
             let mut net_backend =
                 TapNetBackend::new(net_tap.mac(), net_tap.fd(), mem_host_addr, mem_span);
+            let queues = restore_queues(&dev_state.queues, net_backend.max_queue_size());
             net_backend.ack_features(dev_state.acked_features);
             // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
-            net_backend.seed_indices_from_guest(&queues);
+            net_backend
+                .seed_indices_from_guest(&queues)
+                .map_err(|e| RestoreError::Kvm(format!("net seed: {e}")))?;
             net_backend
                 .activate(&queues, &irq_evt)
                 .map_err(|e| RestoreError::Kvm(format!("net activate: {e}")))?;
@@ -514,19 +495,6 @@ fn restore_vm_inner(
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
             let irq_evt = Arc::new(irq_evt);
 
-            let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                .queues
-                .iter()
-                .map(|qs| crate::virtio_mmio::VirtqueueState {
-                    max_size: qs.size,
-                    size: qs.size,
-                    ready: qs.ready,
-                    desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                    avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                    used_addr: vm_memory::GuestAddress(qs.used_addr),
-                })
-                .collect();
-
             let mut blk_backend = crate::block::BlockBackend::new(
                 &cfg.host_path,
                 cfg.readonly,
@@ -534,8 +502,11 @@ fn restore_vm_inner(
                 mem_span,
             )
             .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
+            let queues = restore_queues(&dev_state.queues, blk_backend.max_queue_size());
             blk_backend.ack_features(dev_state.acked_features);
-            blk_backend.seed_indices_from_guest(&queues);
+            blk_backend
+                .seed_indices_from_guest(&queues)
+                .map_err(|e| RestoreError::Kvm(format!("blk seed: {e}")))?;
             blk_backend
                 .activate(&queues, &irq_evt)
                 .map_err(|e| RestoreError::Kvm(format!("blk activate: {e}")))?;
@@ -613,10 +584,10 @@ fn restore_vm_inner(
     ))
 }
 
-/// Put a restored VM on the time dilation its source ran at (spec
-/// 34a-inc9). Must run right after `KVM_CREATE_VM`: the factor rides on
+/// Put a restored VM on the time dilation its source ran at. Must run
+/// right after `KVM_CREATE_VM`: the factor rides on
 /// each vCPU's TSC multiplier, which is programmed at vCPU creation.
-/// A live `SET` on paused vCPUs is the referenced work; restore still applies
+/// A live `SET` on paused vCPUs is a separate path; restore still applies
 /// the factor before any vCPU exists because that is when this path
 /// builds the VM.
 ///
@@ -720,7 +691,7 @@ fn create_and_restore_vcpus(
 /// The forward jump is the same event as a host suspend, which is what
 /// the `KVM_KVMCLOCK_CTRL` above tells the guest to expect.
 ///
-/// Under time dilation  the rest is handed back in
+/// Under time dilation the rest is handed back in
 /// *guest* nanoseconds — `dilation` times the wall time — because that
 /// is what a pause already does: a paused dilated VM's kvmclock is host
 /// time through the patched affine map, so it keeps advancing N× while
@@ -1041,7 +1012,7 @@ fn restore_cpu_state(
         }
     }
 
-    // 5b. Re-queue the event injection the pause interrupted .
+    // 5b. Re-queue the event injection the pause interrupted.
     //
     // The pause signal can kick a vCPU out of KVM_RUN *between* KVM
     // staging an event injection and the VM entry that would deliver
@@ -1252,14 +1223,16 @@ fn copy_chunk_size(mem_size: u64, max_chunks: u64) -> u64 {
 
 /// Acquire fork memory according to the source's shape: `base.mem`
 /// `CoW` + dirty-page memcpy for plain VMs, full memfd copy for
-/// virtiofs-backed VMs (see [`memfd_fork_memory`] for why). The source
-/// must stay paused.
+/// virtiofs-backed VMs (see [`memfd_fork_memory`] for why) and for a
+/// missed 200 ms park (dirty-delta would omit device DMA).
+/// The source must stay paused.
 fn fork_memory_for_state(
     base_mem_path: &Path,
     dirty_bitmap: &[u64],
     source_mem_addr: u64,
     state: &VmState,
     fork_id: &str,
+    force_full_dump: bool,
 ) -> Result<(u64, Option<fs::File>), ForkError> {
     // The mapping, `base.mem` and the dirty bitmap all cover the guest
     // physical span, not just RAM.
@@ -1268,7 +1241,7 @@ fn fork_memory_for_state(
     // #162): leftover descriptors are replayed on the child. Do not wait
     // for used==avail here — that was a 200 ms tax per member on a busy
     // guest after we stopped draining.
-    if state.virtiofs_shares.is_empty() {
+    if state.virtiofs_shares.is_empty() && !force_full_dump {
         let fork_mem_addr =
             mmap_base_mem_private(base_mem_path, mem_size).map_err(ForkError::Restore)?;
         // Memcpy dirty pages: for each set bit, copy 4 KiB from source
@@ -1287,16 +1260,27 @@ fn fork_memory_for_state(
         // window — otherwise the full copy could catch a torn FUSE
         // completion. Bounded wait; on timeout the replay-from-used.idx
         // mechanism still covers unacked requests.
-        drain_fs_queues(state, source_mem_addr, fork_id);
+        if !state.virtiofs_shares.is_empty() {
+            drain_fs_queues(state, source_mem_addr, fork_id);
+        }
         let t = std::time::Instant::now();
         let (file, fork_mem_addr) =
             memfd_fork_memory(source_mem_addr, mem_size).map_err(ForkError::Restore)?;
-        log::info!(
-            "fork_warm '{fork_id}': full memfd copy of {} MiB in {:?} ({} virtiofs shares)",
-            mem_size / (1024 * 1024),
-            t.elapsed(),
-            state.virtiofs_shares.len()
-        );
+        if force_full_dump && state.virtiofs_shares.is_empty() {
+            log::warn!(
+                "fork_warm '{fork_id}': full memfd copy of {} MiB in {:?} \
+                 (virtio worker missed 200ms park)",
+                mem_size / (1024 * 1024),
+                t.elapsed(),
+            );
+        } else {
+            log::info!(
+                "fork_warm '{fork_id}': full memfd copy of {} MiB in {:?} ({} virtiofs shares)",
+                mem_size / (1024 * 1024),
+                t.elapsed(),
+                state.virtiofs_shares.len()
+            );
+        }
         Ok((fork_mem_addr, Some(file)))
     }
 }
@@ -1318,9 +1302,12 @@ fn drain_device_queues(
     device_type: u32,
     tag: &str,
 ) {
-    // Mirror virtio-blk/net `wait_quiescent`: 200 ms is above the
-    // worker poll, and a stuck ring will not drain because we waited
-    // longer (CHALLENGES #162 stacked this 2 s on top of pause).
+    // Mirror virtio-blk/net `wait_quiescent`'s 200 ms bound. This is
+    // *not* the worker-park handshake: virtiofsd is an out-of-process
+    // vhost-user daemon, so `VirtioBackend::wait_quiescent` is a no-op
+    // for it. We wait for used.idx == avail.idx on the fs queues so
+    // FUSE DMA is out of the full-memfd copy window. A stuck ring still
+    // will not drain because we waited longer (CHALLENGES #162).
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     for dev in &state.devices {
         if dev.device_type != device_type {
@@ -1375,6 +1362,7 @@ fn drain_device_queues(
 /// [`fork_memory_for_state`].
 ///
 /// `fork_id` is informational (used in log messages only).
+/// `force_full_dump` skips the dirty-delta `CoW` path.
 pub fn restore_vm_from_state(
     base_mem_path: &Path,
     dirty_bitmap: &[u64],
@@ -1382,9 +1370,16 @@ pub fn restore_vm_from_state(
     state: &VmState,
     fork_id: &str,
     dilation: Option<u32>,
+    force_full_dump: bool,
 ) -> Result<Vm, ForkError> {
-    let (fork_mem_addr, fork_mem_file) =
-        fork_memory_for_state(base_mem_path, dirty_bitmap, source_mem_addr, state, fork_id)?;
+    let (fork_mem_addr, fork_mem_file) = fork_memory_for_state(
+        base_mem_path,
+        dirty_bitmap,
+        source_mem_addr,
+        state,
+        fork_id,
+        force_full_dump,
+    )?;
     build_vm_from_state_and_mem_inner(state, fork_mem_addr, fork_id, None, fork_mem_file, dilation)
 }
 
@@ -1393,6 +1388,7 @@ pub fn restore_vm_from_state(
 ///
 /// Used by [`fork_cluster_warm`] to put the forked VM on the fork's bridge
 /// while preserving the source's guest IP and MAC.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_vm_from_state_with_tap(
     base_mem_path: &Path,
     dirty_bitmap: &[u64],
@@ -1401,9 +1397,16 @@ pub fn restore_vm_from_state_with_tap(
     fork_id: &str,
     tap: TapDevice,
     dilation: Option<u32>,
+    force_full_dump: bool,
 ) -> Result<Vm, ForkError> {
-    let (fork_mem_addr, fork_mem_file) =
-        fork_memory_for_state(base_mem_path, dirty_bitmap, source_mem_addr, state, fork_id)?;
+    let (fork_mem_addr, fork_mem_file) = fork_memory_for_state(
+        base_mem_path,
+        dirty_bitmap,
+        source_mem_addr,
+        state,
+        fork_id,
+        force_full_dump,
+    )?;
     build_vm_from_state_and_mem_inner(
         state,
         fork_mem_addr,
@@ -1424,7 +1427,7 @@ pub struct ClusterForkRequest<'a> {
     pub fork_pod_ips: &'a [Option<Ipv4Addr>],
     /// Optional per-member pod netns paths (empty = skip NAT).
     pub fork_pod_netns: &'a [Option<PathBuf>],
-    /// Child dilation factor . `None` inherits the
+    /// Child dilation factor. `None` inherits the
     /// source's. One factor for every member of this request.
     pub dilation: Option<u32>,
 }
@@ -1455,8 +1458,8 @@ pub fn fork_cluster_warm(
     )
 }
 
-/// [`fork_cluster_warm`] with an explicit child dilation factor
-/// . `None` inherits the source's.
+/// [`fork_cluster_warm`] with an explicit child dilation factor.
+/// `None` inherits the source's.
 #[allow(clippy::too_many_arguments)]
 pub fn fork_cluster_warm_dilated(
     source_net: &ClusterNetwork,
@@ -1574,13 +1577,14 @@ pub fn fork_cluster_warm_batch(
     //    Sources stay paused through all materialisations so each fork's
     //    memory matches the captured registers (no torn mid-memcpy writes).
     let mut was_running: Vec<bool> = Vec::with_capacity(n_members);
-    let mut captured: Vec<(Vec<u64>, VmState, u64, PathBuf)> = Vec::with_capacity(n_members);
+    let mut captured: Vec<(Vec<u64>, VmState, u64, PathBuf, bool)> = Vec::with_capacity(n_members);
     for (vm, _idx) in sources.iter_mut() {
         let running = vm.is_running();
         was_running.push(running);
         if running {
             vm.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
         }
+        let force_full_dump = vm.take_full_dump_if_not_quiescent();
         let base_path = vm
             .fork_source_base_path()
             .map(Path::to_path_buf)
@@ -1595,7 +1599,7 @@ pub fn fork_cluster_warm_batch(
             .to_vec();
         let state = crate::snapshot::capture_vm_state(vm)?;
         let src_mem_addr = vm.mem_host_addr();
-        captured.push((dirty, state, src_mem_addr, base_path));
+        captured.push((dirty, state, src_mem_addr, base_path, force_full_dump));
     }
     log::info!(
         "fork_cluster_warm_batch: pause+capture {n_members} members in {:?}",
@@ -1603,10 +1607,15 @@ pub fn fork_cluster_warm_batch(
     );
 
     // One in-flight pwrite/FLUSH may still hold the inode after
-    // `Vm::pause`'s 200 ms wait_quiescent. Wait a little longer so
-    // FICLONE is not the 3–7 s XFS stall (CHALLENGES #162). The worker
-    // now parks without draining the rest of the ring, so this should
-    // be a no-op. Cap at 200 ms — a longer wait is itself over budget.
+    // `Vm::pause`'s 200 ms wait_quiescent. This extra wait is for
+    // FICLONE of the scratch image, not for the dirty-delta copy:
+    // cloning an 8 GiB scratch while the worker holds the inode has
+    // been measured at 3–7 s (CHALLENGES #162). The worker now parks
+    // without draining the rest of the ring, so this should be a
+    // no-op. Cap at 200 ms — a longer wait is itself over budget.
+    // Not redundant with wait_quiescent: that one is "has the worker
+    // parked?" (miss → full dump); this is "has the inode been
+    // released for FICLONE?".
     let t_q = std::time::Instant::now();
     while !sources.iter().all(|(vm, _)| vm.devices_quiescent())
         && t_q.elapsed() < std::time::Duration::from_millis(200)
@@ -1652,7 +1661,7 @@ pub fn fork_cluster_warm_batch(
             req.fork_pod_netns.to_vec()
         };
         // One `add_taps_at` per cluster: all member TAPs plus their
-        // anti-spoof pins in a single nft transaction (the referenced work — one
+        // anti-spoof pins in a single nft transaction (one
         // nft process per TAP triples the per-cluster fork cost).
         let indices: Vec<u32> = sources.iter().map(|(_src_vm, idx)| *idx).collect();
         match fork_net.add_taps_at(&indices) {
@@ -1697,7 +1706,8 @@ pub fn fork_cluster_warm_batch(
                 .into_iter()
                 .map(|(ci, mi, tap, fork_id, dilation)| {
                     s.spawn(move || {
-                        let (dirty, state, src_mem_addr, base_path) = &captured_ref[mi];
+                        let (dirty, state, src_mem_addr, base_path, force_full_dump) =
+                            &captured_ref[mi];
                         let t = std::time::Instant::now();
                         let result = restore_vm_from_state_with_tap(
                             base_path,
@@ -1707,6 +1717,7 @@ pub fn fork_cluster_warm_batch(
                             &fork_id,
                             tap,
                             dilation,
+                            *force_full_dump,
                         );
                         log::info!(
                             "fork_cluster_warm_batch member '{fork_id}': materialised in {:?}",
@@ -1937,18 +1948,7 @@ fn build_vm_from_state_and_mem_inner(
                 let mut vsock_backend = VhostVsockBackend::new(new_cid, fork_mem_addr, mem_span)
                     .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
 
-                let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                    .queues
-                    .iter()
-                    .map(|qs| crate::virtio_mmio::VirtqueueState {
-                        max_size: qs.size,
-                        size: qs.size,
-                        ready: qs.ready,
-                        desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                        avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                        used_addr: vm_memory::GuestAddress(qs.used_addr),
-                    })
-                    .collect();
+                let queues = restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
                 vsock_backend
                     .activate_with_bases(&queues, &irq_evt, fork_mem_addr)
                     .map_err(|e| RestoreError::Kvm(format!("vsock activate: {e}")))?;
@@ -1983,25 +1983,15 @@ fn build_vm_from_state_and_mem_inner(
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
                 let irq_evt = Arc::new(irq_evt);
 
-                let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                    .queues
-                    .iter()
-                    .map(|qs| crate::virtio_mmio::VirtqueueState {
-                        max_size: qs.size,
-                        size: qs.size,
-                        ready: qs.ready,
-                        desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                        avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                        used_addr: vm_memory::GuestAddress(qs.used_addr),
-                    })
-                    .collect();
-
                 let mut net_backend =
                     TapNetBackend::new(tap.mac(), tap.fd(), fork_mem_addr, mem_span);
+                let queues = restore_queues(&dev_state.queues, net_backend.max_queue_size());
                 // Replay the driver's feature-negotiation outcome from the snapshot.
                 net_backend.ack_features(dev_state.acked_features);
                 // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
-                net_backend.seed_indices_from_guest(&queues);
+                net_backend
+                    .seed_indices_from_guest(&queues)
+                    .map_err(|e| RestoreError::Kvm(format!("net seed: {e}")))?;
                 net_backend
                     .activate(&queues, &irq_evt)
                     .map_err(|e| RestoreError::Kvm(format!("net activate: {e}")))?;
@@ -2075,19 +2065,6 @@ fn build_vm_from_state_and_mem_inner(
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for fs: {e}")))?;
                 let irq_evt = Arc::new(irq_evt);
 
-                let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                    .queues
-                    .iter()
-                    .map(|qs| crate::virtio_mmio::VirtqueueState {
-                        max_size: qs.size,
-                        size: qs.size,
-                        ready: qs.ready,
-                        desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                        avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                        used_addr: vm_memory::GuestAddress(qs.used_addr),
-                    })
-                    .collect();
-
                 let mut fs_backend = crate::virtiofs::VirtioFsBackend::new(
                     &socket_path,
                     &fs_tag,
@@ -2096,6 +2073,7 @@ fn build_vm_from_state_and_mem_inner(
                     mem_fd,
                 )
                 .map_err(|e| RestoreError::Kvm(format!("fs backend (tag={fs_tag}): {e}")))?;
+                let queues = restore_queues(&dev_state.queues, fs_backend.max_queue_size());
                 fs_backend.ack_features(dev_state.acked_features);
                 fs_backend
                     .activate_with_bases(&queues, &irq_evt, fork_mem_addr)
@@ -2195,19 +2173,6 @@ fn build_vm_from_state_and_mem_inner(
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
                 let irq_evt = Arc::new(irq_evt);
 
-                let queues: Vec<crate::virtio_mmio::VirtqueueState> = dev_state
-                    .queues
-                    .iter()
-                    .map(|qs| crate::virtio_mmio::VirtqueueState {
-                        max_size: qs.size,
-                        size: qs.size,
-                        ready: qs.ready,
-                        desc_addr: vm_memory::GuestAddress(qs.desc_addr),
-                        avail_addr: vm_memory::GuestAddress(qs.avail_addr),
-                        used_addr: vm_memory::GuestAddress(qs.used_addr),
-                    })
-                    .collect();
-
                 let mut blk_backend = crate::block::BlockBackend::new(
                     &host_path,
                     cfg.readonly,
@@ -2215,8 +2180,11 @@ fn build_vm_from_state_and_mem_inner(
                     mem_span,
                 )
                 .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
+                let queues = restore_queues(&dev_state.queues, blk_backend.max_queue_size());
                 blk_backend.ack_features(dev_state.acked_features);
-                blk_backend.seed_indices_from_guest(&queues);
+                blk_backend
+                    .seed_indices_from_guest(&queues)
+                    .map_err(|e| RestoreError::Kvm(format!("blk seed: {e}")))?;
                 blk_backend
                     .activate(&queues, &irq_evt)
                     .map_err(|e| RestoreError::Kvm(format!("blk activate: {e}")))?;

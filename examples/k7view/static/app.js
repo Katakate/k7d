@@ -1,4 +1,4 @@
-/* k7d-view — demo-grade observer .
+/* k7d-view — demo-grade observer.
    One EventSource; vanilla JS; no build step. Pure observer: reads SSE +
    ingest, operator verbs only via the explicit drawer buttons. */
 (() => {

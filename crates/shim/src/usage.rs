@@ -105,7 +105,7 @@ impl UsageTracker {
         &self,
         container_id: &str,
         guest_name: &str,
-        guest_cid: u64,
+        endpoint: k7d::guest::AgentEndpoint,
     ) -> Option<ContainerUsage> {
         let (due, cached) = {
             let mut slots = self.slots.lock().unwrap();
@@ -128,7 +128,7 @@ impl UsageTracker {
             let container_id = container_id.to_string();
             let guest_name = guest_name.to_string();
             std::thread::spawn(move || {
-                tracker.refresh(&container_id, &guest_name, guest_cid);
+                tracker.refresh(&container_id, &guest_name, &endpoint);
             });
         }
         cached
@@ -139,8 +139,8 @@ impl UsageTracker {
         self.slots.lock().unwrap().remove(container_id);
     }
 
-    fn refresh(&self, container_id: &str, guest_name: &str, guest_cid: u64) {
-        let result = AgentClient::connect_vsock(guest_cid, AGENT_TIMEOUT)
+    fn refresh(&self, container_id: &str, guest_name: &str, endpoint: &k7d::guest::AgentEndpoint) {
+        let result = AgentClient::connect_endpoint(endpoint, AGENT_TIMEOUT)
             .and_then(|mut agent| agent.container_usage(guest_name));
         let mut slots = self.slots.lock().unwrap();
         let Some(slot) = slots.get_mut(container_id) else {
@@ -255,7 +255,13 @@ mod tests {
         let tracker = UsageTracker::default();
         let start = Instant::now();
         assert!(
-            tracker.sample("c1", "c1", 0xffff_fffe).is_none(),
+            tracker
+                .sample(
+                    "c1",
+                    "c1",
+                    k7d::guest::AgentEndpoint::Vsock { cid: 0xffff_fffe }
+                )
+                .is_none(),
             "nothing can be cached before the first refresh lands"
         );
         assert!(
@@ -278,7 +284,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        tracker.sample("c1", "c1", 0xffff_fffe);
+        tracker.sample(
+            "c1",
+            "c1",
+            k7d::guest::AgentEndpoint::Vsock { cid: 0xffff_fffe },
+        );
         let slots = tracker.slots.lock().unwrap();
         assert!(
             !slots.get("c1").unwrap().refreshing,

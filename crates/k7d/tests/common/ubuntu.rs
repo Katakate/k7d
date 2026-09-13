@@ -1,4 +1,4 @@
-//! Shared Ubuntu bare-VM node helpers .
+//! Shared Ubuntu bare-VM node helpers.
 //!
 //! Lifted out of `test_ubuntu_guest.rs` so the k3s cluster fixture does
 //! not copy the image builder, per-VM reflink, cmdline, or systemd
@@ -174,8 +174,8 @@ pub fn node_cmdline(guest_ip: Ipv4Addr) -> String {
 
 /// Extra kernel cmdline tokens for an Ubuntu node.
 ///
-/// `cni` is the referenced work's `k7d.cni=flannel|none`. `None` on the
-/// Option leaves the token off the line (absent == flannel), so inc2's
+/// `cni` is the `k7d.cni=flannel|none`. `None` on the
+/// Option leaves the token off the line (absent == flannel), so the
 /// path stays byte-identical.
 pub struct NodeCmdlineExtra<'a> {
     pub k3s: Option<&'a str>,
@@ -228,7 +228,7 @@ pub fn build_node_vm_with(
 }
 
 /// Like [`build_node_vm_with`], plus named persistent data disks
-///  the agent mounts before k3s starts.
+/// the agent mounts before k3s starts.
 ///
 /// Declared after the root disk, so `/dev/vda` stays the root and the
 /// `k7d.blk=` mounts the agent performs are the data disks.
@@ -244,17 +244,17 @@ pub fn build_node_vm_with_data(
 
 /// What one node VM is given.
 ///
-/// [`NodeSize::DEFAULT`] is what inc2–inc4 measured their budgets
+/// [`NodeSize::DEFAULT`] is what the cluster fixtures measured their budgets
 /// against, so it stays the default and no existing test moves. A
 /// workload with its own documented floor — Longhorn asks for 4 vCPU and
-/// 4 GB per storage node, where inc2 sized for k3s alone (CHALLENGES
+/// 4 GB per storage node, where we sized for k3s alone (CHALLENGES
 /// #120) — asks for what it needs instead of making every other Ubuntu
 /// test pay for it.
 #[derive(Clone, Copy)]
 pub struct NodeSize {
     pub memory_mb: u64,
     pub vcpus: u32,
-    /// Continuous time dilation factor : the node's
+    /// Continuous time dilation factor: the node's
     /// clocks run this many times faster than wall time. 1 is stock and
     /// needs no kernel patch; anything else needs `utils/kvm-dilation`
     /// installed and fails the boot loudly if it is not.
@@ -467,7 +467,7 @@ pub fn assert_systemd_healthy(agent: &mut AgentClient, whose: &str) -> BTreeSet<
     failed
 }
 
-/// The 19f/19g probes, run on whatever VM is handed in.
+/// The clock and idle probes, run on whatever VM is handed in.
 pub fn assert_clock_and_idle(agent: &mut AgentClient, whose: &str) {
     let clocksource = sh_ok(
         agent,

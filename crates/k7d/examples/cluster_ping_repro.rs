@@ -1,4 +1,4 @@
-//! Diagnostic repro loop for the referenced work (ICMP variant): cluster warm fork →
+//! Diagnostic repro loop for the interrupt-injection bug (ICMP variant): cluster warm fork →
 //! fork0→fork1 ping, N times.
 //!
 //! Not a test. Run manually on the node (needs KVM + vhost-vsock + TUN):

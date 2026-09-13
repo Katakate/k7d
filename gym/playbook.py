@@ -27,7 +27,7 @@ log = logging.getLogger("gym.playbook")
 NS = "k7-exam"
 DEPLOY = "web"
 SERVICE = "web"
-# 25a-inc4 / tetragon inject image. Discover digest at harvest.
+# Tetragon inject image. Discover digest at harvest.
 PINNED_IMAGE = "docker.io/library/busybox:1.36.1"
 PINNED_AIRGAP = Path("/var/cache/k7d-ubuntu/busybox-1.36.1.tar")
 PINNED_AIRGAP_NAME = "busybox-1.36.1.tar"

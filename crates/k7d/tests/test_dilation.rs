@@ -1,4 +1,4 @@
-//! the referenced work / inc6 / inc8 / inc9 — continuous time dilation: swept
+//! Continuous time dilation: swept
 //! over N, changed on a live cluster, tracked both ways, and forked.
 //!
 //! Not part of `make check`: every test here needs the carried KVM patch
@@ -18,8 +18,8 @@
 //!   time, and the kernel says nothing about it. This is the mechanism.
 //! - **I/O** (same test, and the cluster's pod-to-pod RTT): real I/O
 //!   does not dilate, so at N a 1 ms fsync looks like N ms of guest
-//!   time. the referenced work bounded CPU headroom and explicitly could not
-//!   bound this, which makes it inc4's central risk rather than a
+//!   time. The clock survey bounded CPU headroom and explicitly could not
+//!   bound this, which makes it the central risk rather than a
 //!   footnote.
 //! - **Fidelity sweep** (`test_dilation_three_node_k3s_fidelity_sweep`):
 //!   the same scripted episode at N ∈ {1, 2, 4, 8, 12, 16}, three runs
@@ -27,12 +27,12 @@
 //!   The test names the largest N that still has zero unscripted
 //!   restarts, NotReady lapses and dmesg splats, and fails only if that
 //!   knee is below 4. Probe failures and churn rounds are plotted, not
-//!   thresholded. Busy-phase mean awake vCPUs are compared to inc0's
+//!   thresholded. Busy-phase mean awake vCPUs are compared to the survey's
 //!   `n_cpus / mean_awake` ceiling.
 //! - **Forks** (`test_dilation_fork_*`): a warm fork, a cold
 //!   snapshot/restore, and a whole 3-node cluster fork of a dilated
 //!   VM come back at the source's factor, on the source's clock, with
-//!   the time at rest counted in guest time. the referenced work adds a
+//!   the time at rest counted in guest time. There is also a
 //!   child at a *different* N (×8 → ×1, ×1 → ×8, batch shares one
 //!   factor). `make remote-dilation-fork-test` runs every
 //!   `test_dilation_fork_*`.
@@ -72,10 +72,10 @@ use common::ubuntu_k3s::{
 };
 use common::warp::{check_clocksource, check_no_ntp_client, check_no_splats, guest_clocks};
 
-/// Rate-check and fork-child factor: the single point inc4 validated.
+/// Rate-check and fork-child factor: the single validated point.
 const RATE_N: u32 = 8;
 
-/// the referenced work's sweep. N=1 on patched modules is the control.
+/// The sweep. N=1 on patched modules is the control.
 /// Override with `K7_DILATION_SWEEP=16` (comma-separated) to rerun one
 /// factor; the default is the full curve.
 const SWEEP: [u32; 6] = [1, 2, 4, 8, 12, 16];
@@ -94,14 +94,14 @@ fn sweep_factors() -> Vec<u32> {
     }
 }
 
-/// Three runs per N — one run is an anecdote (inc5 trap 4).
+/// Three runs per N — one run is an anecdote.
 const RUNS: usize = 3;
 
 /// A patch that cannot keep restarts / NotReady / splats at zero
 /// through 4× is broken, not merely at its limit.
 const KNEE_MIN: u32 = 4;
 
-/// Inc0's measured CPU-side ceilings, for the comparison the spec's
+/// The survey's measured CPU-side ceilings, for the comparison the
 /// success criteria ask for.
 const CEILING_STEADY: f64 = 10.3;
 const CEILING_WAIT: f64 = 14.9;
@@ -172,7 +172,7 @@ fn boot_node(tag: &str, n: u32) -> (Vm, AgentClient, k7d::network::ClusterNetwor
 /// the guest's clock is running N times faster while it waits, so this
 /// is expected to be ~N times the undilated figure. It is measured
 /// rather than argued because it is the cost that decides whether
-/// dilation is usable, and inc0 could not bound it.
+/// dilation is usable, and the survey could not bound it.
 fn guest_fsync_ms(agent: &mut AgentClient, whose: &str) -> f64 {
     let out = sh_ok(
         agent,
@@ -214,9 +214,7 @@ fn test_dilation_single_vm_runs_guest_time_8x() {
     let rates = measured_rates(&mut agent, "dilated", RATE_WINDOW);
     let names = ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_BOOTTIME"];
     for (rate, name) in rates.iter().zip(names) {
-        eprintln!(
-            "MEASUREMENT 34a-inc4 single-VM {name} guest-per-wall {rate:.3}x (asked {RATE_N}x)"
-        );
+        eprintln!("MEASUREMENT single-VM {name} guest-per-wall {rate:.3}x (asked {RATE_N}x)");
         assert!(
             (rate - f64::from(RATE_N)).abs() <= f64::from(RATE_N) * RATE_TOLERANCE,
             "{name} advanced {rate:.3}x wall time, not {RATE_N}x — the pvclock scale and the \
@@ -236,7 +234,7 @@ fn test_dilation_single_vm_runs_guest_time_8x() {
     let wall = t0.elapsed().as_secs_f64();
     let guest: f64 = slept.trim().parse().expect("guest sleep duration");
     eprintln!(
-        "MEASUREMENT 34a-inc4 single-VM `sleep 8`: {guest:.3} s guest in {wall:.3} s wall \
+        "MEASUREMENT single-VM `sleep 8`: {guest:.3} s guest in {wall:.3} s wall \
          ({:.2}x)",
         guest / wall
     );
@@ -253,14 +251,14 @@ fn test_dilation_single_vm_runs_guest_time_8x() {
     // was, so in guest time it is N times slower.
     let fsync = guest_fsync_ms(&mut agent, "dilated");
     eprintln!(
-        "MEASUREMENT 34a-inc4 single-VM guest-visible fsync {fsync:.3} ms/4KiB at {RATE_N}x \
+        "MEASUREMENT single-VM guest-visible fsync {fsync:.3} ms/4KiB at {RATE_N}x \
          (~{:.3} ms of wall time)",
         fsync / f64::from(RATE_N)
     );
 
     check_no_splats(&mut agent, "dilated");
     eprintln!(
-        "MEASUREMENT 34a-inc4 CPU ceilings from inc0 for reference: \
+        "MEASUREMENT CPU ceilings from the survey for reference: \
          steady {CEILING_STEADY}x, wait {CEILING_WAIT}x, busy {CEILING_BUSY}x"
     );
     vm.shutdown();
@@ -288,7 +286,7 @@ struct Fidelity {
     fsync_ms: f64,
     /// Pod-to-pod round trip, ms of guest time.
     rtt_ms: f64,
-    /// Mean awake vCPUs during the busy/churn window (inc0's reading).
+    /// Mean awake vCPUs during the busy/churn window (the survey's reading).
     mean_awake: f64,
     /// vCPUs in the cluster (3 × 2).
     n_cpus: f64,
@@ -307,7 +305,7 @@ impl Fidelity {
         self.guest.as_secs_f64() / self.wall.as_secs_f64()
     }
 
-    /// inc0's CPU-side ceiling from this run's own awake reading.
+    /// The CPU-side ceiling from this run's own awake reading.
     fn predicted_ceiling(&self) -> f64 {
         if self.mean_awake > 0.0 {
             self.n_cpus / self.mean_awake
@@ -364,7 +362,7 @@ fn splat_count(agent: &mut AgentClient) -> u64 {
     .unwrap_or(0)
 }
 
-/// Pause all three node VMs, sample them, resume them (inc0's reading).
+/// Pause all three node VMs, sample them, resume them (the survey's reading).
 fn sample_cluster(vms: &mut [&mut Vm; 3]) -> (Vec<TimeSample>, Duration) {
     let started = Instant::now();
     let mut guard = scopeguard::guard(vms, |vms| {
@@ -574,7 +572,7 @@ const READY_EVERY: u32 = 2;
 const POLL: Duration = Duration::from_secs(2);
 const SAMPLE_EVERY: u32 = 2;
 
-/// Inc4's published stock numbers. N=1 on patched modules must land here.
+/// The published stock numbers. N=1 on patched modules must land here.
 const STOCK_WALL_S: f64 = 240.3;
 const STOCK_FSYNC_MS: f64 = 2.295;
 
@@ -836,10 +834,10 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
             );
             let run = run_episode(&mut cluster, &tag);
             eprintln!(
-                "MEASUREMENT 34a-inc6 N={n} run {i}: wall {:.1}s guest {:.1}s \
+                "MEASUREMENT N={n} run {i}: wall {:.1}s guest {:.1}s \
                  ({:.2}x) probes {} restarts {} elections {} notready {} \
                  splats {} churn {} fsync {:.3} rtt {:.3} awake {:.3}/{} \
-                 (n={}/mean_awake ceiling {:.1}x vs inc0 busy {CEILING_BUSY}x)",
+                 (n={}/mean_awake ceiling {:.1}x vs busy {CEILING_BUSY}x)",
                 run.wall.as_secs_f64(),
                 run.guest.as_secs_f64(),
                 run.observed(),
@@ -904,8 +902,8 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
     if let Some((_, n1)) = by_n.iter().find(|(n, _)| *n == 1) {
         for (i, run) in n1.iter().enumerate() {
             // A single unscripted kube-apiserver restart at N=1 is the
-            // flake inc6 documented at other N and inc8 sampled at N=1
-            // . The dilation map is the
+            // flake we documented at other N and sampled at N=1
+            // (in the results). The dilation map is the
             // identity at N=1, so this is k3s, not the patch. Fail on
             // NotReady/splats, on more than one restart, or if *every*
             // N=1 run restarted.
@@ -925,7 +923,7 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
             let wall = run.wall.as_secs_f64();
             assert!(
                 (wall - STOCK_WALL_S).abs() / STOCK_WALL_S <= 0.20,
-                "N=1 run {i} wall {wall:.1}s is not inc4's stock {STOCK_WALL_S}s — \
+                "N=1 run {i} wall {wall:.1}s is not the stock {STOCK_WALL_S}s — \
              the patch costs something when it is not asked for"
             );
             assert!(
@@ -935,7 +933,7 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
             );
             assert!(
                 (run.fsync_ms - STOCK_FSYNC_MS).abs() / STOCK_FSYNC_MS <= 1.5,
-                "N=1 run {i} fsync {:.3} ms is not inc4's stock {STOCK_FSYNC_MS} ms",
+                "N=1 run {i} fsync {:.3} ms is not the stock {STOCK_FSYNC_MS} ms",
                 run.fsync_ms
             );
             assert_eq!(
@@ -946,7 +944,7 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
         assert!(
             n1.iter().any(Fidelity::hard_clean),
             "every N=1 run restarted — that is a broken control, not the \
-             single-restart flake inc6/inc8 documented"
+             single-restart flake we documented"
         );
     }
 
@@ -957,7 +955,7 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
         .map(|(n, _)| *n)
         .unwrap_or(0);
     eprintln!(
-        "MEASUREMENT 34a-inc6 knee: largest N with zero restarts, NotReady lapses \
+        "MEASUREMENT knee: largest N with zero restarts, NotReady lapses \
          and splats on every run = {knee} (fail below {KNEE_MIN})"
     );
     if by_n.iter().any(|(n, _)| *n <= KNEE_MIN) {
@@ -986,8 +984,8 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
             f64::INFINITY
         };
         eprintln!(
-            "MEASUREMENT 34a-inc6 N={n} busy-phase mean awake {awake:.3} / {} \
-             → n_cpus/mean_awake {pred:.1}× (inc0 busy ceiling {CEILING_BUSY}×). \
+            "MEASUREMENT N={n} busy-phase mean awake {awake:.3} / {} \
+             → n_cpus/mean_awake {pred:.1}× (busy ceiling {CEILING_BUSY}×). \
              Asked {n}× {} the prediction.",
             runs[0].n_cpus,
             if f64::from(*n) > pred {
@@ -999,8 +997,8 @@ fn test_dilation_three_node_k3s_fidelity_sweep() {
     }
 }
 
-/// the referenced work's ladder: start at the operating point, drop to the
-/// factor inc6 called essentially free.
+/// The ladder: start at the operating point, drop to the
+/// factor the sweep called essentially free.
 const DROP_FROM: u32 = 8;
 const DROP_TO: u32 = 4;
 
@@ -1010,8 +1008,8 @@ const DROP_TO: u32 = 4;
 const REMEASURE: Duration = Duration::from_secs(10);
 
 /// Guest seconds the change itself is allowed to be worth. The daemon's
-/// pause → set → resume is sub-millisecond of wall (the referenced work
-/// measured 0.79–0.83 ms on 3 VMs) and the two agent round-trips around
+/// pause → set → resume is sub-millisecond of wall (measured
+/// 0.79–0.83 ms on 3 VMs) and the two agent round-trips around
 /// it are tens of milliseconds, so at 8× even a slow read pair is worth
 /// well under a second of guest time. A *jump* — the failure this
 /// bounds — would be the whole affine base, seconds or minutes.
@@ -1063,7 +1061,7 @@ impl Across {
         for ((b, a), name) in self.before.iter().zip(&self.after).zip(names) {
             let delta = a - b;
             eprintln!(
-                "MEASUREMENT 34a-inc8 {whose} {name} across the change: +{delta:.3} s guest \
+                "MEASUREMENT {whose} {name} across the change: +{delta:.3} s guest \
                  in {:.3} s wall (budget {budget:.3} s at x{old})",
                 self.wall
             );
@@ -1089,7 +1087,7 @@ impl Across {
         let lead_before = self.before[0] - self.host_before;
         let lead_after = self.after[0] - self.host_after;
         eprintln!(
-            "MEASUREMENT 34a-inc8 {whose} CLOCK_REALTIME ahead of the host: \
+            "MEASUREMENT {whose} CLOCK_REALTIME ahead of the host: \
              {lead_before:.3} s → {lead_after:.3} s"
         );
         assert!(
@@ -1105,7 +1103,7 @@ fn assert_rate(agent: &mut AgentClient, whose: &str, want: u32, window: Duration
     let rates = measured_rates(agent, whose, window);
     let names = ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_BOOTTIME"];
     for (rate, name) in rates.iter().zip(names) {
-        eprintln!("MEASUREMENT 34a-inc8 {whose} {name} guest-per-wall {rate:.3}x (asked {want}x)");
+        eprintln!("MEASUREMENT {whose} {name} guest-per-wall {rate:.3}x (asked {want}x)");
         assert!(
             (rate - f64::from(want)).abs() <= f64::from(want) * RATE_TOLERANCE,
             "{whose}: {name} advanced {rate:.3}x wall time, not {want}x"
@@ -1114,7 +1112,7 @@ fn assert_rate(agent: &mut AgentClient, whose: &str, want: u32, window: Duration
     rates
 }
 
-/// The mechanism inc8 adds: the factor of a *live* VM comes down, its
+/// The mechanism the adaptive policy adds: the factor of a *live* VM comes down, its
 /// clocks change slope, and nothing about them jumps.
 ///
 /// Both halves matter and they fail differently. A factor that does not
@@ -1142,7 +1140,7 @@ fn test_dilation_live_drop_changes_slope_not_the_clock() {
         vm.resume().expect("the VM resumes after a factor change");
         latency = started.elapsed();
     });
-    eprintln!("MEASUREMENT 34a-inc8 single-VM pause → set x{DROP_TO} → resume: {latency:?}");
+    eprintln!("MEASUREMENT single-VM pause → set x{DROP_TO} → resume: {latency:?}");
     assert_eq!(vm.dilation(), DROP_TO);
     across.assert_continuous("live", DROP_FROM);
     across.assert_keeps_its_lead("live");
@@ -1159,7 +1157,7 @@ fn test_dilation_live_drop_changes_slope_not_the_clock() {
     let wall = t0.elapsed().as_secs_f64();
     let guest: f64 = slept.trim().parse().expect("guest sleep duration");
     eprintln!(
-        "MEASUREMENT 34a-inc8 single-VM `sleep 8` after the drop: {guest:.3} s guest in \
+        "MEASUREMENT single-VM `sleep 8` after the drop: {guest:.3} s guest in \
          {wall:.3} s wall ({:.2}x)",
         guest / wall
     );
@@ -1178,9 +1176,9 @@ fn test_dilation_live_drop_changes_slope_not_the_clock() {
     );
 
     // The bottom rung is a legal factor; the peak still names the
-    // highest this VM has run at (inc8). Capture records the *current*
-    // factor — 1 — because that is the rate restore must apply (inc9
-    // lifted the fork refusal). The guest clock sitting in the host's
+    // highest this VM has run at. Capture records the *current*
+    // factor — 1 — because that is the rate restore must apply (the
+    // fork refusal is lifted). The guest clock sitting in the host's
     // future is already in kvmclock.clock_ns.
     vm.pause().expect("pause");
     vm.set_dilation_live(1)
@@ -1189,7 +1187,7 @@ fn test_dilation_live_drop_changes_slope_not_the_clock() {
     assert_eq!(vm.dilation(), 1);
     assert_eq!(vm.dilation_peak(), DROP_FROM);
     let state = k7d::snapshot::capture_vm_state(&vm)
-        .expect("inc9: a VM that has been dilated is capturable at x1");
+        .expect("a VM that has been dilated is capturable at x1");
     assert_eq!(
         state.dilation, 1,
         "capture records the current factor, not the peak"
@@ -1223,7 +1221,7 @@ fn test_dilation_live_set_is_refused_while_a_vcpu_runs() {
     let err = vm
         .set_dilation_live(DROP_TO)
         .expect_err("a running VM must refuse a factor change");
-    eprintln!("MEASUREMENT 34a-inc8 host-side refusal: {err}");
+    eprintln!("MEASUREMENT host-side refusal: {err}");
     assert!(
         matches!(err, k7d::vm::VmError::NotPaused { op, .. } if op == "set_dilation_live"),
         "the host-side refusal was not the paused check: {err}"
@@ -1232,7 +1230,7 @@ fn test_dilation_live_set_is_refused_while_a_vcpu_runs() {
     let err = vm
         .set_dilation_raw(DROP_TO)
         .expect_err("the kernel must refuse a factor change under a runnable vCPU");
-    eprintln!("MEASUREMENT 34a-inc8 kernel-side refusal: {err}");
+    eprintln!("MEASUREMENT kernel-side refusal: {err}");
     let text = err.to_string();
     assert!(
         text.contains("Device or resource busy") || text.contains("EBUSY"),
@@ -1257,7 +1255,7 @@ fn test_dilation_live_set_is_refused_while_a_vcpu_runs() {
     vm.shutdown();
 }
 
-/// The policy, driven by the signal the referenced work names: busy-phase mean
+/// The policy, driven by the named signal: busy-phase mean
 /// awake vCPUs from `Vm::sample_time_state`, not probe failures.
 ///
 /// An idle guest must *not* spend a rung — that is the half of the test
@@ -1288,7 +1286,7 @@ fn test_dilation_policy_drops_under_a_cpu_burner() {
     std::thread::sleep(Duration::from_secs(5));
     for i in 0..2 * POLICY_WINDOW {
         let verdict = observe_once(&mut vm, &mut policy);
-        eprintln!("MEASUREMENT 34a-inc8 idle sample {i}: {verdict:?}");
+        eprintln!("MEASUREMENT idle sample {i}: {verdict:?}");
         assert!(
             !matches!(verdict, k7d::dilation::Verdict::Drop(_)),
             "sample {i} of an idle guest spent a rung: {verdict:?}"
@@ -1297,7 +1295,7 @@ fn test_dilation_policy_drops_under_a_cpu_burner() {
     assert_eq!(policy.factor(), DROP_FROM);
     assert_eq!(policy.drops(), 0);
 
-    // 2. Every vCPU spinning. inc0's busy phase drew 3.74 of 6; this
+    // 2. Every vCPU spinning. The survey's busy phase drew 3.74 of 6; this
     //    draws all of them, which is the saturation the ladder is for.
     // Each burner records its own pid, because the obvious way to stop
     // them again — `pkill -f 'while true'` — matches the shell the agent
@@ -1317,7 +1315,7 @@ fn test_dilation_policy_drops_under_a_cpu_burner() {
     let mut applied = Vec::new();
     for i in 0..4 * POLICY_WINDOW {
         if let k7d::dilation::Verdict::Drop(factor) = observe_once(&mut vm, &mut policy) {
-            eprintln!("MEASUREMENT 34a-inc8 sample {i}: saturated, dropping to x{factor}");
+            eprintln!("MEASUREMENT sample {i}: saturated, dropping to x{factor}");
             vm.pause().expect("pause for the drop");
             vm.set_dilation_live(factor)
                 .expect("the drop the policy asked for");
@@ -1432,7 +1430,7 @@ fn test_dilation_live_set_on_a_three_node_lockstep_cluster() {
     let latency = k7d::vm::set_dilation_lockstep(&mut vms, DROP_TO)
         .expect("a paused cluster takes one factor across every member");
     drop(vms);
-    eprintln!("MEASUREMENT 34a-inc8 3-node pause → set x{DROP_TO} → resume: {latency:?}");
+    eprintln!("MEASUREMENT 3-node pause → set x{DROP_TO} → resume: {latency:?}");
     for vm in [&cluster.server, &cluster.agent1, &cluster.agent2] {
         assert_eq!(vm.dilation(), DROP_TO);
     }
@@ -1478,7 +1476,7 @@ fn test_dilation_live_set_on_a_three_node_lockstep_cluster() {
     drop(server);
 }
 
-/// the referenced work: the same live `SET` in the other direction. inc8's
+/// The same live `SET` in the other direction. The adaptive policy's
 /// kernel path already accepts a raise — this is the missing test, not
 /// a missing ioctl.
 const RAISE_FROM: u32 = 4;
@@ -1504,7 +1502,7 @@ fn test_dilation_live_raise_changes_slope_not_the_clock() {
         vm.resume().expect("the VM resumes after a factor change");
         latency = started.elapsed();
     });
-    eprintln!("MEASUREMENT 34a-inc9 single-VM pause → set x{RAISE_TO} → resume: {latency:?}");
+    eprintln!("MEASUREMENT single-VM pause → set x{RAISE_TO} → resume: {latency:?}");
     assert_eq!(vm.dilation(), RAISE_TO);
     across.assert_continuous("raise", RAISE_FROM);
     across.assert_keeps_its_lead("raise");
@@ -1519,7 +1517,7 @@ fn test_dilation_live_raise_changes_slope_not_the_clock() {
     let wall = t0.elapsed().as_secs_f64();
     let guest: f64 = slept.trim().parse().expect("guest sleep duration");
     eprintln!(
-        "MEASUREMENT 34a-inc9 single-VM `sleep 8` after the raise: {guest:.3} s guest in \
+        "MEASUREMENT single-VM `sleep 8` after the raise: {guest:.3} s guest in \
          {wall:.3} s wall ({:.2}x)",
         guest / wall
     );
@@ -1578,7 +1576,7 @@ fn test_dilation_live_raise_on_a_three_node_lockstep_cluster() {
     let latency = k7d::vm::set_dilation_lockstep(&mut vms, RAISE_TO)
         .expect("a paused cluster takes one raise across every member");
     drop(vms);
-    eprintln!("MEASUREMENT 34a-inc9 3-node pause → set x{RAISE_TO} → resume: {latency:?}");
+    eprintln!("MEASUREMENT 3-node pause → set x{RAISE_TO} → resume: {latency:?}");
     for vm in [&cluster.server, &cluster.agent1, &cluster.agent2] {
         assert_eq!(vm.dilation(), RAISE_TO);
     }
@@ -1645,7 +1643,7 @@ fn test_dilation_policy_tracks_load_both_ways() {
     std::thread::sleep(Duration::from_secs(5));
     for i in 0..2 * POLICY_WINDOW {
         let verdict = observe_track(&mut vm, &mut policy);
-        eprintln!("MEASUREMENT 34a-inc9 idle sample {i}: {verdict:?}");
+        eprintln!("MEASUREMENT idle sample {i}: {verdict:?}");
         assert!(
             !matches!(verdict, k7d::dilation::Verdict::Drop(_)),
             "sample {i} of an idle guest spent a rung: {verdict:?}"
@@ -1669,7 +1667,7 @@ fn test_dilation_policy_tracks_load_both_ways() {
     let mut dropped = Vec::new();
     for i in 0..4 * POLICY_WINDOW {
         if let k7d::dilation::Verdict::Drop(factor) = observe_track(&mut vm, &mut policy) {
-            eprintln!("MEASUREMENT 34a-inc9 sample {i}: saturated, dropping to x{factor}");
+            eprintln!("MEASUREMENT sample {i}: saturated, dropping to x{factor}");
             vm.pause().expect("pause for the drop");
             vm.set_dilation_live(factor)
                 .expect("the drop the policy asked for");
@@ -1697,7 +1695,7 @@ fn test_dilation_policy_tracks_load_both_ways() {
     let mut raised = Vec::new();
     for i in 0..4 * POLICY_WINDOW {
         if let k7d::dilation::Verdict::Raise(factor) = observe_track(&mut vm, &mut policy) {
-            eprintln!("MEASUREMENT 34a-inc9 sample {i}: quiet, raising to x{factor}");
+            eprintln!("MEASUREMENT sample {i}: quiet, raising to x{factor}");
             vm.pause().expect("pause for the raise");
             vm.set_dilation_live(factor)
                 .expect("the raise the policy asked for");
@@ -1740,7 +1738,7 @@ fn observe_track(
     policy.observe_samples(std::slice::from_ref(&sample))
 }
 
-/// the referenced work's four-policy episode: same 240 s of guest time, load
+/// The four-policy episode: same 240 s of guest time, load
 /// script idle / busy / idle in 80 s *guest* windows, three runs each
 /// from a fresh cluster. Shape, not values.
 ///
@@ -1865,7 +1863,7 @@ fn guest_sleep8(agent: &mut AgentClient, whose: &str) -> Sleep8 {
     let wall = t0.elapsed().as_secs_f64();
     let guest: f64 = slept.trim().parse().expect("guest sleep duration");
     eprintln!(
-        "MEASUREMENT 34a-inc9 {whose} `sleep 8`: {guest:.3} s guest in {wall:.3} s wall \
+        "MEASUREMENT {whose} `sleep 8`: {guest:.3} s guest in {wall:.3} s wall \
          ({:.2}x)",
         guest / wall
     );
@@ -2169,7 +2167,7 @@ fn test_dilation_four_policy_idle_busy_idle() {
             );
             let run = run_policy_episode(&mut cluster, arm, &tag);
             eprintln!(
-                "MEASUREMENT 34a-inc9 {} run {i}: wall {:.1}s guest {:.1}s ({:.2}x) \
+                "MEASUREMENT {} run {i}: wall {:.1}s guest {:.1}s ({:.2}x) \
                  probes {} restarts {} elections {} notready {} splats {} \
                  fsync {:.3} sets {} drops {} raises {} straddles {} \
                  traj {:?} after_busy x{} end x{} \
@@ -2339,7 +2337,7 @@ const REST: Duration = Duration::from_secs(3);
 fn assert_rates(rates: [f64; 3], whose: &str, n: u32) {
     let names = ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_BOOTTIME"];
     for (rate, name) in rates.iter().zip(names) {
-        eprintln!("MEASUREMENT 34a-inc9 {whose} {name} guest-per-wall {rate:.3}x (asked {n}x)");
+        eprintln!("MEASUREMENT {whose} {name} guest-per-wall {rate:.3}x (asked {n}x)");
         assert!(
             (rate - f64::from(n)).abs() <= f64::from(n) * RATE_TOLERANCE,
             "{whose}: {name} advanced {rate:.3}x wall time, not {n}x"
@@ -2347,8 +2345,8 @@ fn assert_rates(rates: [f64; 3], whose: &str, n: u32) {
     }
 }
 
-/// the referenced work: a warm fork of a dilated VM runs at the source's
-/// factor and lands on the source's clock.
+/// A warm fork of a dilated VM runs at the source's factor and lands
+/// on the source's clock.
 ///
 /// Two restores are exercised: `prepare_fork_source` swaps the source
 /// for a copy restored from its own keyframe (the cold path,
@@ -2399,7 +2397,7 @@ fn test_dilation_fork_warm_child_runs_at_source_rate() {
     let child_first = guest_clocks(&mut child_agent, "child");
     let src_after = guest_clocks(&mut agent, "source");
     eprintln!(
-        "MEASUREMENT 34a-inc9 warm fork of a x{RATE_N} VM in {fork_wall:?}; child clock at first \
+        "MEASUREMENT warm fork of a x{RATE_N} VM in {fork_wall:?}; child clock at first \
          read sits {:+.3} s of guest time from the source's next read",
         child_first[0] - src_after[0]
     );
@@ -2444,8 +2442,8 @@ fn test_dilation_fork_warm_child_runs_at_source_rate() {
     vm.shutdown();
 }
 
-/// the referenced work: a cold snapshot records the factor, a restore applies
-/// it, and the time the snapshot spent on disk is handed back in guest
+/// A cold snapshot records the factor, a restore applies it, and the
+/// time the snapshot spent on disk is handed back in guest
 /// time — `N × wall` — so the restored clock reads what the source's
 /// would have had it never been snapshotted (a pause of the same wall
 /// duration does exactly that).
@@ -2497,7 +2495,7 @@ fn test_dilation_fork_cold_snapshot_restore_rests_in_guest_time() {
     {
         let rate = (after[i] - before[i]) / wall;
         eprintln!(
-            "MEASUREMENT 34a-inc9 {name} across snapshot + {REST:?} rest + restore: \
+            "MEASUREMENT {name} across snapshot + {REST:?} rest + restore: \
              {:.3} s guest over {wall:.3} s wall = {rate:.3}x",
             after[i] - before[i]
         );
@@ -2517,7 +2515,7 @@ fn test_dilation_fork_cold_snapshot_restore_rests_in_guest_time() {
     restored.shutdown();
 }
 
-/// the referenced work, the shape the gym uses: a 3-node k3s cluster at N=8
+/// The shape the gym uses: a 3-node k3s cluster at N=8
 /// is warm-forked whole, and the child cluster is Ready, dilated, and
 /// quiet, while the source is undisturbed.
 #[test]
@@ -2562,7 +2560,7 @@ fn test_dilation_fork_cluster_warm_child_is_ready_and_dilated() {
     )
     .expect("warm fork of a dilated k3s cluster");
     eprintln!(
-        "MEASUREMENT 34a-inc9 3-node k3s cluster warm fork at x{RATE_N}: {:?}",
+        "MEASUREMENT 3-node k3s cluster warm fork at x{RATE_N}: {:?}",
         t_fork.elapsed()
     );
     assert_eq!(forks.len(), 3);
@@ -2636,8 +2634,8 @@ fn assert_lockstep(
     }
 }
 
-/// the referenced work: a ×8 source warm-forks a ×1 child that lands on the
-/// source's clock, then advances at 1× while the source stays at 8×.
+/// A ×8 source warm-forks a ×1 child that lands on the source's clock,
+/// then advances at 1× while the source stays at 8×.
 #[test]
 fn test_dilation_fork_child_at_one_from_source_at_eight() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -2674,7 +2672,7 @@ fn test_dilation_fork_child_at_one_from_source_at_eight() {
     let child_first = guest_clocks(&mut child_agent, "child");
     let src_after = guest_clocks(&mut agent, "source");
     eprintln!(
-        "MEASUREMENT 34a-inc10 x{RATE_N} -> x1 warm fork in {fork_wall:?}; child clock at first \
+        "MEASUREMENT x{RATE_N} -> x1 warm fork in {fork_wall:?}; child clock at first \
          read sits {:+.3} s of guest time from the source's next read",
         child_first[0] - src_after[0]
     );
@@ -2698,7 +2696,7 @@ fn test_dilation_fork_child_at_one_from_source_at_eight() {
     vm.shutdown();
 }
 
-/// the referenced work: the reverse — a ×1 source warm-forks a ×8 child.
+/// The reverse — a ×1 source warm-forks a ×8 child.
 #[test]
 fn test_dilation_fork_child_at_eight_from_source_at_one() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -2739,7 +2737,7 @@ fn test_dilation_fork_child_at_eight_from_source_at_one() {
     let child_first = guest_clocks(&mut child_agent, "child");
     let src_after = guest_clocks(&mut agent, "source");
     eprintln!(
-        "MEASUREMENT 34a-inc10 x1 -> x{RATE_N} warm fork in {fork_wall:?}; child clock at first \
+        "MEASUREMENT x1 -> x{RATE_N} warm fork in {fork_wall:?}; child clock at first \
          read sits {:+.3} s of guest time from the source's next read",
         child_first[0] - src_after[0]
     );
@@ -2763,7 +2761,7 @@ fn test_dilation_fork_child_at_eight_from_source_at_one() {
     vm.shutdown();
 }
 
-/// the referenced work: `tree_fork_batch` applies one child factor to every
+/// `tree_fork_batch` applies one child factor to every
 /// member of every fork.
 #[test]
 fn test_dilation_fork_batch_shares_one_factor() {
@@ -2830,7 +2828,7 @@ fn test_dilation_fork_batch_shares_one_factor() {
     ));
 }
 
-/// The control-plane half of the referenced work: `Request::SetDilation`
+/// The control-plane half: `Request::SetDilation`
 /// through the real daemon's socket.
 ///
 /// The mechanism is the tests above. What is only reachable from here is
@@ -2880,7 +2878,7 @@ fn test_dilation_set_through_the_daemon_finds_exactly_one_cluster() {
 
     let before = [cid_a, cid_b, cid_off].map(guest_boottime_rate);
     for (rate, who) in before.iter().zip(["A", "B", "off-cluster"]) {
-        eprintln!("MEASUREMENT 34a-inc8 daemon VM {who} before: {rate:.2}x wall");
+        eprintln!("MEASUREMENT daemon VM {who} before: {rate:.2}x wall");
         assert!(
             (rate - f64::from(DROP_FROM)).abs() <= f64::from(DROP_FROM) * DAEMON_RATE_TOLERANCE,
             "VM {who} booted at {rate:.2}x, not x{DROP_FROM}"
@@ -2936,7 +2934,7 @@ fn test_dilation_set_through_the_daemon_finds_exactly_one_cluster() {
             );
             assert!(latency_ns > 0, "the daemon must report its own latency");
             eprintln!(
-                "MEASUREMENT 34a-inc8 daemon set_dilation x{DROP_TO} on 2 VMs: {:.2} ms",
+                "MEASUREMENT daemon set_dilation x{DROP_TO} on 2 VMs: {:.2} ms",
                 latency_ns as f64 / 1e6
             );
         }
@@ -2947,14 +2945,14 @@ fn test_dilation_set_through_the_daemon_finds_exactly_one_cluster() {
     // the new rate is what the guests actually see.
     for (cid, who) in [(cid_a, "A"), (cid_b, "B")] {
         let rate = guest_boottime_rate(cid);
-        eprintln!("MEASUREMENT 34a-inc8 daemon VM {who} after: {rate:.2}x wall");
+        eprintln!("MEASUREMENT daemon VM {who} after: {rate:.2}x wall");
         assert!(
             (rate - f64::from(DROP_TO)).abs() <= f64::from(DROP_TO) * DAEMON_RATE_TOLERANCE,
             "VM {who} runs at {rate:.2}x after the op, not x{DROP_TO}"
         );
     }
     let off = guest_boottime_rate(cid_off);
-    eprintln!("MEASUREMENT 34a-inc8 daemon off-cluster VM after: {off:.2}x wall");
+    eprintln!("MEASUREMENT daemon off-cluster VM after: {off:.2}x wall");
     assert!(
         (off - f64::from(DROP_FROM)).abs() <= f64::from(DROP_FROM) * DAEMON_RATE_TOLERANCE,
         "a VM on another bridge was switched too: it runs at {off:.2}x, not x{DROP_FROM}"

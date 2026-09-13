@@ -1,13 +1,12 @@
-//! Cilium on Ubuntu bare-VM k3s, installed the documented way
-//! .
+//! Cilium on Ubuntu bare-VM k3s, installed the documented way.
 //!
-//! Re-runs 24a-inc3's probe set on the inc2 substrate: Helm talks to
-//! the host kubeconfig, containerd pulls through the bridge, native
-//! routing + kube-proxy replacement. None of 24a-inc3's workarounds
+//! Re-runs the inner-k3s probe set on the Ubuntu substrate: Helm talks
+//! to the host kubeconfig, containerd pulls through the bridge, native
+//! routing + kube-proxy replacement. None of the old workarounds
 //! (static YAML, airgap tars, `imagePullPolicy: Never`, sidecar
 //! memory, guest-kernel patches).
 //!
-//! Parameterises inc2's cluster fixture with `k7d.cni=none`. Does not
+//! Parameterises the cluster fixture with `k7d.cni=none`. Does not
 //! touch the minimal guest, `test_inner_k3s.rs`, the shim, or any
 //! existing budget.
 
@@ -709,7 +708,7 @@ fn assert_clusters_diverge(src_bridge: &str, child_bridge: &str, certs: &Path) {
 }
 
 /// Cilium 1.16.10 via Helm on the Ubuntu 3-node cluster, then the
-/// 24a-inc3 probe set across a warm fork.
+/// full probe set across a warm fork.
 #[test]
 fn test_ubuntu_cilium_datapath_fork() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1134,9 +1133,7 @@ spec:
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

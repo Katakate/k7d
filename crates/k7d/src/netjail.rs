@@ -1,5 +1,5 @@
 //! Per-tree network jail: an nftables table scoped to one `k7-br-{id}`
-//! bridge .
+//! bridge.
 //!
 //! Every live cluster payload — a tree root, a forked node, an adopted
 //! cluster — owns one bridge, and every guest on every bridge sits in
@@ -10,7 +10,7 @@
 //! ends were explicitly accepted.
 //!
 //! The jail is a table per bridge, `k7jail-{bridge}`, with a `forward`
-//! chain and  an `input` chain, both at priority
+//! chain and an `input` chain, both at priority
 //! `filter - 1` so they are evaluated *before* the iptables rules:
 //!
 //! ```text
@@ -75,7 +75,7 @@
 //! guest /24 (sources outside that subnet are legitimate routed
 //! workload traffic — flannel host-gw pod CIDRs — see [`tap_ruleset`]),
 //! and drops every `EtherType` except IPv4 and ARP (which also disables
-//! guest IPv6 and VLAN-tag evasion — the referenced work §5 picks "disable v6 on
+//! guest IPv6 and VLAN-tag evasion — we pick "disable v6 on
 //! the TAP" over a parallel v6 ruleset; the `inet`-family bridge chains
 //! additionally fail closed for any v6 that could appear).
 //!
@@ -91,7 +91,7 @@
 //! The agent **vsock** channel is deliberately not jailed here: it is
 //! the harness's control plane, point-to-point to the host CID (no
 //! inter-tree vsock path exists). Keeping the rogue *workload* away
-//! from `AF_VSOCK` is guest-image hardening, tracked in the referenced work §6.
+//! from `AF_VSOCK` is guest-image hardening, tracked separately.
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -112,16 +112,16 @@ const TAP_TABLE_PREFIX: &str = "k7tapjail-";
 /// Host interfaces a jailed guest may always be forwarded to/from, on
 /// top of the host's default-route interface: reaching the node's pod
 /// network is existing, tested behaviour and is intra-node — it stays
-/// permitted even under `Deny`/`Whitelist` .
+/// permitted even under `Deny`/`Whitelist`.
 const CNI_IFACES: [&str; 2] = ["cni0", "flannel.1"];
 
-/// Default per-tree concurrent-connection cap . Generous:
+/// Default per-tree concurrent-connection cap. Generous:
 /// an inner-k3s cluster's egress (image pulls, DNS) is far below this;
 /// a rogue flood is far above. Override with `K7D_NET_JAIL_CT_MAX`.
 const DEFAULT_CT_MAX: u32 = 16384;
 
-/// Default per-tree new-connection rate cap in packets/second
-/// . Override with `K7D_NET_JAIL_NEW_RATE`.
+/// Default per-tree new-connection rate cap in packets/second.
+/// Override with `K7D_NET_JAIL_NEW_RATE`.
 const DEFAULT_NEW_RATE: u32 = 2000;
 
 /// Whether the jail is enforced. `K7D_NET_JAIL=off` skips installation
@@ -151,8 +151,8 @@ fn env_cap(key: &str, default: u32) -> Result<u32, String> {
     }
 }
 
-/// Egress posture of one tree . `Open` is the default:
-/// the `RuntimeClass` product and every pre-29b test run unchanged.
+/// Egress posture of one tree. `Open` is the default:
+/// the `RuntimeClass` product and every legacy test run unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressMode {
@@ -328,7 +328,7 @@ impl TreeNetJail {
         let ruleset = ruleset(bridge, &table, ifaces, policy, ct_max, new_rate);
         // The elapsed time is part of the message on purpose: this is one
         // `nft` process on the fork path, and it is the jail's whole
-        // measured cost . A regression
+        // measured cost (`LATENCY_BUDGETS.md`). A regression
         // here shows up in the daemon log before it shows up as a blown
         // fork budget.
         let t0 = std::time::Instant::now();
@@ -450,7 +450,7 @@ fn ruleset(
          burst {new_rate} packets counter drop\n"
     ));
     // Whitelist accepts come BEFORE the metadata drop so an explicit
-    // 169.254/16 entry wins .
+    // 169.254/16 entry wins.
     if policy.mode == EgressMode::Whitelist {
         out.push_str(&format!(
             " \x20      iifname \"{bridge}\" meta l4proto {{ tcp, udp }} \
@@ -464,7 +464,7 @@ fn ruleset(
         }
     }
     // Cloud metadata / link-local: denied in EVERY mode unless
-    // whitelisted above (credential-theft path, the referenced work threat model).
+    // whitelisted above (credential-theft path in the threat model).
     out.push_str(&format!(
         " \x20      iifname \"{bridge}\" ip daddr 169.254.0.0/16 counter drop\n"
     ));
@@ -482,7 +482,7 @@ fn ruleset(
     }
     out.push_str(" \x20      counter drop\n \x20  }\n");
 
-    // ── input chain: host lockdown  ──
+    // ── input chain: host lockdown ──
     // Runs at filter - 1, before every iptables INPUT rule. The
     // formerly load-bearing `INPUT -i <bridge> -j ACCEPT` iptables rule
     // is drained by `network.rs` — this chain owns the decision now.
@@ -520,7 +520,7 @@ fn ruleset(
     out
 }
 
-/// Per-TAP L2 anti-spoof : a `netdev`-family ingress
+/// Per-TAP L2 anti-spoof: a `netdev`-family ingress
 /// chain on one TAP that pins every frame the guest emits to the TAP's
 /// assigned `(mac, guest_ip)` — `ether saddr` and the ARP sender fields
 /// must match exactly, `ip saddr` may not claim another guest's address
@@ -895,9 +895,9 @@ mod tests {
         // Atomic replace, not append: a second create on a shared
         // bridge must not stack a duplicate rule set.
         assert!(rules.starts_with("table inet k7jail-k7-br-a\ndelete table inet k7jail-k7-br-a\n"));
-        // Metadata denied even under Open .
+        // Metadata denied even under Open.
         assert!(rules.contains("ip daddr 169.254.0.0/16 counter drop"));
-        // Per-tree caps present in every mode .
+        // Per-tree caps present in every mode.
         assert!(rules.contains(&format!("ct count over {DEFAULT_CT_MAX} counter drop")));
         assert!(rules.contains(&format!("limit rate over {DEFAULT_NEW_RATE}/second")));
         // Open input chain accepts (parity with the drained iptables

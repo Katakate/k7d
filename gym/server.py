@@ -38,7 +38,7 @@ DILATION_FACTOR = 8
 AUTOWARP_MODE_HELP = "off|jump|micro|dilate"
 DILATE_REQUIRES = (
     "autowarp_mode=dilate requires GYM_SOURCE_MODE=ubuntu "
-    "(inc4 busybox is out of scope)"
+    "(busybox is out of scope)"
 )
 import agent  # noqa: E402
 from budget import lease_need, reset_need, tree_budget  # noqa: E402
@@ -285,7 +285,7 @@ class _IncidentProbe:
 # CPU% floor below which a Running payload counts as present-and-idle,
 # not productive. The relay miner busy-loops sha256sum (~7% of one core
 # over the window); a decoy that merely sleeps stays near 0. The floor
-# sits between the two with margin on both sides (26a-inc11 gate).
+# sits between the two with margin on both sides.
 PAYLOAD_CPU_MIN = 2.0
 # Sampling window for the CPU-time delta. The relay miner forks a fresh
 # `sha256sum` process each iteration, so instantaneous `ps %cpu` misses
@@ -311,7 +311,7 @@ echo "K7CPU $((b - a)) $(getconf CLK_TCK)"
 class _SelfplayProbe(_IncidentProbe):
     """Adds `payload_productive` — the red gate. Pure cluster state: the
     payload must be *doing real work* (miner burning CPU), never a policy
-    self-report and never sensor silence (26a-inc11)."""
+    self-report and never sensor silence."""
 
     def payload_productive(self) -> bool:
         if not self.miner_running():
@@ -766,7 +766,7 @@ class Gym:
                 # cni=none until Cilium exists. Host kubectl Ready-wait
                 # hits the wrong 10.200.0.2 (CHALLENGES #144). Helm
                 # before adopt so memory.bin already has the sensors
-                # (27a-inc3 / CHALLENGES #153). Incident soak needs
+                # (CHALLENGES #153). Incident soak needs
                 # Tetragon event_diff for /tmp/nodecheck.
                 ubuntu_src.wait_nodes_present_on_bridge(
                     bridge, cert, key, ubuntu_src.CLUSTER_READY_S
@@ -1278,7 +1278,7 @@ class Gym:
         return out
 
     def _selfplay_lease(self, body: dict[str, Any], client: str) -> dict[str, Any]:
-        """Fork the SETTLED opponent state (26a-inc11 §Fork lease).
+        """Fork the SETTLED opponent state (the fork lease).
 
         Blue on trial: plant the frozen scripted red on a settle branch,
         wait it settled (miner Running), then fork n from that branch —
@@ -1288,7 +1288,7 @@ class Gym:
         each fork from its granted foothold.
 
         The forks are minted from the settled branch's memory.bin, not an
-        aged live source (26a invariant 7).
+        aged live source (invariant 7).
         """
         for key in ("role", "scenario_id", "n", "group_id", "ttl_s"):
             if key not in body:
@@ -1534,7 +1534,7 @@ class Gym:
     @staticmethod
     def _selfplay_fix_hint(scenario: "red_agent.Scenario") -> dict[str, Any]:
         """Oracle peel for blue-on-trial: the scenario incident's full
-        `remediate_cmd` as an exec act (26a-inc11 blue=oracle checkpoint,
+        `remediate_cmd` as an exec act (the blue=oracle checkpoint,
         same peel the incident scoreboard hands blue)."""
         from incidents_load import incidents_mod
 
@@ -1564,7 +1564,7 @@ class Gym:
             # A fresh reset cluster returns at the api gate before its
             # nodes are Ready; the scheduler cannot place the miner until
             # then. A fork of a settled source is already Ready, so this
-            # returns immediately (26a-inc11 / CHALLENGES #174).
+            # returns immediately (CHALLENGES #174).
             ubuntu_src.wait_nodes_ready_on_bridge(
                 bridge, cert, key, ubuntu_src.CLUSTER_READY_S
             )
@@ -2147,7 +2147,7 @@ class Gym:
                 "selfplay": rec,
             }
         raise ValueError(
-            f"unknown action {action!r} (inc0: exec | kubectl | playbook | incident | selfplay)"
+            f"unknown action {action!r} (supported: exec | kubectl | playbook | incident | selfplay)"
         )
 
     def obs(self, env_id: str) -> dict[str, Any]:
@@ -2218,7 +2218,7 @@ class Gym:
             # The services/links block names the cause (`k3s.service:
             # inactive`, `eth0: down`). A tier >= 1 scenario blinds it,
             # so the model must run an investigate command instead of
-            # reading the answer off the observation (27a-inc1).
+            # reading the answer off the observation.
             if self.cfg.source_mode == "ubuntu" and (
                 scenario is None or scenario.expose_services
             ):

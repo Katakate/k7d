@@ -1,8 +1,8 @@
-//! Parameterised 3-node Ubuntu/k3s cluster fixture .
+//! Parameterised 3-node Ubuntu/k3s cluster fixture.
 //!
 //! Lifted out of `test_ubuntu_k3s.rs` so the Cilium increment can pass
 //! `k7d.cni=none` without copying `bring_up_cluster`. Default
-//! [`UbuntuCni::Flannel`] leaves the cmdline token off, so inc2 stays
+//! [`UbuntuCni::Flannel`] leaves the cmdline token off, so flannel stays
 //! the absent-`k7d.cni=` path.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,8 +23,8 @@ use super::ubuntu::{
 };
 
 /// Pre-shared token on the cmdline. Nothing is read back out of the
-/// server — agents join with this .
-pub const K3S_TOKEN: &str = "K7dUbuntuClusterToken.inc2";
+/// server — agents join with this.
+pub const K3S_TOKEN: &str = "K7dUbuntuClusterToken.v1";
 
 /// Pause image shipped in the airgap tarball — used only for the load
 /// churn so the fork test is not also an image-pull test.
@@ -49,7 +49,7 @@ pub const CLUSTER_DNS: &str = "10.245.0.10";
 /// Which CNI the server writes into `config.yaml` before k3s starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UbuntuCni {
-    /// Absent `k7d.cni=` — today's inc2 flannel + kube-proxy path.
+    /// Absent `k7d.cni=` — the default flannel + kube-proxy path.
     Flannel,
     /// `k7d.cni=none` — `flannel-backend: none` + `disable-kube-proxy`
     /// + `disable-network-policy` (Cilium owns netpol).
@@ -67,11 +67,11 @@ impl UbuntuCni {
     }
 }
 
-/// A named persistent data disk  for every node of a
+/// A named persistent data disk for every node of a
 /// cluster: Longhorn's `/var/lib/longhorn` is the reason this exists.
 ///
 /// One disk *per node*, never one shared between them — two live ext4
-/// mounts of one image corrupt it, which is 24a-inc4a's trap 3.
+/// mounts of one image corrupt it.
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterDataDisk {
     /// Absolute guest path each node mounts its own disk at.
@@ -505,26 +505,26 @@ fn wait_nodes(kubeconfig: &Path, names: &[String], ceiling: Duration, ready: boo
     }
 }
 
-/// inc2's default: flannel, wait for three Ready nodes.
+/// The default: flannel, wait for three Ready nodes.
 pub fn bring_up_cluster() -> UbuntuCluster {
     bring_up_cluster_ex(UbuntuCni::Flannel, "ubk3s")
 }
 
 /// Bring up 1 server + 2 agents on one bridge.
 ///
-/// [`UbuntuCni::Flannel`] waits for three Ready nodes (inc2).
+/// [`UbuntuCni::Flannel`] waits for three Ready nodes.
 /// [`UbuntuCni::None`] waits only until the three nodes are *registered*
-/// — they cannot go Ready until a CNI is installed (the referenced work
-/// trap 1). `tag` names the bridge, kubeconfig and per-VM disks.
+/// — they cannot go Ready until a CNI is installed. `tag` names the
+/// bridge, kubeconfig and per-VM disks.
 pub fn bring_up_cluster_ex(cni: UbuntuCni, tag: &str) -> UbuntuCluster {
     bring_up_cluster_with_data(cni, tag, None)
 }
 
 /// Like [`bring_up_cluster_ex`], giving every node its **own** named
 /// persistent data disk mounted at `data.guest_mount` before k3s starts
-/// .
+/// (consumed by Longhorn).
 ///
-/// `None` is byte-identical to inc2–inc4's path: no extra virtio-blk
+/// `None` is byte-identical to the flannel path: no extra virtio-blk
 /// device, no extra mount.
 pub fn bring_up_cluster_with_data(
     cni: UbuntuCni,

@@ -1,7 +1,6 @@
-//! Auto-warp: delete a cluster's idle wall time without being asked
-//! .
+//! Auto-warp: delete a cluster's idle wall time without being asked.
 //!
-//! Inc2 gave the daemon a warp it can be *told* to do. This is the
+//! `warp_clock` gave the daemon a warp it can be *told* to do. This is the
 //! policy that decides to do it: with every member of a cluster paused,
 //! establish that the whole cluster is idle, work out when the next
 //! thing was going to happen, and jump to just before it — all inside
@@ -11,14 +10,14 @@
 //! Two measured facts shape it, and neither is negotiable:
 //!
 //! 1. **There is no deadline MSR to jump to.** `IA32_TSC_DEADLINE` reads
-//!    zero on every vCPU of every node in every sample ,
+//!    zero on every vCPU of every node in every sample,
 //!    because `KVM_GET_SUPPORTED_CPUID` does not report
-//!    `CPUID.1:ECX[24]` on this host kernel; inc2 confirmed it from
+//!    `CPUID.1:ECX[24]` on this host kernel; we confirmed it from
 //!    inside the guest (`/proc/timer_list` says `lapic`, never
 //!    `lapic-deadline`). The timer the guest actually arms is the LAPIC
 //!    one-shot, read here through `KVM_GET_LAPIC`'s live `TMCCT`.
 //! 2. **A jump wider than a node lease flaps the cluster.** Leases are
-//!    40 s with 10 s kubelet renewal, and inc2 measured a +90 s warp
+//!    40 s with 10 s kubelet renewal, and we measured a +90 s warp
 //!    taking every agent `NotReady` for ~9 s. Correct for a caller who
 //!    asked; not something a policy may inject into every idle window.
 //!    Hence [`MAX_JUMP`].
@@ -60,7 +59,7 @@ use crate::vm::{TimerSurvey, Vm};
 /// Not headroom — "stay under the node lease". A k3s node lease is 40 s
 /// and its kubelet renews every 10 s, so a jump past 40 s lands with
 /// every lease already expired from the control plane's point of view;
-/// inc2 measured the resulting `NotReady` window at ~9 s. 30 s leaves a
+/// We measured the resulting `NotReady` window at ~9 s. 30 s leaves a
 /// full renewal interval of margin.
 pub const MAX_JUMP: Duration = Duration::from_secs(30);
 
@@ -68,20 +67,20 @@ pub const MAX_JUMP: Duration = Duration::from_secs(30);
 /// timer still fires *after* the warp rather than being landed on.
 pub const EPSILON: Duration = Duration::from_micros(100);
 
-/// Shortest jump worth taking. Inc2 measured `warp_clock_lockstep` on
+/// Shortest jump worth taking. We measured `warp_clock_lockstep` on
 /// three VMs at 0.79–0.83 ms, so a jump under a millisecond deletes
 /// less guest time than the warp itself costs in wall time — a loss,
 /// not a gain, and the only reason this floor exists.
 pub const MIN_JUMP: Duration = Duration::from_millis(1);
 
 /// Fixed quantum of `micro` mode, and its period: 20 Hz × 50 ms, both
-/// from inc0. At inc2's measured 0.79–0.83 ms warp that is 1.7% of the
+/// from the survey. At the measured 0.79–0.83 ms warp that is 1.7% of the
 /// quantum in overhead — the busy fraction is the entire constraint,
 /// not the cycle cost, so there is nothing to win by making the pause
 /// cheaper or the quantum longer.
 ///
 /// Also `jump` mode's fallback when the whole cluster is provably idle
-/// and *no* source reports an armed deadline : with
+/// and *no* source reports an armed deadline: with
 /// nothing armed there is no deadline to overshoot, and inventing a
 /// target from the absence of one is the thing that is never allowed.
 pub const MICRO_QUANTUM: Duration = Duration::from_millis(50);
@@ -102,16 +101,16 @@ pub const MICRO_QUANTUM: Duration = Duration::from_millis(50);
 ///
 /// Consecutive declines double the wait up to [`PROBE_INTERVAL_MAX`], so
 /// 25% is what a cluster that merely twitched pays, and a cluster that
-/// is genuinely busy is left alone at inc0's cadence and ~1%.
+/// is genuinely busy is left alone at the survey's cadence and ~1%.
 ///
-/// inc0's flat 20–50 ms is not used as the cadence itself: it was the
+/// The survey's flat 20–50 ms is not used as the cadence itself: it was the
 /// sampling rate of a read-only survey that never paused anything, and
 /// so had no duty cycle to respect.
 pub const PROBE_RUN_PER_PAUSE: u32 = 3;
 
 /// Floor and ceiling on the probe interval. The floor keeps a
 /// suspiciously cheap pause from turning the loop into a spin; the
-/// ceiling is inc0's sampling cadence, past which idle windows on a
+/// ceiling is the survey's sampling cadence, past which idle windows on a
 /// 3-node cluster are being missed wholesale.
 pub const PROBE_INTERVAL_MIN: Duration = Duration::from_millis(2);
 /// See [`PROBE_INTERVAL_MIN`].
@@ -125,12 +124,12 @@ pub const PROBE_INTERVAL_MAX: Duration = Duration::from_millis(50);
 /// waits exactly until the timer fires and then samples, which is the
 /// one instant a vCPU is guaranteed to be awake. The first run of this
 /// policy reported half its cycles declining for `vcpu_awake` on a
-/// cluster inc0 had measured 73.4% all-idle, and that gap was the
+/// cluster the survey had measured 73.4% all-idle, and that gap was the
 /// sampling bias, not the cluster (`CHALLENGES.md` #183).
 pub const WAKEUP_GRACE: Duration = Duration::from_micros(500);
 
-/// Pause cost the loop assumes before it has measured its own — inc0's
-/// 0.65 ms and inc2's 0.79–0.83 ms, rounded up. Wrong in either
+/// Pause cost the loop assumes before it has measured its own — the
+/// survey's 0.65 ms and the primitive's 0.79–0.83 ms, rounded up. Wrong in either
 /// direction costs a handful of cycles: the estimate is an EWMA over
 /// every cycle, warps and declines alike.
 const ASSUMED_PAUSE_COST: Duration = Duration::from_millis(1);
@@ -174,7 +173,7 @@ impl AutoWarpMode {
 /// Why a cycle did not warp. Every one of these is a *correct* outcome —
 /// declining costs a sample, guessing a target costs correctness — so
 /// they are counted rather than logged, and the counts are the honest
-/// column of the inc5 benchmark.
+/// column of the dilation benchmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
     /// The cluster has no live member VM.
@@ -855,7 +854,7 @@ impl Driver {
     /// The safety predicate and the jump target, over a paused cluster.
     ///
     /// Checks are ordered by cost: `KVM_GET_MP_STATE` is one ioctl per
-    /// vCPU and rejects most samples on a busy cluster (inc0 measured
+    /// vCPU and rejects most samples on a busy cluster (the survey measured
     /// 62.3% of vCPUs awake in the busy phase), so it runs before
     /// anything that reads guest memory or the APIC page.
     fn decide_jump(&mut self, vms: &mut [&mut Vm]) -> Result<Duration, Decline> {
@@ -1090,7 +1089,7 @@ mod tests {
             );
         }
 
-        // Six of them: settle at inc0's cadence, which is ~1% duty.
+        // Six of them: settle at the survey's cadence, which is ~1% duty.
         // pause_cost has to be large enough that even 75% jitter still
         // clamps to the max — 0.5 ms × 3 × 2^5 = 48 ms, which the
         // jitter can leave under 50 ms.

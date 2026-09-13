@@ -1,5 +1,5 @@
 //! Integration tests: a stock Ubuntu 24.04 userspace on a stock Ubuntu
-//! kernel, booted as a bare k7d `create_vm` VM .
+//! kernel, booted as a bare k7d `create_vm` VM.
 //!
 //! The bet this file exists to check is that the VMM is
 //! workload-agnostic — that only the guest *contents* change between the
@@ -33,7 +33,7 @@ use k7d::vm::Vm;
 
 /// The Cilium/Longhorn set from `test_kernel_features.rs::REQUIRED_CONFIGS`
 /// plus the Tetragon set, checked against the *distro* kernel's config so
-/// inc3/inc4 do not discover a flavour gap late.
+/// the CNI and Tetragon suites do not discover a flavour gap late.
 ///
 /// The minimal guest's copy of this list demands `=y` because it has no
 /// modules at all. A distro kernel ships most of it as modules, so `=m`
@@ -71,7 +71,7 @@ const REQUIRED_CONFIGS: &[&str] = &[
     "CONFIG_NFS_V4",
     "CONFIG_NFS_V4_1",
     "CONFIG_NFS_V4_2",
-    // Tetragon (inc4): kprobes, syscall tracepoints, BPF LSM
+    // Tetragon: kprobes, syscall tracepoints, BPF LSM
     "CONFIG_KPROBES",
     "CONFIG_KPROBES_ON_FTRACE",
     "CONFIG_FTRACE_SYSCALLS",
@@ -81,7 +81,7 @@ const REQUIRED_CONFIGS: &[&str] = &[
 
 /// One booted Ubuntu node: bzImage boot, systemd, the static IP the
 /// daemon assigned, NAT egress through the bridge, the flavour's config
-/// as it will matter to inc3/inc4, and the clock/idle probes.
+/// as it will matter to the CNI and Tetragon suites, and the clock/idle probes.
 #[test]
 fn test_ubuntu_guest_boots_to_agent_with_systemd_network_and_clock() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -153,7 +153,7 @@ fn test_ubuntu_guest_boots_to_agent_with_systemd_network_and_clock() {
     // ── NAT egress through the bridge ──
     // One HTTPS fetch, name resolution included: this is the capability
     // the sidecar substrate never had (no pull path, airgap tars) and the
-    // reason `apt`/`ctr pull` will just work in inc2.
+    // reason `apt`/`ctr pull` will just work on a cluster node.
     let (code, status, stderr) = sh(
         &mut agent,
         "curl -4 -sS --max-time 45 -o /dev/null -w '%{http_code}' \
@@ -169,7 +169,7 @@ fn test_ubuntu_guest_boots_to_agent_with_systemd_network_and_clock() {
     // ── flavour config check ──
     assert_kernel_flavour_covers_cilium_and_tetragon(&mut agent);
 
-    // ── clock + idle (19f / 19g) ──
+    // ── clock + idle ──
     assert_clock_and_idle(&mut agent, "boot");
 
     vm.shutdown();
@@ -203,7 +203,7 @@ fn assert_kernel_flavour_covers_cilium_and_tetragon(agent: &mut AgentClient) {
         assert!(
             y || m,
             "{want} is neither =y nor =m in {kver} — linux-image-virtual cannot carry \
-             the 25a ladder; the remedy is a different flavour, not a workaround"
+             the Ubuntu ladder; the remedy is a different flavour, not a workaround"
         );
         if m {
             findings.push(format!("{want}=m"));
@@ -239,7 +239,7 @@ fn assert_kernel_flavour_covers_cilium_and_tetragon(agent: &mut AgentClient) {
         assert!(
             module_names.contains(module),
             "module {module} is missing from the image's module set in {kver} — \
-             inc3/inc4/inc5 would fail to load it; the remedy is the \
+             the CNI, Tetragon and CSI suites would fail to load it; the remedy is the \
              linux-image-extra-virtual package in build-node-image.sh"
         );
     }
@@ -274,7 +274,7 @@ fn assert_kernel_flavour_covers_cilium_and_tetragon(agent: &mut AgentClient) {
     );
     eprintln!("FINDING flavour {kver}: active LSMs {}", active.trim());
 
-    // Cgroup v2 unified, which k3s (inc2) and Tetragon both assume.
+    // Cgroup v2 unified, which k3s and Tetragon both assume.
     let cgroup = sh_ok(agent, "stat -fc %T /sys/fs/cgroup");
     assert_eq!(
         cgroup.trim(),
@@ -435,7 +435,7 @@ fn test_ubuntu_guest_warm_fork() {
     assert!(
         newly_failed.is_empty(),
         "units failed on the child that were fine on the source: {newly_failed:?} — \
-         something time-triggered fired on resume "
+         something time-triggered fired on resume"
     );
     let (state, _) = systemd_state(&mut child_agent, "fork");
     assert!(
@@ -464,7 +464,7 @@ fn test_ubuntu_guest_warm_fork() {
 /// `Vm`. Preparing that child as a fork source used to drop the husk
 /// that owned the disk, deleting it under the live guest — the
 /// grandchild's FICLONE then failed with `IO error: No such file or
-/// directory`, capping every Ubuntu tree at depth 1 (the 27a-inc1 agent
+/// directory`, capping every Ubuntu tree at depth 1 (the MCP agent
 /// runs hit exactly this). Asserts the grandchild boots, answers on
 /// vsock, inherits child-only disk state, and that the child's image
 /// still exists on the host.
@@ -565,7 +565,7 @@ fn test_ubuntu_guest_fork_of_fork() {
 /// ~11 MiB public object; no registry auth.
 const EGRESS_GITHUB: &str =
     "https://github.com/opencontainers/runc/releases/download/v1.2.5/runc.amd64";
-/// Cilium operator layer (~26 MiB) — the same registry the 25a-inc3 pull starves on.
+/// Cilium operator layer (~26 MiB) — the same registry the Cilium pull starves on.
 const EGRESS_QUAY_BLOB: &str = "https://quay.io/v2/cilium/operator-generic/blobs/sha256:1eb39da6a769c638269f4448e1fe6bad052bf21386de43288c42f0cbc950d7f0";
 const EGRESS_QUAY_AUTH: &str =
     "https://quay.io/v2/auth?service=quay.io&scope=repository:cilium/operator-generic:pull";
@@ -714,8 +714,8 @@ fn test_ubuntu_guest_bridge_tcp() {
     drop(net);
 }
 
-/// the referenced work: a non-agent uid cannot create `AF_VSOCK`, while the
-/// agent still serves a round trip.
+/// A non-agent uid cannot create `AF_VSOCK`, while the agent still
+/// serves a round trip.
 ///
 /// Enforcement is AppArmor: `k7-deny-vsock` on `/usr/bin/python3*`
 /// (`allow all` + `deny network vsock`); `k7-agent` on the agent
@@ -724,7 +724,6 @@ fn test_ubuntu_guest_bridge_tcp() {
 /// Boundary is a non-agent uid running a profiled workload
 /// interpreter. `SystemCallFilter` cannot match `socket()` by family;
 /// `RestrictAddressFamilies` returns EAFNOSUPPORT.
-/// See `internal notes`.
 #[test]
 fn test_ubuntu_vsock_denied_to_non_agent() {
     let _ = env_logger::builder().is_test(true).try_init();

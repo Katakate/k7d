@@ -114,8 +114,7 @@ pub struct TreeBudget {
     /// `has_base_snapshot` ancestor) before consolidation. Recommended: 1.
     /// Not tree-graph / search depth — a graph of root→child→grandchild
     /// is legal while this stays 1. The quantity capped is
-    /// [`restore_chain_depth`]; the orchestrators enforce it on `resume`
-    /// .
+    /// [`restore_chain_depth`]; the orchestrators enforce it on `resume`.
     pub max_chain_depth: usize,
 }
 
@@ -459,7 +458,7 @@ pub fn over_disk(t: &TreeModel) -> bool {
 }
 
 /// Whether the on-disk footprint plus `incoming` bytes about to be
-/// written (a projected new base snapshot — the referenced work) exceeds
+/// written (a projected new base snapshot) exceeds
 /// `max_disk_bytes`. `over_disk_incoming(t, 0)` coincides with
 /// [`over_disk`].
 ///
@@ -503,7 +502,7 @@ pub fn ancestor_ids(t: &TreeModel, id: u64) -> Vec<u64> {
     out
 }
 
-/// Restore-chain depth of `id` : the number of
+/// Restore-chain depth of `id`: the number of
 /// non-checkpoint nodes from `id` (inclusive) up to — but not counting —
 /// its nearest `has_base_snapshot` ancestor, i.e. how many `delta.pack`s
 /// a resume would have to apply on top of that ancestor's `memory.bin`.
@@ -771,12 +770,12 @@ pub const K7DL_MAGIC: &[u8; 4] = b"K7DL";
 
 /// On-disk format version of a K7DL delta.
 ///
-/// the referenced work spends the header's trailing `reserved` u64 on the **base
+/// The header's trailing `reserved` u64 is spent on the **base
 /// identity** of the `memory.bin` the pack is a diff against
 /// (CHALLENGES #144) and does *not* bump this. That field was always
-/// written as zero and never read, so a pre-30b pack decodes as
+/// written as zero and never read, so a legacy pack decodes as
 /// identity 0 -- which [`k7dl_base_identity_ok`] reads as "unknown",
-/// exactly right -- and a 30b pack still parses on an older binary.
+/// exactly right -- and a new pack still parses on an older binary.
 /// Bumping the version would have bought nothing and cost the Group E
 /// round-trip proof.
 pub const K7DL_VERSION: u32 = 1;
@@ -865,8 +864,8 @@ pub fn k7dl_header_bytes(page_count: u32, mem_size: u64) -> [u8; K7DL_HEADER_SIZ
 }
 
 /// Stamp `base_identity` into a header's trailing u64 — the generation
-/// of the `memory.bin` this pack is a diff against (the referenced work /
-/// CHALLENGES #144). 0 means "unknown".
+/// of the `memory.bin` this pack is a diff against
+/// (CHALLENGES #144). 0 means "unknown".
 ///
 /// Verified: `k7dl_base_identity_roundtrip_rust` in
 /// `verif/Verif/Equiv/Transfer.lean` (Group E) — stamping then reading
@@ -881,7 +880,7 @@ pub fn k7dl_set_base_identity(
     header
 }
 
-/// Read the base identity out of a K7DL header. A pre-30b pack wrote
+/// Read the base identity out of a K7DL header. A legacy pack wrote
 /// zeros there, so it reads back as "unknown".
 ///
 /// Verified: `k7dl_base_identity_roundtrip_rust` in
@@ -898,7 +897,7 @@ pub fn k7dl_base_identity(header: &[u8; K7DL_HEADER_SIZE]) -> u64 {
 /// whose identity is `base_identity`?
 ///
 /// A zero on either side is "unknown, not mismatched": packs and
-/// `tree.json` files written before the referenced work carry no identity, and
+/// `tree.json` files written before that change carry no identity, and
 /// refusing them would turn a format bump into data loss. Two *known*
 /// identities that differ are the #144 skew — the caller must fail
 /// loud rather than apply a pack onto a base generation it never saw.
@@ -919,7 +918,7 @@ pub fn k7dl_base_identity_ok(pack_identity: u64, base_identity: u64) -> bool {
 /// Decode a 28-byte K7DL header into `(page_count, mem_size)`. The
 /// base identity is a separate read ([`k7dl_base_identity`]) so this
 /// function -- and its Group E round-trip proof -- stayed put across
-/// the referenced work.
+/// that change.
 ///
 /// Verified: `k7dl_parse_header_equiv` in `verif/Verif/Equiv/K7dl.lean`
 /// (Group E) — the Aeneas translation of this function computes
@@ -995,7 +994,7 @@ mod tests {
     fn k7dl_base_identity_rides_the_reserved_field() {
         // Stamping the identity must not disturb what parse_header reads,
         // and a header that was never stamped reads back as "unknown" --
-        // which is what every pre-30b pack on disk is.
+        // which is what every legacy pack on disk is.
         let plain = k7dl_header_bytes(3, 4096);
         assert_eq!(k7dl_base_identity(&plain), 0);
         assert!(k7dl_base_identity_ok(k7dl_base_identity(&plain), 42));
@@ -1137,7 +1136,7 @@ mod tests {
     fn restore_chain_depth_is_not_graph_depth() {
         // Root is a checkpoint; node 1 is a prepared fork source. Graph
         // depth of node 2 is 2, but its restore chain is 1 hop to its
-        // prepared parent — the the referenced work distinction.
+        // prepared parent — that is the distinction.
         let mut t = test_tree(); // chain 0 → 1 → 2, sibling 3
         t.nodes[0].has_base_snapshot = true;
         t.nodes[1].has_base_snapshot = true;

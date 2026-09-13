@@ -506,7 +506,7 @@ theorem k7dl_parse_header_equiv (b : Array Std.U8 28#usize) :
     absBytes_getElem! b 18 (by scalar_tac), absBytes_getElem! b 19 (by scalar_tac),
     ← hpc, ← hms]
 
--- ## k7dl_set_base_identity / k7dl_base_identity 
+-- ## k7dl_set_base_identity / k7dl_base_identity
 
 /-- Equivalence: `tree_model::k7dl_set_base_identity` computes the
 mirror `K7dlCodec.setBaseIdentity` (and never panics). -/

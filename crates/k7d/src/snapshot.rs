@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use vm_memory::{GuestAddress, GuestMemory};
 
-use crate::virtio_mmio::MmioDeviceState;
+use crate::virtio_mmio::{MmioDeviceState, ValidatedQueue};
 use crate::vm::Vm;
 
 /// Errors from snapshot operations.
@@ -26,7 +26,7 @@ pub enum SnapshotError {
     NotPaused,
     /// An incremental keyframe could not `FICLONE` its ancestor: the two
     /// paths are not on one reflink-capable filesystem. The caller falls
-    /// back to a full dump — loudly .
+    /// back to a full dump — loudly.
     #[error(
         "FICLONE {ancestor} -> {dest}: {detail} — an incremental keyframe needs \
          ancestor and child on one reflink-capable filesystem (the tree root \
@@ -240,7 +240,7 @@ fn capture_kvmclock(vm: &Vm) -> Result<KvmClockState, SnapshotError> {
 
 /// Compat wrapper for CPU state on disk: accepts either a bare
 /// `CpuState` object (legacy single-vCPU `cpu.json` / `VmState.cpu`)
-/// or an array of them (17b+ `cpus`). New writes are always the
+/// or an array of them (the newer `cpus`). New writes are always the
 /// plural array form.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -289,7 +289,7 @@ pub struct SnapshotMetadata {
     /// leaves the clock alone rather than guessing an origin.
     #[serde(default)]
     pub kvmclock: Option<KvmClockState>,
-    /// Time dilation factor the source ran at . Restore
+    /// Time dilation factor the source ran at. Restore
     /// applies it to the new VM before its first vCPU exists and fails
     /// loudly on a host without the patch. Snapshots from before the
     /// field existed were all taken at 1 (the capture refused anything
@@ -381,7 +381,7 @@ pub struct VmState {
     /// off this state re-bases its own clock from it.
     #[serde(default)]
     pub kvmclock: Option<KvmClockState>,
-    /// Time dilation factor of the source ; every fork
+    /// Time dilation factor of the source; every fork
     /// off this state runs at the same one. See
     /// [`SnapshotMetadata::dilation`].
     #[serde(default = "one")]
@@ -415,7 +415,7 @@ pub fn capture_vm_state(vm: &Vm) -> Result<VmState, SnapshotError> {
 
 /// Load resume state from a member snapshot directory.
 ///
-/// Prefers `vm_state.json` (suspend + prepare after the referenced work).
+/// Prefers `vm_state.json` (written by suspend + prepare).
 /// Older checkpoints only have the split files `cpu.json` /
 /// `devices.json` / `irqchip.json` / `metadata.json` — reconstruct
 /// rather than fail resume after a crash of a never-suspended tree.
@@ -877,16 +877,37 @@ pub(crate) fn inject_vsock_transport_reset_into(
             continue;
         }
         if let Some(evq) = state.queues.get(EVQ_INDEX) {
-            if !evq.ready || evq.size == 0 {
+            if !evq.ready {
                 continue;
             }
+            // Every address below is `mem_base + <a u64 the guest wrote>`.
+            // Validate the geometry once, against the device's own
+            // advertised maximum rather than the snapshot's `size`
+            // (`docs/bug-candidates.md` #1, #8, #45).
+            let vq = match ValidatedQueue::from_snapshot(
+                evq,
+                crate::vsock::VSOCK_QUEUE_SIZE,
+                mem_base,
+                mem_span,
+            ) {
+                Ok(vq) => vq,
+                Err(e) => {
+                    log::error!(
+                        "snapshot: refusing to inject TRANSPORT_RESET into an unwalkable \
+                         vsock event queue: {e}"
+                    );
+                    continue;
+                }
+            };
             // Pop a descriptor from the available ring.
-            let avail_base = mem_base + evq.avail_addr;
-            // SAFETY: avail_base points into valid guest memory (VM is paused).
-            let avail_idx = unsafe { std::ptr::read_volatile((avail_base + 2) as *const u16) };
-            let used_base = mem_base + evq.used_addr;
-            // SAFETY: used_base + 2 points to the used ring idx in valid guest memory.
-            let used_idx = unsafe { std::ptr::read_volatile((used_base + 2) as *const u16) };
+            // SAFETY: both pointers are the idx fields of rings this
+            // geometry placed inside the target mapping (VM is paused).
+            let (avail_idx, used_idx) = unsafe {
+                (
+                    std::ptr::read_volatile(vq.avail_idx()),
+                    std::ptr::read_volatile(vq.used_idx().cast_const()),
+                )
+            };
 
             if avail_idx == used_idx {
                 log::warn!("snapshot: vsock event queue empty, cannot inject TRANSPORT_RESET");
@@ -894,48 +915,55 @@ pub(crate) fn inject_vsock_transport_reset_into(
             }
 
             // Read the next available descriptor index.
-            let ring_offset = 4 + (used_idx % evq.size) as u64 * 2;
-            // SAFETY: avail ring entry is within guest memory bounds.
-            let desc_idx: u16 =
-                unsafe { std::ptr::read_volatile((avail_base + ring_offset) as *const u16) };
+            // SAFETY: `avail_ring` wraps into the same validated ring.
+            let desc_idx: u16 = unsafe { std::ptr::read_volatile(vq.avail_ring(used_idx)) };
 
             // Read the descriptor to get the buffer address.
-            let desc_base = mem_base + evq.desc_addr;
-            let desc_addr_ptr = (desc_base + u64::from(desc_idx) * 16) as *const u64;
-            // SAFETY: descriptor table is in valid guest memory.
-            let buf_gpa = unsafe { std::ptr::read_volatile(desc_addr_ptr) };
+            let Some(desc_ptr) = vq.desc(desc_idx) else {
+                log::error!(
+                    "snapshot: vsock evq published descriptor {desc_idx} outside its \
+                     {}-descriptor table",
+                    vq.size()
+                );
+                continue;
+            };
+            // SAFETY: `desc` only yields pointers inside the validated
+            // descriptor table.
+            let buf_gpa = unsafe { std::ptr::read_volatile(desc_ptr) }.addr;
 
             // Write VIRTIO_VSOCK_EVENT_TRANSPORT_RESET (u32) to the buffer.
-            if buf_gpa == 0 || buf_gpa >= mem_span {
+            // `buffer` is what makes the `+ 4` fit: the old guard was
+            // `buf_gpa >= mem_span`, which let the last three bytes of the
+            // event write past the mapping (#1).
+            let Some(buf_hva) = vq.buffer(buf_gpa, 4).filter(|_| buf_gpa != 0) else {
                 log::warn!(
                     "snapshot: vsock evq descriptor {desc_idx} has invalid buf_gpa={buf_gpa:#x}"
                 );
                 continue;
-            }
-            let buf_hva = (mem_base + buf_gpa) as *mut u8;
-            // SAFETY: buf_gpa is verified within guest RAM bounds.
-            // Write as bytes to avoid alignment requirements.
+            };
+            // SAFETY: `buffer` checked `buf_gpa + 4` against the guest RAM
+            // span. Written as bytes to avoid alignment requirements.
             unsafe {
                 let val = VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le_bytes();
-                std::ptr::copy_nonoverlapping(val.as_ptr(), buf_hva, 4);
+                std::ptr::copy_nonoverlapping(val.as_ptr(), buf_hva as *mut u8, 4);
             }
             mark(buf_gpa, 4);
 
             // Add the descriptor to the used ring.
-            let used_ring_offset = 4 + (used_idx % evq.size) as u64 * 8;
-            // SAFETY: used ring entry is within guest memory.
+            // SAFETY: `used_ring` wraps into the validated used ring; the
+            // element is `{id:u32, len:u32}` and both words are inside it.
             unsafe {
-                let entry_ptr = (used_base + used_ring_offset) as *mut u32;
+                let entry_ptr = vq.used_ring(used_idx);
                 std::ptr::write_volatile(entry_ptr, u32::from(desc_idx));
                 std::ptr::write_volatile(entry_ptr.add(1), 4); // len = sizeof(u32)
             }
-            mark(evq.used_addr + used_ring_offset, 8);
+            mark(vq.used_ring_gpa(used_idx), 8);
             // Advance used idx.
-            // SAFETY: used_base + 2 points to the used ring idx field.
+            // SAFETY: `used_idx` is the idx field of the validated ring.
             unsafe {
-                std::ptr::write_volatile((used_base + 2) as *mut u16, used_idx.wrapping_add(1));
+                std::ptr::write_volatile(vq.used_idx(), used_idx.wrapping_add(1));
             }
-            mark(evq.used_addr + 2, 2);
+            mark(vq.used_idx_gpa(), 2);
 
             log::info!(
                 "snapshot: injected TRANSPORT_RESET into vsock event queue \
@@ -1079,7 +1107,7 @@ impl ClonedKeyframe {
     /// cost, which is what the tree's disk budget must count: the cloned
     /// file reports its full logical length, and `st_blocks` is no help
     /// because XFS counts a shared extent in every file that references
-    /// it . A dirty page outside the span is an error,
+    /// it. A dirty page outside the span is an error,
     /// never a silent skip.
     fn patch_and_publish(
         mut self,
@@ -1095,8 +1123,8 @@ impl ClonedKeyframe {
         // keyframe is host-lifetime state, not a durable artifact. An
         // fsync here costs 2-5 s per member against ~100 ms of writes,
         // because every patched page has to break a shared extent and
-        // that lands in the refcount btree (the referenced work §5,
-        // CHALLENGES #154). Readers and `MAP_PRIVATE` see the page
+        // that lands in the refcount btree (CHALLENGES #154).
+        // Readers and `MAP_PRIVATE` see the page
         // cache regardless.
         fs::rename(&self.tmp_path, &self.dest_path)?;
         self.published = true;
@@ -1112,7 +1140,7 @@ impl ClonedKeyframe {
     /// Guest dirt is clustered, and one `pwrite` per 4 KiB page is what
     /// made the first measured incremental keyframe slower than the full
     /// dump it was meant to replace: ~400 000 syscalls for a 30 s-idle
-    /// k3s node . Coalescing adjacent
+    /// k3s node (CHALLENGES #154). Coalescing adjacent
     /// pages into a single write turns that into a few thousand.
     fn patch(
         &self,
@@ -1252,7 +1280,7 @@ fn write_state_files(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> 
     // `ClusterSnapshotTree::resume` reads `vm_state.json`. Suspend
     // writes it; a live prepare/snapshot did not, so a kill -9 of a
     // never-suspended tree could open the on-disk DAG and still fail
-    // resume . The VM is paused here — same contract
+    // resume. The VM is paused here — same contract
     // as `capture_vm_state`.
     let vm_state = capture_vm_state(vm)?;
     let vm_state_json = serde_json::to_string(&vm_state)?;
@@ -1261,7 +1289,7 @@ fn write_state_files(vm: &Vm, snapshot_dir: &Path) -> Result<(), SnapshotError> 
 }
 
 /// Snapshot a paused VM as an **incremental keyframe** against
-/// `ancestor_mem` : clone the ancestor's `memory.bin` and
+/// `ancestor_mem`: clone the ancestor's `memory.bin` and
 /// overwrite only `dirty_bitmap`, then write the same state files a
 /// full snapshot writes.
 ///

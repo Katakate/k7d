@@ -1,4 +1,4 @@
-"""plots.py renders the five inc1 figures from synthetic JSONL. No KVM."""
+"""plots.py renders the five figures from synthetic JSONL. No KVM."""
 
 from __future__ import annotations
 

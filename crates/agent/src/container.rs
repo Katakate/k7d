@@ -118,9 +118,26 @@ struct OverlayMounts {
     /// Directory holding `upper` and `work`, removed after the
     /// unmounts.
     upper_root: PathBuf,
+    /// Guest-root bind mounts of container paths exported to dockerd.
+    /// Unmounted *before* the overlay in [`cleanup_overlay`].
+    exports: Vec<PathBuf>,
 }
 
 fn cleanup_overlay(overlay: &OverlayMounts) {
+    // Path-export binds must come off before the overlay: they hold
+    // the merged dir busy. Reverse order of mount.
+    for mnt in overlay.exports.iter().rev() {
+        let out = Command::new("umount").arg(mnt).output();
+        if let Ok(out) = out {
+            if !out.status.success() {
+                eprintln!(
+                    "k7-agent: umount export {} failed: {}",
+                    mnt.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+    }
     let mut mounts = vec![&overlay.merged];
     mounts.extend(overlay.tmpfs.as_ref());
     for mnt in mounts {
@@ -442,6 +459,7 @@ fn prepare_writable_layer(
 /// The writable layer is the sandbox's host-backed scratch
 /// disk ([`prepare_writable_layer`]), so a container's writes no longer
 /// come out of the pod's memory budget.
+#[allow(clippy::too_many_lines)]
 fn prepare_rootfs_overlay(
     bundle: &Path,
     run_dir: &Path,
@@ -467,7 +485,7 @@ fn prepare_rootfs_overlay(
 
     // upper + work must live on the same writable filesystem: the
     // host-backed scratch disk, or the bounded tmpfs fallback.
-    let overlay = match prepare_writable_layer(run_dir, name, &config)? {
+    let mut overlay = match prepare_writable_layer(run_dir, name, &config)? {
         WritableLayer::Scratch(root) => OverlayMounts {
             // `merged` is only a mount point, so it stays on the guest
             // tmpfs run dir — the bytes behind it are the lower erofs
@@ -476,18 +494,21 @@ fn prepare_rootfs_overlay(
             dedicated: false,
             tmpfs: None,
             upper_root: root,
+            exports: Vec::new(),
         },
         WritableLayer::ContainerScratch(root) => OverlayMounts {
             merged: run_dir.join("merged"),
             dedicated: true,
             tmpfs: None,
             upper_root: root,
+            exports: Vec::new(),
         },
         WritableLayer::Tmpfs(tmpfs) => OverlayMounts {
             merged: tmpfs.join("merged"),
             dedicated: false,
             tmpfs: Some(tmpfs.clone()),
             upper_root: tmpfs,
+            exports: Vec::new(),
         },
     };
     let result = (|| {
@@ -531,10 +552,24 @@ fn prepare_rootfs_overlay(
             overlay.merged.display(),
             overlay.upper_root.display()
         );
+        if crate::service::docker_cmdline() {
+            overlay.exports = export_container_paths(&overlay.merged)?;
+        }
         Ok(patched_bundle)
     })();
     match result {
-        Ok(patched_bundle) => Ok((patched_bundle, Some(overlay))),
+        Ok(patched_bundle) => {
+            if crate::service::docker_cmdline() {
+                match export_container_paths(&overlay.merged) {
+                    Ok(exports) => overlay.exports = exports,
+                    Err(e) => {
+                        cleanup_overlay(&overlay);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok((patched_bundle, Some(overlay)))
+        }
         Err(e) => {
             cleanup_overlay(&overlay);
             Err(e)
@@ -564,6 +599,61 @@ fn container_dir(name: &str) -> PathBuf {
     PathBuf::from(CONTAINER_RUN_DIR).join(name)
 }
 
+/// Paths of the container merged rootfs bind-mounted onto the same
+/// path in the guest root mount namespace so dockerd's `-v /tmp/x:/x`
+/// sees the sandbox's files. Never `/mnt/state`, never
+/// the container `/`.
+const PATH_EXPORTS: &[&str] = &["/home", "/root", "/tmp", "/opt", "/workspace"];
+
+fn export_container_paths(merged: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut exported = Vec::new();
+    for p in PATH_EXPORTS {
+        let src = merged.join(p.trim_start_matches('/'));
+        if !src.is_dir() {
+            continue;
+        }
+        fs::create_dir_all(p).map_err(|e| format!("mkdir {p} for docker path export: {e}"))?;
+        let out = Command::new("mount")
+            .args(["--bind", &src.to_string_lossy(), p])
+            .output()
+            .map_err(|e| format!("bind {p} for docker path export: {e}"))?;
+        if !out.status.success() {
+            for mnt in exported.iter().rev() {
+                let _ = Command::new("umount").arg(mnt).output();
+            }
+            return Err(format!(
+                "mount --bind {} {p}: {}",
+                src.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        eprintln!("k7-agent: docker path export {} -> {p}", src.display());
+        exported.push(PathBuf::from(p));
+    }
+    Ok(exported)
+}
+
+/// After `runc run`, the container's `/run` is a fresh tmpfs, so the
+/// docker socket/CLI have to be planted via `runc exec`.
+fn install_docker_symlinks(name: &str) -> Result<(), String> {
+    let script = "mkdir -p /usr/local/bin /usr/local/lib/docker \
+&& ln -sfn /run/k7d/docker/docker.sock /run/docker.sock \
+&& ln -sfn /run/k7d/docker-tools/bin/docker /usr/local/bin/docker \
+&& ln -sfn /run/k7d/docker-tools/cli-plugins /usr/local/lib/docker/cli-plugins";
+    let output = Command::new(runc_path())
+        .args(["exec", name, "sh", "-c", script])
+        .output()
+        .map_err(|e| format!("runc exec docker symlinks: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "runc exec {name} sh -c docker-symlinks failed (image has no sh?): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    eprintln!("k7-agent: docker socket/CLI symlinks installed in {name}");
+    Ok(())
+}
+
 fn read_from_offset(path: &Path, offset: u64, limit: usize) -> String {
     let Ok(mut f) = fs::File::open(path) else {
         return String::new();
@@ -591,6 +681,7 @@ impl ContainerManager {
     /// Uses `runc run --detach` so this returns as soon as runc forks the
     /// container init process. Stdout/stderr are captured to files under
     /// `/run/k7/containers/{name}/`.
+    #[allow(clippy::too_many_lines)]
     pub fn start(&self, name: &str, bundle_path: &str) -> Result<(), String> {
         {
             let containers = self.containers.lock().unwrap();
@@ -684,6 +775,19 @@ impl ContainerManager {
                 return Err(e);
             }
         };
+
+        if crate::service::docker_cmdline() {
+            if let Err(e) = install_docker_symlinks(name) {
+                if let Some(ref ov) = overlay {
+                    cleanup_overlay(ov);
+                }
+                let _ = Command::new(runc_path())
+                    .args(["delete", "--force", name])
+                    .output();
+                let _ = fs::remove_dir_all(&run_dir);
+                return Err(e);
+            }
+        }
 
         let mut containers = self.containers.lock().unwrap();
         containers.insert(

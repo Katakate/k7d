@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use k7d::api::AgentClient;
+use k7d::guest::AgentEndpoint;
 use k7d::volumes::{MountRewriteMap, PodVolumes};
 
 /// One erofs container-rootfs image attached to the VM as a
@@ -216,27 +217,29 @@ pub struct SandboxState {
     /// the pod (a typo) otherwise leaves that container silently
     /// sharing the pod scratch.
     pub container_scratch: BTreeMap<String, u64>,
-    /// Vsock CID this sandbox's VM was created with.
+    /// Pod asked for dockerd as an agent service.
+    pub docker: bool,
+    /// VMM engine this pod's VM runs on, from
+    /// `k7d.katakate.org/backend`. Kept next to
+    /// `pending_vm` because it outlives it: the workload path checks it
+    /// long after the config has been submitted, and a Firecracker pod
+    /// has no virtiofs to fall back to.
+    pub backend: k7d::guest::Backend,
+    /// How this sandbox's guest agent is reached.
     ///
-    /// Captured from `vm.guest_cid()` in Create and read by the Start
-    /// stdout-bridge and the Exec ttrpc handler so they connect to the
-    /// right VM via `AgentClient::connect_vsock(cid, ...)`.
+    /// Returned by the daemon's `create_vm` / `lookup_sandbox` and read
+    /// by the Start stdout-bridge, the exit watcher and the Exec ttrpc
+    /// handler. `Vsock { cid }` for native VMs — one CID per VM
+    /// (`vsock::allocate_cid`), because a hardcoded 3 limited the node
+    /// to a single `runtimeClassName: k7` pod and collided with the
+    /// production `k7-api` pod. `FcUds { path }` for a
+    /// `backend: firecracker` pod, whose guest is not on the host's
+    /// vsock namespace at all.
     ///
-    /// Historically the shim hardcoded `3` for these bridges, which
-    /// (a) limited the node to one `runtimeClassName: k7` pod at a
-    /// time (the second pod hit `vhost SET_GUEST_CID: Address already
-    /// in use` and never started) and (b) prevented the production
-    /// `k7-api` pod (which uses CID 3) from coexisting with any
-    /// other k7 pod or running test on the same node.
-    /// `Vm::builder()` now defaults to a unique CID per VM via
-    /// `crate::vsock::allocate_cid`; this field carries that value
-    /// to the bridges.
-    ///
-    /// `None` until `Create` runs; defensive consumers
-    /// `.unwrap_or(crate::vsock::DEFAULT_GUEST_CID)` to keep behaving
-    /// like the legacy code in the unlikely case the field is
-    /// missing.
-    pub guest_cid: Option<u64>,
+    /// `None` until `Create` runs. Consumers fail loudly rather than
+    /// guessing: a bridge dialled at the wrong endpoint would silently
+    /// stream another pod's logs.
+    pub agent_endpoint: Option<AgentEndpoint>,
     /// Source CRI sandbox id when this pod's VM was
     /// warm-forked from a live sandbox VM (`k7d.katakate.org/
     /// fork-source-{cluster,vm}` annotations) instead of cold-booted.
@@ -277,7 +280,9 @@ impl SandboxState {
             container_rootfs_keys: BTreeMap::new(),
             etc_pushed: BTreeMap::new(),
             container_scratch: BTreeMap::new(),
-            guest_cid: None,
+            docker: false,
+            backend: k7d::guest::Backend::Native,
+            agent_endpoint: None,
             fork_of: None,
             guest_names: HashMap::new(),
             next_pid: 100,
@@ -370,19 +375,26 @@ impl SandboxState {
         pid
     }
 
-    /// Connect to the guest agent over vsock (retries until timeout).
+    /// Connect to the guest agent (retries until timeout).
     ///
-    /// The VM was booted by the k7d daemon during `Create`; vsock CIDs
-    /// are kernel-global so this process can dial the guest directly
-    /// with the CID the daemon returned. `connect_vsock` retries until
-    /// the guest agent starts listening or the deadline passes, which
-    /// also absorbs the boot time.
+    /// The VM was booted by the k7d daemon during `Create`, which
+    /// returned the endpoint to dial: a kernel-global vsock CID for a
+    /// native guest, the jail's vsock UDS for a Firecracker one.
+    /// Either way the connect retries until the agent starts listening
+    /// or the deadline passes, which also absorbs the boot time.
     pub fn connect_agent(&mut self) -> Result<(), String> {
-        let guest_cid = self.guest_cid.ok_or("VM not created (no guest_cid)")?;
-        let agent = AgentClient::connect_vsock(guest_cid, Duration::from_secs(30))
+        let endpoint = self.endpoint()?;
+        let agent = AgentClient::connect_endpoint(&endpoint, Duration::from_secs(30))
             .map_err(|e| format!("agent connect failed: {e}"))?;
         self.agent = Some(agent);
         Ok(())
+    }
+
+    /// The agent endpoint recorded at Create, or a loud error.
+    pub fn endpoint(&self) -> Result<AgentEndpoint, String> {
+        self.agent_endpoint
+            .clone()
+            .ok_or_else(|| "VM not created (no agent endpoint)".to_string())
     }
 
     /// Get a mutable reference to the agent client.

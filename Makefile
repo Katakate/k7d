@@ -1,4 +1,5 @@
 .PHONY: build build-agent build-guest-kernel build-guest-rootfs \
+       build-docker-payload \
        test test-integration lint fmt-check deny bench warp-bench check gym-test \
        dilation-test dilation-fork-test dilation-install dilation-revert \
        remote-dilation-test remote-dilation-fork-test \
@@ -49,7 +50,7 @@ endef
 fmt-check:
 	cargo fmt --check
 
-# MLSys 2027 paper skeleton . Local only — no KVM.
+# MLSys 2027 paper skeleton. Local only — no KVM.
 paper:
 	$(MAKE) -C paper/mlsys2027 pdf
 
@@ -67,6 +68,9 @@ build-guest-kernel:
 build-guest-rootfs:
 	cd guest/rootfs && ./build.sh
 
+build-docker-payload:
+	cd guest/docker && ./build.sh
+
 deny:
 	cargo deny check
 
@@ -79,7 +83,7 @@ lint:
 # suite never runs against a stale guest (rsync excludes the initramfs
 # artifact; both builds are no-op-fast when nothing changed).
 test: build-agent build-guest-rootfs
-	# Cluster leftovers are reaped by the spec-22d sweep (age-gated
+	# Cluster leftovers are reaped by the orphan sweep (age-gated
 	# `k7-test-run` selector). A cluster-wide `kubectl delete` here
 	# would kill a concurrent suite's live pods and kube-system.
 	-pkill -9 virtiofsd 2>/dev/null
@@ -97,7 +101,7 @@ test-integration:
 bench:
 	cargo bench
 
-# the referenced work's two-arm time-warp benchmark (baseline vs
+# The two-arm time-warp benchmark (baseline vs
 # `AutoWarp { jump }`), three runs per arm from a fresh 3-node Ubuntu
 # k3s cluster each. Deliberately not part of `make check`: ~10 minutes
 # of guest time per run plus a cluster bring-up. ARMS=a runs only the
@@ -105,7 +109,7 @@ bench:
 warp-bench:
 	cargo bench -p k7d --bench warp_bench -- $(if $(ARMS),--arms=$(ARMS),)
 
-# the referenced work's dilation validation. Needs the carried KVM patch
+# The dilation validation. Needs the carried KVM patch
 # loaded (`utils/kvm-dilation/install.sh`); fails loudly on stock
 # modules rather than skipping. Kept out of `make check` for that
 # reason — see the `[[test]] test = false` note in crates/k7d/Cargo.toml.
@@ -113,8 +117,8 @@ dilation-test: build-agent
 	bash utils/kvm-dilation/state.sh
 	cargo test -p k7d --test test_dilation -- --test-threads=1 --nocapture
 
-# the referenced work: only the fork / snapshot / cluster-fork tests of the
-# dilation suite (minutes), without inc6's N sweep (hours).
+# Only the fork / snapshot / cluster-fork tests of the
+# dilation suite (minutes), without the N sweep (hours).
 dilation-fork-test: build-agent
 	bash utils/kvm-dilation/state.sh
 	cargo test -p k7d --test test_dilation test_dilation_fork -- --test-threads=1 --nocapture
@@ -131,7 +135,7 @@ dilation-revert:
 # crates/k7d/tests/test_gym.rs covers the HTTP+k7d path and does not
 # duplicate these.
 #
-# k7d-mcp-test is the 27a-inc1 Python path: stub MCP round-trip (no
+# k7d-mcp-test is the Python path: stub MCP round-trip (no
 # KVM) plus one Ubuntu Cilium+Tetragon smoke (needs the live daemon).
 # PEP 668: Ubuntu 24.04 refuses system-site pip. Keep the venv off
 # the rsync tree so --delete cannot wipe the wheels.
@@ -154,7 +158,7 @@ k7d-mcp-test: k7d-mcp-deps
 gym-test: k7d-mcp-test k7view-test
 	cd gym && python3 -m unittest discover -s tests -v
 
-# k7view observer unit tests (pure Python, no KVM; the referenced work)
+# k7view observer unit tests (pure Python, no KVM)
 k7view-test:
 	python3 examples/k7view/test_store.py
 	python3 examples/k7view/test_probe.py
@@ -196,17 +200,19 @@ verif-build:
 
 # Release tarball in the official layout (matches the katakate/k7d
 # GitHub release artifact): a k7d-v<version>-x86_64-linux/ directory
-# with the binaries, guest kernel/initramfs, and install.sh. The
-# runtime boots guest/rootfs/initramfs.cpio.gz (there is no rootfs.img
-# — container rootfs erofs images are built at runtime); runc.amd64 is
-# included as an extra so nodes without a host runc still work (the
-# shim's tools-image lookup includes /opt/k7d/runc.amd64).
+# with the binaries, guest kernel/initramfs, docker payload, and
+# install.sh. The runtime boots guest/rootfs/initramfs.cpio.gz (there
+# is no rootfs.img — container rootfs erofs images are built at
+# runtime); runc.amd64 is included as an extra so nodes without a host
+# runc still work (the shim's tools-image lookup includes
+# /opt/k7d/runc.amd64). `docker/` is the guest dockerd payload.
 #
 # Run ON a Linux/KVM host, or via `make remote-release`.
-release: build build-agent build-guest-kernel build-guest-rootfs
+release: build build-agent build-guest-kernel build-guest-rootfs build-docker-payload
 	@test -f guest/kernel/vmlinux || { echo "missing guest/kernel/vmlinux" >&2; exit 1; }
 	@test -f guest/rootfs/initramfs.cpio.gz || { echo "missing guest/rootfs/initramfs.cpio.gz" >&2; exit 1; }
 	@test -f guest/rootfs/runc.amd64 || { echo "missing guest/rootfs/runc.amd64" >&2; exit 1; }
+	@test -x guest/docker/payload/bin/dockerd || { echo "missing guest/docker/payload/bin/dockerd" >&2; exit 1; }
 	@test -x target/release/k7d || { echo "missing target/release/k7d" >&2; exit 1; }
 	@test -x target/release/containerd-shim-k7-v1 || { echo "missing shim binary" >&2; exit 1; }
 	@test -x target/x86_64-unknown-linux-musl/release/k7-agent || { echo "missing k7-agent binary" >&2; exit 1; }
@@ -218,6 +224,7 @@ release: build build-agent build-guest-kernel build-guest-rootfs
 	cp guest/kernel/vmlinux "dist/$(RELEASE_NAME)/"
 	cp guest/rootfs/initramfs.cpio.gz "dist/$(RELEASE_NAME)/"
 	cp guest/rootfs/runc.amd64 "dist/$(RELEASE_NAME)/"
+	cp -a guest/docker/payload "dist/$(RELEASE_NAME)/docker"
 	install -m 755 packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
 	install -m 755 scripts/quickstart.sh "dist/$(RELEASE_NAME)/quickstart.sh"
 	tar -C dist -czf "$(RELEASE_TGZ)" "$(RELEASE_NAME)"
@@ -260,13 +267,13 @@ remote-bench:
 remote-warp-bench:
 	@bash utils/remote-run.sh warp-bench "make warp-bench ARMS=$(ARMS)"
 
-# inc5's dilated arms : the patch goes on,
+# The dilated benchmark arms (C and D): the patch goes on,
 # the arms run, and the node goes back to stock whatever they did.
 remote-warp-bench-dilated:
 	@bash utils/remote-run.sh warp-bench-cd \
 	  'make dilation-install && (make warp-bench ARMS=$(if $(ARMS),$(ARMS),c,d); rc=$$?; make dilation-revert; exit $$rc)'
 
-# the referenced work on the node: build + load the patched KVM modules, run
+# Dilation validation on the node: build + load the patched KVM modules, run
 # the dilation suite, and put the node back on stock modules whatever
 # the suite did. Never leave a node patched — every other spec's
 # `remote-check` runs on stock (`utils/kvm-dilation/revert.sh`).
@@ -274,7 +281,7 @@ remote-dilation-test:
 	@bash utils/remote-run.sh dilation \
 	  'make dilation-install && (make dilation-test; rc=$$?; make dilation-revert; exit $$rc)'
 
-# the referenced work's fork tests alone, same install/revert bracket.
+# The fork tests alone, same install/revert bracket.
 remote-dilation-fork-test:
 	@bash utils/remote-run.sh dilation-fork \
 	  'make dilation-install && (make dilation-fork-test; rc=$$?; make dilation-revert; exit $$rc)'

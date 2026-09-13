@@ -1,4 +1,4 @@
-# 2-worker TrainJob on the custom busybox TrainingRuntime .
+# 2-worker TrainJob on the custom busybox TrainingRuntime.
 # Each worker requests nvidia.com/gpu: 1 on the mock. trainer.command
 # overwrites the runtime entrypoint the same way KubeRay's overwrite-cmd
 # does — so Trainer cannot inject torchrun into busybox.

@@ -1,10 +1,10 @@
-//! Tetragon on Ubuntu Cilium k3s, then fork-and-diff .
+//! Tetragon on Ubuntu Cilium k3s, then fork-and-diff.
 //!
-//! Reuses inc3's cluster fixture (`UbuntuCni::None` + Helm Cilium
+//! Reuses the Cilium cluster fixture (`UbuntuCni::None` + Helm Cilium
 //! 1.16.10). Installs Tetragon the documented way (Helm, version-
 //! pinned). Proves a kprobe sensor fires, and a BPF-LSM sensor if the
 //! flavour lists `bpf` in `/sys/kernel/security/lsm`. Then warm-forks
-//! under inc2/inc3 load churn, injects a known action on one branch,
+//! under load churn, injects a known action on one branch,
 //! and diffs the two event streams.
 //!
 //! Does not touch the minimal guest, `test_inner_k3s.rs`, the shim,
@@ -49,7 +49,7 @@ const PATH_PREFIX: &str = "/tmp/k7d-tetra-";
 /// Pin inject pods to one agent so the child's `IfNotPresent` hit is
 /// the same containerd that already pulled busybox on the source.
 /// Scheduling the child inject onto a node that never pulled the image
-/// left it Pending for 180s (first inc4 run).
+/// left it Pending for 180s (first run).
 fn inject_node() -> String {
     UbuntuCluster::node_name(Ipv4Addr::new(10, 200, 0, 3))
 }
@@ -606,7 +606,7 @@ fn assert_cni_none_on_server(cluster: &mut UbuntuCluster) {
 }
 
 /// Tetragon 1.7.0 via Helm on the Ubuntu 3-node Cilium cluster, then
-/// the fork-and-diff the 25a ladder exists for.
+/// the fork-and-diff the Ubuntu ladder exists for.
 #[test]
 fn test_ubuntu_tetragon_fork_event_diff() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -648,7 +648,7 @@ fn test_ubuntu_tetragon_fork_event_diff() {
         eprintln!("flavour lists bpf in LSM — installing BPF-LSM TracingPolicy");
     } else {
         eprintln!(
-            "FINDING the referenced work: /sys/kernel/security/lsm does not list bpf \
+            "FINDING /sys/kernel/security/lsm does not list bpf \
              — kprobe only; this is an image-package / flavour finding, not a \
              config-minimal rebuild"
         );
@@ -728,9 +728,7 @@ fn test_ubuntu_tetragon_fork_event_diff() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

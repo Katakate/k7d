@@ -189,7 +189,7 @@ def overCount (t : TreeModel) (incoming : Nat) : Prop :=
 def overDisk (t : TreeModel) : Prop :=
   t.budget.maxDiskBytes < (usage t).diskBytes
 
-/-- Mirror of `tree_model::over_disk_incoming` (the referenced work: disk
+/-- Mirror of `tree_model::over_disk_incoming` (disk
 headroom check before writing a projected base snapshot; the Rust
 `u64::saturating_add` is mirrored saturation-exactly). -/
 def overDiskIncoming (t : TreeModel) (incoming : Nat) : Prop :=

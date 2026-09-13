@@ -1,4 +1,4 @@
-"""25a Ubuntu node source: image, cmdline, disks, Ready wait.
+"""Ubuntu node source: image, cmdline, disks, Ready wait.
 
 The gym talks only to `/run/k7d/k7d.sock`. This module does not boot
 `Vm` in-process — it builds the guest artifacts and the cmdline the
@@ -28,8 +28,8 @@ SYSTEMD_READY_S = 180
 CLUSTER_READY_S = 600
 UBUNTU_LSM_LIST = "landlock,lockdown,yama,integrity,apparmor,bpf"
 # crates/k7d/tests/common/ubuntu_k3s.rs
-K3S_TOKEN = "K7dUbuntuClusterToken.inc2"
-# 25a-inc2 measured ~1.35 GiB host RAM / node.
+K3S_TOKEN = "K7dUbuntuClusterToken.v1"
+# Measured ~1.35 GiB host RAM / node.
 HOST_RAM_PER_NODE_BYTES = int(1.35 * 1024**3)
 DISKS_DIR = Path("/var/lib/k7d/disks")
 BASE_IMAGES = DISKS_DIR / "base-images"
@@ -88,7 +88,7 @@ def build_or_cache_image(repo: Path) -> dict[str, Any]:
     if not DISKS_DIR.is_dir():
         raise RuntimeError(
             f"{DISKS_DIR} is missing; the reflink XFS is not mounted "
-            "(run the 25a image builder / ensure_loopback_xfs first)"
+            "(run the image builder / ensure_loopback_xfs first)"
         )
     env = os.environ.copy()
     env["AGENT_BIN"] = str(agent_bin)
@@ -280,7 +280,7 @@ def write_host_kubeconfig(cid: int, server_ip: str, dest: Path) -> tuple[Path, P
     return kube, cert, key
 
 
-# Same pin as 25a-inc3 / sensors.py. Pull before helm so a registry
+# Same pin as sensors.py. Pull before helm so a registry
 # or DNS failure is loud in ~3 min, not a 600 s ContainerCreating wait.
 CILIUM_PULL_IMAGE = "quay.io/cilium/cilium:v1.16.10"
 CILIUM_PULL_S = 180
@@ -543,7 +543,7 @@ def memory_floor_error(memory_mb: int) -> str | None:
         return (
             f"GYM_MEMORY_MB={memory_mb} < NODE_MEMORY_MB={NODE_MEMORY_MB} "
             f"(ubuntu mode refuses the create-mode leftover default of 256; "
-            f"a 25a node is {NODE_MEMORY_MB} MiB guest / ~1.35 GiB host RAM)"
+            f"an Ubuntu node is {NODE_MEMORY_MB} MiB guest / ~1.35 GiB host RAM)"
         )
     return None
 

@@ -125,7 +125,7 @@ time so the two arms are never scored by different rules.
 
 ### 1. Tree utilization vs budget
 
-![tree utilization](assets/inc1-plots/01-tree-utilization.png)
+![tree utilization](assets/mcp-plots/01-tree-utilization.png)
 
 This is the "at the limit" story. Live VMs and RAM vs `TreeBudget`.
 Fork waves are the steps up. Prune and evict are the drops. The
@@ -135,7 +135,7 @@ recorded run: **21 of 24** live VMs, ~33 GiB live RAM.
 
 ### 2. Fork latency
 
-![fork latency](assets/inc1-plots/02-fork-latency.png)
+![fork latency](assets/mcp-plots/02-fork-latency.png)
 
 Honest numbers, Ubuntu gym path: three `fork_batch` waves in the
 recorded run — **4.2 s** (n=3), **3.4 s** (n=2), **2.6 s** (n=1),
@@ -146,7 +146,7 @@ without naming the guest.
 
 ### 3. Hypotheses tested vs wall-clock
 
-![hypotheses vs wallclock](assets/inc1-plots/03-hypotheses-wallclock.png)
+![hypotheses vs wallclock](assets/mcp-plots/03-hypotheses-wallclock.png)
 
 The claim is not "faster kubectl." The claim is that tree search
 beats serial trial-and-error on a world you are not allowed to
@@ -162,7 +162,7 @@ delete on the live cluster.
 
 ### 4. Remediation blast radius
 
-![blast radius](assets/inc1-plots/04-remediation-blast-radius.png)
+![blast radius](assets/mcp-plots/04-remediation-blast-radius.png)
 
 Mutating actions on forks vs on the live source, same model both
 arms. Fork arm: **12 mutating commands on forks, 1 on production**
@@ -173,7 +173,7 @@ afford to wreck a copy.
 
 ### 5. RAM per branch
 
-![ram per branch](assets/inc1-plots/05-ram-per-branch.png)
+![ram per branch](assets/mcp-plots/05-ram-per-branch.png)
 
 CoW is what makes the tree affordable. Peak **21 of 24** budget VMs
 / ~33 GiB live RAM on the recorded run. You pay for divergence, not

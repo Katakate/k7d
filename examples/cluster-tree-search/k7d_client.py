@@ -204,7 +204,7 @@ class K7dClient:
         return self.call({"op": "list_vms"})
 
     def auto_warp(self, cluster_id: str, mode: str) -> dict[str, Any]:
-        """Start, switch, or stop a cluster's auto-warp loop (34a-inc3).
+        """Start, switch, or stop a cluster's auto-warp loop.
 
         ``mode`` is ``off`` | ``jump`` | ``micro``. ``off`` returns the
         finished run's counters.

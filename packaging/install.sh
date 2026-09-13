@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.5.0
+# Version: 0.6.0
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"
@@ -18,8 +18,8 @@ Installs k7d + containerd-shim-k7-v1 to $PREFIX/bin (default /usr/local),
 guest kernel/initramfs to $PREFIX/share/k7d, and a systemd unit that sets
 K7D_KERNEL / K7D_INITRD + RUST_LOG=info + LimitNOFILE=524288.
 
-  --with-k3s   Also register RuntimeClass k7 in k3s/containerd
-               (config-v3.toml.tmpl block; no BinaryName options).
+  --with-k3s   Also register RuntimeClass k7 and k7-fc in k3s/containerd
+               (config-v3.toml.tmpl blocks; no BinaryName options).
   --prefix DIR Install prefix (default: /usr/local)
 EOF
 }
@@ -39,8 +39,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz runc.amd64; do
-  if [[ ! -f "$HERE/$f" ]]; then
+for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz runc.amd64 docker/bin/dockerd; do
+  if [[ ! -e "$HERE/$f" ]]; then
     echo "missing $HERE/$f — run from the extracted release tarball" >&2
     exit 1
   fi
@@ -63,6 +63,11 @@ echo "==> installing runc.amd64 to /opt/k7d and $SHARE_DIR"
 install -d /opt/k7d
 install -m 755 "$HERE/runc.amd64" /opt/k7d/runc.amd64
 install -m 755 "$HERE/runc.amd64" "$SHARE_DIR/runc.amd64"
+
+echo "==> installing docker payload to $SHARE_DIR/docker"
+rm -rf "$SHARE_DIR/docker"
+cp -a "$HERE/docker" "$SHARE_DIR/docker"
+chmod -R a+rX "$SHARE_DIR/docker"
 
 KERNEL="$SHARE_DIR/vmlinux"
 INITRD="$SHARE_DIR/initramfs.cpio.gz"
@@ -108,7 +113,7 @@ if [[ "$WITH_K3S" -eq 1 ]]; then
     echo "k3s containerd template missing at $CONFIG" >&2
     exit 1
   fi
-  if ! grep -q 'runtimes.k7' "$CONFIG"; then
+  if ! grep -q 'runtimes.k7]' "$CONFIG"; then
     echo "==> registering k7 runtime in containerd template"
     cat >>"$CONFIG" <<'EOF'
 
@@ -123,7 +128,7 @@ EOF
     if ! grep -q 'pod_annotations = \["k7d.katakate.org/\*"\]' "$CONFIG"; then
       echo "==> adding pod_annotations to existing k7 runtime block"
       # Insert after runtime_type line inside the k7 block — loud if shape unexpected.
-      if ! grep -A5 'runtimes.k7' "$CONFIG" | grep -q 'runtime_type = "io.containerd.k7.v1"'; then
+      if ! grep -A5 'runtimes.k7]' "$CONFIG" | grep -q 'runtime_type = "io.containerd.k7.v1"'; then
         echo "existing k7 runtime block looks unexpected; edit $CONFIG by hand" >&2
         exit 1
       fi
@@ -141,9 +146,28 @@ if 'pod_annotations = ["k7d.katakate.org/*"]' not in text:
 PY
     fi
   fi
-  # Never add [options] / BinaryName — containerd resolves the shim from runtime_type.
-  if grep -A20 'runtimes.k7' "$CONFIG" | grep -q 'BinaryName'; then
+  mkdir -p /etc/k7d
+  printf 'backend = "firecracker"\n' > /etc/k7d/shim-k7-fc.toml
+  if ! grep -q 'runtimes.k7-fc]' "$CONFIG"; then
+    echo "==> registering k7-fc runtime in containerd template (ConfigPath, no BinaryName)"
+    cat >>"$CONFIG" <<'EOF'
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc]
+  runtime_type = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/*"]
+  privileged_without_host_devices = true
+  snapshotter = "overlayfs"
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc.options]
+    ConfigPath = "/etc/k7d/shim-k7-fc.toml"
+EOF
+  fi
+  # Never add BinaryName — containerd resolves the shim from runtime_type.
+  if grep -A20 'runtimes.k7]' "$CONFIG" | grep -q 'BinaryName'; then
     echo "ERROR: k7 runtime block must not set BinaryName (breaks shim cgroup path)" >&2
+    exit 1
+  fi
+  if grep -A20 'runtimes.k7-fc]' "$CONFIG" | grep -q 'BinaryName'; then
+    echo "ERROR: k7-fc runtime block must not set BinaryName (breaks shim cgroup path)" >&2
     exit 1
   fi
   if systemctl is-active k3s >/dev/null 2>&1; then
@@ -162,8 +186,19 @@ metadata:
   name: k7
 handler: k7
 EOF
-  kubectl get runtimeclass k7
-  echo "==> k3s RuntimeClass k7 ready"
+  kubectl apply -f - <<'EOF'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7-fc
+handler: k7-fc
+overhead:
+  podFixed:
+    cpu: 50m
+    memory: 32Mi
+EOF
+  kubectl get runtimeclass k7 k7-fc
+  echo "==> k3s RuntimeClass k7 and k7-fc ready"
 else
   cat <<EOF
 
@@ -178,6 +213,14 @@ Or manually add to ${CONFIG:-/var/lib/rancher/k3s/agent/etc/containerd/config-v3
   privileged_without_host_devices = true
   snapshotter = "overlayfs"
 
-Do NOT add [options] with BinaryName. Then: systemctl restart k3s && kubectl apply RuntimeClass k7.
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc]
+  runtime_type = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/*"]
+  privileged_without_host_devices = true
+  snapshotter = "overlayfs"
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc.options]
+    ConfigPath = "/etc/k7d/shim-k7-fc.toml"
+
+Do NOT add BinaryName. Then: echo 'backend = "firecracker"' > /etc/k7d/shim-k7-fc.toml && systemctl restart k3s && kubectl apply RuntimeClass k7 and k7-fc.
 EOF
 fi

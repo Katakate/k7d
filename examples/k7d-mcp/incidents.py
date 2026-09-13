@@ -26,7 +26,7 @@ HYDRA_SA = "metrics-exporter"
 # `systemctl list-units --type=service` / `kubectl get cronjob` miss it.
 SLEEPER_CRON = "/etc/cron.d/raid-check"
 
-# --- relay  ---------------------------------------------
+# --- relay ---------------------------------------------
 # Layer 1 is the only thing a pre-fork inspect battery names. Layers 2/3
 # are dormant systemd *path* units on the control-plane node, so
 # `systemctl list-units --type=service --state=running`, `list-timers`,
@@ -668,7 +668,7 @@ class Sleeper(Hydra):
 
 class Relay(Incident):
     """Depth-3 causal chain: each layer is revealed only when the one
-    above it is deleted .
+    above it is deleted.
 
     Layer 1 (visible): Deployment ``default/node-agent`` — a busy-CPU
     miner pinned to the control-plane node. A pre-fork inspect battery
@@ -912,7 +912,7 @@ spec:
         log.info("relay layers 2/3 planted on control-plane cid=%s", cid)
 
 
-# --- dormant  -------------------------------------------
+# --- dormant -------------------------------------------
 # Like `relay`, three host layers that resurrect the miner. Unlike
 # `relay`, the reseed is on a *timer*, not an instant inotify edge, and
 # the deepest layer has more than one plausible mitigation. Two changes,
@@ -1274,6 +1274,6 @@ def get(incident_id: str) -> Incident:
 def pick(name: str | None) -> Incident:
     if name:
         return get(name)
-    # the referenced work: the flagship incident whose deeper layers a
-    # pre-fork inspect battery cannot name.
+    # The flagship incident whose deeper layers a pre-fork inspect
+    # battery cannot name.
     return CATALOG["relay"]

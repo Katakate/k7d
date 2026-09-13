@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fail loud if the 29b-inc2 vsock jail is not enforcing. A missing
+# Fail loud if the vsock jail is not enforcing. A missing
 # profile is a guest that looks healthy and still hands AF_VSOCK to
 # every uid.
 set -eu

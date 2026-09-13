@@ -1,4 +1,4 @@
-//! the referenced work: gym `GYM_SOURCE_MODE=ubuntu` over a 25a-inc2 cluster.
+//! Gym `GYM_SOURCE_MODE=ubuntu` over an Ubuntu k3s cluster.
 //!
 //! Talks only to `/run/k7d/k7d.sock`. Never `#[ignore]`. Does not edit
 //! minimal-guest budgets or fall back to busybox / INNER3.
@@ -265,7 +265,7 @@ fn spawn_ubuntu_gym(tree_id: &str) -> GymGuard {
         tree_id: tree_id.to_string(),
         base: format!("http://127.0.0.1:{port}"),
     };
-    // Hang-detection window, not a 250 ms budget (25a-inc2).
+    // Hang-detection window, not a 250 ms budget.
     let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if let Ok((code, _, v)) = try_http("GET", &format!("{}/healthz", guard.base), None, 5) {
@@ -578,7 +578,7 @@ fn test_gym_ubuntu_source_kill_partition_release() {
         measure(&format!("after_{fault_id}"));
     }
 
-    // the referenced work: lease n=1, POST /env/{id}/fork n=2, children obs, clean release.
+    // Lease n=1, POST /env/{id}/fork n=2, children obs, clean release.
     {
         let body = r#"{"fault_id":"none","n":1,"group_id":"g-midfork","ttl_s":180}"#;
         let (code, lease) = http("POST", &format!("{}/lease", gym.base), Some(body), 180);

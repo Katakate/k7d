@@ -170,7 +170,7 @@ def curl_api(
 
     Pass `cert`/`key` for the gym's admin mTLS, or `token` for a
     ServiceAccount bearer (red acts as its granted foothold, never the
-    admin certs — 26a-inc11). The two are mutually exclusive.
+    admin certs). The two are mutually exclusive.
     """
     if token is not None and cert is not None:
         raise ValueError(
@@ -225,7 +225,7 @@ def curl_api(
 def kubectl_to_request(args: list[str]) -> tuple[str, str, str | None, str | None]:
     """Map a kubectl-shaped argv to (method, path, body, content_type).
 
-    Loud on anything inc0 does not implement — no silent no-op.
+    Loud on anything not implemented — no silent no-op.
     """
     if not args:
         raise ValueError("kubectl args must be non-empty")
@@ -315,15 +315,15 @@ def kubectl_to_request(args: list[str]) -> tuple[str, str, str | None, str | Non
             return "GET", f"{base}/{name}" if name else base, None, None
         raise ValueError(
             f"unsupported kubectl get resource {resource!r} "
-            f"(inc0: nodes/pods/ns/deploy or --raw=/path)"
+            f"(supported: nodes/pods/ns/deploy or --raw=/path)"
         )
     if verb == "delete":
         if resource not in ("pod", "pods", "po") or not name:
-            raise ValueError("inc0 kubectl delete supports only: delete pod NAME")
+            raise ValueError("kubectl delete supports only: delete pod NAME")
         return "DELETE", namespaced("pods", name), None, None
     if verb == "scale":
         if resource not in ("deploy", "deployment", "deployments") or not name:
-            raise ValueError("inc0 kubectl scale supports only: scale deploy NAME --replicas=N")
+            raise ValueError("kubectl scale supports only: scale deploy NAME --replicas=N")
         if replicas is None:
             raise ValueError("kubectl scale requires --replicas")
         body = json.dumps({"spec": {"replicas": int(replicas)}})
@@ -331,7 +331,7 @@ def kubectl_to_request(args: list[str]) -> tuple[str, str, str | None, str | Non
         return "PATCH", path, body, "application/merge-patch+json"
     raise ValueError(
         f"unsupported kubectl verb {verb!r} "
-        f"(inc0: get/delete/scale, or a raw /api path)"
+        f"(supported: get/delete/scale, or a raw /api path)"
     )
 
 

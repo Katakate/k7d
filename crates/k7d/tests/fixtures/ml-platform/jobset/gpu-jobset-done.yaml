@@ -1,4 +1,4 @@
-# 2-worker JobSet on the fake GPU fixture .
+# 2-worker JobSet on the fake GPU fixture.
 # CPU/Gloo-shaped rendezvous over JobSet headless DNS — not CUDA.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet

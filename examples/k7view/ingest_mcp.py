@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge a 27a-inc1 MCP JSONL log into k7view's /api/ingest.
+"""Bridge an MCP JSONL log into k7view's /api/ingest.
 
 k7view stays a pure observer: this process *reads* the JSONL that
 ``examples/k7d-mcp/tools.py`` appends for every tool call and posts

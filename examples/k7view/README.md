@@ -47,7 +47,7 @@ K7D_INITRD=/usr/local/share/k7d/initramfs.cpio.gz \
 python3 examples/k7view/run_scenario.py --profile max --keep
 # equivalent:  python3 examples/k7view/run_scenario.py --video --keep
 
-# terminal 2 - ×8 dilated Ubuntu k3s . Requires patched
+# terminal 2 - ×8 dilated Ubuntu k3s. Requires patched
 # KVM modules (`make remote-dilation-install`). Never K7D_KERNEL/INITRD.
 python3 examples/k7view/run_scenario.py --profile ubuntu-dilated --keep \
     --log /tmp/k7d-dilated-tree.jsonl
@@ -139,7 +139,7 @@ ssh -N -L 7475:127.0.0.1:7474 root@${K7_NODE_IP} &   # tunnel
 python3 examples/k7view/capture.py --url http://127.0.0.1:7475/ \
     --out /tmp/take1 --fps 8 --start-phase agent --stop-phase idle
 # /tmp/take1/capture.mp4 is real-time; the agent videos may speed the
-# boring parts. The dilated-tree hero (27a-inc1e) must NOT use setpts:
+# boring parts. The dilated-tree hero must NOT use setpts:
 python3 examples/k7view/capture.py --url http://127.0.0.1:7475/ \
     --out /tmp/dilated --fps 8 --start-phase ready --stop-phase idle --max-s 90
 # trim only (cut source bring-up if it leaked in; open on the Ready root).

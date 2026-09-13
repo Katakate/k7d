@@ -1,10 +1,10 @@
-//! the referenced work — one RL-episode-shaped workload, run under four arms.
+//! One RL-episode-shaped workload, run under four arms.
 //!
 //! | Arm | Mechanism | Modules |
 //! |---|---|---|
 //! | A baseline | nothing | stock |
 //! | B jump | daemon `AutoWarp { mode: jump }` | stock |
-//! | C dilation | inc4 continuous dilation at [`DILATION`]× | patched |
+//! | C dilation | continuous dilation at [`DILATION`]× | patched |
 //! | D both | dilation *and* the jump policy on top | patched |
 //!
 //! A and B need the stock KVM modules and C and D need
@@ -28,7 +28,7 @@
 //! shrinking the workload in proportion to its own speedup.
 //!
 //! **2. Arm B runs through the daemon op, not `Driver::cycle` inline.**
-//! inc3's test interleaved `kubectl` polls with policy cycles on one
+//! The policy test interleaved `kubectl` polls with policy cycles on one
 //! thread, so the loop was stopped for the better part of a second
 //! around every poll. `Request::AutoWarp` runs it on its own thread
 //! while the caller polls, which is what a caller actually gets — and
@@ -45,7 +45,7 @@
 //! time also passes while the cluster runs, so the counters'
 //! guest-per-paused-nanosecond ratio is *not* the speedup
 //! ([`AutoWarpStats::guest_per_wall_paused`] says so in its own docs).
-//! And the ceiling is inc0's all-idle fraction scaled by `N`: a jump
+//! And the ceiling is the survey's all-idle fraction scaled by `N`: a jump
 //! can only delete idle time, so `1/(1 − 0.734) = 3.76×` is arithmetic
 //! rather than a target, while dilation multiplies every second — idle
 //! or not — so the two compose as `N × 3.76×`. A run that beats its
@@ -90,7 +90,7 @@ use common::warp::{
     kubectl_round_trip, start_crashloop, CRASHLOOP_POD,
 };
 
-/// Runs per arm. One run is an anecdote ; three
+/// Runs per arm. One run is an anecdote; three
 /// give a median and a spread.
 const RUNS: usize = 3;
 
@@ -99,9 +99,9 @@ const RUNS: usize = 3;
 /// dominates the ratio — see the assertion in [`report_run`].
 const CEILING_MIN_WALL: Duration = Duration::from_secs(60);
 
-/// Fraction of guest time inc0 measured the 3-node cluster all-idle in
+/// Fraction of guest time the survey measured the 3-node cluster all-idle in
 /// its backoff-wait phase, and so the compression ceiling: idle time is
-/// the only time a jump can delete. inc3 measured 2.34× against it.
+/// the only time a jump can delete. The policy measured 2.34× against it.
 const ALL_IDLE_WAITING: f64 = 0.734;
 
 /// Restarts phase 1 waits for.
@@ -112,7 +112,7 @@ const ALL_IDLE_WAITING: f64 = 0.734;
 /// guest time) ends at the fifth restart, not the fourth. Measured, not
 /// assumed — waiting for four came back at 80–101 s of guest time,
 /// which is the 10/20/40 prefix. Counting restarts against a nominal
-/// schedule is how inc3 first mistook an 81 s window for the 300 s cap
+/// schedule is how we first mistook an 81 s window for the 300 s cap
 /// (`CHALLENGES.md` #184).
 const BACKOFF_RESTARTS: u64 = 5;
 
@@ -141,11 +141,11 @@ const POLL: Duration = Duration::from_millis(500);
 
 /// Poll node readiness every this many phase polls. A node that went
 /// `NotReady` because a jump expired its 40 s lease stays that way for
-/// seconds (inc2 measured ~9 s), so it cannot hide between checks.
+/// seconds (measured ~9 s), so it cannot hide between checks.
 const READY_EVERY: u32 = 6;
 
-/// Node names for the pods this bench plants, kept apart from inc0's
-/// and inc3's so a leftover cannot be mistaken for one of ours.
+/// Node names for the pods this bench plants, kept apart from the
+/// survey's and the policy's so a leftover cannot be mistaken for ours.
 const RECON_DEPLOY: &str = "bench-recon";
 const CHURN_DEPLOY: &str = "bench-churn";
 const BURNER_POD: &str = "bench-burner";
@@ -159,7 +159,7 @@ enum Arm {
     Baseline,
     /// `AutoWarp { mode: jump }` on the daemon, for the whole run.
     Jump,
-    /// inc4's continuous dilation at [`DILATION`], nothing else.
+    /// Continuous dilation at [`DILATION`], nothing else.
     Dilation,
     /// Dilation *and* the jump policy on top of it.
     Both,
@@ -168,7 +168,7 @@ enum Arm {
 /// Every arm, in the order they are run and tabulated.
 const ALL_ARMS: [Arm; 4] = [Arm::Baseline, Arm::Jump, Arm::Dilation, Arm::Both];
 
-/// The dilation factor arms C and D run at .
+/// The dilation factor arms C and D run at (the validated N).
 const DILATION: u32 = 8;
 
 impl Arm {
@@ -199,7 +199,7 @@ impl Arm {
         }
     }
 
-    /// Does the daemon run the inc3 policy loop for this arm?
+    /// Does the daemon run the auto-warp policy loop for this arm?
     fn jumps(self) -> bool {
         matches!(self, Arm::Jump | Arm::Both)
     }
@@ -207,7 +207,7 @@ impl Arm {
 
 /// The auto-warp hold, released on drop.
 ///
-/// the referenced work's fifth safety check in its explicit form: a `kubectl`
+/// The fifth safety check in its explicit form: a `kubectl`
 /// call is guest-side work the policy loop is allowed to interrupt, but
 /// an `exec` this process runs over vsock is a host action against a
 /// member, invisible to the registry lock the loop holds. Without the
@@ -316,7 +316,7 @@ impl DaemonCluster {
         };
 
         // Server first: an agent that races the server's TLS bootstrap
-        // never joins .
+        // never joins.
         let mut server = cluster.create_node(0, "server");
         wait_guest_readyz(&mut server, WHOSE[0], BOOT_UBUNTU_K3S_CLUSTER_3NODE);
         let (kubeconfig, certs_dir) = write_host_kubeconfig(&mut server, server_ip, "warpbench");
@@ -332,12 +332,12 @@ impl DaemonCluster {
         wait_nodes_ready(&cluster.kubeconfig, &names, BOOT_UBUNTU_K3S_CLUSTER_3NODE);
         cluster.boot_to_ready = started.elapsed();
         eprintln!(
-            "MEASUREMENT 34a-inc5 daemon-owned cluster boot-to-Ready: {:?}",
+            "MEASUREMENT daemon-owned cluster boot-to-Ready: {:?}",
             cluster.boot_to_ready
         );
 
         // The preconditions every warp number rests on: the guest reads
-        // the clock k7d owns, arms the LAPIC one-shot inc0 measured, and
+        // the clock k7d owns, arms the LAPIC one-shot the survey measured, and
         // runs no NTP client to step a warp back out (CHALLENGES #180).
         for (agent, whose) in cluster.agents.iter_mut().zip(WHOSE) {
             let (state, _) = systemd_state(agent, whose);
@@ -399,7 +399,7 @@ impl DaemonCluster {
             // One factor for the whole cluster, from one place: every
             // member is created from this literal, so lockstep is a
             // property of the construction rather than of a loop that
-            // has to remember .
+            // has to remember.
             dilation: (self.dilation > 1).then_some(self.dilation),
             ..VmConfig::default()
         };
@@ -639,10 +639,7 @@ fn wait_for(
     let mut polls = 0_u32;
     loop {
         if done(cluster) {
-            eprintln!(
-                "34a-inc5 {what}: after {:?} of wall time",
-                started.elapsed()
-            );
+            eprintln!("{what}: after {:?} of wall time", started.elapsed());
             return;
         }
         polls += 1;
@@ -660,7 +657,7 @@ fn wait_for(
 
 /// Phase 1 — wait-heavy: a pod parked in the kubelet's crash-loop
 /// backoff, waited out to [`BACKOFF_RESTARTS`] (10+20+40+80 s of guest
-/// time). The phase inc0 found idlest and inc3 measured against.
+/// time). The phase the survey found idlest and the policy measured against.
 fn phase_wait(cluster: &mut DaemonCluster, lapses: &mut u32) {
     start_crashloop(&cluster.kubeconfig);
     wait_for(
@@ -725,7 +722,7 @@ fn phase_reconcile(cluster: &mut DaemonCluster) {
     );
 }
 
-/// Phase 3 — busy: inc0's churn loop (scale between 2 and 10 replicas
+/// Phase 3 — busy: the survey's churn loop (scale between 2 and 10 replicas
 /// every ~2 s, plus a CPU burner capped at 200m) for
 /// [`BUSY_GUEST_SECS`] of guest time.
 ///
@@ -738,7 +735,7 @@ fn phase_reconcile(cluster: &mut DaemonCluster) {
 ///   is guest time too. A host-side churn loop would do
 ///   `1/compression` as many rounds per guest second in arm B as in
 ///   arm A — the same workload name over a quieter cluster, which
-///   would flatter the policy exactly where inc0 says it should
+///   would flatter the policy exactly where the survey says it should
 ///   struggle.
 ///
 /// Returns the churn rounds the guest loop completed.
@@ -1000,7 +997,7 @@ fn run_arm(arm: Arm, index: usize) -> Run {
         *warps = stats.warps;
         *phase_started = Instant::now();
         eprintln!(
-            "MEASUREMENT 34a-inc5 {} phase {name}: {:.1}s wall, {:.1}s guest \
+            "MEASUREMENT {} phase {name}: {:.1}s wall, {:.1}s guest \
              ({:.2}× observed), policy added {:.1}s over {} warps of {} cycles \
              ({:.2}× accounted)",
             arm.as_str(),
@@ -1106,7 +1103,7 @@ fn run_arm(arm: Arm, index: usize) -> Run {
     run
 }
 
-/// Everything one run measured, in the shape inc3's `report()` printed
+/// Everything one run measured, in the shape the policy test's `report()` printed
 /// it — plus the assertions that make a number publishable.
 fn report_run(run: &Run) {
     let declines = if run.stats.declines.is_empty() {
@@ -1120,7 +1117,7 @@ fn report_run(run: &Run) {
             .join(" ")
     };
     eprintln!(
-        "MEASUREMENT 34a-inc5 {} run: {:.1}s wall ({:?} of it cluster bring-up, not counted), \
+        "MEASUREMENT {} run: {:.1}s wall ({:?} of it cluster bring-up, not counted), \
          {:.1}s guest, {:.2}× accounted, {:.2}× observed; \
          {} cycles, {} warps, +{:.1}s guest added, mean jump {:?}, \
          {:.1}ms paused ({:.2}% of wall), APIC bus cycle {}fs; \
@@ -1165,7 +1162,7 @@ fn report_run(run: &Run) {
         run.mean_jump()
     );
     for phase in &run.phases {
-        // Only over a window long enough for inc0's idle *fraction* to
+        // Only over a window long enough for the survey's idle *fraction* to
         // describe: a 6 s reconcile phase that happens to contain one
         // 25 s jump reads as 5×, and that is a phase boundary landing
         // next to a jump rather than time being invented. The claim the
@@ -1175,7 +1172,7 @@ fn report_run(run: &Run) {
         }
         assert!(
             phase.compression() <= ceiling(run.arm.dilation()),
-            "phase {} compressed {:.2}×, past the {:.2}× that inc0's {:.1}% all-idle \
+            "phase {} compressed {:.2}×, past the {:.2}× that the survey's {:.1}% all-idle \
              fraction allows at {}× dilation — idle time is the only time there is to \
              delete, so this is an accounting bug rather than a faster policy",
             phase.name,
@@ -1226,7 +1223,7 @@ fn median(mut xs: Vec<f64>) -> (f64, f64, f64) {
 
 /// The spec's `## Results` table, ready to paste.
 fn print_tables(runs: &[Run]) {
-    eprintln!("\nMEASUREMENT 34a-inc5 results ({RUNS} runs per arm, fresh cluster per run)\n");
+    eprintln!("\nMEASUREMENT results ({RUNS} runs per arm, fresh cluster per run)\n");
     eprintln!(
         "| arm | wall (s) | guest (s) | compression | paused % | warps | mean jump | \
          declines (top) |"
@@ -1387,11 +1384,7 @@ fn main() {
     // has churned the node is not a baseline.
     for arm in arms {
         for index in 0..RUNS {
-            eprintln!(
-                "\n==> 34a-inc5 arm {} run {}/{RUNS}\n",
-                arm.as_str(),
-                index + 1
-            );
+            eprintln!("\n==> arm {} run {}/{RUNS}\n", arm.as_str(), index + 1);
             runs.push(run_arm(arm, index));
             between_runs();
         }

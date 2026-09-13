@@ -25,7 +25,7 @@ use k7d::api::AgentClient;
 use k7d::network::ClusterNetwork;
 use k7d::vm::Vm;
 
-/// Every `CONFIG_*` the referenced work adds, asserted as one list rather
+/// Every `CONFIG_*` the guest kernel adds, asserted as one list rather
 /// than a hand-picked subset: picking a subset is how
 /// `CONFIG_NF_TABLES_INET` stayed missing for weeks.
 const REQUIRED_CONFIGS: &[&str] = &[
@@ -43,8 +43,7 @@ const REQUIRED_CONFIGS: &[&str] = &[
     "CONFIG_VXLAN",
     // Cilium's agent startup, not Cilium's IPsec: the module list it
     // reads before any datapath work, and the XFRM netlink socket its
-    // datapath init opens to clear policies (the referenced work,
-    // CHALLENGES #100).
+    // datapath init opens to clear policies (CHALLENGES #100).
     "CONFIG_MODULES",
     "CONFIG_XFRM",
     "CONFIG_XFRM_USER",
@@ -332,7 +331,7 @@ fn test_guest_kernel_features_alive() {
     // ── iSCSI initiator ──
     // ISCSI_TCP registers its transport at boot with no userspace at
     // all, so this is assertable today even though iscsiadm/iscsid only
-    // arrive in 24a-inc2.
+    // arrive with the nodeusr image.
     run_ok(&mut agent, "test -d /sys/class/iscsi_transport/tcp");
 
     // ── SCSI disk layer ──

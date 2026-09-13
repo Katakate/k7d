@@ -1,4 +1,4 @@
-# Custom TrainingRuntime on digest-pinned busybox .
+# Custom TrainingRuntime on digest-pinned busybox.
 # PlainML — no torch / MPI policy, so Trainer does not inject torchrun.
 # Not CUDA, not PyTorch, not the stock ClusterTrainingRuntime image.
 apiVersion: trainer.kubeflow.org/v1alpha1

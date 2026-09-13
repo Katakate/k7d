@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""35a-inc3: held apiserver watch + ClusterIP TCP across Ubuntu TreeFork.
+"""Held apiserver watch + ClusterIP TCP across Ubuntu TreeFork.
 
 Import Cluster. Do not edit fork_under_load.py. Talks to /run/k7d/k7d.sock.
 A *new* curl after the pause is not this assertion (CHALLENGES #42).
@@ -475,9 +475,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = parse_args(argv)
-    tree_id = ns.tree_id or f"hs-35a-{os.getpid()}"
-    if not tree_id.startswith("hs-35a-"):
-        raise RuntimeError(f"tree id must start with hs-35a-, got {tree_id!r}")
+    tree_id = ns.tree_id or f"hs-{os.getpid()}"
+    if not tree_id.startswith("hs-"):
+        raise RuntimeError(f"tree id must start with hs-, got {tree_id!r}")
     client = K7dClient()
     client.ping()
     cluster = Cluster(client, tree_id)

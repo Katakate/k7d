@@ -51,13 +51,13 @@ const POD_NAME: &str = "test-inner-k3s-cri-emptydir";
 const INNER_K3S_MEMORY_MB: u32 = 2560;
 /// Memory limit of the containerd sidecar (+192 MB tmpfs for the
 /// containerd + runc-shim binaries, same warm-fork reason). Pod-level
-/// sandbox memory (10c) is the sum of container limits, so the VM boots
+/// sandbox memory is the sum of container limits, so the VM boots
 /// with `2560 + 640 + 64 MB` overhead = 3264 MB.
 const INNER_K3S_SIDECAR_MEMORY_MB: u32 = 640;
 
 const K3S_POD_NAME: &str = "test-inner-k3s-single-node";
 
-// ──: fixture switchboard  ──
+// ──: fixture switchboard ──
 
 /// Add-ons the inner k3s server enables. `Default` = today's fixture:
 /// everything off. Every field is explicit — no catch-all extras string.
@@ -70,7 +70,7 @@ struct InnerAddons {
     local_storage: bool,
     /// k3s embedded helm controller. Off today (`--disable-helm-controller`).
     helm_controller: bool,
-    /// Drops `--disable-network-policy` when true (inc5).
+    /// Drops `--disable-network-policy` when true.
     network_policy: bool,
 }
 
@@ -147,7 +147,7 @@ impl InnerAddons {
 
 /// Inner k3s datastore engine. Default is kine/sqlite (today's fixture).
 /// `Etcd` is single-member embedded etcd via `--cluster-init` on the
-/// server only — the prod engine, not HA quorum .
+/// server only — the prod engine, not HA quorum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum InnerDatastore {
     #[default]
@@ -160,7 +160,7 @@ enum InnerDatastore {
 /// `FlannelHostGw` is today's fixture: k3s's bundled flannel plus
 /// kube-proxy, which every other inner-k3s test depends on. `Cilium`
 /// swaps both out — `--flannel-backend=none --disable-kube-proxy` and
-/// an eBPF datapath the test installs itself .
+/// an eBPF datapath the test installs itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum InnerCni {
     #[default]
@@ -195,15 +195,15 @@ impl InnerClusterProfile {
         }
     }
 
-    /// Default 3-node fixture with CoreDNS enabled .
+    /// Default 3-node fixture with CoreDNS enabled.
     fn coredns_3node() -> Self {
         let mut p = Self::default_3node();
         p.addons.coredns = true;
         p
     }
 
-    /// Inc1 profile plus ServiceLB + Traefik + the embedded helm
-    /// controller . Traefik is a HelmChart CR — enabling
+    /// Base profile plus ServiceLB + Traefik + the embedded helm
+    /// controller. Traefik is a HelmChart CR — enabling
     /// `traefik` without `helm_controller` deploys nothing.
     fn ingress_3node() -> Self {
         let mut p = Self::coredns_3node();
@@ -216,7 +216,7 @@ impl InnerClusterProfile {
         p
     }
 
-    /// Inc1 profile plus local-storage . CoreDNS stays
+    /// Base profile plus local-storage. CoreDNS stays
     /// on so the provisioner can resolve the in-cluster API.
     fn local_path_3node() -> Self {
         let mut p = Self::coredns_3node();
@@ -224,7 +224,7 @@ impl InnerClusterProfile {
         p
     }
 
-    /// Inc1 profile plus metrics-server . CoreDNS stays
+    /// Base profile plus metrics-server. CoreDNS stays
     /// on per the spec; metrics-server itself dials the apiserver and
     /// the kubelets by IP.
     fn metrics_3node() -> Self {
@@ -233,8 +233,8 @@ impl InnerClusterProfile {
         p
     }
 
-    /// Inc1 profile with `--disable-network-policy` dropped (spec
-    /// 22a-inc5). k3s's embedded netpol controller (the kube-router
+    /// Base profile with `--disable-network-policy` dropped. k3s's
+    /// embedded netpol controller (the kube-router
     /// lib) runs in every k3s process and programs iptables + ipset
     /// inside each guest — the guest kernel carries `CONFIG_IP_SET`
     /// and `CONFIG_NETFILTER_XT_SET` for exactly this profile.
@@ -244,8 +244,8 @@ impl InnerClusterProfile {
         p
     }
 
-    /// Inc1 profile plus embedded etcd (`--cluster-init` on the server
-    /// only; the referenced work). Topology stays 1 server + 2 agents —
+    /// Base profile plus embedded etcd (`--cluster-init` on the server
+    /// only). Topology stays 1 server + 2 agents —
     /// single-member etcd, not HA quorum.
     fn etcd_3node() -> Self {
         let mut p = Self::coredns_3node();
@@ -255,7 +255,7 @@ impl InnerClusterProfile {
 
     /// CoreDNS 3-node plus a larger sidecar tmpfs so the ArgoCD image
     /// (and redis + alpine/git + the baked git-daemon image) fit the
-    /// airgap import . ArgoCD itself is a workload the
+    /// airgap import. ArgoCD itself is a workload the
     /// test installs, not an add-on.
     fn argocd_3node() -> Self {
         let mut p = Self::coredns_3node();
@@ -264,7 +264,7 @@ impl InnerClusterProfile {
     }
 
     /// 3-node fixture whose CNI is Cilium in native-routing mode with
-    /// kube-proxy replaced by eBPF . CoreDNS stays off:
+    /// kube-proxy replaced by eBPF. CoreDNS stays off:
     /// every probe here addresses pod IPs and Service VIPs directly, so
     /// DNS would only add a second thing to bootstrap through a cluster
     /// that has no service datapath until the DaemonSet is ready.
@@ -295,8 +295,7 @@ impl InnerClusterProfile {
     /// Seconds the k3s container waits for the sidecar's airgap import
     /// marker. 180 s covers pause + CoreDNS + busybox; Cilium's agent
     /// tar is an order of magnitude larger and extracts on one vCPU,
-    /// and a blown wait here reads as a CNI problem (the referenced work
-    /// trap 2).
+    /// and a blown wait here reads as a CNI problem.
     fn airgap_import_wait_secs(&self) -> u32 {
         match self.cni {
             InnerCni::FlannelHostGw => 180,
@@ -512,8 +511,8 @@ const INNER3_REDIS_REF: &str = "docker.io/library/redis:7.0.15-alpine";
 /// `git-daemon` binary (CHALLENGES #94).
 const INNER3_GIT_IMAGE: &str = "docker.io/alpine/git:2.45.2@sha256:16ad8e788e1d3b0c30f18da8dde5c0ace3b187445a62d8af893b003ca1e70592";
 const INNER3_GIT_REF: &str = "docker.io/alpine/git:2.45.2";
-/// Cilium agent v1.16.10 — the CNI this fixture installs itself
-/// . Digest-pinned like every other inner image; the
+/// Cilium agent v1.16.10 — the CNI this fixture installs itself.
+/// Digest-pinned like every other inner image; the
 /// guests have no registry, so it arrives as an airgap tar.
 const INNER3_CILIUM_IMAGE: &str = "quay.io/cilium/cilium:v1.16.10@sha256:fc4ccc494c4a381439162fd3684c07ba9c26d3c2670a2b2e1623acee99097461";
 const INNER3_CILIUM_REF: &str = "quay.io/cilium/cilium:v1.16.10";
@@ -725,7 +724,7 @@ fn test_sidecar_containerd_socket_via_emptydir() {
     // Sidecar: real containerd listening on the shared emptyDir socket.
     // Main: wait for the socket, then `ctr version` against it and write
     // a marker file so the host can poll without scraping container logs.
-    // Combined memory limits = 1Gi (/ 10c floor).
+    // Combined memory limits = 1Gi (the floor).
     //
     // containerd's root must be tmpfs (bolt databases need writable shared
     // mmap, which virtiofs `--cache never` rejects with ENODEV) and `lo`
@@ -2290,7 +2289,7 @@ fn list_k7_bridges() -> Vec<String> {
 }
 
 /// Long-lived watch stream against the source API server — one held
-/// TCP/TLS session that must survive the fork (the 9d headline).
+/// TCP/TLS session that must survive the fork (the headline).
 /// `curl -N …?watch=true` blocks streaming events until killed; if the
 /// connection resets, curl exits on its own.
 fn start_held_watch(bridge_dev: &str) -> std::process::Child {
@@ -2664,6 +2663,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(guest_cids.len(), 3, "adopted root must have 3 members");
             (tree_id, root_id, guest_cids)
@@ -2703,7 +2703,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     }
 
     // Held watch stream: one TCP/TLS session that must survive the fork
-    // (the 9d headline). New /readyz connections during the ~8 s source
+    // (the headline). New /readyz connections during the ~8 s source
     // pause can flake — do not sample those; poll explicitly after resume
     // (CHALLENGES #42).
     let mut watch = start_held_watch(&source_bridge);
@@ -2931,7 +2931,7 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
     thread::sleep(Duration::from_secs(2));
 
     // One held TCP/TLS session against the source API server across
-    // the whole annotation-driven adopt + fork (the 9d headline).
+    // the whole annotation-driven adopt + fork (the headline).
     let mut watch = start_held_watch(&source_bridge);
     thread::sleep(Duration::from_secs(1));
     assert!(
@@ -3015,7 +3015,7 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
 }
 
 /// Mechanical pin: the default profile renders today's k3s server CLI
-/// for both the single-node and 3-node fixtures .
+/// for both the single-node and 3-node fixtures.
 #[test]
 fn default_profile_renders_today_k3s_server_flags() {
     let p = InnerClusterProfile::default_3node();
@@ -3624,6 +3624,7 @@ fn test_inner_k3s_coredns_dns_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -3800,7 +3801,7 @@ fn test_inner_k3s_coredns_dns_fork() {
     teardown(&mut client);
 }
 
-// ──: metrics-server  ──
+// ──: metrics-server ──
 
 /// metrics-server's only nested-runc hole is the projected SA token
 /// (CHALLENGES #88): it authenticates to the apiserver *and* to every
@@ -4856,6 +4857,7 @@ fn test_inner_k3s_ingress_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -5613,6 +5615,7 @@ fn test_inner_k3s_local_path_pvc_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -5886,6 +5889,7 @@ fn test_inner_k3s_metrics_server_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -6076,7 +6080,7 @@ fn test_inner_k3s_metrics_server_fork() {
     teardown(&mut client);
 }
 
-// ── NetworkPolicy enforcement  ──
+// ── NetworkPolicy enforcement ──
 
 /// Port the busybox `httpd` server pod listens on.
 const NP_HTTP_PORT: u16 = 8080;
@@ -6479,6 +6483,7 @@ fn test_inner_k3s_network_policy_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -6614,7 +6619,7 @@ fn test_inner_k3s_network_policy_fork() {
     teardown(&mut client);
 }
 
-// ── HPA end-to-end across a warm fork  ──
+// ── HPA end-to-end across a warm fork ──
 
 const HPA_LOAD_NAME: &str = "hpa-load";
 const HPA_LOAD_BURN: &str = "while :; do :; done";
@@ -6966,6 +6971,7 @@ fn test_inner_k3s_hpa_scale_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -7320,7 +7326,7 @@ fn assert_etcd_datadir(server_pod: &str) {
 
 /// Embedded etcd (not kine/sqlite) across a warm cluster fork: history
 /// survives, per-bridge writes work and diverge, /readyz stays etcd-ok,
-/// and node leases still renew ~60 s later .
+/// and node leases still renew ~60 s later.
 #[test]
 fn test_inner_k3s_etcd_datastore_fork() {
     let _leak_guard = ensure_shim_installed();
@@ -7367,6 +7373,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -7537,7 +7544,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
     teardown(&mut client);
 }
 
-// ──: ArgoCD core GitOps  ──
+// ──: ArgoCD core GitOps ──
 
 const ARGOCD_NS: &str = "argocd";
 const ARGOCD_APP: &str = "gitops-demo";
@@ -7548,7 +7555,7 @@ const GITOPS_MARKER_PRE: &str = "pre-fork";
 const GITOPS_MARKER_FORK: &str = "fork-only";
 const FORK_COMMIT_OK: &str = "FORK_COMMIT_OK";
 
-/// Transport choice : `git daemon` (`git://`)
+/// Transport choice: `git daemon` (`git://`)
 /// behind a ClusterIP Service. First candidate was digest-pinned
 /// `alpine/git`, but that image is client-only (`git: 'daemon' is not a
 /// git command`). Stay on candidate 1 by baking `alpine` + `apk add git
@@ -8481,7 +8488,7 @@ fn refresh_application(bridge: &str) -> Result<(), String> {
 /// no UI/dex) plus an in-cluster `git daemon`, then a warm cluster fork.
 /// Pre-fork the Application is Synced/Healthy; post-fork both bridges
 /// stay live (`status.reconciledAt` advances; CHALLENGES #96) and a commit pushed only to the
-/// fork's git syncs only on the fork .
+/// fork's git syncs only on the fork.
 #[test]
 fn test_inner_k3s_argocd_gitops_fork() {
     let _leak_guard = ensure_shim_installed();
@@ -8584,6 +8591,7 @@ fn test_inner_k3s_argocd_gitops_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),
@@ -8848,14 +8856,14 @@ fn test_inner_k3s_argocd_gitops_fork() {
     teardown(&mut client);
 }
 
-// ── Cilium as the inner CNI, kube-proxy replaced  ──
+// ── Cilium as the inner CNI, kube-proxy replaced ──
 
 /// Namespace every Cilium object lands in — the same one the upstream
 /// chart uses, so `cilium-dbg` and the agent's own defaults agree.
 const CILIUM_NS: &str = "kube-system";
 /// Native routing CIDR, and the inner cluster's `--cluster-cidr`. Every
 /// node's `spec.podCIDR` must sit inside it or `auto-direct-node-routes`
-/// silently masquerades instead of routing .
+/// silently masquerades instead of routing.
 const CILIUM_NATIVE_ROUTING_CIDR: &str = "10.60.0.0/16";
 /// HTTP port of the cross-node datapath fixture's httpd backend.
 const CILIUM_HTTP_PORT: u16 = 8080;
@@ -9016,7 +9024,7 @@ fn cilium_rbac_yaml() -> String {
 /// `KUBERNETES_SERVICE_HOST` is load-bearing: with `--disable-kube-proxy`
 /// nothing resolves the `kubernetes` Service VIP until this very
 /// DaemonSet is ready, so the agent has to reach the apiserver by node
-/// IP .
+/// IP.
 fn cilium_agent_yaml(profile: &InnerClusterProfile) -> String {
     let api_host = profile.guest_ip(0);
     format!(
@@ -9618,7 +9626,7 @@ fn assert_no_flannel(profile: &InnerClusterProfile) {
 /// member has no `KUBE-SERVICES` chain.
 ///
 /// The exit code is deliberately ignored: `cilium status` exits 0 with
-/// warnings , so the field is the assertion. The
+/// warnings, so the field is the assertion. The
 /// iptables half is the other direction of the same claim — a
 /// `KUBE-SERVICES` chain would mean kube-proxy is alive somewhere and
 /// the ClusterIP probe could succeed without touching eBPF.
@@ -9680,7 +9688,7 @@ fn assert_kube_proxy_replaced(profile: &InnerClusterProfile) {
 /// Every member carries a direct route to every *other* member's
 /// podCIDR via that member's node IP.
 ///
-/// This is the referenced work trap 3 in assertion form: with
+/// This is the masquerade trap in assertion form: with
 /// `auto-direct-node-routes` a podCIDR outside
 /// `ipv4-native-routing-cidr` is silently masqueraded instead of
 /// routed, so cross-node connectivity would pass while the datapath was
@@ -9857,7 +9865,7 @@ fn inner_restart_counts_via(bridge: &str) -> std::collections::BTreeMap<String, 
 }
 
 /// Cilium as the inner CNI, with kube-proxy replaced, across a warm
-/// fork of the whole three-node cluster .
+/// fork of the whole three-node cluster.
 ///
 /// The bring-up itself is the first assertion: with
 /// `--flannel-backend=none --disable-kube-proxy` no node reaches Ready
@@ -10060,6 +10068,7 @@ fn test_inner_k3s_cilium_datapath_fork() {
             tree_id,
             root_id,
             guest_cids,
+            ..
         }) => {
             assert_eq!(
                 guest_cids.len(),

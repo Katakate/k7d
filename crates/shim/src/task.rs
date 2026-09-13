@@ -31,8 +31,13 @@ use crate::sandbox::{ContainerState, ImageSlot, ProcessState, RootfsDevice, Sand
 
 const CRI_CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
 const CRI_SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
+/// CRI sandbox annotation naming the containerd runtime handler
+/// (`RuntimeClass.handler`). k3s v1.36 / containerd 2.3.3 does **not**
+/// set this on the sandbox OCI spec (CHALLENGES #228); the shim still
+/// reads it when present, and falls back to `ConfigPath`.
+const CRI_RUNTIME_HANDLER: &str = "io.kubernetes.cri.runtime-handler";
 /// Kubernetes container name, stamped on a WORKLOAD container's OCI
-/// spec (never on the sandbox's). matches it against the names
+/// spec (never on the sandbox's). The shim matches it against the names
 /// in [`ANN_CONTAINER_SCRATCH_SIZE`]; the guest agent reads the same
 /// key off the bundle, because the guest runc name is the containerd
 /// container id, which does not exist yet when the sandbox declares a
@@ -147,8 +152,8 @@ const ANN_SCRATCH_SIZE: &str = "k7d.katakate.org/scratch-size";
 /// (`dedicated: false`) rather than dressed up as a limit.
 const ANN_CONTAINER_SCRATCH_SIZE: &str = "k7d.katakate.org/container-scratch-size";
 
-/// Pod annotation asking for **named persistent** data disks
-/// : disks whose lifetime is not the pod's, so an inner
+/// Pod annotation asking for **named persistent** data disks: disks
+/// whose lifetime is not the pod's, so an inner
 /// node's `/var/lib/longhorn` is still there for the next VM that claims
 /// the same id.
 ///
@@ -161,17 +166,34 @@ const ANN_CONTAINER_SCRATCH_SIZE: &str = "k7d.katakate.org/container-scratch-siz
 /// like a per-container scratch image — which is why this is a pod-level
 /// opt-in and not something every sandbox gets.
 const ANN_DATA_DISKS: &str = "k7d.katakate.org/data-disks";
-/// Default spare image-slot count (each costs one MMIO slot + IOAPIC pin).
-const DEFAULT_IMAGE_SLOTS: u32 = 4;
+/// `k7d.katakate.org/docker` — `"true"` boots dockerd as an agent
+/// service with a RO payload slot and a per-VM graph scratch disk.
+/// Any other value fails Create loudly.
+const ANN_DOCKER: &str = "k7d.katakate.org/docker";
+/// `k7d.katakate.org/docker-disk` — graph disk size; default 20Gi.
+/// Requires [`ANN_DOCKER`]=true. Parsed like [`ANN_SCRATCH_SIZE`].
+const ANN_DOCKER_DISK: &str = "k7d.katakate.org/docker-disk";
+/// `k7d.katakate.org/backend` — which VMM runs the pod: `native`
+/// (default, k7d's in-process KVM VMM) or `firecracker` (stock
+/// Firecracker under the stock jailer). Any other value
+/// fails Create: silently falling back to native would hide a typo
+/// behind a pod that boots on the wrong engine.
+const ANN_BACKEND: &str = "k7d.katakate.org/backend";
+/// Default spare image-slot count. Guest boots `noapic` so virtio-mmio
+/// is capped at [`MMIO_DEVICE_BUDGET`] (PIC IRQs 5..=15). Four slots
+/// plus vsock/tools/rootfs/scratch/net already leaves only one spare
+/// for a volume; hostPath/PVC pods overflow. Two slots leaves room
+/// for payload+graph (docker) or several hostPath disks.
+const DEFAULT_IMAGE_SLOTS: u32 = 2;
+const DEFAULT_IMAGE_SLOTS_DOCKER: u32 = 2;
 /// Default slot capacity: 2 GiB, sparse (blocks allocate on fill).
 const DEFAULT_IMAGE_SLOT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// Guest mount prefix for assigned image slots (`/run/k7d/slot-<n>`).
 const GUEST_IMAGE_SLOT_PREFIX: &str = "/run/k7d/slot";
-/// virtio-mmio device budget: IOAPIC has 24 pins, devices take IRQ
-/// `5 + idx` (COM1=4, COM2=3), so at most 19 devices fit. The VMM
-/// re-checks the final total at build; checking here (at slot
-/// declaration) is what lets the error name the annotation.
-const MMIO_DEVICE_BUDGET: usize = 19;
+/// virtio-mmio device budget: guest boots `noapic` (8259 PIC IRQs
+/// 0..=15). Devices take IRQ `5 + idx`, so at most 11 fit. IRQ 16+
+/// makes `virtio_net` probe fail with -EINVAL. The VMM re-checks.
+const MMIO_DEVICE_BUDGET: usize = 11;
 
 // Block-path guest layout. All under /run/k7d/
 // (guest tmpfs; the initramfs root) or /mnt/ (kept for the explicit
@@ -179,6 +201,13 @@ const MMIO_DEVICE_BUDGET: usize = 19;
 // `fix_oci_config`.
 /// Guest mount point of the cached "tools" erofs image (static runc).
 const GUEST_TOOLS_MOUNT: &str = "/run/k7d/tools";
+/// Guest mount of the Docker payload erofs. Read-only,
+/// host-enforced.
+const GUEST_DOCKER_TOOLS_MOUNT: &str = "/run/k7d/docker-tools";
+/// Guest directory bound into the sandbox container so a supervisor
+/// restart of dockerd creates a new socket inode the container still
+/// sees.
+const GUEST_DOCKER_SOCK_DIR: &str = "/run/k7d/docker";
 /// Guest mount prefix for container-rootfs erofs devices
 /// (`/run/k7d/rootfs-<n>`, one per distinct container image).
 const GUEST_ROOTFS_PREFIX: &str = "/run/k7d/rootfs";
@@ -274,6 +303,17 @@ pub struct ShimAnnotations {
     /// `id:size:guest-mount,...` list of named persistent disks; parsed
     /// loudly at sandbox Create ([`data_disks_from_annotations`]).
     pub data_disks: Option<String>,
+    /// `k7d.katakate.org/docker` — `"true"` or absent.
+    pub docker: Option<String>,
+    /// `k7d.katakate.org/docker-disk` — graph size quantity.
+    pub docker_disk: Option<String>,
+    /// `k7d.katakate.org/backend` — `native` or `firecracker`. Raw
+    /// string; parsed loudly at sandbox Create ([`resolve_backend`]).
+    pub backend: Option<String>,
+    /// `io.kubernetes.cri.runtime-handler` — containerd runtime name
+    /// (`k7` or `k7-fc`). Absent on this node's k3s containerd
+    /// (CHALLENGES #228); `ConfigPath` is the fallback.
+    pub runtime_handler: Option<String>,
 }
 
 impl ShimAnnotations {
@@ -463,6 +503,261 @@ fn annotations_from_spec(bundle: &str) -> ShimAnnotations {
         container_scratch_size: ShimAnnotations::lookup(annotations, ANN_CONTAINER_SCRATCH_SIZE)
             .map(str::to_string),
         data_disks: ShimAnnotations::lookup(annotations, ANN_DATA_DISKS).map(str::to_string),
+        docker: ShimAnnotations::lookup(annotations, ANN_DOCKER).map(str::to_string),
+        docker_disk: ShimAnnotations::lookup(annotations, ANN_DOCKER_DISK).map(str::to_string),
+        backend: ShimAnnotations::lookup(annotations, ANN_BACKEND).map(str::to_string),
+        runtime_handler: ShimAnnotations::lookup(annotations, CRI_RUNTIME_HANDLER)
+            .map(str::to_string),
+    }
+}
+
+/// Parse an explicit `k7d.katakate.org/backend` value. `None` means
+/// the annotation was absent — not "native".
+fn explicit_backend(ann: &ShimAnnotations) -> Result<Option<k7d::guest::Backend>, String> {
+    match ann.backend.as_deref() {
+        None => Ok(None),
+        Some("native") => Ok(Some(k7d::guest::Backend::Native)),
+        Some("firecracker") => Ok(Some(k7d::guest::Backend::Firecracker)),
+        Some(other) => Err(format!(
+            "{ANN_BACKEND}={other:?} is not a backend — use \"native\" or \"firecracker\""
+        )),
+    }
+}
+
+/// Backend implied by the CRI runtime handler, if containerd stamped
+/// [`CRI_RUNTIME_HANDLER`]. `k7-fc` is Firecracker; `k7` is native
+/// (the annotation may still opt in to Firecracker).
+fn handler_backend(ann: &ShimAnnotations) -> Result<Option<k7d::guest::Backend>, String> {
+    match ann.runtime_handler.as_deref() {
+        Some("k7-fc") => Ok(Some(k7d::guest::Backend::Firecracker)),
+        Some("k7") => Ok(Some(k7d::guest::Backend::Native)),
+        Some(other) if other.starts_with("k7") => Err(format!(
+            "{CRI_RUNTIME_HANDLER}={other:?} is not a k7 handler — use \"k7\" or \"k7-fc\""
+        )),
+        Some(_) | None => Ok(None),
+    }
+}
+
+/// Combine the CRI handler, the `ConfigPath` shim toml, and an explicit
+/// pod annotation into one backend.
+///
+/// Rules:
+/// - `k7-fc` (handler or `ConfigPath`) ⇒ Firecracker.
+/// - `k7` ⇒ native by default; `k7d.katakate.org/backend=firecracker`
+///   is still the opt-in (annotation does not "lose").
+/// - An explicit `backend=native` on a Firecracker handler is a loud
+///   Create error — no silent override of `k7-fc`.
+/// - If the handler is `k7-fc` and neither the annotation nor
+///   `ConfigPath` yielded Firecracker, that is also a loud error (would
+///   otherwise boot native and hide a mis-registered runtime).
+fn resolve_backend(
+    ann: &ShimAnnotations,
+    config_backend: Option<k7d::guest::Backend>,
+) -> Result<k7d::guest::Backend, String> {
+    let from_handler = handler_backend(ann)?;
+    let derived = match (from_handler, config_backend) {
+        (Some(h), Some(c)) if h != c => {
+            return Err(format!(
+                "{CRI_RUNTIME_HANDLER}={:?} and ConfigPath backend {c:?} disagree",
+                ann.runtime_handler.as_deref().unwrap_or("")
+            ));
+        }
+        (Some(h), _) => Some(h),
+        (_, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    let explicit = explicit_backend(ann)?;
+    match (explicit, derived) {
+        (Some(k7d::guest::Backend::Native), Some(k7d::guest::Backend::Firecracker)) => {
+            Err(format!(
+                "{ANN_BACKEND}=\"native\" contradicts runtime handler {:?} \
+                 (derived backend firecracker) — refusing Create",
+                ann.runtime_handler
+                    .as_deref()
+                    .unwrap_or("k7-fc (ConfigPath)")
+            ))
+        }
+        (Some(e), _) => Ok(e),
+        (None, Some(d)) => Ok(d),
+        (None, None) => Ok(k7d::guest::Backend::Native),
+    }
+}
+
+/// `ConfigPath` from the sandbox bundle's `options.json` (JSON CRI
+/// options) or from the `CreateTask` protobuf Any
+/// (`runtimeoptions.v1.Options.config_path` is field **2**).
+fn config_path_from_create(req: &api::CreateTaskRequest) -> Option<String> {
+    let bundle_path = Path::new(&req.bundle).join("options.json");
+    if let Ok(text) = std::fs::read_to_string(&bundle_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            for key in ["ConfigPath", "config_path", "configPath"] {
+                if let Some(s) = v.get(key).and_then(serde_json::Value::as_str) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    config_path_from_options_any(&req.options)
+}
+
+fn config_path_from_options_any(
+    options: &MessageField<containerd_shim::protos::protobuf::well_known_types::any::Any>,
+) -> Option<String> {
+    let any = options.as_ref()?;
+    if any.value.is_empty() {
+        return None;
+    }
+    config_path_from_options_bytes(&any.value)
+}
+
+fn config_path_from_options_bytes(value: &[u8]) -> Option<String> {
+    // runtimeoptions.v1.Options { type_url = 1, config_path = 2, config_body = 3 }.
+    // Field 9 was a wrong guess (CHALLENGES #230).
+    if let Some(s) = protobuf_len_delimited_string(value, 2) {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    protobuf_all_strings(value)
+        .into_iter()
+        .find(|s| s.ends_with("shim-k7-fc.toml") || s.ends_with("shim-k7.toml"))
+}
+
+/// Protobuf wire-format: length-delimited string at `field`.
+fn protobuf_len_delimited_string(buf: &[u8], field: u32) -> Option<String> {
+    let mut i = 0;
+    while i < buf.len() {
+        let (key, n) = decode_varint(&buf[i..])?;
+        i += n;
+        let fn_ = (key >> 3) as u32;
+        let wt = key & 7;
+        match wt {
+            0 => {
+                let (_, n) = decode_varint(&buf[i..])?;
+                i += n;
+            }
+            1 => i = i.checked_add(8)?,
+            2 => {
+                let (len, n) = decode_varint(&buf[i..])?;
+                i += n;
+                let end = i.checked_add(len as usize)?;
+                if end > buf.len() {
+                    return None;
+                }
+                if fn_ == field {
+                    return String::from_utf8(buf[i..end].to_vec()).ok();
+                }
+                i = end;
+            }
+            5 => i = i.checked_add(4)?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn protobuf_all_strings(buf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let Some((key, n)) = decode_varint(&buf[i..]) else {
+            break;
+        };
+        i += n;
+        let wt = key & 7;
+        match wt {
+            0 => {
+                let Some((_, n)) = decode_varint(&buf[i..]) else {
+                    break;
+                };
+                i += n;
+            }
+            1 => {
+                let Some(n) = i.checked_add(8) else {
+                    break;
+                };
+                i = n;
+            }
+            2 => {
+                let Some((len, n)) = decode_varint(&buf[i..]) else {
+                    break;
+                };
+                i += n;
+                let Some(end) = i.checked_add(len as usize) else {
+                    break;
+                };
+                if end > buf.len() {
+                    break;
+                }
+                if let Ok(s) = String::from_utf8(buf[i..end].to_vec()) {
+                    out.push(s);
+                }
+                i = end;
+            }
+            5 => {
+                let Some(n) = i.checked_add(4) else {
+                    break;
+                };
+                i = n;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if i >= 10 {
+            return None;
+        }
+        result |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some((result, i + 1));
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn backend_from_shim_toml(path: &str) -> Result<k7d::guest::Backend, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read ConfigPath {path}: {e}"))?;
+    let mut found = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!("ConfigPath {path}: not key = value: {line:?}"));
+        };
+        if k.trim() != "backend" {
+            continue;
+        }
+        let val = v.trim().trim_matches('"').trim_matches('\'');
+        found = Some(match val {
+            "firecracker" => k7d::guest::Backend::Firecracker,
+            "native" => k7d::guest::Backend::Native,
+            other => {
+                return Err(format!(
+                    "ConfigPath {path}: backend={other:?} is not \"native\" or \"firecracker\""
+                ));
+            }
+        });
+    }
+    found.ok_or_else(|| format!("ConfigPath {path}: missing backend"))
+}
+
+fn config_backend_from_create(
+    req: &api::CreateTaskRequest,
+) -> Result<Option<k7d::guest::Backend>, String> {
+    match config_path_from_create(req) {
+        Some(path) => Ok(Some(backend_from_shim_toml(&path)?)),
+        None => Ok(None),
     }
 }
 
@@ -522,6 +817,41 @@ fn scratch_size_from_annotations(ann: &ShimAnnotations) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Docker graph disk from `k7d.katakate.org/docker` /
+/// `docker-disk`. Absent docker → `None`. `"true"` → `Some` with
+/// default 20Gi. Any other docker value, or `docker-disk` without
+/// docker, fails loud.
+fn docker_from_annotations(
+    ann: &ShimAnnotations,
+) -> Result<Option<k7d::control::DockerConfig>, String> {
+    match ann.docker.as_deref() {
+        None => {
+            if ann.docker_disk.is_some() {
+                return Err(format!("{ANN_DOCKER_DISK} requires {ANN_DOCKER}=true"));
+            }
+            Ok(None)
+        }
+        Some("true") => {
+            let graph_size_bytes = match ann.docker_disk.as_deref() {
+                Some(raw) => parse_size_quantity(raw)
+                    .map_err(|e| format!("invalid {ANN_DOCKER_DISK}: {e}"))?,
+                None => k7d::disks::DEFAULT_DOCKER_DISK_SIZE,
+            };
+            if graph_size_bytes < k7d::disks::MIN_SCRATCH_SIZE {
+                return Err(format!(
+                    "{ANN_DOCKER_DISK} is {graph_size_bytes} bytes, below the \
+                     {}-byte minimum for a usable ext4 graph filesystem",
+                    k7d::disks::MIN_SCRATCH_SIZE
+                ));
+            }
+            Ok(Some(k7d::control::DockerConfig { graph_size_bytes }))
+        }
+        Some(other) => Err(format!(
+            "{ANN_DOCKER}={other:?} must be \"true\" (got anything else is a loud failure)"
+        )),
+    }
+}
+
 /// Containers that get their own writable image, from the
 /// `k7d.katakate.org/container-scratch-size` annotation.
 ///
@@ -574,7 +904,7 @@ fn container_scratch_from_annotations(
 }
 
 /// Named persistent data disks, from the `k7d.katakate.org/data-disks`
-/// annotation .
+/// annotation.
 ///
 /// Loud on every malformed entry: a pod that asked for a persistent disk
 /// and silently did not get one would write its replicas to the
@@ -982,14 +1312,30 @@ fn sandbox_create_fork_adopt(
         }
     }
 
-    let (fork_vm_id, fork_cid) = match daemon.call(&k7d::control::Request::ForkVm {
+    let (fork_vm_id, endpoint) = match daemon.call(&k7d::control::Request::ForkVm {
         vm_id: src_vm_id.clone(),
         sandbox_id: Some(sandbox_id.to_string()),
         dilation: None,
     })? {
         k7d::control::Response::VmForked {
-            vm_id, guest_cid, ..
-        } => (vm_id, guest_cid),
+            vm_id,
+            guest_cid,
+            agent_endpoint,
+            ..
+        } => {
+            let endpoint = agent_endpoint.ok_or_else(|| {
+                format!("k7d fork_vm({src_vm_id}) returned no agent_endpoint for {vm_id}")
+            })?;
+            log::info!(
+                "sandbox {sandbox_id}: adopted warm fork {vm_id} (cid {guest_cid}, \
+                 agent={endpoint:?}) of source sandbox {src_sandbox} (vm {src_vm_id})"
+            );
+            debug_log_cni(&format!(
+                "Create: sandbox={sandbox_id} fork-adopted vm={vm_id} cid={guest_cid} \
+                 agent={endpoint:?} source_sandbox={src_sandbox} source_vm={src_vm_id}"
+            ));
+            (vm_id, endpoint)
+        }
         k7d::control::Response::Error { message } => {
             return Err(format!("fork_vm({src_vm_id}): {message}"));
         }
@@ -999,17 +1345,8 @@ fn sandbox_create_fork_adopt(
     let state_dir = std::env::temp_dir().join(format!("k7d-shim-{sandbox_id}"));
     let _ = std::fs::create_dir_all(&state_dir);
 
-    log::info!(
-        "sandbox {sandbox_id}: adopted warm fork {fork_vm_id} (cid {fork_cid}) of \
-         source sandbox {src_sandbox} (vm {src_vm_id})"
-    );
-    debug_log_cni(&format!(
-        "Create: sandbox={sandbox_id} fork-adopted vm={fork_vm_id} cid={fork_cid} \
-         source_sandbox={src_sandbox} source_vm={src_vm_id}"
-    ));
-
     state.vm_id = Some(fork_vm_id);
-    state.guest_cid = Some(fork_cid);
+    state.agent_endpoint = Some(endpoint);
     state.sandbox_id = Some(sandbox_id.to_string());
     state.state_dir = Some(state_dir);
     state.fork_of = Some(src_sandbox);
@@ -1108,19 +1445,25 @@ fn reattach_sandbox_state(
     match resp {
         k7d::control::Response::SandboxFound {
             vm_id,
-            guest_cid,
             vm_index,
             cluster_id,
             pod_netns_attached,
+            agent_endpoint,
             ..
         } => {
+            // A daemon that answered without an endpoint predates the
+            // Firecracker backend; its VMs are native, and `guest_cid`
+            // is the endpoint. Anything else must not be guessed at.
+            let endpoint = agent_endpoint.ok_or_else(|| {
+                format!("reattach: sandbox {sandbox_id} came back with no agent endpoint")
+            })?;
             debug_log_cni(&format!(
-                "reattach: sandbox {sandbox_id} -> vm {vm_id} (cid {guest_cid})"
+                "reattach: sandbox {sandbox_id} -> vm {vm_id} ({endpoint:?})"
             ));
             {
                 let mut st = state.lock().unwrap();
                 st.vm_id = Some(vm_id);
-                st.guest_cid = Some(guest_cid);
+                st.agent_endpoint = Some(endpoint);
                 st.sandbox_id = Some(sandbox_id.to_string());
                 st.cluster_id = cluster_id;
                 st.vm_index = vm_index;
@@ -1271,7 +1614,7 @@ impl K7Service {
         &self,
         container_id: String,
         guest_name: String,
-        guest_cid: u64,
+        endpoint: k7d::guest::AgentEndpoint,
         exit_code: Arc<Mutex<Option<i32>>>,
         pid: u32,
     ) {
@@ -1280,7 +1623,7 @@ impl K7Service {
         let namespace = self.namespace.clone();
         let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
-            let Some(code) = watch_container_exit(guest_cid, &guest_name, &exit_code) else {
+            let Some(code) = watch_container_exit(&endpoint, &guest_name, &exit_code) else {
                 return;
             };
             {
@@ -1321,7 +1664,11 @@ impl K7Service {
 /// is gone from the agent (stopped/torn down), or the VM's vsock died
 /// (sandbox teardown is normal shutdown, not an error). Never panics —
 /// the shim must not be taken down by its watchers.
-fn watch_container_exit(guest_cid: u64, name: &str, exit_code: &Mutex<Option<i32>>) -> Option<i32> {
+fn watch_container_exit(
+    endpoint: &k7d::guest::AgentEndpoint,
+    name: &str,
+    exit_code: &Mutex<Option<i32>>,
+) -> Option<i32> {
     use k7d::api::{AgentClient, AgentError};
     let mut agent: Option<AgentClient> = None;
     let mut connect_failures = 0u32;
@@ -1330,7 +1677,7 @@ fn watch_container_exit(guest_cid: u64, name: &str, exit_code: &Mutex<Option<i32
             return None;
         }
         let Some(ref mut a) = agent else {
-            if let Ok(a) = AgentClient::connect_vsock(guest_cid, Duration::from_secs(2)) {
+            if let Ok(a) = AgentClient::connect_endpoint(endpoint, Duration::from_secs(2)) {
                 agent = Some(a);
                 connect_failures = 0;
             } else {
@@ -1523,7 +1870,7 @@ impl Task for K7Service {
                 // to each other at L2 with stable 10.200.0.X guest IPs.
                 // The CNI per-pod-netns plumbing moves the TAP out of
                 // that shared bridge into the pod's private netns,
-                // which silently breaks 9d's L2 sharing — pods in the
+                // which silently breaks L2 sharing — pods in the
                 // same "cluster" can no longer reach each other on
                 // their guest IPs, and warm-fork loses its network
                 // identity invariant. Skip CNI integration entirely
@@ -1653,6 +2000,42 @@ impl Task for K7Service {
                     debug_log_cni(&format!("Create: data disks for {} failed: {e}", req.id));
                     containerd_shim::Error::Other(e)
                 })?;
+                let docker = docker_from_annotations(&ann).map_err(|e| {
+                    debug_log_cni(&format!("Create: docker for {} failed: {e}", req.id));
+                    containerd_shim::Error::Other(e)
+                })?;
+                let config_backend = config_backend_from_create(&req).map_err(|e| {
+                    debug_log_cni(&format!(
+                        "Create: ConfigPath backend for {} failed: {e}",
+                        req.id
+                    ));
+                    containerd_shim::Error::Other(e)
+                })?;
+                let backend = resolve_backend(&ann, config_backend).map_err(|e| {
+                    debug_log_cni(&format!("Create: backend for {} failed: {e}", req.id));
+                    containerd_shim::Error::Other(e)
+                })?;
+                debug_log_cni(&format!(
+                    "Create: sandbox={} backend={backend:?} handler={:?} explicit={:?} config={config_backend:?}",
+                    req.id,
+                    ann.runtime_handler,
+                    ann.backend,
+                ));
+                if docker.is_some() {
+                    let payload = prepare_docker_payload_image(cache_dir).map_err(|e| {
+                        debug_log_cni(&format!(
+                            "Create: docker payload for {} failed: {e}",
+                            req.id
+                        ));
+                        containerd_shim::Error::Other(format!("docker payload: {e}"))
+                    })?;
+                    block_devices.push(k7d::control::BlockDeviceConfig {
+                        host_path: payload.to_string_lossy().into_owned(),
+                        readonly: true,
+                        guest_mount: Some(GUEST_DOCKER_TOOLS_MOUNT.to_string()),
+                        fstype: Some("erofs".to_string()),
+                    });
+                }
                 let mut config = k7d::control::VmConfig {
                     kernel: None,
                     initrd: None,
@@ -1668,15 +2051,17 @@ impl Task for K7Service {
                     scratch_size_bytes: Some(scratch_size_bytes),
                     container_scratch,
                     data_disks,
+                    docker,
                     sandbox_id: Some(req.id.clone()),
                     network: Some(k7d::control::NetConfig {
                         cluster_id: cluster_id.clone(),
                         vm_index: ann.fork_vm_index,
                         pod_netns: cni_netns.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     }),
-                    // Dilation is a bench mechanism , not
+                    // Dilation is a bench mechanism, not
                     // something a pod asks for.
                     dilation: None,
+                    backend,
                 };
                 // Declare the spare image-slot devices
                 // while the VmConfig is still parked — they must be in
@@ -1714,6 +2099,11 @@ impl Task for K7Service {
                 state.sandbox_id = Some(req.id.clone());
                 state.cluster_id = Some(cluster_id);
                 state.cluster_mode = cluster_mode_pod;
+                state.docker = state
+                    .pending_vm
+                    .as_ref()
+                    .is_some_and(|c| c.docker.is_some());
+                state.backend = backend;
                 state.vm_index = ann.fork_vm_index;
                 state.pod_volumes = None;
                 state
@@ -1807,19 +2197,20 @@ impl Task for K7Service {
     ) -> TtrpcResult<api::StartResponse> {
         log::info!("Start: id={} exec_id={}", req.id, req.exec_id);
 
-        // (guest_cid, exit_code, guest container name)
+        // (agent endpoint, exit_code, guest container name)
         // of a workload whose natural exit must be watched — set inside
         // the lock, spawned after it is released. Sandboxes keep their
         // synthetic exit behaviour (there is no runc container for the
         // pause task). The guest name differs from the containerd id
         // only for fork-adopted containers.
-        let mut exit_watch: Option<(u64, Arc<Mutex<Option<i32>>>, String)> = None;
+        let mut exit_watch: Option<(k7d::guest::AgentEndpoint, Arc<Mutex<Option<i32>>>, String)> =
+            None;
 
         let pid = {
             let mut state = self.state.lock().unwrap();
 
             if !req.exec_id.is_empty() {
-                let guest_cid = state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID);
+                let endpoint = state.endpoint().map_err(containerd_shim::Error::Other)?;
                 let container = state.containers.get(&req.id).ok_or_else(|| {
                     containerd_shim::Error::NotFoundError(format!("container {} not found", req.id))
                 })?;
@@ -1832,7 +2223,7 @@ impl Task for K7Service {
                 // non-PTY bridge was already spawned in `Exec`).
                 if exec.terminal {
                     let params = crate::exec::PtyBridgeParams {
-                        guest_cid,
+                        endpoint,
                         container: state.guest_name(&req.id),
                         exec_id: req.exec_id.clone(),
                         args: exec.args.clone(),
@@ -1895,18 +2286,12 @@ impl Task for K7Service {
                     })?;
                 }
 
+                let endpoint = state.endpoint().map_err(containerd_shim::Error::Other)?;
                 if let Some(container) = state.containers.get(&req.id) {
-                    // Read the VM's actual CID instead of
-                    // hardcoding `3`. Falls back to
-                    // `DEFAULT_GUEST_CID` only for sandboxes
-                    // somehow restored from before this field
-                    // existed — should never happen in practice
-                    // because Create writes it unconditionally.
-                    let guest_cid = state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID);
                     if !container.init.stdout.is_empty() || !container.init.stderr.is_empty() {
                         let bridge = io_bridge::start_output_bridge(
                             guest_name.clone(),
-                            guest_cid,
+                            endpoint.clone(),
                             container.init.stdout.clone(),
                             container.init.stderr.clone(),
                         );
@@ -1914,15 +2299,15 @@ impl Task for K7Service {
                         bridges.insert(req.id.clone(), bridge);
                     }
                     exit_watch =
-                        Some((guest_cid, Arc::clone(&container.init.exit_code), guest_name));
+                        Some((endpoint, Arc::clone(&container.init.exit_code), guest_name));
                 }
             }
 
             state.containers.get(&req.id).map_or(1, |c| c.init.pid)
         }; // state lock released here
 
-        if let Some((guest_cid, exit_code, guest_name)) = exit_watch {
-            self.spawn_exit_watcher(req.id.clone(), guest_name, guest_cid, exit_code, pid);
+        if let Some((endpoint, exit_code, guest_name)) = exit_watch {
+            self.spawn_exit_watcher(req.id.clone(), guest_name, endpoint, exit_code, pid);
         }
 
         let mut event = TaskStart::new();
@@ -1988,20 +2373,67 @@ impl Task for K7Service {
             // shorter, so kubelet retries forever and the pod can never
             // terminate. A fresh dial reaches the swapped VM on the same
             // CID in milliseconds (the same pattern the exec bridges use).
-            if let Some(cid) = state.guest_cid {
-                #[allow(clippy::cast_possible_wrap)]
-                let signal = req.signal as i32;
-                if let Ok(mut agent) =
-                    k7d::api::AgentClient::connect_vsock(cid, Duration::from_secs(2))
-                {
-                    let _ = agent.container_signal(&guest_name, signal);
+            let already_exited = state
+                .containers
+                .get(&req.id)
+                .is_some_and(|c| c.init.exit_code.lock().unwrap().is_some());
+            if already_exited {
+                // containerd's exit handling Deletes with
+                // `WithProcessKill` (a SIGKILL after the exit was
+                // observed): nothing left to signal, and `runc kill`
+                // would only report "not running".
+                self.bridges.lock().unwrap().remove(&req.id);
+                return Ok(api::Empty::new());
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            let signal = req.signal as i32;
+            let delivered = match state.agent_endpoint {
+                Some(ref endpoint) => {
+                    k7d::api::AgentClient::connect_endpoint(endpoint, Duration::from_secs(2))
+                        .map_err(|e| format!("agent dial: {e}"))
+                        .and_then(|mut agent| {
+                            agent
+                                .container_signal(&guest_name, signal)
+                                .map_err(|e| format!("container_signal: {e}"))
+                        })
+                }
+                None => Err("no agent endpoint".to_string()),
+            };
+            // The exit code is OWNED by the exit watcher: a SIGTERM'd
+            // container may trap the signal and exit with its own
+            // status, or (as PID 1 of its pid namespace) ignore it and
+            // keep running until containerd's grace period sends
+            // SIGKILL. Stamping `0` here — as this branch did from
+            // milestone 6 until docs/bug-candidates.md #46 — reported
+            // "Completed" for every `kubectl delete`, unblocked `Wait`
+            // while the process was still alive (so `Delete`'s
+            // `container_stop` SIGKILLed it a few ms after SIGTERM,
+            // defeating `terminationGracePeriodSeconds`), and hid a
+            // failed delivery behind a clean exit. Only SIGKILL has a
+            // deterministic outcome, so only SIGKILL is stamped eagerly
+            // (137 — what the watcher would report anyway); it is also
+            // the backstop that terminates a pod whose watcher already
+            // gave up (#47), because containerd always follows an
+            // unanswered SIGTERM with SIGKILL.
+            if let Err(e) = &delivered {
+                if req.signal == 9 {
+                    // Usually the process died between the watcher's
+                    // polls; 137 is stamped below either way.
+                    log::warn!("Kill: id={} SIGKILL not delivered ({e})", req.id);
+                } else {
+                    log::error!(
+                        "Kill: id={} signal={} NOT delivered ({e}); exit status left to the \
+                         watcher / containerd's SIGKILL follow-up",
+                        req.id,
+                        req.signal
+                    );
                 }
             }
-            if let Some(container) = state.containers.get(&req.id) {
-                if req.signal == 9 || req.signal == 15 {
+            if req.signal == 9 {
+                if let Some(container) = state.containers.get(&req.id) {
                     let mut ec = container.init.exit_code.lock().unwrap();
                     if ec.is_none() {
-                        *ec = Some(if req.signal == 9 { 137 } else { 0 });
+                        *ec = Some(137);
                     }
                     // Close the stdio FIFOs now that the task is dead —
                     // see the sandbox branch above for why this cannot
@@ -2069,9 +2501,9 @@ impl Task for K7Service {
                 // Fresh dial, not the cached agent — see Kill above (a
                 // fork-prepared source's cached connection is dead and
                 // would block teardown while holding the state lock).
-                if let Some(cid) = state.guest_cid {
+                if let Some(ref endpoint) = state.agent_endpoint {
                     if let Ok(mut agent) =
-                        k7d::api::AgentClient::connect_vsock(cid, Duration::from_secs(2))
+                        k7d::api::AgentClient::connect_endpoint(endpoint, Duration::from_secs(2))
                     {
                         let _ = agent.container_stop(&guest_name);
                     }
@@ -2176,7 +2608,7 @@ impl Task for K7Service {
 
         let exit_code = Arc::new(Mutex::new(None));
 
-        let (guest_cid, guest_name) = {
+        let (endpoint, guest_name) = {
             let mut state = self.state.lock().unwrap();
             let pid = state.alloc_pid();
 
@@ -2202,14 +2634,12 @@ impl Task for K7Service {
                 ))
                 .into());
             }
-            // Capture the VM's actual CID while we hold the lock so
-            // the spawned exec bridge thread doesn't need to re-lock.
-            // Falls back to `DEFAULT_GUEST_CID` only for
-            // SandboxStates somehow created before this field
-            // existed. The guest container name differs from `req.id`
-            // only for fork-adopted containers.
+            // Capture the endpoint while we hold the lock so the
+            // spawned exec bridge thread doesn't need to re-lock. The
+            // guest container name differs from `req.id` only for
+            // fork-adopted containers.
             (
-                state.guest_cid.unwrap_or(k7d::vsock::DEFAULT_GUEST_CID),
+                state.endpoint().map_err(containerd_shim::Error::Other)?,
                 state.guest_name(&req.id),
             )
         }; // state lock released here
@@ -2224,7 +2654,7 @@ impl Task for K7Service {
             let stderr_path = req.stderr.clone();
             std::thread::spawn(move || {
                 run_exec_bridge(
-                    guest_cid,
+                    &endpoint,
                     &container_name,
                     &args,
                     &exit_code_clone,
@@ -2297,17 +2727,17 @@ impl Task for K7Service {
         // ride in the payload below) — never as a reason to change the
         // payload's shape. Returns without waiting on the guest.
         {
-            let (guest_cid, guest_name, is_workload) = {
+            let (endpoint, guest_name, is_workload) = {
                 let state = self.state.lock().unwrap();
                 (
-                    state.guest_cid,
+                    state.agent_endpoint.clone(),
                     state.guest_name(&req.id),
                     state.containers.contains_key(&req.id)
                         && state.sandbox_id.as_deref() != Some(req.id.as_str()),
                 )
             };
-            if let (true, Some(cid)) = (is_workload, guest_cid) {
-                self.usage.sample(&req.id, &guest_name, cid);
+            if let (true, Some(endpoint)) = (is_workload, endpoint) {
+                self.usage.sample(&req.id, &guest_name, endpoint);
             }
         }
 
@@ -2579,14 +3009,15 @@ fn parse_exec_process_spec(
 }
 
 fn run_exec_bridge(
-    guest_cid: u64,
+    endpoint: &k7d::guest::AgentEndpoint,
     container_name: &str,
     args: &[String],
     exit_code: &Arc<Mutex<Option<i32>>>,
     stdout_path: &str,
     stderr_path: &str,
 ) {
-    let mut agent = match k7d::api::AgentClient::connect_vsock(guest_cid, Duration::from_secs(10)) {
+    let mut agent = match k7d::api::AgentClient::connect_endpoint(endpoint, Duration::from_secs(10))
+    {
         Ok(a) => a,
         Err(e) => {
             log::error!("exec bridge: agent connect failed: {e}");
@@ -2680,11 +3111,16 @@ fn mount_rootfs(
 ///   paths via the [`k7d::volumes::MountRewriteMap`]
 /// - Strip remaining bind mounts whose source is outside the
 ///   container rootfs and wasn't covered by the rewrite map
-/// - Strip seccomp, apparmor, `maskedPaths`, `readonlyPaths`,
-///   `cgroupsPath` (runc creates a fresh guest path)
+/// - Strip only confinement the guest cannot honour:
+///   `cgroupsPath` (host path; runc creates a fresh guest path),
+///   `process.apparmorProfile` (no LSM in `config-minimal`), and
+///   namespace `path`s (host `/proc/<pid>/ns/*`). Keep
+///   `linux.seccomp`, `maskedPaths`, and `readonlyPaths` — the
+///   guest has `CONFIG_SECCOMP_FILTER` and runc links libseccomp
 /// - Preserve CRI `linux.resources` (memory/cpu/…) so guest runc
-///   enforces per-container cgroup limits; always
-///   force a devices allow-all (CHALLENGES #36)
+///   enforces per-container cgroup limits. Pass `devices` through
+///   from CRI (deny-all for unprivileged, allow-all for
+///   privileged) instead of forcing allow-all (CHALLENGES #36 / #210)
 ///
 /// Fail-loud: the caller reads and parses
 /// `config.json` once and propagates any read/parse error before
@@ -2692,10 +3128,12 @@ fn mount_rootfs(
 /// raw, unfixed config (which would leave host-only bind mounts and
 /// namespace paths the guest can't satisfy). A serialization
 /// failure is returned as an `io::Error` so Create fails.
+#[allow(clippy::too_many_lines)]
 fn fix_oci_config(
     mut spec: serde_json::Value,
     rewrites: &k7d::volumes::MountRewriteMap,
     guest_root: Option<&str>,
+    docker: bool,
 ) -> std::io::Result<String> {
     // The container rootfs lives on an erofs
     // virtio-blk device mounted in the guest — rewrite `root.path`
@@ -2719,7 +3157,7 @@ fn fix_oci_config(
     // we know how to translate ends up with an in-VM source string
     // and survives the bind-mount strip downstream. Untranslated
     // bind mounts (hostPath, /etc/resolv.conf, etc.) are still
-    // dropped by the strip pass — chunk 2b extends the rewrite map
+    // dropped by the strip pass — a later pass extends the rewrite map
     // to cover those cases too.
     if !rewrites.is_empty() {
         let summary = rewrites.rewrite_oci_mounts(&mut spec);
@@ -2748,7 +3186,7 @@ fn fix_oci_config(
         // private subtree — exactly what Kata/stock k8s containers
         // see. Nested daemons (dockerd, k3s) handle cgroup2's
         // no-internal-process constraint themselves via the standard
-        // dind-style evacuation (moby hack/dind), so 18b's guest-root
+        // dind-style evacuation (moby hack/dind), so the guest-root
         // shortcut (dropping cgroupns) is unnecessary and
         // over-permissive.
         namespaces.retain(|ns| {
@@ -2823,18 +3261,48 @@ fn fix_oci_config(
                     });
             !is_bind || is_in_vm_source
         });
+        if docker {
+            insert_docker_mounts(mounts);
+        }
+    } else if docker {
+        let mut mounts = Vec::new();
+        insert_docker_mounts(&mut mounts);
+        spec["mounts"] = serde_json::Value::Array(mounts);
     }
 
+    if docker {
+        ensure_docker_host_env(&mut spec);
+    }
+
+    // Detect privileged from the CRI-expanded spec *before* we
+    // mutate linux: kubelet omits maskedPaths/readonlyPaths and
+    // grants CAP_SYS_ADMIN. The k7 runtime sets
+    // `privileged_without_host_devices`, so CRI still emits a
+    // devices deny-all (no host /dev); guest kubelet then dies on
+    // /dev/kmsg (CHALLENGES #36 / #210).
+    let privileged = oci_spec_is_privileged(&spec);
     if let Some(linux) = spec.get_mut("linux").and_then(|v| v.as_object_mut()) {
-        linux.remove("seccomp");
-        linux.remove("maskedPaths");
-        linux.remove("readonlyPaths");
+        // Host cgroup path; guest runc allocates its own.
         linux.remove("cgroupsPath");
-        let resources = sanitize_guest_resources(linux.remove("resources"))?;
-        linux.insert("resources".to_string(), resources);
+        match linux.remove("resources") {
+            Some(resources) => {
+                linux.insert(
+                    "resources".to_string(),
+                    sanitize_guest_resources(resources, privileged)?,
+                );
+            }
+            None if privileged => {
+                linux.insert(
+                    "resources".to_string(),
+                    sanitize_guest_resources(serde_json::json!({}), privileged)?,
+                );
+            }
+            None => {}
+        }
     }
 
-    // Remove apparmor profile
+    // Guest kernel has no AppArmor/SELinux; applying a host profile
+    // would make runc fail. Strip rather than invent a no-op.
     if let Some(process) = spec.get_mut("process").and_then(|v| v.as_object_mut()) {
         process.remove("apparmorProfile");
     }
@@ -2843,22 +3311,102 @@ fn fix_oci_config(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Bind the docker socket **directory** and the RO payload after the
+/// `/run` tmpfs (mount order matters — a bind before tmpfs is hidden).
+/// k3s containerd CRI does not add a `/run` tmpfs (that was a dockerd
+/// runtime default); inject one after `/proc` so later `/run/secrets`
+/// mounts still overlay and the docker binds cannot be hidden.
+fn insert_docker_mounts(mounts: &mut Vec<serde_json::Value>) {
+    let run_idx = mounts.iter().position(|m| {
+        m.get("destination").and_then(|d| d.as_str()) == Some("/run")
+            && m.get("type").and_then(|t| t.as_str()) == Some("tmpfs")
+    });
+    let run_idx = if let Some(idx) = run_idx {
+        idx
+    } else {
+        let insert_at = mounts
+            .iter()
+            .position(|m| m.get("destination").and_then(|d| d.as_str()) == Some("/proc"))
+            .map_or(0, |i| i + 1);
+        mounts.insert(
+            insert_at,
+            serde_json::json!({
+                "destination": "/run",
+                "type": "tmpfs",
+                "source": "tmpfs",
+                "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+            }),
+        );
+        insert_at
+    };
+    mounts.insert(
+        run_idx + 1,
+        serde_json::json!({
+            "destination": GUEST_DOCKER_SOCK_DIR,
+            "type": "bind",
+            "source": GUEST_DOCKER_SOCK_DIR,
+            "options": ["rbind", "rw", "rprivate"]
+        }),
+    );
+    mounts.insert(
+        run_idx + 2,
+        serde_json::json!({
+            "destination": GUEST_DOCKER_TOOLS_MOUNT,
+            "type": "bind",
+            "source": GUEST_DOCKER_TOOLS_MOUNT,
+            "options": ["rbind", "ro", "rprivate"]
+        }),
+    );
+}
+
+/// Set `DOCKER_HOST` unless the user already did. Never marks the
+/// container privileged.
+fn ensure_docker_host_env(spec: &mut serde_json::Value) {
+    const HOST: &str = "DOCKER_HOST=unix:///run/k7d/docker/docker.sock";
+    let Some(process) = spec.get_mut("process").and_then(|v| v.as_object_mut()) else {
+        spec["process"] = serde_json::json!({ "env": [HOST] });
+        return;
+    };
+    match process.get_mut("env") {
+        Some(serde_json::Value::Array(env)) => {
+            let already = env.iter().any(|e| {
+                e.as_str()
+                    .is_some_and(|s| s == HOST || s.starts_with("DOCKER_HOST="))
+            });
+            if !already {
+                env.push(serde_json::Value::String(HOST.into()));
+            }
+        }
+        _ => {
+            process.insert("env".into(), serde_json::json!([HOST]));
+        }
+    }
+}
+
 /// Keep CRI memory/cpu (and other) resource fields so
-/// guest runc enforces per-container cgroup limits; force devices
-/// allow-all (CHALLENGES #36); drop swap fields/unified keys the
-/// no-swap guest kernel cannot honour (CHALLENGES #54).
+/// guest runc enforces per-container cgroup limits. Pass `devices`
+/// through for unprivileged containers (CRI deny-all + runc's
+/// implicit default node set). For privileged containers the k7
+/// runtime's `privileged_without_host_devices` makes CRI emit the
+/// same deny-all — that is *host* devices. Replace it with an
+/// explicit `/dev/kmsg` allow (`1:11`) plus a guest allow-all so
+/// in-guest kubelet can open kmsg without the shim deleting the
+/// filter on every container (CHALLENGES #36 / #210). A missing
+/// `devices` list on an unprivileged spec stays missing.
+/// Drop swap fields/unified keys the no-swap guest kernel cannot
+/// honour (CHALLENGES #54).
 fn sanitize_guest_resources(
-    resources: Option<serde_json::Value>,
+    resources: serde_json::Value,
+    privileged: bool,
 ) -> std::io::Result<serde_json::Value> {
     let mut resources = match resources {
-        Some(serde_json::Value::Object(map)) => map,
-        Some(other) => {
+        serde_json::Value::Object(map) => map,
+        other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("linux.resources must be an object, got {other}"),
             ));
         }
-        None => serde_json::Map::new(),
     };
     // Structured OCI `memory.swap` maps to memory.swap.max — absent
     // when CONFIG_SWAP=n.
@@ -2890,11 +3438,124 @@ fn sanitize_guest_resources(
     if drop_unified {
         resources.remove("unified");
     }
-    resources.insert(
-        "devices".to_string(),
-        serde_json::json!([{ "allow": true, "access": "rwm" }]),
-    );
+    apply_guest_device_rules(&mut resources, privileged);
     Ok(serde_json::Value::Object(resources))
+}
+
+/// CRI-expanded privileged: no path masks and `CAP_SYS_ADMIN`.
+fn oci_spec_is_privileged(spec: &serde_json::Value) -> bool {
+    let linux = spec.get("linux");
+    if linux.and_then(|l| l.get("maskedPaths")).is_some()
+        || linux.and_then(|l| l.get("readonlyPaths")).is_some()
+    {
+        return false;
+    }
+    spec.pointer("/process/capabilities/bounding")
+        .and_then(|v| v.as_array())
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("CAP_SYS_ADMIN")))
+}
+
+fn linux_device_kmsg_allow() -> serde_json::Value {
+    serde_json::json!({
+        "allow": true,
+        "type": "c",
+        "major": 1,
+        "minor": 11,
+        "access": "rwm"
+    })
+}
+
+fn linux_device_allow_all() -> serde_json::Value {
+    serde_json::json!({ "allow": true, "access": "rwm" })
+}
+
+fn devices_is_wildcard_allow(rules: &[serde_json::Value]) -> bool {
+    rules.iter().any(|rule| {
+        rule.get("allow") == Some(&serde_json::Value::Bool(true))
+            && rule.get("access").and_then(|a| a.as_str()) == Some("rwm")
+            && rule.get("type").is_none()
+            && rule.get("major").is_none()
+            && rule.get("minor").is_none()
+    })
+}
+
+fn devices_is_deny_all_only(rules: &[serde_json::Value]) -> bool {
+    rules.len() == 1
+        && rules[0].get("allow") == Some(&serde_json::Value::Bool(false))
+        && rules[0].get("access").and_then(|a| a.as_str()) == Some("rwm")
+        && rules[0].get("type").is_none()
+        && rules[0].get("major").is_none()
+}
+
+fn is_kmsg_allow(rule: &serde_json::Value) -> bool {
+    rule.get("allow") == Some(&serde_json::Value::Bool(true))
+        && rule.get("type").and_then(|t| t.as_str()) == Some("c")
+        && rule.get("major") == Some(&serde_json::json!(1))
+        && rule.get("minor") == Some(&serde_json::json!(11))
+}
+
+/// Privileged + CRI deny-all (`privileged_without_host_devices`):
+/// explicit `/dev/kmsg` allow plus a guest allow-all. Unprivileged
+/// specs keep the CRI list untouched.
+fn apply_guest_device_rules(
+    resources: &mut serde_json::Map<String, serde_json::Value>,
+    privileged: bool,
+) {
+    if !privileged {
+        return;
+    }
+    let mut rules = match resources.get("devices") {
+        Some(serde_json::Value::Array(arr)) => arr.clone(),
+        None | Some(_) => Vec::new(),
+    };
+    if devices_is_deny_all_only(&rules) {
+        rules.clear();
+    }
+    if !rules.iter().any(is_kmsg_allow) {
+        rules.insert(0, linux_device_kmsg_allow());
+    }
+    if !devices_is_wildcard_allow(&rules) {
+        rules.push(linux_device_allow_all());
+    }
+    resources.insert("devices".into(), serde_json::Value::Array(rules));
+}
+
+/// `runc --version` stdout includes a `libseccomp:` line when the
+/// binary was linked against libseccomp. A static runc without it
+/// is a build error — guest `linux.seccomp` would be rejected at
+/// `runc run`, not silently dropped.
+fn runc_version_has_libseccomp(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let line = line.trim();
+        line.to_ascii_lowercase()
+            .split_once(':')
+            .is_some_and(|(k, v)| k.trim() == "libseccomp" && !v.trim().is_empty())
+    })
+}
+
+/// Fail loud if `runc --version` does not report libseccomp.
+fn assert_runc_links_libseccomp(runc: &Path) -> Result<(), String> {
+    let output = std::process::Command::new(runc)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("{} --version: {e}", runc.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version failed ({}): {stdout}{}",
+            runc.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if !runc_version_has_libseccomp(&stdout) {
+        return Err(format!(
+            "{} is a build error: `runc --version` has no libseccomp line \
+             (guest seccomp would fail at runc run):\n{stdout}",
+            runc.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Locate the static runc binary on the host for the guest tools
@@ -2926,6 +3587,7 @@ fn prepare_tools_image(cache_dir: &Path) -> Result<PathBuf, String> {
         "runc binary not found on host (looked for guest/rootfs/runc.amd64, \
          /usr/bin/runc, /usr/sbin/runc) — container start would fail",
     )?;
+    assert_runc_links_libseccomp(&runc)?;
     let staging = std::env::temp_dir().join(format!(
         "k7d-tools-stage-{}-{}",
         std::process::id(),
@@ -2947,6 +3609,58 @@ fn prepare_tools_image(cache_dir: &Path) -> Result<PathBuf, String> {
     })();
     let _ = std::fs::remove_dir_all(&staging);
     result
+}
+
+/// Build (or cache-hit) the Docker payload erofs: static
+/// dockerd/CLI/plugins/iptables, attached read-only at
+/// [`GUEST_DOCKER_TOOLS_MOUNT`]. Content-walk keyed. Fail-loud if the
+/// payload has not been built (`guest/docker/build.sh`).
+fn prepare_docker_payload_image(cache_dir: &Path) -> Result<PathBuf, String> {
+    let payload = find_docker_payload().ok_or(
+        "docker payload not found (looked for guest/docker/payload, \
+         /root/k7d/guest/docker/payload, /usr/local/share/k7d/docker) — \
+         run guest/docker/build.sh",
+    )?;
+    if !payload.join("bin/dockerd").exists() {
+        return Err(format!(
+            "docker payload at {} is missing bin/dockerd",
+            payload.display()
+        ));
+    }
+    if !payload.join("etc/ssl/certs/ca-certificates.crt").exists() {
+        return Err(format!(
+            "docker payload at {} is missing etc/ssl/certs/ca-certificates.crt",
+            payload.display()
+        ));
+    }
+    let cached = k7d::erofs::cached_erofs_image(cache_dir, &payload, None)
+        .map_err(|e| format!("docker payload erofs image: {e}"))?;
+    let key = cached
+        .file_stem()
+        .map_or_else(|| "payload".into(), |s| s.to_string_lossy().into_owned());
+    let named = cache_dir.join(format!("docker-payload-{key}.erofs"));
+    if !named.exists() {
+        std::fs::hard_link(&cached, &named)
+            .or_else(|_| std::fs::copy(&cached, &named).map(|_| ()))
+            .map_err(|e| format!("name docker payload image {}: {e}", named.display()))?;
+    }
+    Ok(named)
+}
+
+fn find_docker_payload() -> Option<PathBuf> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(|r| r.join("guest/docker/payload"));
+    let mut candidates = Vec::new();
+    if let Some(w) = workspace {
+        candidates.push(w);
+    }
+    candidates.push(PathBuf::from("/root/k7d/guest/docker/payload"));
+    candidates.push(PathBuf::from("/usr/local/share/k7d/docker"));
+    candidates
+        .into_iter()
+        .find(|c| c.join("bin/dockerd").is_file())
 }
 
 /// Configure the guest's eth0 / default route once its VM is up.
@@ -3134,7 +3848,7 @@ fn workload_create_block(
     // volume sources -> in-VM paths, host-only mounts stripped) and
     // push the bundle over vsock into guest tmpfs.
     let rewrites = state.mount_rewrite_map();
-    let fixed = fix_oci_config(spec_val, &rewrites, Some(&guest_root))
+    let fixed = fix_oci_config(spec_val, &rewrites, Some(&guest_root), state.docker)
         .map_err(|e| format!("fix OCI config for {}: {e}", req.id))?;
     // Host-side copy for debugging (best-effort — the guest copy is
     // the one runc consumes).
@@ -3306,7 +4020,7 @@ fn prepare_rootfs_device(
 /// garbage). The blk backend reads capacity from backing-file size at
 /// boot, hence the up-front ftruncate. Count/size come from the
 /// `k7d.katakate.org/image-slots` / `image-slot-size` pod annotations
-/// (defaults 4 / 2 GiB); invalid values fail loud.
+/// (defaults 2 / 2 GiB); invalid values fail loud.
 fn declare_image_slots(
     config: &mut k7d::control::VmConfig,
     ann: &ShimAnnotations,
@@ -3316,7 +4030,13 @@ fn declare_image_slots(
         Some(raw) => raw
             .parse::<u32>()
             .map_err(|e| format!("invalid {ANN_IMAGE_SLOTS} {raw:?}: {e}"))?,
-        None => DEFAULT_IMAGE_SLOTS,
+        None => {
+            if config.docker.is_some() {
+                DEFAULT_IMAGE_SLOTS_DOCKER
+            } else {
+                DEFAULT_IMAGE_SLOTS
+            }
+        }
     };
     let size = match ann.image_slot_size.as_deref() {
         Some(raw) => raw
@@ -3344,10 +4064,13 @@ fn declare_image_slots(
         + usize::from(config.scratch_size_bytes.is_some())
         + config.container_scratch.len()
         // Named persistent disks are appended by the daemon too.
-        + config.data_disks.len();
+        + config.data_disks.len()
+        // Docker graph scratch is appended last by the daemon; the
+        // payload slot is already in `block_devices`.
+        + usize::from(config.docker.is_some());
     if declared + count as usize > MMIO_DEVICE_BUDGET {
         return Err(format!(
-            "{ANN_IMAGE_SLOTS}={count} exceeds the MMIO/IOAPIC pin budget: {declared} \
+            "{ANN_IMAGE_SLOTS}={count} exceeds the MMIO/PIC pin budget: {declared} \
              devices already declared, at most {MMIO_DEVICE_BUDGET} total"
         ));
     }
@@ -3454,6 +4177,32 @@ fn assign_image_slot(
         .open(&backing)
         .and_then(|f| f.set_len(capacity))
         .map_err(|e| format!("ftruncate {} back to {capacity}: {e}", backing.display()))?;
+
+    // A Firecracker VM does not see the fill: the file it has open is
+    // a link staged into its chroot at boot, and on a node whose erofs
+    // cache and jail filesystems differ that link is a copy, not the
+    // slot's own inode. Repoint the drive instead.
+    if state.backend == k7d::guest::Backend::Firecracker {
+        let vm_id = state
+            .vm_id
+            .clone()
+            .ok_or("image slot fill on a Firecracker sandbox with no VM")?;
+        let response = k7d::control::Client::connect_env()
+            .map_err(|e| format!("connect to k7d for update_drive: {e}"))?
+            .call(&k7d::control::Request::UpdateDrive {
+                vm_id: vm_id.clone(),
+                device_index,
+                host_path: backing.to_string_lossy().into_owned(),
+            })
+            .map_err(|e| format!("update_drive({vm_id}, {device_index}): {e}"))?;
+        match response {
+            k7d::control::Response::Ok => {}
+            k7d::control::Response::Error { message } => {
+                return Err(format!("update_drive({vm_id}, {device_index}): {message}"))
+            }
+            other => return Err(format!("update_drive: unexpected response {other:?}")),
+        }
+    }
 
     let letter = u8::try_from(device_index)
         .ok()
@@ -3650,8 +4399,60 @@ fn push_etc_files(state: &mut SandboxState, to_push: &[(String, String)]) -> Res
             .map_err(|e| format!("push etc-file {host} -> {guest}: {e}"))?;
         state.etc_pushed.insert(host.clone(), guest.clone());
         debug_log_cni(&format!("Create: pushed etc-file {host} -> {guest}"));
+        if state.docker {
+            let leaf = guest.rsplit('/').next().unwrap_or("");
+            let name = leaf.rsplit_once('-').map_or(leaf, |(_, n)| n);
+            let guest_etc = match name {
+                "resolv.conf" => Some("/etc/resolv.conf"),
+                "hosts" => Some("/etc/hosts"),
+                "hostname" => Some("/etc/hostname"),
+                _ => None,
+            };
+            if let Some(path) = guest_etc {
+                let payload = if path == "/etc/resolv.conf" {
+                    guest_dockerd_resolv(&data)
+                } else {
+                    data.clone()
+                };
+                state
+                    .agent_mut()?
+                    .write_file(path, &payload)
+                    .map_err(|e| format!("push docker guest {path} from {host}: {e}"))?;
+                debug_log_cni(&format!(
+                    "Create: docker planted {path} from {host} so dockerd can resolve"
+                ));
+            }
+        }
+    }
+    if state.docker
+        && !state.etc_pushed.values().any(|g| {
+            g.rsplit('/')
+                .next()
+                .is_some_and(|l| l.ends_with("resolv.conf"))
+        })
+    {
+        return Err(
+            "docker pod OCI spec has no /etc/resolv.conf; dockerd would default to [::1]:53".into(),
+        );
     }
     Ok(())
+}
+
+/// Dockerd lives in the guest root netns. CRI resolv.conf points at
+/// `ClusterIP` (10.43.0.10 on k3s); after dockerd installs nft/iptables
+/// that address is `network is unreachable` from guest root. Keep
+/// search/options and use public resolvers the TAP NAT can reach.
+fn guest_dockerd_resolv(cri: &[u8]) -> Vec<u8> {
+    let mut out = String::new();
+    for line in String::from_utf8_lossy(cri).lines() {
+        if line.trim_start().starts_with("nameserver ") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    out.into_bytes()
 }
 
 /// k7d-provisioned RWO disk volumes (static
@@ -3853,6 +4654,9 @@ fn prepare_hostpath_fallback(
     sandbox_id: &str,
     spec: &serde_json::Value,
 ) -> Result<(), String> {
+    if k7d::volumes::virtiofs_fallback_denied()? {
+        return Err(k7d::volumes::DENY_VIRTIOFS_FALLBACK_MSG.to_string());
+    }
     if let Some(ref mut pv) = state.pod_volumes {
         // Shares already attached at boot: the share roots are live
         // virtiofs directories, so new binds under them appear in
@@ -3885,6 +4689,17 @@ fn prepare_hostpath_fallback(
         // No fallback needed — drop the scratch tree again.
         pv.cleanup();
         return Ok(());
+    }
+
+    // A Firecracker VM has no vhost-user-fs device, and never will.
+    // Refusing here rather than letting `create_vm` reject the share
+    // keeps the failure at the volume that caused it.
+    if state.backend == k7d::guest::Backend::Firecracker {
+        pv.cleanup();
+        return Err(format!(
+            "{} (backend firecracker has no virtiofs)",
+            k7d::volumes::DENY_VIRTIOFS_FALLBACK_MSG
+        ));
     }
 
     let Some(cfg) = state.pending_vm.as_mut() else {
@@ -3948,14 +4763,23 @@ fn boot_pending_vm(state: &mut SandboxState) -> Result<(), String> {
         )
     })?;
     let created = daemon.call(&k7d::control::Request::CreateVm { config })?;
-    let (vm_id, guest_cid, vm_index, pod_netns_attached) = match created {
+    let (vm_id, agent_endpoint, vm_index, pod_netns_attached) = match created {
         k7d::control::Response::VmCreated {
             vm_id,
-            guest_cid,
+            guest_cid: _,
             vm_index,
             pod_netns_attached,
             pooled: _,
-        } => (vm_id, guest_cid, vm_index, pod_netns_attached),
+            agent_endpoint,
+        } => {
+            // No fallback to `guest_cid`: a daemon that did not say how
+            // to reach the agent may have booted the VM on a backend
+            // this shim would then dial the wrong way, and dialling a
+            // stale CID reaches somebody else's VM.
+            let endpoint = agent_endpoint
+                .ok_or_else(|| format!("k7d create_vm returned no agent_endpoint for {vm_id}"))?;
+            (vm_id, endpoint, vm_index, pod_netns_attached)
+        }
         k7d::control::Response::Error { message } => {
             return Err(format!("k7d create_vm: {message}"));
         }
@@ -3964,16 +4788,22 @@ fn boot_pending_vm(state: &mut SandboxState) -> Result<(), String> {
         }
     };
     debug_log_cni(&format!(
-        "Create: daemon vm_id={vm_id} guest_cid={guest_cid} vm_index={vm_index:?} \
+        "Create: daemon vm_id={vm_id} agent={agent_endpoint:?} vm_index={vm_index:?} \
          pod_netns_attached={pod_netns_attached}"
     ));
     state.vm_id = Some(vm_id);
-    state.guest_cid = Some(guest_cid);
+    state.agent_endpoint = Some(agent_endpoint);
     state.vm_index = vm_index;
     state.pod_netns = if pod_netns_attached { pod_netns } else { None };
     state.pending_vm = None;
 
     state.connect_agent()?;
+    if state.docker {
+        match state.agent_mut()?.ping() {
+            Ok(pong) => debug_log_cni(&format!("Create: docker Pong.services={:?}", pong.services)),
+            Err(e) => debug_log_cni(&format!("Create: docker ping failed: {e}")),
+        }
+    }
     configure_guest_network(state);
     Ok(())
 }
@@ -3988,6 +4818,92 @@ mod tests {
             image_slot_size: size.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    fn backend_ann(handler: Option<&str>, backend: Option<&str>) -> ShimAnnotations {
+        ShimAnnotations {
+            runtime_handler: handler.map(str::to_string),
+            backend: backend.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn k7_fc_handler_selects_firecracker_without_annotation() {
+        assert_eq!(
+            resolve_backend(&backend_ann(Some("k7-fc"), None), None).unwrap(),
+            k7d::guest::Backend::Firecracker
+        );
+    }
+
+    #[test]
+    fn k7_handler_defaults_native() {
+        assert_eq!(
+            resolve_backend(&backend_ann(Some("k7"), None), None).unwrap(),
+            k7d::guest::Backend::Native
+        );
+    }
+
+    #[test]
+    fn k7_handler_still_allows_firecracker_annotation() {
+        assert_eq!(
+            resolve_backend(&backend_ann(Some("k7"), Some("firecracker")), None).unwrap(),
+            k7d::guest::Backend::Firecracker
+        );
+    }
+
+    #[test]
+    fn k7_fc_plus_native_annotation_is_a_loud_contradiction() {
+        let err = resolve_backend(&backend_ann(Some("k7-fc"), Some("native")), None).unwrap_err();
+        assert!(
+            err.contains("contradicts") && err.contains("native"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_path_firecracker_plus_native_annotation_contradicts() {
+        let err = resolve_backend(
+            &backend_ann(None, Some("native")),
+            Some(k7d::guest::Backend::Firecracker),
+        )
+        .unwrap_err();
+        assert!(err.contains("contradicts"), "{err}");
+    }
+
+    #[test]
+    fn config_path_selects_firecracker_when_handler_absent() {
+        assert_eq!(
+            resolve_backend(
+                &backend_ann(None, None),
+                Some(k7d::guest::Backend::Firecracker)
+            )
+            .unwrap(),
+            k7d::guest::Backend::Firecracker
+        );
+    }
+
+    #[test]
+    fn unknown_backend_annotation_is_loud() {
+        let err = resolve_backend(&backend_ann(None, Some("qemu")), None).unwrap_err();
+        assert!(err.contains("qemu") && err.contains("native"), "{err}");
+    }
+
+    #[test]
+    fn protobuf_config_path_field_2_is_runtimeoptions_v1() {
+        // runtimeoptions.v1.Options { config_path: "/etc/k7d/shim-k7-fc.toml" }
+        // field 2, wire type 2, length-delimited (CHALLENGES #230).
+        let path = "/etc/k7d/shim-k7-fc.toml";
+        let mut buf = Vec::new();
+        let tag = (2u32 << 3) | 2;
+        buf.push(tag as u8);
+        buf.push(path.len() as u8);
+        buf.extend_from_slice(path.as_bytes());
+        assert_eq!(
+            protobuf_len_delimited_string(&buf, 2).as_deref(),
+            Some(path)
+        );
+        assert_eq!(config_path_from_options_bytes(&buf).as_deref(), Some(path));
     }
 
     #[test]
@@ -4007,6 +4923,22 @@ mod tests {
             let len = std::fs::metadata(&slot.backing).unwrap().len();
             assert_eq!(len, DEFAULT_IMAGE_SLOT_SIZE);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn docker_default_image_slots_fit_pic_budget() {
+        let dir = std::env::temp_dir().join(format!("k7d-slot-docker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = k7d::control::VmConfig {
+            docker: Some(k7d::control::DockerConfig {
+                graph_size_bytes: k7d::disks::DEFAULT_DOCKER_DISK_SIZE,
+            }),
+            ..Default::default()
+        };
+        let slots = declare_image_slots(&mut config, &slot_ann(None, None), &dir).unwrap();
+        assert_eq!(slots.len(), DEFAULT_IMAGE_SLOTS_DOCKER as usize);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4046,7 +4978,7 @@ mod tests {
     }
 
     /// The per-container annotation parses to exactly what it
-    /// says, and 19b behaviour is what its absence means.
+    /// says, and the legacy behaviour is what its absence means.
     #[test]
     fn container_scratch_annotation_parses() {
         assert!(
@@ -4271,14 +5203,22 @@ mod tests {
                     "devices": [{ "allow": false, "access": "rwm" }]
                 },
                 "cgroupsPath": "/kubepods/pod123/ctr456",
-                "seccomp": { "defaultAction": "SCMP_ACT_ERRNO" }
+                "seccomp": { "defaultAction": "SCMP_ACT_ERRNO" },
+                "maskedPaths": ["/proc/kcore"],
+                "readonlyPaths": ["/proc/sysrq-trigger"],
+                "namespaces": [
+                    { "type": "pid", "path": "/proc/1/ns/pid" },
+                    { "type": "mount" }
+                ]
             },
+            "process": { "apparmorProfile": "cri-containerd.apparmor.d" },
             "mounts": []
         });
         let empty = k7d::volumes::MountRewriteMap::default();
-        let fixed: serde_json::Value =
-            serde_json::from_str(&fix_oci_config(spec, &empty, Some("/run/k7d/rootfs-0")).unwrap())
-                .unwrap();
+        let fixed: serde_json::Value = serde_json::from_str(
+            &fix_oci_config(spec, &empty, Some("/run/k7d/rootfs-0"), false).unwrap(),
+        )
+        .unwrap();
         assert_eq!(fixed["linux"]["resources"]["memory"]["limit"], 33_554_432);
         assert_eq!(
             fixed["linux"]["resources"]["memory"]["reservation"],
@@ -4287,16 +5227,82 @@ mod tests {
         assert_eq!(fixed["linux"]["resources"]["cpu"]["quota"], 50_000);
         assert_eq!(fixed["linux"]["resources"]["cpu"]["period"], 100_000);
         assert_eq!(fixed["linux"]["resources"]["cpu"]["shares"], 1024);
-        // Host device deny-all must be replaced with guest allow-all.
+        // CRI deny-all reaches guest runc; do not replace with allow-all.
         assert_eq!(
             fixed["linux"]["resources"]["devices"],
-            serde_json::json!([{ "allow": true, "access": "rwm" }])
+            serde_json::json!([{ "allow": false, "access": "rwm" }])
         );
         // Swap + oom.group unified keys dropped for the guest; with
         // nothing left, the unified object itself is removed.
         assert!(fixed["linux"]["resources"].get("unified").is_none());
         assert!(fixed["linux"].get("cgroupsPath").is_none());
-        assert!(fixed["linux"].get("seccomp").is_none());
+        assert_eq!(
+            fixed["linux"]["seccomp"],
+            serde_json::json!({ "defaultAction": "SCMP_ACT_ERRNO" })
+        );
+        assert_eq!(
+            fixed["linux"]["maskedPaths"],
+            serde_json::json!(["/proc/kcore"])
+        );
+        assert_eq!(
+            fixed["linux"]["readonlyPaths"],
+            serde_json::json!(["/proc/sysrq-trigger"])
+        );
+        assert!(fixed["process"].get("apparmorProfile").is_none());
+        let ns = fixed["linux"]["namespaces"].as_array().unwrap();
+        assert_eq!(ns.len(), 2);
+        assert!(ns[0].get("path").is_none(), "host namespace path stripped");
+        assert_eq!(ns[0]["type"], "pid");
+    }
+
+    #[test]
+    fn fix_oci_config_passes_privileged_devices_allow() {
+        let spec = serde_json::json!({
+            "root": { "path": "/x" },
+            "process": { "capabilities": { "bounding": ["CAP_SYS_ADMIN"] } },
+            "linux": {
+                "resources": {
+                    "devices": [{ "allow": true, "access": "rwm" }]
+                }
+            },
+            "mounts": []
+        });
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
+        assert_eq!(
+            fixed["linux"]["resources"]["devices"],
+            serde_json::json!([
+                { "allow": true, "type": "c", "major": 1, "minor": 11, "access": "rwm" },
+                { "allow": true, "access": "rwm" }
+            ])
+        );
+    }
+
+    #[test]
+    fn fix_oci_config_privileged_cri_deny_all_gets_kmsg_allow() {
+        // privileged_without_host_devices: CRI emits deny-all even
+        // for privileged. Guest kubelet needs /dev/kmsg (CHALLENGES #36).
+        let spec = serde_json::json!({
+            "root": { "path": "/x" },
+            "process": { "capabilities": { "bounding": ["CAP_CHOWN", "CAP_SYS_ADMIN"] } },
+            "linux": {
+                "resources": {
+                    "devices": [{ "allow": false, "access": "rwm" }]
+                }
+            },
+            "mounts": []
+        });
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
+        assert_eq!(
+            fixed["linux"]["resources"]["devices"],
+            serde_json::json!([
+                { "allow": true, "type": "c", "major": 1, "minor": 11, "access": "rwm" },
+                { "allow": true, "access": "rwm" }
+            ])
+        );
     }
 
     #[test]
@@ -4312,7 +5318,7 @@ mod tests {
         });
         let empty = k7d::volumes::MountRewriteMap::default();
         let fixed: serde_json::Value =
-            serde_json::from_str(&fix_oci_config(spec, &empty, None).unwrap()).unwrap();
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
         assert_eq!(fixed["linux"]["resources"]["memory"]["limit"], 268_435_456);
         assert!(fixed["linux"]["resources"]["memory"].get("swap").is_none());
     }
@@ -4356,7 +5362,7 @@ mod tests {
         });
         let empty = k7d::volumes::MountRewriteMap::default();
         let fixed: serde_json::Value =
-            serde_json::from_str(&fix_oci_config(spec, &empty, None).unwrap()).unwrap();
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
         let mounts = fixed["mounts"].as_array().unwrap();
         assert_eq!(mounts.len(), 2, "cgroup mounts kept, mqueue stripped");
         assert_eq!(mounts[0]["destination"], "/sys/fs/cgroup");
@@ -4380,7 +5386,7 @@ mod tests {
     }
 
     #[test]
-    fn fix_oci_config_resources_absent_still_gets_devices_allow() {
+    fn fix_oci_config_resources_absent_leaves_devices_absent() {
         let spec = serde_json::json!({
             "root": { "path": "/x" },
             "linux": {},
@@ -4388,12 +5394,46 @@ mod tests {
         });
         let empty = k7d::volumes::MountRewriteMap::default();
         let fixed: serde_json::Value =
-            serde_json::from_str(&fix_oci_config(spec, &empty, None).unwrap()).unwrap();
-        assert_eq!(
-            fixed["linux"]["resources"]["devices"],
-            serde_json::json!([{ "allow": true, "access": "rwm" }])
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
+        assert!(
+            fixed["linux"].get("resources").is_none(),
+            "absent CRI resources must stay absent, not grow an allow-all devices list"
         );
-        assert!(fixed["linux"]["resources"].get("memory").is_none());
+    }
+
+    #[test]
+    fn fix_oci_config_resources_without_devices_leaves_devices_absent() {
+        let spec = serde_json::json!({
+            "root": { "path": "/x" },
+            "linux": {
+                "resources": { "memory": { "limit": 4096 } }
+            },
+            "mounts": []
+        });
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, false).unwrap()).unwrap();
+        assert_eq!(fixed["linux"]["resources"]["memory"]["limit"], 4096);
+        assert!(fixed["linux"]["resources"].get("devices").is_none());
+    }
+
+    #[test]
+    fn runc_version_detects_libseccomp_line() {
+        assert!(runc_version_has_libseccomp(
+            "runc version 1.1.12\ncommit: abc\nspec: 1.0.2-dev\nlibseccomp: 2.5.4\n"
+        ));
+        assert!(!runc_version_has_libseccomp(
+            "runc version 1.1.12\ncommit: abc\nspec: 1.0.2-dev\n"
+        ));
+        assert!(!runc_version_has_libseccomp("libseccomp:\n"));
+    }
+
+    #[test]
+    fn tools_runc_links_libseccomp() {
+        let runc = find_runc_binary().expect(
+            "runc must exist on the remote node (guest/rootfs/runc.amd64 or /usr/bin/runc)",
+        );
+        assert_runc_links_libseccomp(&runc).unwrap();
     }
 
     #[test]
@@ -4442,5 +5482,208 @@ mod tests {
         let s = vm_sizing_from_annotations(&ann(None, Some(-1), Some(100_000)));
         assert_eq!(s.vcpus, 1);
         assert_eq!(s.cpu_quota, None);
+    }
+
+    #[test]
+    fn docker_true_parses_default_and_override_size() {
+        let def = docker_from_annotations(&ShimAnnotations {
+            docker: Some("true".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("docker");
+        assert_eq!(def.graph_size_bytes, k7d::disks::DEFAULT_DOCKER_DISK_SIZE);
+        let over = docker_from_annotations(&ShimAnnotations {
+            docker: Some("true".into()),
+            docker_disk: Some("4Gi".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("docker");
+        assert_eq!(over.graph_size_bytes, 4 * 1024 * 1024 * 1024);
+        assert!(docker_from_annotations(&ShimAnnotations::default())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn docker_disk_without_docker_fails() {
+        let err = docker_from_annotations(&ShimAnnotations {
+            docker_disk: Some("4Gi".into()),
+            ..Default::default()
+        })
+        .expect_err("docker-disk alone");
+        assert!(err.contains(ANN_DOCKER_DISK), "{err}");
+        assert!(err.contains(ANN_DOCKER), "{err}");
+    }
+
+    #[test]
+    fn docker_garbage_value_fails() {
+        let err = docker_from_annotations(&ShimAnnotations {
+            docker: Some("yes".into()),
+            ..Default::default()
+        })
+        .expect_err("not true");
+        assert!(err.contains(ANN_DOCKER), "{err}");
+        let err = docker_from_annotations(&ShimAnnotations {
+            docker: Some("true".into()),
+            docker_disk: Some("nope".into()),
+            ..Default::default()
+        })
+        .expect_err("garbage size");
+        assert!(err.contains(ANN_DOCKER_DISK), "{err}");
+    }
+
+    #[test]
+    fn docker_graph_counts_against_the_pin_budget() {
+        let dir = std::env::temp_dir().join(format!("k7d-docker-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = k7d::control::VmConfig {
+            vsock: true,
+            docker: Some(k7d::control::DockerConfig {
+                graph_size_bytes: k7d::disks::DEFAULT_DOCKER_DISK_SIZE,
+            }),
+            data_disks: (0..MMIO_DEVICE_BUDGET - 5)
+                .map(|i| k7d::control::DataDiskConfig {
+                    id: format!("d{i}"),
+                    size_bytes: k7d::disks::MIN_DATA_DISK_SIZE,
+                    guest_mount: format!("/var/lib/d{i}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = declare_image_slots(&mut config, &slot_ann(Some("4"), None), &dir)
+            .expect_err("docker graph must count against the budget");
+        assert!(err.contains(ANN_IMAGE_SLOTS), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn docker_oci_spec() -> serde_json::Value {
+        serde_json::json!({
+            "root": { "path": "/x" },
+            "process": { "env": ["PATH=/usr/bin"] },
+            "linux": { "namespaces": [{ "type": "pid" }, { "type": "mount" }] },
+            "mounts": [
+                {
+                    "destination": "/proc",
+                    "type": "proc",
+                    "source": "proc"
+                },
+                {
+                    "destination": "/run",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+                },
+                {
+                    "destination": "/dev",
+                    "type": "tmpfs",
+                    "source": "tmpfs"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn fix_oci_config_docker_mounts_after_run_tmpfs() {
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(docker_oci_spec(), &empty, None, true).unwrap())
+                .unwrap();
+        let mounts = fixed["mounts"].as_array().unwrap();
+        let run_idx = mounts
+            .iter()
+            .position(|m| m["destination"] == "/run" && m["type"] == "tmpfs")
+            .expect("/run tmpfs");
+        assert_eq!(mounts[run_idx + 1]["destination"], GUEST_DOCKER_SOCK_DIR);
+        assert_eq!(mounts[run_idx + 1]["source"], GUEST_DOCKER_SOCK_DIR);
+        assert!(mounts[run_idx + 1]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "rbind" || o == "bind"));
+        assert_eq!(mounts[run_idx + 2]["destination"], GUEST_DOCKER_TOOLS_MOUNT);
+        assert_eq!(mounts[run_idx + 2]["source"], GUEST_DOCKER_TOOLS_MOUNT);
+        let tools_opts = mounts[run_idx + 2]["options"].as_array().unwrap();
+        assert!(tools_opts.iter().any(|o| o == "ro"));
+    }
+
+    #[test]
+    fn fix_oci_config_docker_sets_docker_host_unless_present() {
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(docker_oci_spec(), &empty, None, true).unwrap())
+                .unwrap();
+        let env: Vec<&str> = fixed["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            env.iter()
+                .any(|e| *e == "DOCKER_HOST=unix:///run/k7d/docker/docker.sock"),
+            "{env:?}"
+        );
+        let mut spec = docker_oci_spec();
+        spec["process"]["env"] = serde_json::json!(["DOCKER_HOST=unix:///tmp/custom.sock"]);
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, true).unwrap()).unwrap();
+        let env: Vec<&str> = fixed["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            env.iter().filter(|e| e.starts_with("DOCKER_HOST=")).count(),
+            1,
+            "{env:?}"
+        );
+        assert!(env.contains(&"DOCKER_HOST=unix:///tmp/custom.sock"));
+    }
+
+    #[test]
+    fn fix_oci_config_docker_injects_run_tmpfs_when_cri_omits_it() {
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let spec = serde_json::json!({
+            "root": { "path": "/x" },
+            "mounts": [{ "destination": "/proc", "type": "proc", "source": "proc" }]
+        });
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(spec, &empty, None, true).unwrap()).unwrap();
+        let mounts = fixed["mounts"].as_array().unwrap();
+        assert_eq!(mounts[0]["destination"], "/proc");
+        assert_eq!(mounts[1]["destination"], "/run");
+        assert_eq!(mounts[1]["type"], "tmpfs");
+        assert_eq!(mounts[2]["destination"], GUEST_DOCKER_SOCK_DIR);
+        assert_eq!(mounts[3]["destination"], GUEST_DOCKER_TOOLS_MOUNT);
+    }
+
+    #[test]
+    fn guest_dockerd_resolv_drops_cluster_dns() {
+        let out = guest_dockerd_resolv(
+            b"search default.svc.cluster.local svc.cluster.local\nnameserver 10.43.0.10\noptions ndots:5\n",
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("search default.svc.cluster.local"));
+        assert!(text.contains("options ndots:5"));
+        assert!(text.contains("nameserver 1.1.1.1"));
+        assert!(text.contains("nameserver 8.8.8.8"));
+        assert!(!text.contains("10.43.0.10"));
+    }
+
+    #[test]
+    fn fix_oci_config_docker_does_not_mark_privileged() {
+        let empty = k7d::volumes::MountRewriteMap::default();
+        let fixed: serde_json::Value =
+            serde_json::from_str(&fix_oci_config(docker_oci_spec(), &empty, None, true).unwrap())
+                .unwrap();
+        assert!(fixed["process"].get("capabilities").is_none());
+        assert_ne!(
+            fixed["linux"]["resources"]["devices"],
+            serde_json::json!([{ "allow": true, "access": "rwm" }])
+        );
     }
 }

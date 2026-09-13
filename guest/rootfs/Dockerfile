@@ -7,7 +7,7 @@
 # image is not part of the initramfs — it is handed to a guest over
 # virtiofs by whoever needs it, the same arrangement runc has.
 #
-# Until the referenced work this file still described the whole rootfs and
+# This file once described the whole rootfs and
 # nothing built it: an out-of-date copy of a build nobody ran.
 #
 # iproute2-minimal ships `ip`, iproute2-tc ships `tc` — alpine splits

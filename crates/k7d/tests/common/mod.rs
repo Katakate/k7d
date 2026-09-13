@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A snapshot-tree root on the node's reflink XFS, removed on Drop.
 ///
-/// Incremental keyframes  `FICLONE` their ancestor's
+/// Incremental keyframes `FICLONE` their ancestor's
 /// `memory.bin`, which needs source and destination on one
 /// reflink-capable filesystem. The node's root FS — where
 /// `tempfile::tempdir()` lands — is ext4 and cannot clone at all, so a
@@ -60,7 +60,7 @@ impl ReflinkTreeRoot {
         )
         .unwrap_or_else(|e| {
             panic!(
-                "the referenced work needs a reflink-capable tree root on this node, and \
+                "the snapshot tree needs a reflink-capable tree root on this node, and \
                  provisioning the XFS loopback failed: {e}"
             )
         });
@@ -174,6 +174,90 @@ impl Drop for LeakGuard {
     fn drop(&mut self) {
         cleanup_k7_runtime_leaks();
     }
+}
+
+/// Ensure the shim binary is built (release), installed, containerd config
+/// has the k7 runtime, RuntimeClass exists, and k3s is running.
+/// This is idempotent — safe to call before every kubectl test.
+pub fn ensure_shim_installed() -> LeakGuard {
+    // Best-effort teardown of orphan
+    // virtiofsd/shim processes and stale /tmp/k7d-shim mounts left by
+    // earlier tests/binaries before we (re)install the shim.
+    cleanup_k7_runtime_leaks();
+
+    let shim_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/release/containerd-shim-k7-v1");
+
+    // Always build: cargo no-ops in ~a second when the binary is
+    // fresh, and skipping the build when `shim_src` merely *exists*
+    // deploys a stale shim after source edits (bit us twice — the
+    // crash-recovery hooks were first tested against a stale
+    // binary; see `ensure_k7d_daemon_running` for the
+    // first time).
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "containerd-shim-k7-v1"])
+        .status()
+        .expect("cargo build should run");
+    assert!(status.success(), "shim build failed");
+
+    let installed = Path::new("/usr/local/bin/containerd-shim-k7-v1");
+    let need_install = if installed.exists() {
+        let src_meta = std::fs::metadata(&shim_src).unwrap();
+        let dst_meta = std::fs::metadata(installed).unwrap();
+        src_meta.len() != dst_meta.len()
+            || src_meta.modified().unwrap() > dst_meta.modified().unwrap()
+    } else {
+        true
+    };
+
+    if need_install {
+        eprintln!("  installing shim to /usr/local/bin/");
+        let _ = Command::new("pkill")
+            .args(["-9", "-f", "containerd-shim-k7-v1"])
+            .status();
+        std::thread::sleep(Duration::from_millis(500));
+        // Unlink first: copying over a binary some straggler shim still
+        // executes fails with ETXTBSY; a fresh inode never does.
+        let _ = std::fs::remove_file(installed);
+        std::fs::copy(&shim_src, installed).expect("copy shim binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = Command::new("systemctl").args(["restart", "k3s"]).status();
+        wait_for_k3s_ready();
+    }
+
+    let rc_check = Command::new("kubectl")
+        .args(["get", "runtimeclass", "k7"])
+        .output()
+        .expect("kubectl should run");
+    if !rc_check.status.success() {
+        eprintln!("  creating RuntimeClass k7");
+        let _ = Command::new("kubectl")
+            .args(["apply", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.as_mut().unwrap().write_all(
+                    b"apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: k7\nhandler: k7\n",
+                ).unwrap();
+                child.wait()
+            })
+            .expect("create RuntimeClass");
+    }
+
+    // The shim's sandbox Create now requires a running k7d
+    // daemon (it owns the VMs); install and start it.
+    ensure_k7d_daemon_running();
+
+    LeakGuard
 }
 
 /// Install `/usr/local/bin/k7d`, register it as the
@@ -313,6 +397,52 @@ WantedBy=multi-user.target\n",
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Install the pinned Firecracker + jailer via the same script a node
+/// setup runs (`utils/install-firecracker.sh`), and hand back the
+/// pinned version.
+///
+/// Idempotent and cheap on a node that already has them: the script's
+/// fast path is two sha256 digests. Deliberately the *script* and not a
+/// Rust reimplementation — a suite that installed the binaries some
+/// other way would prove nothing about the thing operators run, and the
+/// sha check is the whole point of the pin.
+pub fn ensure_firecracker_installed() -> String {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf();
+    let script = repo.join("utils/install-firecracker.sh");
+    assert!(script.is_file(), "missing {}", script.display());
+    let out = Command::new("bash")
+        .arg(&script)
+        .output()
+        .expect("run install-firecracker.sh");
+    assert!(
+        out.status.success(),
+        "install-firecracker.sh failed ({}): {}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    firecracker_pin("FIRECRACKER_VERSION")
+}
+
+/// One value out of `guest/fc/pins.env`.
+pub fn firecracker_pin(key: &str) -> String {
+    let pins = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .join("guest/fc/pins.env");
+    let text = std::fs::read_to_string(&pins).expect("read guest/fc/pins.env");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("{key} is not set in {}", pins.display()))
+        .trim()
+        .to_string()
 }
 
 /// Installed guest artifact paths — the layout `packaging/install.sh`
@@ -494,6 +624,140 @@ pub fn ensure_pod_annotations_forwarded() {
     }
 }
 
+/// Shim toml the `k7-fc` containerd runtime's `ConfigPath` points at.
+pub const SHIM_FC_CONFIG_PATH: &str = "/etc/k7d/shim-k7-fc.toml";
+
+/// Memory overhead for the `k7-fc` class. Method and the
+/// busybox / Ubuntu measurements live in `OVERHEAD.md`.
+pub const K7_FC_OVERHEAD_MEMORY: &str = "32Mi";
+
+/// CPU overhead for the `k7-fc` class.
+pub const K7_FC_OVERHEAD_CPU: &str = "50m";
+
+const K7_FC_RUNTIME_BLOCK: &str = r#"
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc]
+  runtime_type = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/*"]
+  privileged_without_host_devices = true
+  snapshotter = "overlayfs"
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc.options]
+    ConfigPath = "/etc/k7d/shim-k7-fc.toml"
+"#;
+
+fn k7_fc_runtimeclass_yaml() -> String {
+    // Do not use `\ ` line continuations here: Rust strips the next
+    // line's indent, so `  name: k7-fc` became a top-level `name:` and
+    // kubectl applied a RuntimeClass with an empty metadata.name
+    // (CHALLENGES #229).
+    format!(
+        r#"apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7-fc
+handler: k7-fc
+overhead:
+  podFixed:
+    cpu: {K7_FC_OVERHEAD_CPU}
+    memory: {K7_FC_OVERHEAD_MEMORY}
+"#
+    )
+}
+
+/// Register containerd `runtimes.k7-fc` (`ConfigPath`, no `BinaryName`)
+/// and the `k7-fc` class with the measured `PodOverhead`.
+///
+/// Idempotent. Restarts k3s only when the containerd template changed.
+/// This node's k3s/containerd 2.3.3 does not stamp
+/// `io.kubernetes.cri.runtime-handler` on the sandbox OCI spec, so the
+/// `ConfigPath` toml is the signal that puts a `k7-fc` pod on Firecracker
+/// (CHALLENGES #228).
+pub fn ensure_k7_fc_runtime_registered() {
+    std::fs::create_dir_all("/etc/k7d").expect("mkdir /etc/k7d");
+    let toml = "backend = \"firecracker\"\n";
+    let need_toml = std::fs::read_to_string(SHIM_FC_CONFIG_PATH)
+        .map(|t| t != toml)
+        .unwrap_or(true);
+    if need_toml {
+        std::fs::write(SHIM_FC_CONFIG_PATH, toml).expect("write shim-k7-fc.toml");
+    }
+
+    const CANDIDATES: [&str; 2] = [
+        "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl",
+        "/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl",
+    ];
+    let mut found = false;
+    let mut patched = false;
+    for path in CANDIDATES {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        found = true;
+        if let Some(err) = k7_fc_block_binary_name_error(&text) {
+            panic!("{err}");
+        }
+        if text.contains("runtimes.k7-fc]") && text.contains("shim-k7-fc.toml") {
+            continue;
+        }
+        let new = if text.contains("runtimes.k7-fc]") {
+            // Block exists but `ConfigPath` does not — refuse to guess a
+            // `BinaryName`-shaped `[options]` table. Append the options
+            // table next to the existing block.
+            format!(
+                "{text}\n  [plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.k7-fc.options]\n    ConfigPath = \"{SHIM_FC_CONFIG_PATH}\"\n"
+            )
+        } else {
+            format!("{text}\n{K7_FC_RUNTIME_BLOCK}")
+        };
+        std::fs::write(path, new).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        eprintln!("  patched {path} with runtimes.k7-fc (ConfigPath, no BinaryName)");
+        patched = true;
+    }
+    assert!(
+        found,
+        "no k3s containerd config template found (node not set up?)"
+    );
+    if patched {
+        let _ = Command::new("systemctl").args(["restart", "k3s"]).status();
+        wait_for_k3s_ready();
+    }
+
+    let yaml = k7_fc_runtimeclass_yaml();
+    let output = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            {
+                let mut stdin = child.stdin.take().expect("kubectl stdin");
+                stdin.write_all(yaml.as_bytes())?;
+            }
+            child.wait_with_output()
+        })
+        .expect("kubectl apply RuntimeClass k7-fc");
+    assert!(
+        output.status.success(),
+        "kubectl apply RuntimeClass k7-fc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `BinaryName` in the k7-fc options table leaks into the cgroup path
+/// the same way it did for `runtimes.k7` (CHALLENGES on `BinaryName`).
+fn k7_fc_block_binary_name_error(text: &str) -> Option<String> {
+    let start = text.find("runtimes.k7-fc]")?;
+    let rest = &text[start..];
+    let end = rest[1..].find("\n[").map(|i| i + 1).unwrap_or(rest.len());
+    let section = &rest[..end];
+    if section.contains("BinaryName") {
+        Some("k7-fc runtime block must not set BinaryName (breaks shim cgroup path)".to_string())
+    } else {
+        None
+    }
+}
+
 /// Block-path VM facts reported by the daemon's
 /// `vm_status` for assertions (zero-virtiofs invariant, explicit
 /// virtiofs fallback, CoW-vs-full-copy fork memory).
@@ -589,12 +853,20 @@ pub fn current_hostname() -> String {
 
 /// Pin a pod manifest to this node so kubelet never schedules onto a
 /// peer without the k7 runtime registered in containerd.
+///
+/// Matches `runtimeClassName: k7` and `k7-fc` separately — a naive
+/// `k7` prefix replace would also rewrite `k7-fc`.
 pub fn pin_to_local_node(pod_yaml: &str) -> String {
     let host = current_hostname();
-    let inject = format!(
-        "  nodeSelector:\n    kubernetes.io/hostname: \"{host}\"\n  runtimeClassName: k7\n"
-    );
-    pod_yaml.replace("  runtimeClassName: k7\n", &inject)
+    let pin = |yaml: String, rc: &str| {
+        yaml.replace(
+            &format!("  runtimeClassName: {rc}\n"),
+            &format!(
+                "  nodeSelector:\n    kubernetes.io/hostname: \"{host}\"\n  runtimeClassName: {rc}\n"
+            ),
+        )
+    };
+    pin(pin(pod_yaml.to_string(), "k7-fc"), "k7")
 }
 
 /// Label key stamped on every cluster-scoped resource a test creates.
@@ -1000,7 +1272,7 @@ fn sweep_disks(report: &mut Vec<String>) {
     sweep_data_disks(&live, report);
 }
 
-/// Reap **named persistent** data disks  left behind by
+/// Reap **named persistent** data disks left behind by
 /// a run that died.
 ///
 /// Deliberately not the same rule as the loop above: a data disk's whole

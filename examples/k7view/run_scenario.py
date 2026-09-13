@@ -10,7 +10,7 @@ Profiles:
           tree. This is the video profile: big git-graph, many clusters,
           many VMs, many forks, pressure bars going hot, then evict.
   ubuntu-dilated — 3-node Ubuntu k3s source at dilation: 8, waves 6+4+4,
-          scored by a guest-time Deployment readiness gate .
+          scored by a guest-time Deployment readiness gate.
 """
 
 from __future__ import annotations
@@ -681,8 +681,8 @@ def run_cluster_tree(
         if wave > 0:
             # Park live losers first — this is the RL policy of killing
             # branches, and it keeps protect-chain visibility. The daemon
-            # now also evicts for incoming VMs inside fork_batch (spec
-            # 9g-inc1 / CHALLENGES #115), so this is no longer *required*
+            # now also evicts for incoming VMs inside fork_batch
+            # (CHALLENGES #115), so this is no longer *required*
             # for a legal under-budget fork_batch.
             parked = 0
             states = node_states(client, tree_id)

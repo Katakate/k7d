@@ -1,4 +1,4 @@
-//! the referenced work: `tree_rollback` after a dirty Ubuntu child.
+//! `tree_rollback` after a dirty Ubuntu child.
 //!
 //! Runs `gym/rollback_cluster.py` against the live daemon on an Ubuntu
 //! 3-node bare-VM tree. No `#[ignore]`. No new `crates/k7d/src`
@@ -49,7 +49,7 @@ fn wipe_stale_rb_trees() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("rb-35a-") {
+        if t.tree_id.starts_with("rb-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -81,8 +81,8 @@ fn test_rollback_cluster_after_mutate() {
     wipe_stale_rb_trees();
 
     let root = workspace_root();
-    let tree_id = format!("rb-35a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-35a-inc2-{}", std::process::id()));
+    let tree_id = format!("rb-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-rollback-cluster-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -100,7 +100,7 @@ fn test_rollback_cluster_after_mutate() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 35a-inc2 harness {} ({elapsed:?}) ----\n{log_text}\n---- end 35a-inc2 ----",
+        "---- rollback harness {} ({elapsed:?}) ----\n{log_text}\n---- end rollback ----",
         log_path.display()
     );
     assert!(

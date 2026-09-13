@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-12
+
+A second VMM: stock Firecracker under the jailer (`k7-fc`), plus
+dockerd as an agent-supervised guest service. Shim and guest
+confinement tighten; forks refuse a missed virtio park.
+
+### Added
+
+- Firecracker engine: boot the k7d guest on stock Firecracker + jailer,
+  CRI pods on RuntimeClass `k7-fc` (ConfigPath, PodOverhead), Diff
+  snapshot → reflinked base → LoadSnapshot fork, cluster fork,
+  suspend/resume, warm pool, and CRI exec / kube Ready.
+- `dockerd` as an agent-supervised guest service (overlay2 on a
+  per-sandbox virtio-blk disk; forkable). The release tarball ships
+  the payload under `docker/` (`install.sh` → `/usr/local/share/k7d/docker`).
+
+### Fixed
+
+- Pass OCI confinement through to guest runc; do not follow symlinks
+  under virtiofs hostPath shares; data-disk exclusivity, socket mode,
+  and bounded agent lines.
+- Validate virtqueue geometry at the guest→host boundary; refuse a
+  fork when a virtio worker misses the 200ms park.
+- `Kill(SIGTERM)` reports the real exit code.
+- Pool `compatible()` sees dilation and `data_disks`; `create_vm`
+  fails when a requested CNI attach cannot complete; Firecracker live
+  lookups cover data disks, serial dump, and tree members;
+  `evict_subtree` reaps parked disk clones.
+
 ## [0.5.0] — 2026-09-06
 
 The public tree now ships the gym and the carried KVM dilation patch.

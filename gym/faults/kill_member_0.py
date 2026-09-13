@@ -40,7 +40,7 @@ _HEALTHY = f"test ! -f {MARKER} && test -f {RESTORED}"
 _UBUNTU_UNIT = "k3s.service"
 _UBUNTU_STOP = ["systemctl", "stop", _UBUNTU_UNIT]
 _UBUNTU_START = ["systemctl", "start", _UBUNTU_UNIT]
-# 25a-inc4 kprobe prefix. Touch so Tetragon sees a child-only path.
+# Tetragon kprobe prefix. Touch so Tetragon sees a child-only path.
 TETRAGON_PATH = "/tmp/k7d-tetra-kill-member-0"
 INJECT_POD = "k7-kill-member-0"
 _UBUNTU_DOWN = (
@@ -74,7 +74,7 @@ class KillMember0(Fault):
                 )
             if self.keep_apiserver:
                 # Host touch is not a Tetragon event (CHALLENGES #147).
-                # 25a-inc4 fires fd_install from a pinned busybox pod.
+                # fd_install fires from a pinned busybox pod.
                 from pathlib import Path
 
                 from tetragon import create_inject_pod, wait_path_events

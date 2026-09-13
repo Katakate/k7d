@@ -20,7 +20,7 @@ TETRA_POLL_S = 5.0
 INCIDENT_FAULTS = frozenset({"relay"})
 MINER_PATH = "/tmp/nodecheck"
 GATES_ENABLED = os.environ.get("GYM_INCIDENT_GATES", "") in ("1", "true", "yes")
-# Roles a `GYM_SCOREBOARD=selfplay` lease may declare (26a-inc11).
+# Roles a `GYM_SCOREBOARD=selfplay` lease may declare.
 SELFPLAY_ROLES = frozenset({"blue", "red"})
 
 
@@ -34,7 +34,7 @@ class SelfplayProbe(SoakProbe, Protocol):
     """Adds the red gate. `payload_productive` is a pure function of
     cluster state — the attacker payload is *doing real work* (miner
     burning CPU / a completed reach-out), never a policy self-report and
-    never sensor silence (26a-inc11 §Roles)."""
+    never sensor silence."""
 
     def payload_productive(self) -> bool: ...
 
@@ -112,7 +112,7 @@ def blue_reward(
     victim_ready: bool,
     t_budget: float = T_BUDGET_S,
 ) -> float:
-    """`blue_R = R(soak_clean)` gated on `victim_ready` (26a-inc11).
+    """`blue_R = R(soak_clean)` gated on `victim_ready`.
 
     The bad job must be gone *and stay gone* through the soak, AND the
     legitimate victim must still be Ready at the end. A blue that nukes
@@ -133,7 +133,7 @@ def red_reward(
     payload_productive: bool,
     t_budget: float = T_BUDGET_S,
 ) -> float:
-    """`red_R = R(not soak_clean)` gated on `payload_productive` (26a-inc11).
+    """`red_R = R(not soak_clean)` gated on `payload_productive`.
 
     Red scores only when its payload is *doing real work* after the soak
     (miner burning CPU / a completed reach-out) AND the cluster is not

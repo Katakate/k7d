@@ -336,7 +336,7 @@ fn test_fork_warm_batch_10() {
 /// Warm-fork a 2-vCPU source. The child sees 2 CPUs, memory
 /// independence holds, the source stays undisturbed, and both child
 /// vCPU kernel TIDs land in a per-VM CPU cgroup (all-N-TIDs coverage,
-/// the 17a `apply_cpu_cap` contract).
+/// the `apply_cpu_cap` contract).
 #[test]
 fn test_fork_warm_multi_vcpu() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -462,7 +462,7 @@ fn test_fork_latency_cold_source() {
     vm.shutdown();
 }
 
-/// Regression for the referenced work: an external interrupt captured *mid-injection*
+/// Regression: an external interrupt captured *mid-injection*
 /// (the pause signal cancels `KVM_RUN` between KVM staging the injection and
 /// the VM entry delivering it) must be re-queued on the restored vCPU. The
 /// interrupt controller has already ACKed the vector by that point, so
@@ -506,8 +506,9 @@ fn test_fork_requeues_interrupted_injection() {
     events.data[8] = 1;
     events.data[9] = 0x35;
 
-    let fork =
-        k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, "reinject", None);
+    let fork = k7d::fork::restore_vm_from_state(
+        &base_path, &dirty, src_mem, &state, "reinject", None, false,
+    );
     source.resume().expect("resume source");
     let mut fork = fork.expect("materialise fork");
 
@@ -541,7 +542,7 @@ fn test_fork_requeues_interrupted_injection() {
     source.shutdown();
 }
 
-/// Stress regression for the referenced work: 100 back-to-back warm forks, each with
+/// Stress regression: 100 back-to-back warm forks, each with
 /// agent traffic immediately before the pause (the window that puts a vsock
 /// interrupt mid-injection), each fork probed over vsock. Pre-fix this
 /// failed ~6% per fork (18/300 in the diagnostic loop); post-fix it is

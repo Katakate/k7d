@@ -74,7 +74,7 @@ class Lease:
     expires_at: float
     envs: list[Env]
     client: str = ""
-    # Set only for fault_id="scripted" (27a-inc1); picks the pack entry.
+    # Set only for fault_id="scripted"; picks the pack entry.
     scenario_id: str = ""
     released: bool = False
     pending: bool = False

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Choose this VM's k3s role from the kernel command line .
+# Choose this VM's k3s role from the kernel command line.
 #
 #   k7d.k3s=server|agent,<server-ip>,<token>
 #   k7d.cni=flannel|none          (optional; default flannel)
@@ -8,7 +8,7 @@
 # nothing to discover. The k3s units are shipped disabled; this oneshot
 # writes /etc/rancher/k3s/config.yaml and starts the matching unit.
 #
-# k7d.cni=none is the referenced work: the server config gets
+# k7d.cni=none: the server config gets
 # `flannel-backend: none`, `disable-kube-proxy: true`, and
 # `disable-network-policy: true` so Cilium owns kube-proxy replacement
 # *and* NetworkPolicy. k3s's embedded kube-router otherwise REJECTs
@@ -17,9 +17,9 @@
 # loud failure.
 #
 # Agents wait for the server's /readyz (not just a TCP connect) so the
-# first join does not bounce into k3s' tens-of-seconds backoff
-# . The token is a pre-shared cmdline value — there
-# is nothing to read back out of the server first.
+# first join does not bounce into k3s' tens-of-seconds backoff.
+# The token is a pre-shared cmdline value — there is nothing to read
+# back out of the server first.
 #
 # Loud on every failure: a malformed spec or a k3s that will not start
 # fails the unit so the zero-failed-units assertion says so.
@@ -39,7 +39,7 @@ for tok in $(cat /proc/cmdline); do
     esac
 done
 
-# Absent means today's inc2 path. Anything else must be one of the two
+# Absent means the default flannel path. Anything else must be one of the two
 # documented values — a typo must not silently keep flannel.
 if [ -z "$CNI" ]; then
     CNI="flannel"
@@ -50,7 +50,7 @@ case "$CNI" in
 esac
 
 if [ -z "$SPEC" ]; then
-    # inc1 VMs, and any node that is just a distro guest, have no k3s role.
+    # Bare VMs, and any node that is just a distro guest, have no k3s role.
     log "no k7d.k3s= on the command line; k3s stays disabled"
     exit 0
 fi
@@ -71,7 +71,7 @@ OWN_IP=$(echo "$IP_SPEC" | cut -d, -f1 | cut -d/ -f1)
 
 # /dev/kmsg is what k3s' containerd logs through; without it the daemon
 # starts and then sits in CrashLoop with a message that looks like a
-# cgroup problem .
+# cgroup problem.
 [ -e /dev/kmsg ] || die "/dev/kmsg is missing — k3s containerd will not start"
 
 NODE_NAME="k7d-$(echo "$OWN_IP" | tr . -)"
@@ -92,7 +92,7 @@ wait_http() {
     # still "ready enough to join"; 200 is the anonymous-auth case.
     # 300 × 2 s = 600 s of *guest* time: at dilation N=16 that is 37 s
     # of wall, enough for the server to mint TLS; 90 × 2 s was 11 s and
-    # N=16 died there (34a-inc6).
+    # N=16 died there.
     url=$1
     shift
     i=0
@@ -136,7 +136,7 @@ cluster-dns: 10.245.0.10
 EOF
         if [ "$CNI" = "none" ]; then
             # Written before k3s starts so the first apiserver process is
-            # already kube-proxy-free and CNI-less .
+            # already kube-proxy-free and CNI-less.
             cat >> /etc/rancher/k3s/config.yaml <<'CNIEOF'
 flannel-backend: none
 disable-kube-proxy: true

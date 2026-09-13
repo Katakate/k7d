@@ -1,7 +1,7 @@
-//! Longhorn CSI on Ubuntu Cilium k3s, then fork .
+//! Longhorn CSI on Ubuntu Cilium k3s, then fork.
 //!
-//! Reuses inc3/inc4's cluster fixture (`UbuntuCni::None` + Helm Cilium
-//! 1.16.10), now with a 24a-inc4a **persistent data disk** per node
+//! Reuses the Cilium cluster fixture (`UbuntuCni::None` + Helm Cilium
+//! 1.16.10), now with a **persistent data disk** per node
 //! mounted at `/var/lib/longhorn` — Longhorn's replica directory has to
 //! outlive the VM that is the node, and each fork branch has to get its
 //! own reflinked copy rather than two live ext4 mounts of one image.
@@ -13,7 +13,7 @@
 //! What it proves: manager/CSI/instance-manager Ready, an RWO volume
 //! written and read back, an RWX volume written on one node and read on
 //! another (Longhorn's NFS share-manager), and then a warm fork under
-//! inc2 load churn where the child sees the volumes and their markers,
+//! load churn where the child sees the volumes and their markers,
 //! the source never sees a child-only write, no pod restarts or is
 //! recreated across the whole converge wait, the child's API answers on
 //! its own bridge, and no systemd unit fails on a child that was fine on
@@ -62,7 +62,7 @@ const LONGHORN_DATA_PATH: &str = "/var/lib/longhorn";
 const DATA_DISK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Longhorn documents 4 vCPU and 4 GB of RAM per storage node, so give
-/// it that. inc2–inc4's 2 GB is demonstrably too little: manager, CSI
+/// it that. The earlier 2 GB is demonstrably too little: manager, CSI
 /// sidecar and node-driver-registrar containers are OOMKilled while ten
 /// images are still being pulled and unpacked, which reads as a broken
 /// Longhorn rather than as a node with no headroom (CHALLENGES #120).
@@ -678,8 +678,7 @@ fn cluster_node_name(index: u8) -> String {
 
 /// The same probe against a cluster reachable only over its own bridge —
 /// after the fork, source and child answer on identical guest IPs, so
-/// `curl --interface <bridge>` is the only way to address one of them
-/// .
+/// `curl --interface <bridge>` is the only way to address one of them.
 fn run_probe_bridge(
     bridge: &str,
     certs: &Path,
@@ -1010,7 +1009,7 @@ fn cilium_drop_diagnostics(
 
 /// Longhorn 1.12.1 via Helm on the Ubuntu 3-node Cilium cluster with a
 /// persistent data disk per node, RWO + RWX proven, then the warm fork
-/// the 25a ladder exists for.
+/// the Ubuntu ladder exists for.
 #[test]
 fn test_ubuntu_longhorn_fork_volumes() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -1256,7 +1255,7 @@ fn test_ubuntu_longhorn_fork_volumes() {
     assert_eq!(forks.len(), 3);
 
     // Each child's data disk is its **own** reflinked image: two live
-    // ext4 mounts of one image is 24a-inc4a trap 3, and it would corrupt
+    // ext4 mounts of one image would corrupt
     // both clusters' replicas.
     for (i, child) in forks.iter().enumerate() {
         let devices = child.block_devices();

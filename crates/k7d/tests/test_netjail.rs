@@ -1,7 +1,7 @@
-//! the referenced work layer 2 + the referenced work: the per-tree network jail.
+//! The per-tree network jail.
 //!
 //! The properties under test are "two trees on one node cannot reach
-//! each other" (29a), and 29b's extensions: the egress policy
+//! each other", and its extensions: the egress policy
 //! (Open/Deny/Whitelist), host lockdown on the `input` hook, per-TAP
 //! anti-spoof, the per-tree conntrack/rate caps, and the always-on
 //! metadata (`169.254.0.0/16`) deny. They are tested where they live —
@@ -16,7 +16,7 @@
 //! anything if it beats them, so the tests prove the baseline is
 //! reachable first and then that the jail closes it.
 //!
-//! RoCEv2/Soft-RoCE  rides the guest TAP as **UDP/4791**
+//! RoCEv2/Soft-RoCE rides the guest TAP as **UDP/4791**
 //! — `test_egress_policy_modes` proves the jail treats it like any
 //! other UDP (egress 4791 drops under Deny, passes when whitelisted)
 //! and that *intra-tree* 4791 keeps flowing under Deny, which is what
@@ -658,7 +658,7 @@ fn test_inter_tree_traffic_denied() {
     );
 }
 
-/// the referenced work §1: the egress knob. Open forwards to the WAN iface,
+/// The egress knob. Open forwards to the WAN iface,
 /// Deny does not, Whitelist forwards only the named CIDR:port pairs —
 /// including UDP/4791 (RoCEv2), which must drop under Deny, pass when
 /// whitelisted, and keep flowing *intra-tree* regardless of mode.
@@ -770,7 +770,7 @@ fn test_egress_policy_modes() {
     drop(jail);
 }
 
-/// the referenced work §2: host lockdown. Under Deny/Whitelist a guest cannot
+/// Host lockdown. Under Deny/Whitelist a guest cannot
 /// reach a service bound on the gateway (the host), and a whitelist
 /// entry naming the gateway explicitly re-opens exactly that port.
 /// Open keeps today's behaviour (guest→host allowed).
@@ -827,8 +827,8 @@ fn test_host_lockdown() {
     drop(jail);
 }
 
-/// the referenced work §3: per-TAP anti-spoof, verified with duplicate IPs across
-/// two live trees (the load-bearing constraint: forks REUSE guest IPs,
+/// Per-TAP anti-spoof, verified with duplicate IPs across two live
+/// trees (the load-bearing constraint: forks REUSE guest IPs,
 /// so the pin is per-TAP, never a global source-IP set). Also proves
 /// the v6/EtherType lockdown (§5): the guest cannot emit IPv6.
 #[test]
@@ -1041,8 +1041,8 @@ fn test_tap_anti_spoof() {
     );
 }
 
-/// the referenced work §4: the per-tree conntrack and new-connection rate caps
-/// engage under a flood from one tree.
+/// The per-tree conntrack and new-connection rate caps engage under a
+/// flood from one tree.
 #[test]
 fn test_ct_and_rate_caps() {
     let topo = Topology::up();

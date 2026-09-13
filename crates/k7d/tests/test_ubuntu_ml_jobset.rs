@@ -1,5 +1,4 @@
-//! JobSet on the 31a-inc1 fake GPU fixture, then a warm fork
-//! .
+//! JobSet on the fake GPU fixture, then a warm fork.
 //!
 //! Two workers each request `nvidia.com/gpu: 1` and rendezvous over
 //! JobSet headless DNS with a CPU/Gloo-shaped script. Not CUDA, not
@@ -512,9 +511,7 @@ fn test_ubuntu_ml_jobset_gpu_fork() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

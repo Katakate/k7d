@@ -1,4 +1,4 @@
-"""35a-inc3 harness guards — no KVM."""
+"""Held-session harness guards — no KVM."""
 
 from __future__ import annotations
 
@@ -41,5 +41,5 @@ class TestHeldSessionYaml(unittest.TestCase):
     def test_main_refuses_wrong_tree_prefix(self) -> None:
         with patch.object(hs, "K7dClient", MagicMock()):
             with self.assertRaises(RuntimeError) as ctx:
-                hs.main(["--tree-id", "ful-28a-nope"])
-        self.assertIn("hs-35a-", str(ctx.exception))
+                hs.main(["--tree-id", "ful-nope"])
+        self.assertIn("hs-", str(ctx.exception))

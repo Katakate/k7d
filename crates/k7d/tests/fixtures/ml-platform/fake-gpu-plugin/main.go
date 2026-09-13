@@ -1,6 +1,6 @@
 // Fake kubelet device plugin that advertises nvidia.com/gpu count=2.
 //
-// Fixture only : no NVML, no /dev/nvidia*, no CUDA.
+// Fixture only: no NVML, no /dev/nvidia*, no CUDA.
 // Socket dir comes from PLUGIN_SOCK_DIR so the DaemonSet can point at
 // k3s' kubelet path instead of stock /var/lib/kubelet/device-plugins/.
 package main

@@ -1,4 +1,4 @@
-//! Daemon-wide seccomp allowlist .
+//! Daemon-wide seccomp allowlist.
 //!
 //! k7d is one process and every tree's VMs are threads of it, so there
 //! is no per-tree process to filter: a filter installed on the main
@@ -28,7 +28,7 @@
 //!    filter. Their syscall surface is much wider than the daemon's, so
 //!    the allowlist has to cover them too.
 //!
-//! the referenced work flipped the default after a full suite run on
+//! The default flipped to enforce after a full suite run on
 //! k7-node-02 produced no daemon/helper `SECCOMP` audit lines (the
 //! only hits were the unit-test `getcpu` probe). `K7D_SECCOMP=log`
 //! and `off` remain escape hatches.
@@ -45,7 +45,7 @@ use seccompiler::{
 pub enum Mode {
     /// Kill the process. The default: a mismatch takes the whole
     /// fleet with it, which is why the allowlist was proven in `log`
-    /// mode first .
+    /// mode first.
     Enforce,
     /// Log and allow. Escape hatch: `K7D_SECCOMP=log`.
     Log,
@@ -85,11 +85,12 @@ impl Mode {
 }
 
 /// ioctl request types (bits 8..15) the daemon and its helpers may issue.
-const IOCTL_TYPES: [u64; 10] = [
+const IOCTL_TYPES: [u64; 11] = [
     0xAE, // KVM
     0xAF, // vhost / vhost-vsock
     0x54, // 'T': TUN/TAP and the terminal ioctls Rust's std issues
     0x94, // FICLONE / FICLONERANGE (disk CoW)
+    0x66, // 'f': FS_IOC_FIEMAP — the shared-extent proof behind every FC fork
     0x89, // socket SIOC* (`ip` and TAP identity)
     0x12, // BLK* (`mkfs.ext4`, `mount`)
     0x4C, // LOOP_* (`losetup`)
@@ -306,6 +307,16 @@ const HELPER_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_personality,
     // iptables (xtables-legacy-multi) times out its lock wait with alarm(3).
     libc::SYS_alarm,
+    // Firecracker's jailer. It sheds every inherited
+    // descriptor with one close_range(3, ~0) and asks getsid(0) whether
+    // it already leads a session before setsid(). Denying either kills
+    // the jailer with SIGSYS before it has staged anything, and the only
+    // evidence is an audit record (CHALLENGES #214). The rest of its
+    // trace — unshare, pivot_root, chroot, mknod, mount, setgroups,
+    // capset, seccomp, execve — is already covered above by virtiofsd's
+    // and the volume mounts' entries.
+    libc::SYS_close_range,
+    libc::SYS_getsid,
 ];
 
 /// Build the filter program for `mode`.
@@ -550,7 +561,7 @@ mod tests {
     }
 
     /// A KVM ioctl matches the type-byte condition and, say, a socket
-    /// ioctl from a different driver does not. FICLONE (disk CoW) is
+    /// ioctl from a different driver does not. FICLONE (disk `CoW`) is
     /// on the allowlist; RNDGETENTCNT is not.
     #[test]
     fn ioctl_type_mask_selects_the_vmm_drivers() {

@@ -1,4 +1,4 @@
-//! the referenced work — how much wall time could a guest-clock time-warp
+//! How much wall time could a guest-clock time-warp
 //! delete on the real 3-node Ubuntu k3s cluster?
 //!
 //! Read-only by construction. The survey pauses all three node VMs,
@@ -7,7 +7,7 @@
 //! no TSC offset — a warp mechanism that did would invalidate the
 //! numbers it is being sized from.
 //!
-//! Two distributions decide whether the later increments of the referenced work
+//! Two distributions decide whether the later time-warp work
 //! are worth building: how often *every* vCPU across all three nodes is
 //! halted at once, and how far away the nearest armed timer deadline is
 //! at those moments. This measures both across three phases (idle
@@ -42,11 +42,11 @@ const MAX_P90_SAMPLER_COST: Duration = Duration::from_millis(5);
 
 /// Assumed cost of one pause-warp-resume cycle when turning the
 /// measured gaps into a speedup bound. Deliberately a round number: the
-/// real figure is inc2's to measure, and the sampler cost printed below
+/// real figure is the warp primitive's to measure, and the sampler cost printed below
 /// is the honest lower bound for it.
 const ASSUMED_JUMP_COST_MS: f64 = 1.0;
 
-/// Quantum for the micro-jump bound. the referenced work's inc3 fallback jumps a
+/// Quantum for the micro-jump bound. The policy fallback jumps a
 /// fixed amount regardless of any deadline, so its bound is computable
 /// from the measured idle fraction and the measured cycle cost even
 /// when no deadline is ever armed.
@@ -563,9 +563,7 @@ fn test_time_warp_idle_and_deadline_survey() {
     stats.push(PhaseStats::compute("busy", &busy));
     report_nodes(&kubeconfig, "after the busy phase");
 
-    eprintln!(
-        "\nMEASUREMENT 34a-inc0 time-warp survey (jump cost assumed {ASSUMED_JUMP_COST_MS} ms)"
-    );
+    eprintln!("\nMEASUREMENT time-warp survey (jump cost assumed {ASSUMED_JUMP_COST_MS} ms)");
     eprintln!("{HEADER}");
     for s in &stats {
         eprintln!("{}", s.row());
@@ -574,7 +572,7 @@ fn test_time_warp_idle_and_deadline_survey() {
         "µjump bound assumes a {MICRO_JUMP_QUANTUM_MS} ms quantum and the measured cycle cost; \
          jump bound assumes {ASSUMED_JUMP_COST_MS} ms and the measured mean deadline gap"
     );
-    eprintln!("\nDilation bound  — CPU headroom only:");
+    eprintln!("\nDilation bound — CPU headroom only:");
     eprintln!("{DILATION_HEADER}");
     for s in &stats {
         eprintln!("{}", s.dilation_row());

@@ -1,4 +1,4 @@
-//! Shared 31a GPU / DCGM fixture helpers (inc1–inc5).
+//! Shared GPU / DCGM fixture helpers.
 //!
 //! Applies the digest-pinned fake `nvidia.com/gpu` plugin and
 //! dcgm-exporter-shaped scrape. Does not copy `bring_up_cluster`.
@@ -15,7 +15,7 @@ use k7d::vm::Vm;
 use super::ubuntu::{connect_or_dump, sh_ok, workspace_path};
 use super::ubuntu_k3s::{kubectl, UbuntuCluster};
 
-/// the referenced work invariant 6 named this k3s path. k3s v1.32.5+k3s1 keeps
+/// The ML fixture pins this k3s path. k3s v1.32.5+k3s1 keeps
 /// kubelet.sock at the stock kubelet dir (CHALLENGES #146).
 pub const K3S_DEVICE_PLUGIN_DIR: &str = "/var/lib/rancher/k3s/agent/kubelet/device-plugins";
 pub const KUBELET_DEVICE_PLUGIN_DIR: &str = "/var/lib/kubelet/device-plugins";
@@ -580,7 +580,7 @@ pub fn assert_gpu_consistent(
     );
 }
 
-/// Build the plugin, copy it onto every node, apply the inc1 DaemonSet
+/// Build the plugin, copy it onto every node, apply the DaemonSet
 /// + DCGM scrape, wait Capacity=2/node.
 pub fn apply_gpu_dcgm_fixture(cluster: &mut UbuntuCluster) -> GpuCounts {
     let plugin = build_fake_gpu_plugin();

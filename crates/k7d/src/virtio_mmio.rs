@@ -3,8 +3,9 @@
 //! Implements the virtio-MMIO register interface (virtio 1.x, non-legacy)
 //! so the guest kernel can discover and configure virtio devices.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use vm_memory::{Address, GuestAddress};
@@ -77,6 +78,110 @@ pub const VIRTIO_ID_NET: u32 = 1;
 /// policy loop pays it 30 times a second.
 pub(crate) const PARK_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 
+/// Bound on [`VirtioBackend::wait_quiescent`].
+///
+/// Must stay 200 ms: it is above the worker's 100 ms `poll`, and the old
+/// 2 s bound blew `FORK_INNER_K3S_CLUSTER_3VM` (CHALLENGES #162). A
+/// missed deadline is no longer a warning — the fork path fails rather
+/// than copying a torn used ring (`docs/bug-candidates.md` #59).
+pub const QUIESCE_DEADLINE: Duration = Duration::from_millis(200);
+
+/// A virtio worker did not park before [`QUIESCE_DEADLINE`].
+///
+/// Named so the fork path can fail loudly instead of proceeding with a
+/// dirty delta that would omit host-side device writes (CHALLENGES #79, #101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotQuiescent {
+    /// Device identity, e.g. `virtio-blk (/var/lib/k7d/scratch.img)` or
+    /// `virtio-net mac=fe:00:00:00:00:01`.
+    pub device: String,
+    /// How long `wait_quiescent` waited before giving up.
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for NotQuiescent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} did not park within {:?} (deadline {:?})",
+            self.device, self.waited, QUIESCE_DEADLINE
+        )
+    }
+}
+
+impl std::error::Error for NotQuiescent {}
+
+/// Process-wide count of forks that hit a non-quiescent virtio-blk worker.
+static FORK_NONQUIESCENT_BLK: AtomicU64 = AtomicU64::new(0);
+/// Process-wide count of forks that hit a non-quiescent virtio-net worker.
+static FORK_NONQUIESCENT_NET: AtomicU64 = AtomicU64::new(0);
+/// Process-wide count of forks that hit any other non-quiescent device.
+static FORK_NONQUIESCENT_OTHER: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide counters for forks that hit a missed quiescence deadline.
+///
+/// The point of the counter is to answer "is 200 ms actually enough on
+/// real workloads?" with data instead of a guess (`docs/bug-candidates.md`
+/// #59).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkNonquiescentCounts {
+    /// Forks that named a `virtio-blk` device in the miss.
+    pub virtio_blk: u64,
+    /// Forks that named a `virtio-net` device in the miss.
+    pub virtio_net: u64,
+    /// Any other device type.
+    pub other: u64,
+}
+
+/// Snapshot of [`FORK_NONQUIESCENT_BLK`] / net / other.
+#[must_use]
+pub fn fork_nonquiescent_counts() -> ForkNonquiescentCounts {
+    ForkNonquiescentCounts {
+        virtio_blk: FORK_NONQUIESCENT_BLK.load(Ordering::Relaxed),
+        virtio_net: FORK_NONQUIESCENT_NET.load(Ordering::Relaxed),
+        other: FORK_NONQUIESCENT_OTHER.load(Ordering::Relaxed),
+    }
+}
+
+/// Record one fork that took the full-dump path because `missed` was
+/// non-empty. Increments once per named device.
+pub fn record_fork_nonquiescent(missed: &[NotQuiescent]) {
+    for m in missed {
+        if m.device.starts_with("virtio-blk") {
+            FORK_NONQUIESCENT_BLK.fetch_add(1, Ordering::Relaxed);
+        } else if m.device.starts_with("virtio-net") {
+            FORK_NONQUIESCENT_NET.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FORK_NONQUIESCENT_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Poll `parked` until it is true, the worker has exited, or
+/// [`QUIESCE_DEADLINE`] elapses.
+///
+/// `hold` is the test-only wedge: when true the waiter ignores `parked`
+/// and always waits out the deadline (the worker itself is not changed).
+pub(crate) fn wait_for_park(
+    parked: &AtomicBool,
+    running: &AtomicBool,
+    hold: bool,
+    device: impl FnOnce() -> String,
+) -> Result<(), NotQuiescent> {
+    let start = Instant::now();
+    let deadline = start + QUIESCE_DEADLINE;
+    while running.load(Ordering::SeqCst) && (hold || !parked.load(Ordering::SeqCst)) {
+        if Instant::now() >= deadline {
+            return Err(NotQuiescent {
+                device: device(),
+                waited: start.elapsed(),
+            });
+        }
+        std::thread::sleep(PARK_POLL);
+    }
+    Ok(())
+}
+
 /// How often a parked worker re-reads `paused` while it waits to be let
 /// go again.
 ///
@@ -89,6 +194,372 @@ pub(crate) const PARK_POLL: std::time::Duration = std::time::Duration::from_micr
 /// multi-second fork pause, where the waiter polls only for the tens of
 /// microseconds a park takes.
 pub(crate) const UNPARK_POLL: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// A virtio split-ring descriptor, exactly as the guest publishes it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct VirtqDesc {
+    /// Guest-physical address of the buffer.
+    pub addr: u64,
+    /// Buffer length in bytes.
+    pub len: u32,
+    /// `VIRTQ_DESC_F_*` flags.
+    pub flags: u16,
+    /// Next descriptor in the chain, when `VIRTQ_DESC_F_NEXT` is set.
+    pub next: u16,
+}
+
+/// Virtio descriptor flag: the chain continues at `next`.
+pub const VIRTQ_DESC_F_NEXT: u16 = 1;
+/// Virtio descriptor flag: the buffer is device-writable.
+pub const VIRTQ_DESC_F_WRITE: u16 = 2;
+/// Virtio descriptor flag: `addr` points at an indirect descriptor table,
+/// not at a buffer. k7d never advertises `VIRTIO_F_INDIRECT_DESC`.
+pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
+
+/// Metadata of one descriptor in a chain, as read from the guest's
+/// descriptor table: guest-physical address, length, and whether the
+/// buffer is device-writable (`VIRTQ_DESC_F_WRITE`).
+#[derive(Clone, Copy, Debug)]
+pub struct DescMeta {
+    /// Guest-physical address of the buffer.
+    pub addr: u64,
+    /// Buffer length in bytes.
+    pub len: u32,
+    /// Device-writable (`VIRTQ_DESC_F_WRITE`).
+    pub write: bool,
+}
+
+/// Why a guest's virtqueue geometry cannot be walked by the host.
+#[derive(Debug, thiserror::Error)]
+pub enum QueueGeometryError {
+    /// The device has no guest-memory mapping to validate against.
+    #[error("no guest memory mapping to validate the queue against")]
+    NoGuestMemory,
+    /// `QUEUE_NUM` was never programmed (or programmed to zero). Every
+    /// consumer indexes its rings with `% size`.
+    #[error("queue size is 0")]
+    ZeroSize,
+    /// The driver asked for more descriptors than the device advertised
+    /// through `QUEUE_NUM_MAX`.
+    #[error("queue size {size} exceeds the device maximum of {max}")]
+    SizeAboveMax {
+        /// Size the driver programmed.
+        size: u16,
+        /// Size the device advertised.
+        max: u16,
+    },
+    /// Virtio 1.x requires a power-of-two queue size; the ring-slot
+    /// arithmetic here relies on it.
+    #[error("queue size {0} is not a power of two")]
+    SizeNotPowerOfTwo(u16),
+    /// One of the three rings does not fit inside the guest's own RAM.
+    #[error(
+        "{ring} ring at {gpa:#x} spanning {len} bytes escapes the {span:#x}-byte guest memory"
+    )]
+    RingOutOfRange {
+        /// Which ring (`descriptor`, `avail`, `used`).
+        ring: &'static str,
+        /// Guest-physical address the driver programmed.
+        gpa: u64,
+        /// Computed span of the ring.
+        len: u64,
+        /// Guest-physical span available.
+        span: u64,
+    },
+}
+
+/// Why a descriptor chain the guest published cannot be serviced.
+#[derive(Debug, thiserror::Error)]
+pub enum DescChainError {
+    /// The guest named a descriptor outside its own table.
+    #[error("descriptor index {idx} is outside the {size}-descriptor table")]
+    IndexOutOfRange {
+        /// Index the guest published.
+        idx: u16,
+        /// Queue size.
+        size: u16,
+    },
+    /// More `NEXT` hops than the queue has descriptors — a chain that
+    /// points back at itself would otherwise spin the worker forever.
+    #[error("descriptor chain is longer than the {0}-descriptor queue (cycle?)")]
+    TooLong(u16),
+    /// A buffer the chain points at is not inside the guest's RAM.
+    #[error("descriptor {idx} buffer {addr:#x}+{len} escapes the {span:#x}-byte guest memory")]
+    BufferOutOfRange {
+        /// Index of the offending descriptor.
+        idx: u16,
+        /// Buffer address the guest published.
+        addr: u64,
+        /// Buffer length the guest published.
+        len: u32,
+        /// Guest-physical span available.
+        span: u64,
+    },
+}
+
+/// The geometry of one guest virtqueue, checked once against the guest's
+/// own RAM mapping.
+///
+/// Every host-side walk of a virtqueue is `mem_base + <a u64 the guest
+/// wrote>`. [`ValidatedQueue::new`] is the only way to obtain one of
+/// these, so a queue whose rings cannot be walked in bounds never
+/// reaches a device worker at all: the arithmetic is checked once at
+/// activation instead of on every descriptor
+/// (`docs/bug-candidates.md` #1, #8, #40–#45).
+///
+/// Ring layouts (virtio 1.x split ring, no `VIRTIO_F_EVENT_IDX` padding
+/// assumptions beyond the trailing `u16`):
+/// - descriptor table: `size` × 16 bytes;
+/// - avail ring: `flags:u16 + idx:u16 + ring[size]:u16 + used_event:u16`;
+/// - used ring: `flags:u16 + idx:u16 + elem[size]:{id:u32,len:u32} + avail_event:u16`.
+#[derive(Clone, Debug)]
+pub struct ValidatedQueue {
+    mem_base: u64,
+    mem_span: u64,
+    size: u16,
+    desc_gpa: u64,
+    avail_gpa: u64,
+    used_gpa: u64,
+}
+
+impl ValidatedQueue {
+    /// Validate a live queue's geometry against the guest mapping at
+    /// `mem_base` spanning `mem_span` guest-physical bytes.
+    pub fn new(
+        q: &VirtqueueState,
+        mem_base: u64,
+        mem_span: u64,
+    ) -> Result<Self, QueueGeometryError> {
+        Self::build(
+            q.size,
+            q.max_size,
+            q.desc_addr.raw_value(),
+            q.avail_addr.raw_value(),
+            q.used_addr.raw_value(),
+            mem_base,
+            mem_span,
+        )
+    }
+
+    /// Validate a snapshotted queue's geometry. `max_size` comes from the
+    /// device that is about to own the queue, never from the snapshot —
+    /// the snapshot carries only what the *driver* chose
+    /// (`docs/bug-candidates.md` #45).
+    pub fn from_snapshot(
+        qs: &VirtqueueSnapshot,
+        max_size: u16,
+        mem_base: u64,
+        mem_span: u64,
+    ) -> Result<Self, QueueGeometryError> {
+        Self::build(
+            qs.size,
+            max_size,
+            qs.desc_addr,
+            qs.avail_addr,
+            qs.used_addr,
+            mem_base,
+            mem_span,
+        )
+    }
+
+    fn build(
+        size: u16,
+        max_size: u16,
+        desc_gpa: u64,
+        avail_gpa: u64,
+        used_gpa: u64,
+        mem_base: u64,
+        mem_span: u64,
+    ) -> Result<Self, QueueGeometryError> {
+        if mem_span == 0 {
+            return Err(QueueGeometryError::NoGuestMemory);
+        }
+        if size == 0 {
+            return Err(QueueGeometryError::ZeroSize);
+        }
+        if size > max_size {
+            return Err(QueueGeometryError::SizeAboveMax {
+                size,
+                max: max_size,
+            });
+        }
+        if !size.is_power_of_two() {
+            return Err(QueueGeometryError::SizeNotPowerOfTwo(size));
+        }
+        let n = u64::from(size);
+        for (ring, gpa, len) in [
+            ("descriptor", desc_gpa, n * 16),
+            ("avail", avail_gpa, 6 + n * 2),
+            ("used", used_gpa, 6 + n * 8),
+        ] {
+            let fits = gpa.checked_add(len).is_some_and(|end| end <= mem_span);
+            if !fits {
+                return Err(QueueGeometryError::RingOutOfRange {
+                    ring,
+                    gpa,
+                    len,
+                    span: mem_span,
+                });
+            }
+        }
+        Ok(Self {
+            mem_base,
+            mem_span,
+            size,
+            desc_gpa,
+            avail_gpa,
+            used_gpa,
+        })
+    }
+
+    /// Queue size in descriptors (non-zero, a power of two).
+    #[must_use]
+    pub fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Host address the guest's RAM is mapped at.
+    #[must_use]
+    pub fn mem_base(&self) -> u64 {
+        self.mem_base
+    }
+
+    /// Guest-physical span of that mapping.
+    #[must_use]
+    pub fn mem_span(&self) -> u64 {
+        self.mem_span
+    }
+
+    /// Guest-physical address and byte span of the descriptor table.
+    #[must_use]
+    pub fn desc_ring(&self) -> (u64, u64) {
+        (self.desc_gpa, u64::from(self.size) * 16)
+    }
+
+    /// Guest-physical address and byte span of the available ring.
+    #[must_use]
+    pub fn avail_ring_span(&self) -> (u64, u64) {
+        (self.avail_gpa, 6 + u64::from(self.size) * 2)
+    }
+
+    /// Guest-physical address and byte span of the used ring.
+    #[must_use]
+    pub fn used_ring_span(&self) -> (u64, u64) {
+        (self.used_gpa, 6 + u64::from(self.size) * 8)
+    }
+
+    /// Host pointer to descriptor `idx`, or `None` when the guest named a
+    /// descriptor outside its own table.
+    #[must_use]
+    pub fn desc(&self, idx: u16) -> Option<*const VirtqDesc> {
+        if idx >= self.size {
+            return None;
+        }
+        Some((self.mem_base + self.desc_gpa + u64::from(idx) * 16) as *const VirtqDesc)
+    }
+
+    /// Host pointer to the available ring's `idx` field.
+    #[must_use]
+    pub fn avail_idx(&self) -> *const u16 {
+        (self.mem_base + self.avail_gpa + 2) as *const u16
+    }
+
+    /// Host pointer to available-ring slot `i`, wrapped into the ring.
+    #[must_use]
+    pub fn avail_ring(&self, i: u16) -> *const u16 {
+        (self.mem_base + self.avail_gpa + 4 + u64::from(i % self.size) * 2) as *const u16
+    }
+
+    /// Host pointer to the used ring's `idx` field.
+    #[must_use]
+    pub fn used_idx(&self) -> *mut u16 {
+        (self.mem_base + self.used_gpa + 2) as *mut u16
+    }
+
+    /// Guest-physical address of the used ring's `idx` field.
+    #[must_use]
+    pub fn used_idx_gpa(&self) -> u64 {
+        self.used_gpa + 2
+    }
+
+    /// Host pointer to used-ring element `i` (`{id:u32, len:u32}`),
+    /// wrapped into the ring.
+    #[must_use]
+    pub fn used_ring(&self, i: u16) -> *mut u32 {
+        (self.mem_base + self.used_ring_gpa(i)) as *mut u32
+    }
+
+    /// Guest-physical address of used-ring element `i`.
+    #[must_use]
+    pub fn used_ring_gpa(&self, i: u16) -> u64 {
+        self.used_gpa + 4 + u64::from(i % self.size) * 8
+    }
+
+    /// Host address of the guest buffer `[gpa, gpa + len)`, or `None`
+    /// when it does not fit entirely inside guest RAM.
+    #[must_use]
+    pub fn buffer(&self, gpa: u64, len: u64) -> Option<u64> {
+        let end = gpa.checked_add(len)?;
+        if end > self.mem_span {
+            return None;
+        }
+        Some(self.mem_base + gpa)
+    }
+
+    /// Walk the descriptor chain starting at `head`.
+    ///
+    /// The one chain walker in the daemon: `block.rs` and `network.rs`
+    /// both go through it, so a lying guest gets the same refusal from
+    /// every device. Bounded at `size` hops (a `next` pointing back at
+    /// itself is a refusal, not a spinning worker), rejects a descriptor
+    /// index outside the table, and checks every `addr + len` against
+    /// the guest's RAM span with checked arithmetic before the caller
+    /// can copy a byte.
+    ///
+    /// Descriptors land in `out`, which is cleared first, so a hot RX/TX
+    /// path reuses one allocation.
+    pub fn walk_chain<'a>(
+        &self,
+        head: u16,
+        out: &'a mut Vec<DescMeta>,
+    ) -> Result<&'a [DescMeta], DescChainError> {
+        out.clear();
+        let mut idx = head;
+        loop {
+            if out.len() >= self.size as usize {
+                return Err(DescChainError::TooLong(self.size));
+            }
+            let Some(ptr) = self.desc(idx) else {
+                return Err(DescChainError::IndexOutOfRange {
+                    idx,
+                    size: self.size,
+                });
+            };
+            // SAFETY: `desc` only yields pointers inside the descriptor
+            // table this geometry placed within the caller's live guest
+            // mapping, which outlives the walk.
+            let d: VirtqDesc = unsafe { std::ptr::read_volatile(ptr) };
+            if self.buffer(d.addr, u64::from(d.len)).is_none() {
+                return Err(DescChainError::BufferOutOfRange {
+                    idx,
+                    addr: d.addr,
+                    len: d.len,
+                    span: self.mem_span,
+                });
+            }
+            out.push(DescMeta {
+                addr: d.addr,
+                len: d.len,
+                write: d.flags & VIRTQ_DESC_F_WRITE != 0,
+            });
+            if d.flags & VIRTQ_DESC_F_NEXT == 0 {
+                return Ok(out);
+            }
+            idx = d.next;
+        }
+    }
+}
 
 /// State of a single virtqueue as programmed by the guest.
 #[derive(Debug, Clone, Default)]
@@ -119,6 +590,14 @@ pub trait VirtioBackend: Send {
     fn num_queues(&self) -> usize;
     /// Maximum queue size for each queue.
     fn max_queue_size(&self) -> u16;
+    /// The guest-memory mapping this device's queues live in:
+    /// `(host base address, guest-physical span)`.
+    ///
+    /// [`MmioDevice::handle_status_write`] validates every ready queue's
+    /// geometry against it before activating, so a backend that cannot
+    /// answer is a backend whose rings nobody is checking — hence no
+    /// default.
+    fn guest_mapping(&self) -> (u64, u64);
     /// Read device-specific config space.
     fn read_config(&self, offset: u64, data: &mut [u8]);
     /// Write device-specific config space.
@@ -135,13 +614,22 @@ pub trait VirtioBackend: Send {
     /// same window or in-flight TCP on the source dies across the pause.
     /// Default: no-op (vhost backends are paused via the vCPU/irq path).
     fn set_paused(&self, _paused: bool) {}
-    /// Block (bounded) until the backend's paused workers have stopped
-    /// touching guest memory.
+    /// Block (bounded by [`QUIESCE_DEADLINE`]) until the backend's paused
+    /// workers have stopped touching guest memory.
     ///
     /// Called by `Vm::pause` after `set_paused(true)` and the vCPU join so
     /// that snapshot/fork memory captures never race in-flight device DMA
-    /// (e.g. a virtio-blk read completing mid-memcpy). Default: no-op.
-    fn wait_quiescent(&self) {}
+    /// (e.g. a virtio-blk read completing mid-memcpy). Default: instantly
+    /// quiescent (no worker). A miss is reported, not logged-and-ignored:
+    /// `Vm::pause` records it and the fork path fails.
+    fn wait_quiescent(&self) -> Result<(), NotQuiescent> {
+        Ok(())
+    }
+    /// Test-only wedge: when `hold` is true, [`Self::wait_quiescent`]
+    /// ignores the worker's `parked` flag and waits out the deadline.
+    /// Default: no-op. The worker itself is not changed, so the source VM
+    /// stays healthy for the integration test.
+    fn hold_park_for_test(&self, _hold: bool) {}
     /// Whether paused workers have stopped touching the backing file
     /// and guest memory. Default true (no worker). Used so a fork can
     /// delay `FICLONE` until a stuck virtio-blk `pwrite` finishes —
@@ -244,6 +732,18 @@ impl MmioDevice {
         Arc::clone(&self.interrupt_status)
     }
 
+    /// Virtio device type of the backend.
+    #[must_use]
+    pub fn device_type(&self) -> u32 {
+        self.backend.device_type()
+    }
+
+    /// The queue state the guest has programmed so far.
+    #[must_use]
+    pub fn queues(&self) -> &[VirtqueueState] {
+        &self.queues
+    }
+
     /// Get the IRQ eventfd (for injection from backend).
     #[must_use]
     pub fn irq_eventfd(&self) -> Arc<EventFd> {
@@ -336,7 +836,24 @@ impl MmioDevice {
                 }
             }
             MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
-            MMIO_QUEUE_SEL => self.queue_sel = val,
+            MMIO_QUEUE_SEL => {
+                // Out of range is still *stored*: the virtio spec makes a
+                // driver read `QUEUE_NUM_MAX` after selecting, and 0 tells
+                // it the queue does not exist, which is how Linux probes.
+                // What must not happen is what used to: every subsequent
+                // `QUEUE_*` write silently dropped on the floor, leaving a
+                // device the driver believes it configured
+                // (`docs/bug-candidates.md` #41).
+                if val as usize >= self.queues.len() {
+                    log::error!(
+                        "virtio-mmio (type={}): driver selected queue {val} of {} — \
+                         its QUEUE_NUM/DESC/AVAIL/USED writes will be discarded",
+                        self.backend.device_type(),
+                        self.queues.len()
+                    );
+                }
+                self.queue_sel = val;
+            }
             MMIO_QUEUE_NUM => {
                 if self.features_ok() || self.device_status & STATUS_DRIVER != 0 {
                     if let Some(q) = self.selected_queue_mut() {
@@ -424,6 +941,20 @@ impl MmioDevice {
         }
 
         if val & STATUS_DRIVER_OK != 0 && !self.activated {
+            // Validate the geometry the guest programmed *before* a worker
+            // thread exists to walk it. A ready queue whose rings do not
+            // fit in the guest's own RAM, or whose size is 0 / above the
+            // advertised maximum / not a power of two, fails the device
+            // instead of handing a lying guest an out-of-bounds host walk
+            // (`docs/bug-candidates.md` #8, #40, #41, #42).
+            if let Err(e) = self.validate_ready_queues() {
+                log::error!(
+                    "virtio-mmio: refusing activation (type={}): {e}",
+                    self.backend.device_type()
+                );
+                self.device_status |= STATUS_FAILED;
+                return;
+            }
             let queues: Vec<VirtqueueState> = self.queues.clone();
             match self.backend.activate(&queues, &self.irq_evt) {
                 Ok(()) => {
@@ -439,6 +970,23 @@ impl MmioDevice {
                 }
             }
         }
+    }
+
+    /// Build the validated geometry of every queue the driver marked
+    /// ready, discarding the result: this is the activation gate, and the
+    /// backends rebuild their own from the same `(mem_base, mem_span)`.
+    ///
+    /// Queues the driver never readied are not validated — an unused
+    /// queue nobody walks is not a boundary.
+    fn validate_ready_queues(&self) -> Result<(), String> {
+        let (mem_base, mem_span) = self.backend.guest_mapping();
+        for (i, q) in self.queues.iter().enumerate() {
+            if !q.ready {
+                continue;
+            }
+            ValidatedQueue::new(q, mem_base, mem_span).map_err(|e| format!("queue {i}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Restore MMIO register state from a snapshot (without activating backend).
@@ -482,8 +1030,13 @@ impl MmioDevice {
 
     /// Wait (bounded) for paused workers to quiesce (see
     /// [`VirtioBackend::wait_quiescent`]).
-    pub fn wait_quiescent(&self) {
-        self.backend.wait_quiescent();
+    pub fn wait_quiescent(&self) -> Result<(), NotQuiescent> {
+        self.backend.wait_quiescent()
+    }
+
+    /// See [`VirtioBackend::hold_park_for_test`].
+    pub fn hold_park_for_test(&self, hold: bool) {
+        self.backend.hold_park_for_test(hold);
     }
 
     /// See [`VirtioBackend::is_quiescent`].
@@ -511,7 +1064,7 @@ impl MmioDevice {
 
 /// Whether queue `index` of a `device_type` device is one the **driver**
 /// fills with requests, so `avail.idx == used.idx` means "nothing in
-/// flight" .
+/// flight" (the third safety check).
 ///
 /// The distinction is the whole check. On a receive queue — virtio-net
 /// RX, vsock RX — a guest at rest keeps buffers posted for traffic that
@@ -534,10 +1087,6 @@ pub fn queue_is_driver_filled(device_type: u32, index: usize) -> bool {
     }
 }
 
-/// Virtio descriptor flag: the descriptor points at an indirect table, not
-/// at a buffer.
-const VIRTQ_DESC_F_INDIRECT: u16 = 4;
-
 /// Mark every ready virtqueue's rings — and the buffers its descriptors
 /// point at — dirty in `acc`.
 ///
@@ -557,39 +1106,44 @@ fn mark_virtqueue_pages_dirty(
     mem_host_addr: u64,
     mem_span: u64,
 ) {
-    for q in queues {
-        if !q.ready || q.size == 0 {
+    for (i, q) in queues.iter().enumerate() {
+        if !q.ready {
             continue;
         }
-        let n = u64::from(q.size);
-        let desc_gpa = q.desc_addr.raw_value();
-        mark_gpa_range_dirty(acc, desc_gpa, n * 16);
-        mark_gpa_range_dirty(acc, q.avail_addr.raw_value(), 6 + n * 2);
-        mark_gpa_range_dirty(acc, q.used_addr.raw_value(), 6 + n * 8);
-        if mem_host_addr == 0 || mem_span == 0 {
-            continue;
+        // A queue whose geometry does not validate is a queue the kernel
+        // vhost worker could not have DMA'd into either (it would have
+        // taken EFAULT on the same addresses), and activation now refuses
+        // it outright — so there is nothing to mark. Say so rather than
+        // reading past the mapping to find out.
+        let vq = match ValidatedQueue::new(q, mem_host_addr, mem_span) {
+            Ok(vq) => vq,
+            Err(e) => {
+                log::error!(
+                    "virtqueue {i} geometry is unwalkable ({e}) — not marking its \
+                     vhost DMA for the warm-fork dirty delta"
+                );
+                continue;
+            }
+        };
+        for (gpa, len) in [vq.desc_ring(), vq.avail_ring_span(), vq.used_ring_span()] {
+            mark_gpa_range_dirty(acc, gpa, len);
         }
-        for i in 0..n {
-            let desc_hva = mem_host_addr + desc_gpa + i * 16;
-            // SAFETY: desc_hva is a descriptor of a ready virtqueue inside the
-            // caller's live guest mapping, which outlives this call. The caller
-            // has paused the vCPUs, so the guest is not rewriting the table.
-            let (buf_gpa, buf_len, flags) = unsafe {
-                (
-                    std::ptr::read_volatile(desc_hva as *const u64),
-                    u64::from(std::ptr::read_volatile((desc_hva + 8) as *const u32)),
-                    std::ptr::read_volatile((desc_hva + 12) as *const u16),
-                )
-            };
+        for idx in 0..vq.size() {
+            let Some(ptr) = vq.desc(idx) else { continue };
+            // SAFETY: `desc` only yields pointers inside the descriptor
+            // table this geometry placed within the caller's live guest
+            // mapping, which outlives this call. The caller has paused the
+            // vCPUs, so the guest is not rewriting the table.
+            let d: VirtqDesc = unsafe { std::ptr::read_volatile(ptr) };
             // An indirect descriptor's `addr` is a descriptor table, not a
             // buffer; the ring pages above already cover what vhost writes.
-            if flags & VIRTQ_DESC_F_INDIRECT != 0 || buf_gpa == 0 || buf_len == 0 {
+            if d.flags & VIRTQ_DESC_F_INDIRECT != 0 || d.addr == 0 || d.len == 0 {
                 continue;
             }
-            if buf_gpa >= mem_span || buf_len > mem_span - buf_gpa {
+            if vq.buffer(d.addr, u64::from(d.len)).is_none() {
                 continue;
             }
-            mark_gpa_range_dirty(acc, buf_gpa, buf_len);
+            mark_gpa_range_dirty(acc, d.addr, u64::from(d.len));
         }
     }
 }
@@ -602,8 +1156,19 @@ fn mark_gpa_range_dirty(acc: &mut [u64], gpa: u64, len: u64) {
     if len == 0 {
         return;
     }
+    // A wrapping (gpa, len) used to mark from `gpa/4096` up to a tiny
+    // `last`, i.e. nothing — or, worse, the wrong pages. Silent wrong
+    // dirty bits produce a corrupt fork child with no error anywhere
+    // (`docs/bug-candidates.md` #43), so refuse loudly instead.
+    let Some(end) = gpa.checked_add(len - 1) else {
+        log::error!(
+            "virtqueue dirty range {gpa:#x}+{len} wraps the address space — \
+             a warm fork will miss this vhost DMA"
+        );
+        return;
+    };
     let first = gpa / 4096;
-    let last = (gpa + len - 1) / 4096;
+    let last = end / 4096;
     let last_tracked = (acc.len() as u64).saturating_mul(64).saturating_sub(1);
     if first > last_tracked {
         log::error!(
@@ -694,9 +1259,25 @@ impl MmioDeviceRegistry {
     }
 
     /// Wait (bounded) for every paused backend's workers to quiesce.
-    pub fn wait_quiescent_all(&self) {
+    ///
+    /// Returns every device that missed [`QUIESCE_DEADLINE`]. An empty
+    /// vec means every worker parked (or had no worker). `Vm::pause`
+    /// records the list; it does not fail.
+    #[must_use]
+    pub fn wait_quiescent_all(&self) -> Vec<NotQuiescent> {
+        let mut missed = Vec::new();
         for dev in &self.devices {
-            dev.lock().unwrap().wait_quiescent();
+            if let Err(e) = dev.lock().unwrap().wait_quiescent() {
+                missed.push(e);
+            }
+        }
+        missed
+    }
+
+    /// See [`VirtioBackend::hold_park_for_test`].
+    pub fn hold_park_for_test_all(&self, hold: bool) {
+        for dev in &self.devices {
+            dev.lock().unwrap().hold_park_for_test(hold);
         }
     }
 
@@ -706,6 +1287,47 @@ impl MmioDeviceRegistry {
         self.devices
             .iter()
             .all(|d| d.lock().unwrap().is_quiescent())
+    }
+
+    /// Device-bound virtqueues with work the guest has handed over and
+    /// not yet had completed — one description per queue, empty when
+    /// every device is idle (CHALLENGES #79's `avail`/`used` handshake).
+    ///
+    /// Reads the live queues rather than a snapshot so the geometry is
+    /// validated against the device's own advertised maximum before
+    /// either index is dereferenced. Only queues the *driver* fills are
+    /// compared (see [`queue_is_driver_filled`]).
+    #[must_use]
+    pub fn queues_in_flight(&self, mem_host_addr: u64, mem_span: u64) -> Vec<String> {
+        let mut busy = Vec::new();
+        for dev in &self.devices {
+            let dev = dev.lock().unwrap();
+            let device_type = dev.device_type();
+            for (i, q) in dev.queues().iter().enumerate() {
+                if !q.ready || !queue_is_driver_filled(device_type, i) {
+                    continue;
+                }
+                let Ok(vq) = ValidatedQueue::new(q, mem_host_addr, mem_span) else {
+                    continue;
+                };
+                // SAFETY: both pointers are the `idx` fields of rings this
+                // geometry placed inside the caller's live guest mapping.
+                // The caller has paused the vCPUs and parked the device
+                // workers, so nothing is writing them.
+                let (avail, used) = unsafe {
+                    (
+                        std::ptr::read_volatile(vq.avail_idx()),
+                        std::ptr::read_volatile(vq.used_idx().cast_const()),
+                    )
+                };
+                if avail != used {
+                    busy.push(format!(
+                        "virtio type {device_type} queue {i}: avail.idx {avail} != used.idx {used}"
+                    ));
+                }
+            }
+        }
+        busy
     }
 
     /// Merge every backend's device-DMA dirty pages into `acc`. `mem_host_addr`
@@ -733,6 +1355,30 @@ pub struct VirtqueueSnapshot {
     pub avail_addr: u64,
     /// Used ring GPA.
     pub used_addr: u64,
+}
+
+/// Rebuild live queue state from a snapshot, taking `max_size` from the
+/// device that is about to own the queues (`backend.max_queue_size()`).
+///
+/// `max_size` is a *device* constant the guest reads back through
+/// `MMIO_QUEUE_NUM_MAX`. Copying the snapshot's `size` into it laundered
+/// the driver's last choice into the device's own limit, so every forked
+/// VM — and every pool member is a fork — reported its negotiated size as
+/// the maximum and made the activation check a no-op
+/// (`docs/bug-candidates.md` #45). The snapshot carries only `size`.
+#[must_use]
+pub fn restore_queues(snapshots: &[VirtqueueSnapshot], max_size: u16) -> Vec<VirtqueueState> {
+    snapshots
+        .iter()
+        .map(|qs| VirtqueueState {
+            max_size,
+            size: qs.size,
+            ready: qs.ready,
+            desc_addr: GuestAddress(qs.desc_addr),
+            avail_addr: GuestAddress(qs.avail_addr),
+            used_addr: GuestAddress(qs.used_addr),
+        })
+        .collect()
 }
 
 /// Serializable state of a single MMIO device (for snapshot).
@@ -835,13 +1481,32 @@ mod tests {
     }
 
     #[test]
-    fn ring_pages_are_marked_without_a_mapping_to_walk() {
+    fn mark_gpa_range_ignores_a_wrapping_range() {
         let mut acc = vec![0u64; 4];
-        mark_virtqueue_pages_dirty(&[ready_queue(0x1000, 0x2000, 0x3000)], &mut acc, 0, 0);
+        mark_gpa_range_dirty(&mut acc, u64::MAX - 16, 4096);
+        assert_eq!(
+            acc, [0; 4],
+            "a wrapping range marks nothing, not the wrong pages"
+        );
+    }
+
+    #[test]
+    fn ring_pages_are_marked_when_no_descriptor_points_anywhere() {
+        // 64 pages of zeroed guest RAM: every descriptor reads `addr = 0`,
+        // so only the three rings are marked.
+        let span = 64 * 4096;
+        let mem = vec![0u8; span as usize];
+        let mut acc = vec![0u64; 4];
+        mark_virtqueue_pages_dirty(
+            &[ready_queue(0x1000, 0x2000, 0x3000)],
+            &mut acc,
+            mem.as_ptr() as u64,
+            span,
+        );
         assert!(is_dirty(&acc, 1), "descriptor table");
         assert!(is_dirty(&acc, 2), "avail ring");
         assert!(is_dirty(&acc, 3), "used ring");
-        assert!(!is_dirty(&acc, 4));
+        assert!(!is_dirty(&acc, 5));
     }
 
     #[test]
@@ -854,26 +1519,275 @@ mod tests {
     }
 
     #[test]
+    fn an_unwalkable_queue_marks_nothing() {
+        // Rings programmed past the end of RAM: nothing to mark, and the
+        // device would have failed activation.
+        let mut acc = vec![0u64; 4];
+        mark_virtqueue_pages_dirty(
+            &[ready_queue(1 << 40, 1 << 40, 1 << 40)],
+            &mut acc,
+            4096,
+            4096,
+        );
+        assert_eq!(acc, [0; 4]);
+    }
+
+    /// Lay out `descs` at GPA `0x1000` in a fresh `span`-byte guest RAM.
+    fn mem_with_descs(span: u64, descs: &[VirtqDesc]) -> Vec<u8> {
+        let mut mem = vec![0u8; span as usize];
+        for (i, d) in descs.iter().enumerate() {
+            let at = 0x1000 + i * 16;
+            mem[at..at + 8].copy_from_slice(&d.addr.to_le_bytes());
+            mem[at + 8..at + 12].copy_from_slice(&d.len.to_le_bytes());
+            mem[at + 12..at + 14].copy_from_slice(&d.flags.to_le_bytes());
+            mem[at + 14..at + 16].copy_from_slice(&d.next.to_le_bytes());
+        }
+        mem
+    }
+
+    fn desc(addr: u64, len: u32, flags: u16, next: u16) -> VirtqDesc {
+        VirtqDesc {
+            addr,
+            len,
+            flags,
+            next,
+        }
+    }
+
+    #[test]
     fn descriptor_buffers_are_marked_and_bogus_ones_rejected() {
         // A one-descriptor queue whose buffer sits at page 8, plus a second
         // descriptor pointing outside the span and a third marked indirect.
         let span = 64 * 4096;
-        let mut mem = vec![0u8; span as usize];
-        let write_desc = |mem: &mut [u8], i: usize, addr: u64, len: u32, flags: u16| {
-            let at = 0x1000 + i * 16;
-            mem[at..at + 8].copy_from_slice(&addr.to_le_bytes());
-            mem[at + 8..at + 12].copy_from_slice(&len.to_le_bytes());
-            mem[at + 12..at + 14].copy_from_slice(&flags.to_le_bytes());
-        };
-        write_desc(&mut mem, 0, 8 * 4096, 4096, 0);
-        write_desc(&mut mem, 1, span + 4096, 4096, 0);
-        write_desc(&mut mem, 2, 9 * 4096, 4096, VIRTQ_DESC_F_INDIRECT);
+        let mem = mem_with_descs(
+            span,
+            &[
+                desc(8 * 4096, 4096, 0, 0),
+                desc(span + 4096, 4096, 0, 0),
+                desc(9 * 4096, 4096, VIRTQ_DESC_F_INDIRECT, 0),
+            ],
+        );
 
         let mut q = ready_queue(0x1000, 0x2000, 0x3000);
-        q.size = 3;
+        q.size = 4;
         let mut acc = vec![0u64; 1];
         mark_virtqueue_pages_dirty(&[q], &mut acc, mem.as_ptr() as u64, span);
         assert!(is_dirty(&acc, 8), "buffer of a plain descriptor");
         assert!(!is_dirty(&acc, 9), "indirect descriptor is not a buffer");
+    }
+
+    #[test]
+    fn geometry_rejects_every_kind_of_hostile_size() {
+        let span = 1 << 20;
+        let mut q = ready_queue(0, 0x1000, 0x2000);
+        q.size = 0;
+        assert!(matches!(
+            ValidatedQueue::new(&q, 0, span),
+            Err(QueueGeometryError::ZeroSize)
+        ));
+        q.size = 65535;
+        assert!(matches!(
+            ValidatedQueue::new(&q, 0, span),
+            Err(QueueGeometryError::SizeAboveMax {
+                size: 65535,
+                max: 256
+            })
+        ));
+        q.size = 100;
+        assert!(matches!(
+            ValidatedQueue::new(&q, 0, span),
+            Err(QueueGeometryError::SizeNotPowerOfTwo(100))
+        ));
+        q.size = 256;
+        assert!(matches!(
+            ValidatedQueue::new(&q, 0, 0),
+            Err(QueueGeometryError::NoGuestMemory)
+        ));
+        assert!(ValidatedQueue::new(&q, 0, span).is_ok());
+    }
+
+    #[test]
+    fn geometry_rejects_each_ring_crossing_the_end_of_ram() {
+        // size 256 ⇒ desc 4096 bytes, avail 518, used 2054.
+        let span = 1 << 20;
+        let ok = ready_queue(0, 0x2000, 0x3000);
+        assert!(ValidatedQueue::new(&ok, 0, span).is_ok());
+
+        for (label, q) in [
+            ("descriptor", ready_queue(span - 4095, 0x2000, 0x3000)),
+            ("avail", ready_queue(0, span - 517, 0x3000)),
+            ("used", ready_queue(0, 0x2000, span - 2053)),
+            ("overflow", ready_queue(u64::MAX - 8, 0x2000, 0x3000)),
+        ] {
+            assert!(
+                matches!(
+                    ValidatedQueue::new(&q, 0, span),
+                    Err(QueueGeometryError::RingOutOfRange { .. })
+                ),
+                "{label} ring crossing mem_span must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn walker_refuses_a_self_referential_chain() {
+        let span = 64 * 4096;
+        let mem = mem_with_descs(span, &[desc(4096, 16, VIRTQ_DESC_F_NEXT, 0)]);
+        let mut q = ready_queue(0x1000, 0x2000, 0x3000);
+        q.size = 4;
+        let vq = ValidatedQueue::new(&q, mem.as_ptr() as u64, span).expect("geometry");
+        let mut out = Vec::new();
+        assert!(matches!(
+            vq.walk_chain(0, &mut out),
+            Err(DescChainError::TooLong(4))
+        ));
+    }
+
+    #[test]
+    fn walker_refuses_an_index_past_the_table_and_a_buffer_past_ram() {
+        let span = 64 * 4096;
+        let mem = mem_with_descs(
+            span,
+            &[
+                desc(4096, 16, VIRTQ_DESC_F_NEXT, 9),
+                desc(span, 16, 0, 0),
+                desc(span - 8, 16, 0, 0),
+            ],
+        );
+        let mut q = ready_queue(0x1000, 0x2000, 0x3000);
+        q.size = 4;
+        let vq = ValidatedQueue::new(&q, mem.as_ptr() as u64, span).expect("geometry");
+        let mut out = Vec::new();
+        assert!(matches!(
+            vq.walk_chain(0, &mut out),
+            Err(DescChainError::IndexOutOfRange { idx: 9, size: 4 })
+        ));
+        assert!(matches!(
+            vq.walk_chain(1, &mut out),
+            Err(DescChainError::BufferOutOfRange { idx: 1, .. })
+        ));
+        assert!(
+            matches!(
+                vq.walk_chain(2, &mut out),
+                Err(DescChainError::BufferOutOfRange { idx: 2, .. })
+            ),
+            "addr + len must be checked, not just addr"
+        );
+        assert!(vq.desc(4).is_none(), "desc index == size is out of range");
+    }
+
+    #[test]
+    fn walker_returns_a_well_formed_chain() {
+        let span = 64 * 4096;
+        let mem = mem_with_descs(
+            span,
+            &[
+                desc(4096, 16, VIRTQ_DESC_F_NEXT, 1),
+                desc(8192, 32, VIRTQ_DESC_F_WRITE, 0),
+            ],
+        );
+        let mut q = ready_queue(0x1000, 0x2000, 0x3000);
+        q.size = 4;
+        let vq = ValidatedQueue::new(&q, mem.as_ptr() as u64, span).expect("geometry");
+        let mut out = Vec::new();
+        let chain = vq.walk_chain(0, &mut out).expect("well-formed chain");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(
+            (chain[0].addr, chain[0].len, chain[0].write),
+            (4096, 16, false)
+        );
+        assert_eq!(
+            (chain[1].addr, chain[1].len, chain[1].write),
+            (8192, 32, true)
+        );
+    }
+
+    struct StubBackend {
+        parked: Arc<AtomicBool>,
+        running: Arc<AtomicBool>,
+        name: String,
+    }
+
+    impl VirtioBackend for StubBackend {
+        fn device_type(&self) -> u32 {
+            2
+        }
+        fn device_features(&self) -> u64 {
+            0
+        }
+        fn ack_features(&mut self, _: u64) {}
+        fn num_queues(&self) -> usize {
+            1
+        }
+        fn max_queue_size(&self) -> u16 {
+            256
+        }
+        fn guest_mapping(&self) -> (u64, u64) {
+            (0, 4096)
+        }
+        fn read_config(&self, _: u64, _: &mut [u8]) {}
+        fn write_config(&mut self, _: u64, _: &[u8]) {}
+        fn activate(&mut self, _: &[VirtqueueState], _: &EventFd) -> Result<(), String> {
+            Ok(())
+        }
+        fn queue_notify(&self, _: u32) {}
+        fn wait_quiescent(&self) -> Result<(), NotQuiescent> {
+            wait_for_park(&self.parked, &self.running, false, || self.name.clone())
+        }
+    }
+
+    fn mmio_with(backend: StubBackend) -> Arc<Mutex<MmioDevice>> {
+        let irq = EventFd::new(0).expect("eventfd");
+        Arc::new(Mutex::new(MmioDevice::new(
+            0,
+            5,
+            Arc::new(irq),
+            Box::new(backend),
+        )))
+    }
+
+    #[test]
+    fn wait_quiescent_all_names_a_never_parking_device() {
+        let parked = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut reg = MmioDeviceRegistry::new();
+        reg.add(mmio_with(StubBackend {
+            parked,
+            running: Arc::clone(&running),
+            name: "virtio-blk (/tmp/wedged.img)".into(),
+        }));
+        let start = Instant::now();
+        let missed = reg.wait_quiescent_all();
+        let elapsed = start.elapsed();
+        running.store(false, Ordering::SeqCst);
+        assert_eq!(missed.len(), 1, "{missed:?}");
+        assert_eq!(missed[0].device, "virtio-blk (/tmp/wedged.img)");
+        assert!(
+            elapsed >= QUIESCE_DEADLINE && elapsed < Duration::from_millis(400),
+            "deadline must stay 200 ms (CHALLENGES #162), was {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wait_quiescent_all_skips_a_device_that_parks_on_the_second_poll() {
+        let parked = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&parked);
+        std::thread::spawn(move || {
+            std::thread::sleep(PARK_POLL + PARK_POLL);
+            flag.store(true, Ordering::SeqCst);
+        });
+        let mut reg = MmioDeviceRegistry::new();
+        reg.add(mmio_with(StubBackend {
+            parked,
+            running: Arc::clone(&running),
+            name: "virtio-blk (/tmp/ok.img)".into(),
+        }));
+        let missed = reg.wait_quiescent_all();
+        running.store(false, Ordering::SeqCst);
+        assert!(
+            missed.is_empty(),
+            "a worker that parks on the second poll must not be reported: {missed:?}"
+        );
     }
 }

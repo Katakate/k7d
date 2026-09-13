@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bring up the 25a Ubuntu source, inject an incident, hand control to an agent.
+"""Bring up the Ubuntu source, inject an incident, hand control to an agent.
 
 `--policy scripted` is the CI arm: proves everything but the model.
 `--no-fork` is the same-model single-world baseline.
@@ -205,7 +205,7 @@ def run_once(ns: argparse.Namespace, *, run_idx: int, no_fork: bool) -> Path:
                 "type": "run",
                 "tree_id": tree_id,
                 "phase": "preparing-source",
-                "goal": "27a-inc1 incident demo",
+                "goal": "incident demo",
             },
         )
         cluster = cl.bring_up(

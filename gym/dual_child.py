@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""35a-inc1: dual-child write isolation at Ubuntu cluster fidelity.
+"""Dual-child write isolation at Ubuntu cluster fidelity.
 
 One 3-node Ubuntu source, `tree_fork_batch` labels=["alice","bob"], then
 exclusive ConfigMaps and /var/tmp mark files on alice / bob / root.
@@ -200,7 +200,7 @@ def run(cluster: Cluster) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--out", type=Path, default=Path("/tmp/k7-35a-inc1"))
+    p.add_argument("--out", type=Path, default=Path("/tmp/k7-dual-child"))
     p.add_argument("--tree-id", default="")
     return p.parse_args(argv)
 
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = parse_args(argv)
     ns.out.mkdir(parents=True, exist_ok=True)
-    tree_id = ns.tree_id or f"dci-35a-{os.getpid()}"
+    tree_id = ns.tree_id or f"dci-{os.getpid()}"
     client = K7dClient()
     client.ping()
     cluster = Cluster(client, tree_id)

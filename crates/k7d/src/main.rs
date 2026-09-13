@@ -113,7 +113,7 @@ fn run_quickstart(args: &[String]) {
         }
     };
     match client.call(&k7d::control::Request::Ping) {
-        Ok(k7d::control::Response::Pong { version }) => {
+        Ok(k7d::control::Response::Pong { version, .. }) => {
             println!("quickstart: k7d {version} at {socket}");
         }
         Ok(other) => {
@@ -139,8 +139,7 @@ fn run_quickstart(args: &[String]) {
     }
 }
 
-/// Put the snapshot-tree root on the reflink XFS and say so in the log
-/// .
+/// Put the snapshot-tree root on the reflink XFS and say so in the log.
 ///
 /// Not fatal: a tree on ext4 still works, it just pays a full guest-RAM
 /// dump for every keyframe instead of cloning its ancestor's. The
@@ -155,7 +154,7 @@ fn prepare_tree_root() {
             Ok(()) => log::info!("tree root {custom} (K7D_TREE_ROOT) is reflink-capable"),
             Err(e) => log::warn!(
                 "tree root {custom} (K7D_TREE_ROOT) is NOT reflink-capable ({e}) — every \
-                 snapshot-tree keyframe there costs a full guest-RAM dump "
+                 snapshot-tree keyframe there costs a full guest-RAM dump"
             ),
         }
         return;
@@ -163,7 +162,29 @@ fn prepare_tree_root() {
     if let Err(e) = k7d::disks::ensure_reflink_tree_root() {
         log::warn!(
             "could not put the snapshot-tree root on the reflink XFS ({e}) — keyframes \
-             will fall back to full guest-RAM dumps ; run \
+             will fall back to full guest-RAM dumps; run \
+             `your node provisioning` on this node"
+        );
+    }
+}
+
+/// Put the Firecracker jailer chroot base on the reflink XFS, unless
+/// the operator pinned it with
+/// `K7D_FC_CHROOT_BASE`.
+///
+/// A warning, not a fatal: a node that never creates a
+/// `backend: firecracker` VM does not need this at all, and one that
+/// does gets the honest error from `fc::stage` naming both
+/// filesystems when it tries to link a disk in.
+fn prepare_fc_chroot_base() {
+    if let Ok(custom) = std::env::var("K7D_FC_CHROOT_BASE") {
+        log::info!("Firecracker jailer chroot base {custom} (K7D_FC_CHROOT_BASE)");
+        return;
+    }
+    if let Err(e) = k7d::disks::ensure_reflink_fc_root() {
+        log::warn!(
+            "could not put the Firecracker jailer chroot base on the reflink XFS ({e}) — \
+             a `backend: firecracker` VM with a disk will fail to stage it; run \
              `your node provisioning` on this node"
         );
     }
@@ -186,7 +207,7 @@ fn main() {
 
     install_signal_handlers();
 
-    // the referenced work layer 4. Installed before the first VM (and before the
+    // Installed before the first VM (and before the
     // pool's threads) exists: a filter on this thread is inherited by
     // every thread and child process created afterwards, which is what
     // makes a daemon-wide filter possible at all in a process that owns
@@ -227,14 +248,14 @@ fn main() {
     // GC per-VM CPU cgroups a crashed previous daemon left
     // under this service's cgroup (their vCPU threads died with it).
     k7d::cgroup::clean_stale_vm_cgroups();
-    // Same contract for the tree jail's leftovers : an empty
+    // Same contract for the tree jail's leftovers: an empty
     // cgroup is harmless, but a stale nft table silently filters the
     // next bridge that reuses the name.
     k7d::cgroup::clean_stale_tree_cgroups();
     // Re-open on-disk cluster trees a previous daemon left behind
     // (kill -9 / crash). After cgroup GC so `open()` does not collide
     // with a stale jail. Nodes come back Suspended — live KVM died
-    // with the process . Not in Daemon::new: in-process
+    // with the process. Not in Daemon::new: in-process
     // tests must not sweep /var/lib/k7d/trees.
     daemon.rehydrate_trees_from_disk();
     let reaped_jails = k7d::netjail::clean_stale_jails();
@@ -246,6 +267,16 @@ fn main() {
         log::warn!("reaped stale tap anti-spoof jails: {reaped_tap_jails:?}");
     }
     prepare_tree_root();
+    prepare_fc_chroot_base();
+    // A bad K7D_FC_FORK_SNAPSHOT would otherwise surface only at the
+    // first Firecracker fork point.
+    match k7d::fc::snapshot::fork_mode() {
+        Ok(mode) => log::info!("Firecracker fork snapshot mode: {mode:?}"),
+        Err(e) => {
+            eprintln!("k7d: {e}");
+            std::process::exit(1);
+        }
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Bridge the C signal handler's static flag into the Arc the serve

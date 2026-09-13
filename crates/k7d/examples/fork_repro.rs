@@ -1,4 +1,4 @@
-//! Diagnostic repro loop for the referenced work: warm fork → vsock connect, N times.
+//! Diagnostic repro loop for the interrupt-injection bug: warm fork → vsock connect, N times.
 //!
 //! Not a test. Run manually on the node (needs KVM + vhost-vsock + guest):
 //!
@@ -13,7 +13,7 @@
 //! short 3 s connect (normal is < 100 ms). On a probe failure it keeps
 //! trying for the full 30 s the real tests use, then pauses the deaf
 //! fork and dumps its LAPIC ISR/IRR, `vcpu_events`, `mp_state` and the
-//! IOAPIC redirection table — the evidence the referenced work asks for.
+//! IOAPIC redirection table — the evidence the bug needs.
 
 use std::time::Duration;
 
@@ -195,8 +195,9 @@ fn main() {
         let state = k7d::snapshot::capture_vm_state(&source).expect("capture state");
         let src_mem = source.mem_host_addr();
         let fork_id = format!("repro-{i}");
-        let fork =
-            k7d::fork::restore_vm_from_state(&base_path, &dirty, src_mem, &state, &fork_id, None);
+        let fork = k7d::fork::restore_vm_from_state(
+            &base_path, &dirty, src_mem, &state, &fork_id, None, false,
+        );
         source.resume().expect("resume source");
         let mut fork = fork.expect("materialise fork");
 

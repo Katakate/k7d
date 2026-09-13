@@ -25,7 +25,7 @@
 --      verified functions never read (`kind`, `dirty_pages`,
 --      `max_chain_depth`) are dropped from the mirror
 --      (`has_base_snapshot` used to be dropped too, until
---      `restore_chain_depth` started reading it — the referenced work).
+--      `restore_chain_depth` started reading it).
 --      Change the Rust, update the mirror.
 --   2. The theorems are proven on the mirror.
 --

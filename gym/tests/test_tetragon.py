@@ -71,7 +71,7 @@ def _exec(binary: str, *, ns: str = "kube-system", args: str = "") -> str:
 
 SRC_PATH = "/tmp/k7d-tetra-src-1"
 CHILD_PATH = "/tmp/k7d-tetra-child-1"
-# 25a-inc4 shape: source has its own inject + kube-system probe noise.
+# Source has its own inject + kube-system probe noise.
 SOURCE = "\n".join(
     [
         _exec("/usr/lib/cilium/cilium-agent", ns="kube-system"),
@@ -122,7 +122,7 @@ class TestParseAndDiff(unittest.TestCase):
         paths = {k.path for k in diff.branch_only}
         self.assertIn(CHILD_PATH, paths)
         self.assertNotIn(SRC_PATH, paths)
-        # Source stream must not contain the child's path (25a-inc4 assert).
+        # Source stream must not contain the child's path.
         self.assertFalse(any(e.key.path == CHILD_PATH for e in src))
 
     def test_leak_to_source_zeros_contained(self) -> None:

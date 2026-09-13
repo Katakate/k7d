@@ -31,7 +31,7 @@ use crate::devices::{
 };
 use crate::mem_layout::{MemLayout, MMIO_HOLE_START};
 use crate::network::{TapDevice, TapNetBackend};
-use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, SharedMmioRegistry};
+use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, NotQuiescent, SharedMmioRegistry};
 use crate::virtiofs::{VirtioFsBackend, VirtiofsdProcess};
 use crate::vsock::{allocate_cid, VhostVsockBackend};
 
@@ -155,7 +155,7 @@ pub enum VmError {
     #[error("warp_clock: {what} on vCPU {cpu}: {reason} — {rollback}")]
     WarpVcpu {
         /// vCPU the warp died on. Named so the caller knows which
-        /// guest CPU to look at, per the referenced work.
+        /// guest CPU to look at.
         cpu: usize,
         /// The step that failed.
         what: &'static str,
@@ -297,7 +297,7 @@ pub enum LapicTimerMode {
     Periodic,
     /// Fires when `IA32_TSC` passes `IA32_TSC_DEADLINE`. Needs
     /// `CPUID.1:ECX[24]`, which this host's `KVM_GET_SUPPORTED_CPUID`
-    /// does not report , so it is never seen here.
+    /// does not report, so it is never seen here.
     TscDeadline,
     /// Bits 18:17 = 3, reserved by the SDM.
     Reserved,
@@ -365,7 +365,7 @@ fn decode_divide(tdcr: u32) -> u32 {
 }
 
 /// What Linux has left PIT channel 0 — the guest's `tick_broadcast`
-/// device (measured as the PIT by the referenced work) — programmed to do.
+/// device (measured as the PIT) — programmed to do.
 ///
 /// Read from the mode byte, because that is the only thing about the
 /// broadcast device `KVM_GET_PIT2` actually tells the truth about:
@@ -508,7 +508,7 @@ pub struct CpuTimeSample {
 
 impl CpuTimeSample {
     /// Whether this vCPU was in `HLT` — the state an idle guest CPU
-    /// parks in once the haltpoll window expires .
+    /// parks in once the haltpoll window expires.
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.mp_state == kvm_bindings::KVM_MP_STATE_HALTED
@@ -637,8 +637,8 @@ const KVM_VM_DILATION: u32 = 0x6469_6c61;
 const KVM_VM_DILATION_FACTOR: u64 = 0;
 const KVM_VM_DILATION_ABI: u64 = 1;
 
-/// The patch generation that added a live factor change .
-/// Generation 1  answers `EBUSY` once any vCPU exists.
+/// The patch generation that added a live factor change.
+/// Generation 1 answers `EBUSY` once any vCPU exists.
 pub const DILATION_ABI_LIVE_SET: u32 = 2;
 
 /// Largest factor the carried patch accepts (`KVM_MAX_DILATION`). The
@@ -729,12 +729,12 @@ pub fn host_supports_dilation() -> Result<(), String> {
 
 /// Set this VM's dilation factor.
 ///
-/// Legal before any vCPU exists  and, since spec
-/// 34a-inc8, on a live VM whose every vCPU is paused. The kernel is the
+/// Legal before any vCPU exists and also on a live VM whose every
+/// vCPU is paused. The kernel is the
 /// one that decides: a runnable vCPU is `EBUSY`, because the factor
 /// rides on each vCPU's hardware TSC multiplier and half a cluster at
 /// the new rate is worse than a refusal. `pub(crate)` so restore
-///  can apply a snapshot's factor before the first vCPU
+/// can apply a snapshot's factor before the first vCPU
 /// exists.
 pub(crate) fn set_dilation(vm_fd: &VmFd, factor: u32) -> Result<(), String> {
     vm_supports_dilation(vm_fd).map_err(|e| {
@@ -867,10 +867,12 @@ const E820_RESERVED: u32 = 2;
 // they never overlap guest RAM regardless of how much RAM the guest has
 // and always stay addressable in 32 bits.
 const MMIO_IRQ_BASE: u32 = 5; // IRQ 5+ for virtio devices (COM1=4, COM2=3)
-/// IOAPIC pin count — every virtio-mmio device burns one pin
-/// (IRQ `MMIO_IRQ_BASE + idx`), so at most `24 - 5 = 19` devices fit
-/// (pin-budget check).
-const IOAPIC_PINS: usize = 24;
+/// Guest boots `noapic` (8259 PIC, IRQs 0..=15). Each virtio-mmio
+/// device takes `MMIO_IRQ_BASE + idx`; IRQ 16+ makes `request_irq`
+/// return `-EINVAL` and the device never appears (`virtio_net`
+/// probe -22). IOAPIC has 24 pins but this guest does not use it.
+const PIC_IRQ_MAX: u32 = 15;
+const MMIO_DEVICE_BUDGET: usize = (PIC_IRQ_MAX - MMIO_IRQ_BASE + 1) as usize;
 
 /// Configuration for one host-guest directory sharing.
 ///
@@ -1011,11 +1013,17 @@ pub struct VmBuilder {
     scratch_disk: Option<crate::disks::ScratchDisk>,
     /// Per-container writable images, same ownership rules.
     container_scratch_disks: Vec<crate::disks::ScratchDisk>,
-    /// Named persistent data disks . Attached as
+    /// Named persistent data disks. Attached as
     /// read-write virtio-blk devices like the scratch images, but
     /// **retained**: the built `Vm` never unlinks them.
     data_disks: Vec<crate::disks::DataDisk>,
-    /// Continuous time dilation factor : guest time runs
+    /// Docker graph scratch image. Same ownership as
+    /// [`Self::scratch_disk`]: unlinked on Drop, reflinked on fork.
+    docker_disk: Option<crate::disks::ScratchDisk>,
+    /// When true, the builder appends `k7d.docker=1` so the agent
+    /// supervises dockerd. Set by [`Self::docker_disk`].
+    docker: bool,
+    /// Continuous time dilation factor: guest time runs
     /// `dilation` times faster than wall time. 1 is stock. Anything
     /// above 1 requires the carried KVM patch in `utils/kvm-dilation`
     /// and fails the build loudly on a stock host.
@@ -1048,6 +1056,18 @@ impl Default for VmBuilder {
 /// the daemon (`k7d.service`) and the tests. The shim is neither — it
 /// is spawned by containerd with no environment — so it sends no guest
 /// paths at all and lets the daemon answer. See CHALLENGES #72.
+/// Kernel command line every k7d guest boots with, on either backend.
+///
+/// The reasoning behind each token is in [`VmBuilder::new`], where this
+/// used to be a literal. It is a constant so the Firecracker backend
+/// (`crates/k7d/src/fc/`) boots the *same* guest with the *same*
+/// arguments: a guest that behaves differently under the two VMMs
+/// because one of them quietly dropped `clocksource=kvm-clock` would be
+/// a miserable thing to debug. Both backends append their own
+/// `virtio_mmio.device=` enumeration on top — k7d's builder for the
+/// native path, Firecracker itself for the legacy (`MPTable`) path.
+pub const DEFAULT_GUEST_CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic reboot=k panic=1 pci=off rdinit=/init initcall_debug mitigations=off cpuidle_haltpoll.force=1 haltpoll.guest_halt_poll_ns=200000 haltpoll.guest_halt_poll_grow_start=200000 haltpoll.guest_halt_poll_allow_shrink=0 clocksource=kvm-clock";
+
 #[must_use]
 pub fn default_guest_paths() -> (PathBuf, PathBuf) {
     let env_kernel = std::env::var_os("K7D_KERNEL");
@@ -1175,9 +1195,7 @@ impl VmBuilder {
             // force=1 is "I know what I am asking for" without a
             // promise `patch_cpuid_for_kvm_guest` would have to keep.
             // `mitigations=off` and `clocksource=kvm-clock` stay.
-            cmdline: String::from(
-                "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic reboot=k panic=1 pci=off rdinit=/init initcall_debug mitigations=off cpuidle_haltpoll.force=1 haltpoll.guest_halt_poll_ns=200000 haltpoll.guest_halt_poll_grow_start=200000 haltpoll.guest_halt_poll_allow_shrink=0 clocksource=kvm-clock",
-            ),
+            cmdline: String::from(DEFAULT_GUEST_CMDLINE),
             vsock_enabled: false,
             // Every fresh VmBuilder gets a unique vsock CID from the
             // 100+ pool — vhost-vsock is a kernel-global namespace
@@ -1208,6 +1226,8 @@ impl VmBuilder {
             scratch_disk: None,
             container_scratch_disks: Vec::new(),
             data_disks: Vec::new(),
+            docker_disk: None,
+            docker: false,
             dilation: 1,
         }
     }
@@ -1244,7 +1264,7 @@ impl VmBuilder {
     /// [`Self::build`] time, whatever base is set here.
     ///
     /// A guest with a different init contract needs a different base
-    /// line: an Ubuntu node image  boots `root=/dev/vda` into
+    /// line: an Ubuntu node image boots `root=/dev/vda` into
     /// systemd and must not carry `rdinit=/init`. Overriding is
     /// deliberate and total — there is no merge, so a caller that drops
     /// `console=ttyS0` gets a VM whose agent marker never reaches the
@@ -1271,8 +1291,8 @@ impl VmBuilder {
         self
     }
 
-    /// Run this guest's clocks `n` times faster than wall time
-    /// . `n == 1` is stock.
+    /// Run this guest's clocks `n` times faster than wall time.
+    /// `n == 1` is stock.
     ///
     /// The factor is a property of the VM, not of a vCPU: it rides on
     /// each vCPU's hardware TSC multiplier, which KVM programs at vCPU
@@ -1356,19 +1376,11 @@ impl VmBuilder {
     /// based on the `k7d.virtiofs=` cmdline param this builder
     /// emits.
     ///
-    /// `readonly: true` is enforced via the in-guest mount option
-    /// `-o ro`. The agent reads `:ro` out of the `k7d.virtiofs=`
-    /// cmdline param and passes `-o ro` to `mount -t virtiofs …`.
-    /// Any write from a guest userspace process is bounced with
-    /// `EROFS` at the VFS layer before reaching virtiofsd, matching
-    /// the `runc` `ConfigMap` / `Secret` contract.
-    ///
-    /// The host-side `virtiofsd --readonly` belt-and-suspenders that
-    /// the original design sketch describes does not exist in the
-    /// rust-vmm `virtiofsd` (≥1.7 removed the flag); see
-    /// [`crate::virtiofs::VirtiofsdProcess::spawn_with_options`] for
-    /// the place to add it back if a future virtiofsd build re-
-    /// exposes the option.
+    /// `readonly: true` is enforced on the host by bind-remounting
+    /// the share root `MS_RDONLY` before virtiofsd chroots, plus the
+    /// in-guest `mount -o ro` the agent issues
+    /// when it sees `:ro` in `k7d.virtiofs=`. The rust-vmm virtiofsd
+    /// we ship has no `--readonly` flag.
     #[must_use]
     pub fn virtiofs_share(
         mut self,
@@ -1482,7 +1494,7 @@ impl VmBuilder {
         builder
     }
 
-    /// Attach a **named persistent** data disk : one
+    /// Attach a **named persistent** data disk: one
     /// more read-write virtio-blk image, agent-mounted at the disk's
     /// [`crate::disks::DataDisk::guest_mount`] as ext4, whose lifetime is
     /// *not* the VM's.
@@ -1499,6 +1511,24 @@ impl VmBuilder {
         let mount = disk.guest_mount().to_string();
         let mut builder = self.block_device_mounted(disk.path(), false, &mount, "ext4");
         builder.data_disks.push(disk);
+        builder
+    }
+
+    /// Attach the Docker graph disk: one more read-write
+    /// virtio-blk image, agent-mounted at
+    /// [`crate::disks::DOCKER_GRAPH_GUEST_MOUNT`], owned by the built
+    /// [`Vm`] exactly like the sandbox scratch. Also puts `k7d.docker=1`
+    /// on the kernel cmdline so the agent starts dockerd.
+    #[must_use]
+    pub fn docker_disk(self, disk: crate::disks::ScratchDisk) -> Self {
+        let mut builder = self.block_device_mounted(
+            disk.path(),
+            false,
+            crate::disks::DOCKER_GRAPH_GUEST_MOUNT,
+            "ext4",
+        );
+        builder.docker_disk = Some(disk);
+        builder.docker = true;
         builder
     }
 
@@ -1529,7 +1559,7 @@ impl VmBuilder {
         let vm_fd = kvm.create_vm().map_err(VmError::CreateVm)?;
 
         // Before the vCPUs exist: their TSC multipliers are programmed
-        // at creation and the factor rides on them .
+        // at creation and the factor rides on them.
         if self.dilation != 1 {
             set_dilation(&vm_fd, self.dilation).map_err(|e| {
                 VmError::Pipe(std::io::Error::other(format!(
@@ -1625,20 +1655,18 @@ impl VmBuilder {
         let mut full_cmdline = self.cmdline.clone();
         let mmio_registry = Arc::new(std::sync::Mutex::new(MmioDeviceRegistry::new()));
 
-        // Every virtio-mmio device consumes one IOAPIC
-        // pin (IRQ `MMIO_IRQ_BASE + idx`, 24 pins total). Fail loud
-        // BEFORE allocating past the budget — a device on a phantom
-        // pin would silently never deliver interrupts.
+        // Every virtio-mmio device consumes one PIC IRQ
+        // (`MMIO_IRQ_BASE + idx`). The guest boots `noapic`, so IRQ 16+
+        // is not requestable and the device probe fails (-EINVAL).
         let mmio_devices = usize::from(self.vsock_enabled)
             + self.virtiofs_shares.len()
             + self.block_devices.len()
             + usize::from(self.network.is_some());
-        if MMIO_IRQ_BASE as usize + mmio_devices > IOAPIC_PINS {
+        if mmio_devices > MMIO_DEVICE_BUDGET {
             return Err(VmError::Pipe(std::io::Error::other(format!(
-                "{mmio_devices} virtio-mmio devices exceed the IOAPIC pin budget \
-                 (IRQs {MMIO_IRQ_BASE}..{IOAPIC_PINS}, at most {} devices) — reduce \
-                 block devices / virtiofs shares / image slots",
-                IOAPIC_PINS - MMIO_IRQ_BASE as usize
+                "{mmio_devices} virtio-mmio devices exceed the PIC IRQ budget \
+                 (IRQs {MMIO_IRQ_BASE}..={PIC_IRQ_MAX}, at most {MMIO_DEVICE_BUDGET} devices) — reduce \
+                 block devices / virtiofs shares / image slots"
             ))));
         }
 
@@ -1833,6 +1861,9 @@ impl VmBuilder {
             }
             full_cmdline.push_str(&format!(" k7d.mkdir={}", self.guest_dirs.join(",")));
         }
+        if self.docker {
+            full_cmdline.push_str(" k7d.docker=1");
+        }
 
         // Add virtio-net MMIO device if network is configured.
         let mut tap_device = None;
@@ -2022,6 +2053,7 @@ impl VmBuilder {
             vcpu_resume_txs: Vec::new(),
             vcpu_telemetry: Vec::new(),
             last_pause: PauseCost::default(),
+            pause_not_quiescent: Vec::new(),
             vcpu_tids: Vec::new(),
             vcpu_kernel_tids: Vec::new(),
             restored: false,
@@ -2036,6 +2068,7 @@ impl VmBuilder {
             scratch_disk: self.scratch_disk,
             container_scratch_disks: self.container_scratch_disks,
             data_disks: self.data_disks,
+            docker_disk: self.docker_disk,
             dilation: self.dilation,
             dilation_peak: self.dilation,
         })
@@ -2113,6 +2146,10 @@ pub struct Vm {
     /// Where the last [`Vm::pause`] spent its time. See
     /// [`Vm::last_pause_cost`].
     last_pause: PauseCost,
+    /// Devices that missed the 200 ms park deadline on the last
+    /// [`Self::pause`]. Empty when every worker parked. `pause` itself
+    /// never fails (it has non-fork callers); the fork path reads this.
+    pause_not_quiescent: Vec<NotQuiescent>,
     /// `pthread_t` of each vCPU thread (for sending signals to break
     /// `KVM_RUN`), in vCPU-index order.
     vcpu_tids: Vec<Arc<AtomicU64>>,
@@ -2160,7 +2197,7 @@ pub struct Vm {
     /// asked for its own writable-space limit. Same ownership and fork
     /// rules as `scratch_disk`.
     container_scratch_disks: Vec<crate::disks::ScratchDisk>,
-    /// Named persistent data disks . Held for reporting;
+    /// Named persistent data disks. Held for reporting;
     /// deliberately **not** cleaned up on drop — `delete_vm` leaves a
     /// data disk's image alone, and only an explicit
     /// [`crate::disks::DataDisk::delete`] (or the age-gated sweep)
@@ -2170,12 +2207,15 @@ pub struct Vm {
     /// image, the child's copy is a reflink in the fork's own directory,
     /// and so — after `prepare_fork_source` — is the source's.
     data_disks: Vec<crate::disks::DataDisk>,
-    /// Time dilation factor this VM runs at *now* ; 1 for
+    /// Docker graph scratch image. Same ownership as
+    /// [`Self::scratch_disk`]: unlinked on Drop, reflinked on fork.
+    docker_disk: Option<crate::disks::ScratchDisk>,
+    /// Time dilation factor this VM runs at *now*; 1 for
     /// every VM that did not ask for it. A restored or forked VM runs at
-    /// the factor its snapshot was taken at  — the
+    /// the factor its snapshot was taken at — the
     /// snapshot carries it, and `fork::restore_dilation` applies it
     /// before the first vCPU exists. [`Vm::set_dilation_live`] moves it
-    /// on a paused VM .
+    /// on a paused VM.
     dilation: u32,
     /// The highest factor this VM has ever run at — what the fork and
     /// snapshot refusal asks, because dropping the factor back to 1 does
@@ -2183,7 +2223,7 @@ pub struct Vm {
     dilation_peak: u32,
 }
 
-/// Outcome of preparing a VM as a fork source .
+/// Outcome of preparing a VM as a fork source.
 ///
 /// The `disk_bytes` field is what the snapshot tree's disk budget must
 /// count for the keyframe: an incremental keyframe is a reflink clone,
@@ -2285,6 +2325,7 @@ impl Vm {
             vcpu_resume_txs: Vec::new(),
             vcpu_telemetry: Vec::new(),
             last_pause: PauseCost::default(),
+            pause_not_quiescent: Vec::new(),
             vcpu_tids: Vec::new(),
             vcpu_kernel_tids: Vec::new(),
             restored: true,
@@ -2302,6 +2343,7 @@ impl Vm {
             scratch_disk: None,
             container_scratch_disks: Vec::new(),
             data_disks: Vec::new(),
+            docker_disk: None,
             dilation,
             dilation_peak: dilation,
         }
@@ -2309,9 +2351,9 @@ impl Vm {
 
     /// This VM's time dilation factor **now**: guest time runs this many
     /// times faster than wall time. 1 unless [`VmBuilder::dilation`]
-    /// asked for more , the snapshot it was restored from
-    /// was taken at more , or [`Self::set_dilation_live`]
-    /// changed it since .
+    /// asked for more, the snapshot it was restored from
+    /// was taken at more, or [`Self::set_dilation_live`]
+    /// changed it since.
     #[must_use]
     pub fn dilation(&self) -> u32 {
         self.dilation
@@ -2322,7 +2364,7 @@ impl Vm {
     /// Not the same question as [`Self::dilation`]: a VM whose factor
     /// has been dropped back to 1 has a stock *rate* but a guest clock
     /// still sitting in the host's future (CHALLENGES #191). Capture
-    /// records the *current* factor ; the peak is for
+    /// records the *current* factor; the peak is for
     /// observers, not a fork refusal.
     #[must_use]
     pub fn dilation_peak(&self) -> u32 {
@@ -2605,8 +2647,12 @@ impl Vm {
         // parks; leftover ring entries are replayed (CHALLENGES #162).
         // DMA from that in-flight request is in the dirty bitmap before
         // memcpy. No-op for backends without userspace DMA workers.
+        // A miss is recorded, not swallowed: pause itself cannot fail
+        // (warp / shutdown / snapshot all call it). The fork path reads
+        // `pause_not_quiescent` and takes a full memory dump instead of a
+        // dirty-delta copy that would miss in-flight device DMA.
         let t = Instant::now();
-        self.mmio_registry.lock().unwrap().wait_quiescent_all();
+        self.pause_not_quiescent = self.mmio_registry.lock().unwrap().wait_quiescent_all();
         self.last_pause.quiesce = t.elapsed();
         Ok(())
     }
@@ -2615,7 +2661,7 @@ impl Vm {
     ///
     /// Exposed because a pause is wall time in which no guest time
     /// passes, so for anything that pauses repeatedly — the auto-warp
-    /// policy loop of the referenced work — it is the entire cost of the
+    /// policy loop — it is the entire cost of the
     /// exercise, and a total is not enough to act on (`CHALLENGES.md`
     /// #183).
     #[must_use]
@@ -2634,7 +2680,7 @@ impl Vm {
     /// grace period the calling thread waits out in state `D`, where no
     /// signal reaches it. That cost ~2 ms per vCPU, so the auto-warp
     /// policy loop measured a 6 ms pause on a 3-node cluster against
-    /// inc2's 0.8 ms for the whole warp, and spent it in the one place
+    /// 0.8 ms for the whole warp, and spent it in the one place
     /// a warp has nothing to show for it (`CHALLENGES.md` #183).
     ///
     /// Signals until each thread confirms it has parked, rather than
@@ -2775,6 +2821,50 @@ impl Vm {
         self.mmio_registry.lock().unwrap().all_quiescent()
     }
 
+    /// Devices that missed the 200 ms park deadline on the last pause.
+    #[must_use]
+    pub fn pause_not_quiescent(&self) -> &[NotQuiescent] {
+        &self.pause_not_quiescent
+    }
+
+    /// Take the last pause's miss list so a fork path can choose a full
+    /// dump instead of a dirty-delta copy. `pause` itself never fails.
+    #[must_use]
+    pub fn take_pause_not_quiescent(&mut self) -> Vec<NotQuiescent> {
+        std::mem::take(&mut self.pause_not_quiescent)
+    }
+
+    /// If the last pause missed the 200 ms park deadline, count it and
+    /// tell the caller to take a full memory dump instead of the dirty
+    /// delta. Resumes nothing — the caller owns pause/resume.
+    pub fn take_full_dump_if_not_quiescent(&mut self) -> bool {
+        let missed = self.take_pause_not_quiescent();
+        if missed.is_empty() {
+            return false;
+        }
+        crate::virtio_mmio::record_fork_nonquiescent(&missed);
+        log::warn!(
+            "virtio worker(s) did not park within 200ms — full memory dump \
+             instead of dirty-delta: {}",
+            missed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        true
+    }
+
+    /// Test-only: make `wait_quiescent` ignore `parked` and wait out the
+    /// 200 ms deadline, so a fork can be shown to take the full-dump path
+    /// rather than a torn dirty-delta. Workers still park.
+    pub fn hold_virtio_workers_for_test(&self, hold: bool) {
+        self.mmio_registry
+            .lock()
+            .unwrap()
+            .hold_park_for_test_all(hold);
+    }
+
     /// Resume a paused VM by restarting the vCPU run loop.
     pub fn resume(&mut self) -> Result<(), VmError> {
         if !self.paused.load(Ordering::SeqCst) {
@@ -2835,7 +2925,7 @@ impl Vm {
     }
 
     /// Read this VM's clocks and per-vCPU timer state without writing
-    /// anything .
+    /// anything (the clock survey).
     ///
     /// **Paused-only.** Between [`Self::start`] and [`Self::pause`] the
     /// `VcpuFd`s live inside the run threads, so any vCPU ioctl issued
@@ -2863,11 +2953,11 @@ impl Vm {
         })
     }
 
-    /// One paused vCPU's LAPIC timer programming .
+    /// One paused vCPU's LAPIC timer programming.
     ///
     /// `IA32_TSC_DEADLINE` reads zero on every vCPU of this guest
     /// because `KVM_GET_SUPPORTED_CPUID` does not report
-    /// `CPUID.1:ECX[24]` , so this — the LAPIC one-shot
+    /// `CPUID.1:ECX[24]`, so this — the LAPIC one-shot
     /// counter — is the timer an auto-warp policy actually has to read.
     pub fn lapic_timer(&self, cpu: usize) -> Result<LapicTimerState, VmError> {
         self.require_paused("lapic_timer")?;
@@ -2924,7 +3014,7 @@ impl Vm {
     }
 
     /// Every timer of this paused VM that a forward clock jump must not
-    /// leap over .
+    /// leap over.
     ///
     /// `bus_cycle_fs` is the measured length of one APIC bus cycle in
     /// **femtoseconds** — [`Self::calibrate_apic_bus_cycle_fs`]
@@ -3000,7 +3090,7 @@ impl Vm {
     }
 
     /// Measure how long one APIC bus cycle is, in femtoseconds, on this
-    /// host .
+    /// host.
     ///
     /// KVM computes `TMCCT` as `(target_expiration − now) / (bus cycle ×
     /// divisor)`, and `now` is host time that keeps running while the
@@ -3059,7 +3149,7 @@ impl Vm {
         // under dilation runs `dilation` times faster. Reporting the guest
         // figure is what keeps every consumer of this number — ε, the
         // minimum jump, the 30 s cap, the deadline a jump targets — in the
-        // one unit the guest's own timers are in . At 1x it
+        // one unit the guest's own timers are in. At 1x it
         // is the identity.
         let guest_ns = elapsed_ns * u128::from(self.dilation);
         let bus_cycle_fs = u64::try_from(guest_ns * u128::from(FS_PER_NS) / cycles).unwrap_or(0);
@@ -3121,35 +3211,10 @@ impl Vm {
     /// [`Self::tap_has_pending_frame`] instead.
     #[must_use]
     pub fn virtio_queues_in_flight(&self) -> Vec<String> {
-        let mem_base = self.mem_host_addr();
-        let mut busy = Vec::new();
-        for dev in self.mmio_registry.lock().unwrap().snapshot_device_states() {
-            for (i, q) in dev.queues.iter().enumerate() {
-                if !q.ready
-                    || q.size == 0
-                    || !crate::virtio_mmio::queue_is_driver_filled(dev.device_type, i)
-                {
-                    continue;
-                }
-                let state = crate::virtio_mmio::VirtqueueState {
-                    max_size: q.size,
-                    size: q.size,
-                    ready: q.ready,
-                    desc_addr: GuestAddress(q.desc_addr),
-                    avail_addr: GuestAddress(q.avail_addr),
-                    used_addr: GuestAddress(q.used_addr),
-                };
-                let avail = crate::network::read_avail_idx(mem_base, &state);
-                let used = crate::network::read_used_idx(mem_base, &state);
-                if avail != used {
-                    busy.push(format!(
-                        "virtio type {} queue {i}: avail.idx {avail} != used.idx {used}",
-                        dev.device_type
-                    ));
-                }
-            }
-        }
-        busy
+        self.mmio_registry
+            .lock()
+            .unwrap()
+            .queues_in_flight(self.mem_host_addr(), self.mem_span())
     }
 
     /// Whether the host side of this VM's TAP has a frame queued for
@@ -3181,8 +3246,8 @@ impl Vm {
         Ok(want)
     }
 
-    /// Change this **paused** VM's dilation factor in place
-    /// : guest time runs `factor` nanoseconds per wall
+    /// Change this **paused** VM's dilation factor in place: guest
+    /// time runs `factor` nanoseconds per wall
     /// nanosecond from here on.
     ///
     /// **Paused-only, slope-only.** The kernel re-pins the affine map
@@ -3222,8 +3287,8 @@ impl Vm {
         set_dilation(&self.vm_fd, factor).map_err(|reason| VmError::SetDilation { factor, reason })
     }
 
-    /// Advance this paused VM's guest-visible clock by `delta`
-    /// , so the guest's backoffs, probe periods and
+    /// Advance this paused VM's guest-visible clock by `delta`, so
+    /// the guest's backoffs, probe periods and
     /// lease TTLs behave as if that much time had passed.
     ///
     /// **Paused-only, forward-only, all-or-nothing.** The clock the
@@ -3285,8 +3350,8 @@ impl Vm {
         match self.warp_vcpus(delta_ns, &offsets) {
             Ok(()) => {
                 // `debug`, not `info`: the auto-warp policy loop calls
-                // this up to 20 times a second per member (spec
-                // 34a-inc3), and a per-VM info line at that rate buries
+                // this up to 20 times a second per member, and a
+                // per-VM info line at that rate buries
                 // every other line in the daemon's journal.
                 log::debug!(
                     "warp_clock: +{}ms on {} vCPUs (kvmclock {clock_before} → {})",
@@ -3337,7 +3402,7 @@ impl Vm {
             //    LAPIC one-shot timer, because KVM_GET_SUPPORTED_CPUID
             //    on host kernels before 6.14 does not report
             //    CPUID.1:ECX[24] and `patch_cpuid_for_kvm_guest` passes
-            //    that through . The write
+            //    that through (measured). The write
             //    is kept because it is correct the day the bit is
             //    advertised, not because it is the re-arm story here.
             let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)
@@ -3440,7 +3505,7 @@ impl Vm {
     }
 
     /// PIDs of this VM's virtiofsd helper processes, so a tree can pull
-    /// them into its cgroup jail . Empty for a VM
+    /// them into its cgroup jail. Empty for a VM
     /// with no virtiofs share.
     #[must_use]
     pub fn virtiofsd_pids(&self) -> Vec<u32> {
@@ -3556,6 +3621,14 @@ impl Vm {
         self.running.load(Ordering::SeqCst) && !self.paused.load(Ordering::SeqCst)
     }
 
+    /// Whether the vCPU threads are parked after [`Self::pause`].
+    /// Distinct from [`Self::is_running`]: a shut-down VM is neither
+    /// running nor paused.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
     /// Get the host virtual address of guest memory.
     ///
     /// For CoW-restored VMs, returns the `MAP_PRIVATE` mmap address.
@@ -3617,7 +3690,7 @@ impl Vm {
     /// fork is a full memfd copy of guest RAM. `prepare_fork_source*`
     /// refuses such VMs loudly by default so nothing degrades
     /// silently; callers that knowingly accept full-copy forks (the
-    /// daemon's virtiofs sandbox pods, the 13a cluster-adopt path)
+    /// daemon's virtiofs sandbox pods, the cluster-adopt path)
     /// call this first. No-op for share-less VMs.
     pub fn allow_slow_fork(&mut self) {
         if !self.virtiofs_shares.is_empty() {
@@ -3651,11 +3724,14 @@ impl Vm {
 
         self.snapshot(base_dir)
             .map_err(crate::fork::ForkError::Snapshot)?;
+        // `snapshot` already wrote every page. Count a miss so the 200 ms
+        // question has data; do not refuse — a full dump is what ran.
+        let _ = self.take_full_dump_if_not_quiescent();
         self.restore_swap_onto_base(base_dir)
     }
 
     /// Like [`Self::prepare_fork_source_in`], but write the keyframe
-    /// **incrementally** against `ancestor_mem` : `FICLONE`
+    /// **incrementally** against `ancestor_mem`: `FICLONE`
     /// the ancestor's `memory.bin` and overwrite only the pages this VM
     /// has dirtied since it was materialized from that very file, so a
     /// fork point down the tree costs O(divergence) instead of O(guest
@@ -3709,6 +3785,20 @@ impl Vm {
         let was_running = self.is_running();
         if was_running {
             self.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
+        }
+        if self.take_full_dump_if_not_quiescent() {
+            if was_running {
+                self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
+            }
+            log::warn!(
+                "prepare_fork_source_incremental_in: VM (cid {}) missed the 200ms park \
+                 — writing a full keyframe instead of an incremental dirty-delta",
+                self.guest_cid
+            );
+            return Ok(PreparedBase::full(
+                self.prepare_fork_source_in(base_dir)?,
+                self.mem_span(),
+            ));
         }
         // The complete dirty set vs the ancestor keyframe: KVM's log ∪
         // the device-DMA bitmaps ∪ the vhost-vsock rings (#101). The
@@ -3843,6 +3933,7 @@ impl Vm {
         // source, so it is the VM that must be able to report which
         // persistent disks it was created with.
         restored.data_disks = std::mem::take(&mut self.data_disks);
+        restored.docker_disk = self.docker_disk.take();
 
         // The old source was already shut down above (CID release);
         // dropping the swapped-out husk just unmaps its memory.
@@ -4046,7 +4137,7 @@ impl Vm {
     /// dirty delta (memory-to-memory copy). No disk I/O during the hot path.
     ///
     /// The source must have `fork_source_base_path` set (own keyframe
-    /// or an inherited ancestor file — the referenced work).
+    /// or an inherited ancestor file).
     ///
     /// Steps (part 1, §Warm fork):
     /// 1. Pause source.
@@ -4065,7 +4156,7 @@ impl Vm {
     /// The source is paused once, the dirty bitmap captured once, CPU state
     /// saved once — then each fork is materialized independently.
     ///
-    /// `dilation`  names the child's factor; `None`
+    /// `dilation` names the child's factor; `None`
     /// inherits the source's.
     pub fn fork_warm_batch(
         &mut self,
@@ -4082,6 +4173,7 @@ impl Vm {
         if was_running {
             self.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
         }
+        let force_full_dump = self.take_full_dump_if_not_quiescent();
 
         // Capture dirty bitmap + CPU + device + IRQ state (all in-memory).
         let dirty_bitmap = self
@@ -4105,6 +4197,7 @@ impl Vm {
                 &state,
                 id,
                 dilation,
+                force_full_dump,
             ) {
                 Ok(fork) => forks.push(fork),
                 Err(e) => {
@@ -4198,7 +4291,7 @@ impl Vm {
 }
 
 /// Advance the guest-visible clock of every VM in `vms` by the same
-/// `delta`, with all of them paused for the whole write ,
+/// `delta`, with all of them paused for the whole write,
 /// and hand back the host wall time the pause → warp → resume cycle
 /// took.
 ///
@@ -4245,7 +4338,7 @@ pub fn warp_clock_lockstep(vms: &mut [&mut Vm], delta: Duration) -> Result<Durat
 }
 
 /// Change the dilation factor of every VM in `vms` to `factor`, with all
-/// of them paused for the whole write , and hand back the
+/// of them paused for the whole write, and hand back the
 /// host wall time the pause → set → resume cycle took.
 ///
 /// One factor for the cluster, for the same reason a warp is lockstep:
@@ -4647,7 +4740,7 @@ fn clear_dirty_log(vm_fd: &VmFd, slot: u32, memory_size: u64) -> Result<(), VmEr
 /// landed outside `KVM_RUN` and were swallowed, leaving the thread to
 /// sit in `KVM_RUN` until the *guest* next exited on its own: the
 /// auto-warp loop measured 10.6 signals and ~1.1 ms per vCPU to stop a
-/// 3-node cluster, against 0.8 ms for inc2's whole warp
+/// 3-node cluster, against 0.8 ms for the whole warp
 /// (`CHALLENGES.md` #183).
 ///
 /// The mask blocks everything else on purpose. An empty mask also works
@@ -4800,7 +4893,7 @@ fn install_vcpu_signal_handler() {
 /// Which of the two kernel image formats a file holds.
 ///
 /// k7d's own guest is an uncompressed ELF `vmlinux`; a distro kernel
-/// (`/boot/vmlinuz-*`, the referenced work) is a bzImage. Both boot on this VMM,
+/// (`/boot/vmlinuz-*`) is a bzImage. Both boot on this VMM,
 /// but they differ in where the entry point is and in whether the zero
 /// page must carry the image's own setup header — so the format is
 /// decided once, by magic bytes, instead of being guessed by trying

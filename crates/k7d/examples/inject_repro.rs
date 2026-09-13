@@ -6,7 +6,7 @@
 //! the forcing rather than on the fork path itself (0 failures in 150).
 //! Any non-zero vector reproduces, so it is not specific to the `0x35` the
 //! test uses. Run it against two `guest/kernel/vmlinux` builds to compare
-//! rates; on this guest the flake predates the 24a-inc1 kernel.
+//! rates; on this guest the flake predates the current kernel.
 use std::time::Duration;
 
 use k7d::api::AgentClient;
@@ -54,8 +54,9 @@ fn main() {
             ev.data[8] = 1;
             ev.data[9] = vector;
         }
-        let fork =
-            k7d::fork::restore_vm_from_state(&base, &dirty, src_mem, &state, "reinject", None);
+        let fork = k7d::fork::restore_vm_from_state(
+            &base, &dirty, src_mem, &state, "reinject", None, false,
+        );
         source.resume().expect("resume");
         let mut fork = fork.expect("materialise");
         fork.start().expect("start fork");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time Ubuntu 3-node prepare for the 28a / GRPO checkpoint.
+"""Time Ubuntu 3-node prepare for the GRPO checkpoint.
 
 `tree_adopt_cluster` is the real prepare (`new_cluster` calls
 `prepare_fork_source_in` on every member). The later
@@ -44,7 +44,7 @@ def _memory_bins(tree_id: str) -> list[dict[str, int | str]]:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    tree_id = f"prep-28a-{os.getpid()}"
+    tree_id = f"prep-{os.getpid()}"
     client = K7dClient()
     client.ping()
     cluster = Cluster(client, tree_id)

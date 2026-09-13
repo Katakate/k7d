@@ -1,4 +1,4 @@
-# dcgm-exporter-shaped Prometheus fixture . Not NVML.
+# dcgm-exporter-shaped Prometheus fixture. Not NVML.
 # Serves DCGM_FI_DEV_GPU_UTIL and DCGM_FI_DEV_FB_USED on :9400.
 apiVersion: apps/v1
 kind: Deployment

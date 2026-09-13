@@ -1,5 +1,5 @@
 -- Equivalence for the restore-chain walk
--- `restore_chain_depth` . Same fuel-recursion skeleton as
+-- `restore_chain_depth`. Same fuel-recursion skeleton as
 -- `Anc.lean`'s `ancestor_ids`, but simpler: the loop carries a scalar
 -- depth counter instead of pushing into a `Vec`, so there is no
 -- capacity side condition — the theorem is unconditional. The

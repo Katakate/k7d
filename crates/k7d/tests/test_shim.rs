@@ -644,90 +644,11 @@ fn test_boot_timing_breakdown() {
 
 mod common;
 
-/// Ensure the shim binary is built (release), installed, containerd config
-/// has the k7 runtime, RuntimeClass exists, and k3s is running.
-/// This is idempotent — safe to call before every kubectl test.
+/// Ensure the shim binary is built (release), installed, containerd
+/// config has the k7 runtime, RuntimeClass exists, and k3s is running.
+/// Idempotent — safe to call before every kubectl test.
 fn ensure_shim_installed() -> common::LeakGuard {
-    use std::process::Command;
-
-    // Best-effort teardown of orphan
-    // virtiofsd/shim processes and stale /tmp/k7d-shim mounts left by
-    // earlier tests/binaries before we (re)install the shim.
-    common::cleanup_k7_runtime_leaks();
-
-    let shim_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target/release/containerd-shim-k7-v1");
-
-    // Always build: cargo no-ops in ~a second when the binary is
-    // fresh, and skipping the build when `shim_src` merely *exists*
-    // deploys a stale shim after source edits (bit us twice — the
-    // crash-recovery hooks were first tested against a stale
-    // binary; see `ensure_k7d_daemon_running` for the
-    // first time).
-    let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "containerd-shim-k7-v1"])
-        .status()
-        .expect("cargo build should run");
-    assert!(status.success(), "shim build failed");
-
-    let installed = std::path::Path::new("/usr/local/bin/containerd-shim-k7-v1");
-    let need_install = if installed.exists() {
-        let src_meta = std::fs::metadata(&shim_src).unwrap();
-        let dst_meta = std::fs::metadata(installed).unwrap();
-        src_meta.len() != dst_meta.len()
-            || src_meta.modified().unwrap() > dst_meta.modified().unwrap()
-    } else {
-        true
-    };
-
-    if need_install {
-        eprintln!("  installing shim to /usr/local/bin/");
-        let _ = Command::new("pkill")
-            .args(["-9", "-f", "containerd-shim-k7-v1"])
-            .status();
-        std::thread::sleep(Duration::from_millis(500));
-        // Unlink first: copying over a binary some straggler shim still
-        // executes fails with ETXTBSY; a fresh inode never does.
-        let _ = std::fs::remove_file(installed);
-        std::fs::copy(&shim_src, installed).expect("copy shim binary");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(installed, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let _ = Command::new("systemctl").args(["restart", "k3s"]).status();
-        common::wait_for_k3s_ready();
-    }
-
-    let rc_check = Command::new("kubectl")
-        .args(["get", "runtimeclass", "k7"])
-        .output()
-        .expect("kubectl should run");
-    if !rc_check.status.success() {
-        eprintln!("  creating RuntimeClass k7");
-        let _ = Command::new("kubectl")
-            .args(["apply", "-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child.stdin.as_mut().unwrap().write_all(
-                    b"apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: k7\nhandler: k7\n",
-                ).unwrap();
-                child.wait()
-            })
-            .expect("create RuntimeClass");
-    }
-
-    // The shim's sandbox Create now requires a running k7d
-    // daemon (it owns the VMs); install and start it.
-    common::ensure_k7d_daemon_running();
-
-    common::LeakGuard
+    common::ensure_shim_installed()
 }
 
 fn kubectl_apply(yaml: &str) -> Result<(), String> {
@@ -1006,8 +927,8 @@ spec:
     eprintln!();
 }
 
-////18d: OCI `cgroup`/`cgroup2` mounts are translated to a
-/// guest cgroup2 mount instead of stripped, and (18d) the cgroup
+/// OCI `cgroup`/`cgroup2` mounts are translated to a
+/// guest cgroup2 mount instead of stripped, and the cgroup
 /// namespace is KEPT, so every container sees a private namespaced
 /// subtree — `/proc/self/cgroup` reads `0::/` and siblings are
 /// invisible, exactly like Kata/stock k8s. A plain container sees a
@@ -1102,8 +1023,8 @@ spec:
         &[
             "sh",
             "-c",
-            "mkdir /sys/fs/cgroup/k7d-18d-test && \
-             cat /sys/fs/cgroup/k7d-18d-test/cgroup.procs && \
+            "mkdir /sys/fs/cgroup/k7d-cgroup-test && \
+             cat /sys/fs/cgroup/k7d-cgroup-test/cgroup.procs && \
              echo CGWRITE-OK",
         ],
     )
@@ -1120,7 +1041,7 @@ spec:
         &[
             "sh",
             "-c",
-            "test ! -d /sys/fs/cgroup/k7d-18d-test && echo SIBLING-HIDDEN",
+            "test ! -d /sys/fs/cgroup/k7d-cgroup-test && echo SIBLING-HIDDEN",
         ],
     )
     .unwrap();
@@ -1134,7 +1055,7 @@ spec:
         &[
             "sh",
             "-c",
-            "rmdir /sys/fs/cgroup/k7d-18d-test && echo CGRM-OK",
+            "rmdir /sys/fs/cgroup/k7d-cgroup-test && echo CGRM-OK",
         ],
     )
     .unwrap();
@@ -1858,6 +1779,127 @@ spec:
              id={id} first_id={first_id})"
         );
         std::thread::sleep(Duration::from_secs(1));
+    }
+
+    kubectl_delete("pod", &pod).unwrap();
+}
+
+/// CRI container id of a named container in a pod (running or not).
+fn cri_container_id(pod: &str, container: &str) -> String {
+    let sandbox_id = common::pod_sandbox_id(pod);
+    let ps = std::process::Command::new("k3s")
+        .args([
+            "crictl",
+            "ps",
+            "-a",
+            "-p",
+            &sandbox_id,
+            "--name",
+            container,
+            "-q",
+        ])
+        .output()
+        .expect("k3s crictl ps");
+    let id = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(
+        !id.is_empty(),
+        "no CRI container found for {container}: {}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    id
+}
+
+/// Exit code kubelet recorded for a named container — in `lastState`
+/// once it was restarted, or in `state.terminated` during the restart
+/// window. Empty until one of them is populated.
+fn recorded_exit_code(pod: &str, container: &str) -> String {
+    let sel = format!(".status.containerStatuses[?(@.name==\"{container}\")]");
+    let last = pod_jsonpath(pod, &format!("{sel}.lastState.terminated.exitCode"));
+    if last.is_empty() {
+        pod_jsonpath(pod, &format!("{sel}.state.terminated.exitCode"))
+    } else {
+        last
+    }
+}
+
+/// A container stopped through the CRI (SIGTERM, then SIGKILL after
+/// the grace timeout — every `kubectl delete`, rolling update and
+/// eviction) must be reported with the exit status the process
+/// ACTUALLY died with, observed by the exit watcher — not stamped by
+/// the shim's `Kill` handler (docs/bug-candidates.md #46, which
+/// reported `0`/Completed for every SIGTERM regardless of what the
+/// process did, and unblocked `Wait` while it was still running).
+///
+///   - `graceful` traps SIGTERM and exits 3 → kubelet must see 3;
+///   - `stubborn` is a PID-1 `sleep` that ignores SIGTERM → containerd
+///     SIGKILLs it at the timeout → kubelet must see 137.
+#[test]
+fn test_cri_stop_reports_real_exit_code() {
+    let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name("test-k7d-sigterm");
+    let _ = kubectl_delete("pod", &pod);
+    let _pod_guard = PodGuard(pod.clone());
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+spec:
+  runtimeClassName: k7
+  restartPolicy: Always
+  containers:
+  - name: graceful
+    image: busybox:1.36
+    command: ["sh", "-c", "trap 'exit 3' TERM; while true; do sleep 1; done"]
+  - name: stubborn
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .unwrap();
+    wait_for_all_containers_ready(&pod, Duration::from_secs(180)).unwrap();
+
+    for (container, timeout, want) in [("graceful", "10", "3"), ("stubborn", "3", "137")] {
+        let cid = cri_container_id(&pod, container);
+        let started = Instant::now();
+        let stop = std::process::Command::new("k3s")
+            .args(["crictl", "stop", "-t", timeout, &cid])
+            .output()
+            .expect("k3s crictl stop");
+        assert!(
+            stop.status.success(),
+            "crictl stop {container}: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        eprintln!(
+            "crictl stop -t {timeout} {container}: {:?}",
+            started.elapsed()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let got = recorded_exit_code(&pod, container);
+            if !got.is_empty() {
+                assert_eq!(
+                    got, want,
+                    "{container}: kubelet recorded exit code {got}, expected {want}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{container}: no terminated exit code ever recorded"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     kubectl_delete("pod", &pod).unwrap();
@@ -2804,8 +2846,8 @@ spec:
     teardown(&mut daemon);
 }
 
-/// / 18a: kubectl pod B with `fork-source-{cluster,vm}` pointing
-/// at Running pod A boots as a warm fork of A's VM (annotation-only
+/// A kubectl pod B with `fork-source-{cluster,vm}` pointing at Running
+/// pod A boots as a warm fork of A's VM (annotation-only
 /// drive path — no test-side `ForkVm`). Share-less emptyDir → CoW;
 /// source still execs (CID preserved across prepare swap).
 #[test]
@@ -2910,7 +2952,7 @@ spec:
     let _ = kubectl_delete("pod", &src);
 }
 
-/// / 18a: half-specified `fork-source-*` annotations fail
+/// Half-specified `fork-source-*` annotations fail
 /// sandbox Create loudly (events name the annotation keys).
 #[test]
 fn test_kubectl_fork_source_half_specified_fails_loud() {

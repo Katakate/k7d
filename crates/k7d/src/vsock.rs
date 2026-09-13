@@ -2,10 +2,12 @@
 
 use std::os::unix::io::AsRawFd;
 
-use vm_memory::Address;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::virtio_mmio::{VirtioBackend, VirtqueueState, VIRTIO_ID_VSOCK};
+use crate::virtio_mmio::{ValidatedQueue, VirtioBackend, VirtqueueState, VIRTIO_ID_VSOCK};
+
+/// Maximum descriptors per vhost-vsock virtqueue (`QUEUE_NUM_MAX`).
+pub const VSOCK_QUEUE_SIZE: u16 = 256;
 
 /// Default guest vsock CID.
 pub const DEFAULT_GUEST_CID: u64 = 3;
@@ -80,7 +82,6 @@ fn cid_seed_pid() -> u64 {
 pub const AGENT_VSOCK_PORT: u32 = 1024;
 
 const VSOCK_NUM_QUEUES: usize = 3;
-const VSOCK_QUEUE_SIZE: u16 = 256;
 
 // vhost ioctl numbers
 const VHOST_SET_OWNER: libc::c_ulong = 0x0000_AF01;
@@ -211,6 +212,43 @@ impl VhostVsockBackend {
             _call_thread: None,
         })
     }
+
+    /// Validate one queue's geometry against a guest mapping before any
+    /// of its addresses reaches the kernel.
+    ///
+    /// `VHOST_SET_VRING_ADDR` asks the *kernel's* vhost driver to DMA at
+    /// an address the guest picked. "The kernel will probably reject it"
+    /// is not a boundary (`docs/bug-candidates.md` #44), and the restore
+    /// path replays the same snapshotted state, so a poisoned VM would
+    /// otherwise stay poisoned across every fork.
+    fn validated(
+        &self,
+        q: &VirtqueueState,
+        index: usize,
+        mem_base: u64,
+    ) -> Result<ValidatedQueue, String> {
+        ValidatedQueue::new(q, mem_base, self.mem_size)
+            .map_err(|e| format!("vhost-vsock queue {index} geometry: {e}"))
+    }
+
+    fn set_vring_addr(&self, index: u32, vq: &ValidatedQueue) -> Result<(), String> {
+        let (desc, _) = vq.desc_ring();
+        let (avail, _) = vq.avail_ring_span();
+        let (used, _) = vq.used_ring_span();
+        ioctl_ref(
+            self.vhost_raw_fd,
+            VHOST_SET_VRING_ADDR,
+            &VhostVringAddr {
+                index,
+                flags: 0,
+                desc_user_addr: self.mem_addr + desc,
+                used_user_addr: self.mem_addr + used,
+                avail_user_addr: self.mem_addr + avail,
+                log_guest_addr: 0,
+            },
+            "SET_VRING_ADDR",
+        )
+    }
 }
 
 impl VirtioBackend for VhostVsockBackend {
@@ -232,6 +270,10 @@ impl VirtioBackend for VhostVsockBackend {
 
     fn max_queue_size(&self) -> u16 {
         VSOCK_QUEUE_SIZE
+    }
+
+    fn guest_mapping(&self) -> (u64, u64) {
+        (self.mem_addr, self.mem_size)
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -284,10 +326,11 @@ impl VirtioBackend for VhostVsockBackend {
         // vhost-vsock only handles 2 queues (RX=0, TX=1), not the event queue
         let mut kick_evts = Vec::new();
         for (idx, q) in queues.iter().take(2).enumerate() {
-            if !q.ready || q.size == 0 {
+            if !q.ready {
                 continue;
             }
             let i = idx as u32;
+            let vq = self.validated(q, idx, self.mem_addr)?;
 
             let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
 
@@ -296,27 +339,12 @@ impl VirtioBackend for VhostVsockBackend {
                 VHOST_SET_VRING_NUM,
                 &VhostVringState {
                     index: i,
-                    num: q.size as u32,
+                    num: u32::from(vq.size()),
                 },
                 "SET_VRING_NUM",
             )?;
 
-            let desc = self.mem_addr + q.desc_addr.raw_value();
-            let used = self.mem_addr + q.used_addr.raw_value();
-            let avail = self.mem_addr + q.avail_addr.raw_value();
-            ioctl_ref(
-                fd,
-                VHOST_SET_VRING_ADDR,
-                &VhostVringAddr {
-                    index: i,
-                    flags: 0,
-                    desc_user_addr: desc,
-                    used_user_addr: used,
-                    avail_user_addr: avail,
-                    log_guest_addr: 0,
-                },
-                "SET_VRING_ADDR",
-            )?;
+            self.set_vring_addr(i, &vq)?;
 
             ioctl_ref(
                 fd,
@@ -403,10 +431,15 @@ impl VhostVsockBackend {
 
         let mut kick_evts = Vec::new();
         for (idx, q) in queues.iter().take(2).enumerate() {
-            if !q.ready || q.size == 0 {
+            if !q.ready {
                 continue;
             }
             let i = idx as u32;
+            // The rings are programmed against this device's own mapping,
+            // but the `used.idx` below is read out of the caller's (the
+            // fork's `MAP_PRIVATE` view), so both need validating.
+            let vq = self.validated(q, idx, self.mem_addr)?;
+            let read_vq = self.validated(q, idx, mem_host_addr)?;
 
             let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
 
@@ -415,34 +448,19 @@ impl VhostVsockBackend {
                 VHOST_SET_VRING_NUM,
                 &VhostVringState {
                     index: i,
-                    num: q.size as u32,
+                    num: u32::from(vq.size()),
                 },
                 "SET_VRING_NUM",
             )?;
 
-            let desc = self.mem_addr + q.desc_addr.raw_value();
-            let used = self.mem_addr + q.used_addr.raw_value();
-            let avail = self.mem_addr + q.avail_addr.raw_value();
-            ioctl_ref(
-                fd,
-                VHOST_SET_VRING_ADDR,
-                &VhostVringAddr {
-                    index: i,
-                    flags: 0,
-                    desc_user_addr: desc,
-                    used_user_addr: used,
-                    avail_user_addr: avail,
-                    log_guest_addr: 0,
-                },
-                "SET_VRING_ADDR",
-            )?;
+            self.set_vring_addr(i, &vq)?;
 
             // The vring base tells the vhost module where to start reading
             // from the available ring. Use used_idx (= number of entries the
             // host already processed) so the module sees remaining entries.
-            let used_idx_addr = (mem_host_addr + q.used_addr.raw_value() + 2) as *const u16;
-            // SAFETY: used_idx_addr points into the CoW-mapped guest memory.
-            let used_idx = unsafe { std::ptr::read_volatile(used_idx_addr) };
+            // SAFETY: `used_idx` is the idx field of a ring this geometry
+            // placed inside the caller's CoW-mapped guest memory.
+            let used_idx = unsafe { std::ptr::read_volatile(read_vq.used_idx().cast_const()) };
             ioctl_ref(
                 fd,
                 VHOST_SET_VRING_BASE,

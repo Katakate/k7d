@@ -105,7 +105,7 @@ CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
 # datapath work and its Start hook is fatal on failure, so a
 # modules-less kernel takes Cilium down with
 # "failed to open loaded modules information at /proc/modules"
-# . Every real node has this file, and
+# (CHALLENGES #100). Every real node has this file, and
 # on this guest it is correctly empty.
 CONFIG_MODULES=y
 # Nothing loads or unloads modules here, so the rest of the subsystem
@@ -191,7 +191,7 @@ CONFIG_NETFILTER_XT_MATCH_MARK=y
 CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
 CONFIG_NETFILTER_XT_MATCH_PHYSDEV=y
 CONFIG_NETFILTER_XT_MATCH_STATISTIC=y
-# NetworkPolicy enforcement : k3s's embedded netpol
+# NetworkPolicy enforcement: k3s's embedded netpol
 # controller (the kube-router lib) probes the guest with `ipset save`
 # at startup and, when the ipset netlink subsystem is absent, logs
 # "Skipping network policy controller start, ipset save failed: ipset
@@ -247,7 +247,7 @@ CONFIG_BRIDGE_NETFILTER=y
 # ── Cilium eBPF datapath ──
 # Cilium's sysreq set, minus what the cgroup/BPF_SYSCALL block above
 # already provides for runc. This is what makes a k7d VM usable as a
-# real k8s *node* : without it Cilium's agent aborts at
+# real k8s *node*: without it Cilium's agent aborts at
 # startup on probe failures instead of loading a datapath.
 #
 # JIT: BPF_JIT_ALWAYS_ON is not a performance knob here, it is what
@@ -271,7 +271,7 @@ CONFIG_IPV6_MULTIPLE_TABLES=y
 # Native-routing mode is the expected first deployment on a k7d bridge
 # (all node VMs are L2-adjacent on `k7-br-*`, so no encapsulation is
 # needed), but VXLAN is Cilium's *default* tunnel mode and costs little
-# built in. Both get tested; whichever one 24a-inc3 picks, the kernel
+# built in. Both get tested; whichever one Cilium picks, the kernel
 # is not the thing that has to change.
 CONFIG_VXLAN=y
 # Cilium's tunnel/IPsec key handling and the NFSv4 client below both
@@ -280,7 +280,7 @@ CONFIG_CRYPTO=y
 CONFIG_CRYPTO_SHA1=y
 CONFIG_CRYPTO_USER_API_HASH=y
 # The XFRM *netlink* interface, not IPsec. Cilium's transparent
-# encryption is off and stays off (out of scope for 24a-inc3), but the
+# encryption is off and stays off (out of scope), but the
 # agent's datapath (re)initialisation unconditionally lists and deletes
 # xfrm policies and state before it programs anything — on a kernel with
 # no NETLINK_XFRM that socket() returns EPROTONOSUPPORT and the agent
@@ -316,7 +316,7 @@ CONFIG_OVERLAY_FS=y
 CONFIG_EXT4_FS=y
 CONFIG_EROFS_FS=y
 # Disk quota support, for ext4 project quotas: bounding one container's
-# writable space on a shared scratch image needs them, and 19c had to
+# writable space on a shared scratch image needs them, and we had to
 # rule that out only because no guest kernel rebuild was in flight to
 # carry the options. This is that rebuild; nothing enforces quotas yet.
 CONFIG_QUOTA=y
@@ -335,7 +335,7 @@ CONFIG_QFMT_V2=y
 #
 # ISCSI_TCP registers its transport at boot with no userspace at all
 # (/sys/class/iscsi_transport/tcp), which is what makes this kernel
-# assertable today; the iscsiadm/iscsid userspace is 24a-inc2's rootfs
+# assertable today; the iscsiadm/iscsid userspace is a rootfs
 # problem, not this kernel's.
 #
 # Deliberately out: Longhorn v2 (SPDK — nvme-tcp, hugepages, uio),

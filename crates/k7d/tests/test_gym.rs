@@ -1,4 +1,4 @@
-//! the referenced work: gym HTTP lease / act / score / reap.
+//! Gym HTTP lease / act / score / reap.
 //!
 //! Spawns `gym/server.py` against the node daemon (create mode), drives
 //! the frozen contract, and asserts zero residue vs a pre-lease snapshot.
@@ -592,7 +592,7 @@ fn assert_terms_present(score: &serde_json::Value) {
     }
 }
 
-/// the referenced work: named injectors, contain/restore terms, zero residue.
+/// Named injectors, contain/restore terms, zero residue.
 #[test]
 fn test_gym_fault_catalog_contain_restore() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -771,7 +771,7 @@ fn test_gym_autowarp_mode_jump() {
     let dilate_err = dilate["error"].as_str().unwrap_or("");
     assert!(
         dilate_err.contains("GYM_SOURCE_MODE=ubuntu"),
-        "dilate must require the ubuntu source : {dilate_err}"
+        "dilate must require the ubuntu source (the reset requirement was lifted): {dilate_err}"
     );
 
     let (code, lease) = http(
@@ -852,7 +852,7 @@ fn test_gym_autowarp_mode_jump() {
 }
 
 /// `dilate` is CreateVm N=8, not `Request::AutoWarp`. Create-mode
-/// (busybox) is out of scope for inc4 — refuse loud on stock KVM.
+/// (busybox) is out of scope — refuse loud on stock KVM.
 #[test]
 fn test_gym_autowarp_mode_dilate_refuses_create() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -875,6 +875,6 @@ fn test_gym_autowarp_mode_dilate_refuses_create() {
     let err = rec["error"].as_str().unwrap_or("");
     assert!(
         err.contains("GYM_SOURCE_MODE=ubuntu"),
-        "dilate must require the ubuntu source : {err}"
+        "dilate must require the ubuntu source (the reset requirement was lifted): {err}"
     );
 }

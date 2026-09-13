@@ -1,4 +1,4 @@
-//! the referenced work: daemon crash mid-tree — Ubuntu rehydrate.
+//! Daemon crash mid-tree — Ubuntu rehydrate.
 //!
 //! Runs `gym/tree_rehydrate.py` against the live systemd k7d. This test
 //! owns `k7d.service` for the duration (kill -9 + restart). No `#[ignore]`.
@@ -48,7 +48,7 @@ fn wipe_stale_rh_via_daemon() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("rh-35a-") {
+        if t.tree_id.starts_with("rh-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -61,7 +61,7 @@ fn wipe_stale_rh_on_disk() {
     if let Ok(rd) = std::fs::read_dir(&trees) {
         for e in rd.flatten() {
             let name = e.file_name();
-            if name.to_string_lossy().starts_with("rh-35a-") {
+            if name.to_string_lossy().starts_with("rh-") {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
@@ -70,7 +70,7 @@ fn wipe_stale_rh_on_disk() {
     if let Ok(rd) = std::fs::read_dir(&disks) {
         for e in rd.flatten() {
             let name = e.file_name();
-            if name.to_string_lossy().starts_with("ubuntu-ful-rh-35a-") {
+            if name.to_string_lossy().starts_with("ubuntu-ful-rh-") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -104,8 +104,8 @@ fn test_tree_rehydrate_after_daemon_kill() {
     wipe_stale_rh_on_disk();
 
     let root = workspace_root();
-    let tree_id = format!("rh-35a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-35a-inc4-{}", std::process::id()));
+    let tree_id = format!("rh-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-tree-rehydrate-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -123,7 +123,7 @@ fn test_tree_rehydrate_after_daemon_kill() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 35a-inc4 harness {} ({elapsed:?}) ----\n{log_text}\n---- end 35a-inc4 ----",
+        "---- rehydrate harness {} ({elapsed:?}) ----\n{log_text}\n---- end rehydrate ----",
         log_path.display()
     );
     assert!(

@@ -80,7 +80,7 @@ def headerBytes (pc : BitVec 32) (ms : BitVec 64) : List Byte :=
     ++ List.replicate 8 (BitVec.ofNat 8 0)
 
 /-- Mirror of `crate::tree_model::k7dl_set_base_identity`: replace the
-header's trailing 8 bytes with `bi` little-endian . -/
+header's trailing 8 bytes with `bi` little-endian. -/
 def setBaseIdentity (hdr : List Byte) (bi : BitVec 64) : List Byte :=
   hdr.take 20 ++ u64ToLe bi
 
@@ -177,7 +177,7 @@ theorem k7dl_entry_roundtrip (idx : BitVec 32) (page : List Byte) :
   show (u32FromLe _ _ _ _, page) = (idx, page)
   rw [u32_le_roundtrip idx]
 
-/-- the referenced work / CHALLENGES #144: the guard rejects exactly the case it
+/-- CHALLENGES #144: the guard rejects exactly the case it
 exists for — two *known* generations that disagree. -/
 theorem baseIdentityOk_rejects_known_mismatch (pack base : BitVec 64)
     (hp : pack ≠ 0#64) (hb : base ≠ 0#64) (hne : pack ≠ base) :
@@ -190,12 +190,12 @@ theorem baseIdentityOk_self (id : BitVec 64) : baseIdentityOk id id = true := by
   simp [baseIdentityOk]
 
 /-- An unknown identity on either side loads: every pack written before
-the referenced work carries a zero there. -/
+the identity landed carries a zero there. -/
 theorem baseIdentityOk_unknown (pack base : BitVec 64)
     (h : pack = 0#64 ∨ base = 0#64) : baseIdentityOk pack base = true := by
   rcases h with h | h <;> simp [baseIdentityOk, h]
 
-/-- the referenced work: the base identity survives its own round-trip through the
+/-- The base identity survives its own round-trip through the
 header's trailing u64. -/
 theorem k7dl_base_identity_roundtrip (pc : BitVec 32) (ms bi : BitVec 64) :
     baseIdentity (setBaseIdentity (headerBytes pc ms) bi) = bi := by
@@ -205,7 +205,7 @@ theorem k7dl_base_identity_roundtrip (pc : BitVec 32) (ms bi : BitVec 64) :
   simp only [List.getElem!_cons_succ, List.getElem!_cons_zero]
   exact u64_le_roundtrip bi
 
-/-- the referenced work, the load-bearing half: stamping the identity does not
+/-- The load-bearing half: stamping the identity does not
 disturb `page_count` or `mem_size`. If it did, a resumed node would
 scatter its pages by an index the writer never meant. -/
 theorem k7dl_set_base_identity_preserves_header (pc : BitVec 32) (ms bi : BitVec 64) :

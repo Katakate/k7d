@@ -1,4 +1,4 @@
-"""Render shared vs diverged RAM from 28a harness JSONL (stdlib SVG).
+"""Render shared vs diverged RAM from harness JSONL (stdlib SVG).
 
 Each record is one `tree_nodes` sample:
 

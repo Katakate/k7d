@@ -1,4 +1,4 @@
-"""JSONL schema + stats for the five 27a-inc2 plots. Stdlib only.
+"""JSONL schema + stats for the five plots. Stdlib only.
 
 THIS MODULE DOES NOT TRAIN A MODEL.
 
@@ -203,7 +203,7 @@ def std_solve_vs_turn(eps: list[dict[str, Any]]) -> dict[str, Any]:
 def selfplay_rows(
     rows: list[dict[str, Any]], role: str | None = None
 ) -> list[dict[str, Any]]:
-    """Self-play harvest rows (26a-inc11). Missing selfplay payload is
+    """Self-play harvest rows. Missing selfplay payload is
     loud. Filter by role when given (advantage is within-role)."""
     from soak import require_selfplay_payload, require_selfplay_role
 

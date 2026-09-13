@@ -10,6 +10,7 @@ This directory only keeps repo-local assets referenced by the README:
 
 | Path | Purpose |
 |------|---------|
+| `backends.md` | Backend selection (annotation / `k7-fc` / `VmConfig`) and feature matrix |
 | `assets/` | Agent-run videos, GIF highlights, and their JSONL transcripts for the README |
 | `demo/` | Tiny explainer for the frontier-agent run (`agent.html`) |
 | `blog/` | Benchmark write-up and the frontier-agent post linked from the README |

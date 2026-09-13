@@ -150,7 +150,7 @@ theorem ram_soft_limit_below_max_rust (b : tree_model.TreeBudget) :
   rw [hpost]
   exact Tree.ram_soft_limit_below_max (absBudget b)
 
-/-- Group B on the Rust code : with zero incoming bytes
+/-- Group B on the Rust code: with zero incoming bytes
 the disk-headroom check decides exactly `over_disk`. -/
 theorem over_disk_incoming_zero_rust (t : tree_model.TreeModel) :
     ∃ b, tree_model.over_disk_incoming t 0#u64 = ok b
@@ -160,7 +160,7 @@ theorem over_disk_incoming_zero_rust (t : tree_model.TreeModel) :
   rw [hpost]
   simp [Tree.over_disk_incoming_zero]
 
-/-- Group B on the Rust code : the disk-headroom check is
+/-- Group B on the Rust code: the disk-headroom check is
 monotone in the projected write — if `i` bytes do not fit, neither does
 any `j ≥ i`. -/
 theorem over_disk_incoming_mono_rust (t : tree_model.TreeModel)
@@ -256,7 +256,7 @@ theorem leaf_subtree_has_no_live_descendants_rust (t : tree_model.TreeModel)
   rw [hpost]
   exact Tree.leaf_subtree_has_no_live_descendants (absTree t)
 
-/-- Group C on the Rust code : `restore_chain_depth`
+/-- Group C on the Rust code: `restore_chain_depth`
 never panics, and a checkpoint node's restore chain is 0 — resume reads
 its own `memory.bin`, no deltas. -/
 theorem restore_chain_depth_checkpoint_rust (t : tree_model.TreeModel)
@@ -270,7 +270,7 @@ theorem restore_chain_depth_checkpoint_rust (t : tree_model.TreeModel)
   rw [hpost]
   exact Tree.restore_chain_depth_checkpoint (absTree t) id.val n hl hb
 
-/-- Group C on the Rust code (the referenced work, the load-bearing
+/-- Group C on the Rust code (the load-bearing
 distinction): a non-checkpoint node whose parent is a checkpoint has
 restore chain exactly 1, however deep it sits in the tree graph —
 `root → child → grandchild` is graph depth 2 but restore depth 1 once
@@ -390,7 +390,7 @@ theorem k7dl_header_roundtrip_rust (pc : Std.U32) (ms : Std.U64) :
   · rcases e with got | v | ⟨a, b⟩ | ⟨a, b⟩ <;>
       simp [headerPost, hround] at hpost
 
-/-- Group E on the Rust code : the base identity round-trips
+/-- Group E on the Rust code: the base identity round-trips
 through the header's trailing u64, and stamping it leaves what
 `k7dl_parse_header` reads untouched. The second half is the one that
 matters — a stamp that shifted `page_count` or `mem_size` would make a
@@ -428,10 +428,10 @@ theorem k7dl_base_identity_roundtrip_rust (pc : Std.U32) (ms bi : Std.U64) :
     · rcases e with got | v | ⟨a, b⟩ | ⟨a, b⟩ <;>
         simp [headerPost, hround] at hpost
 
-/-- Group E on the Rust code : the
+/-- Group E on the Rust code (CHALLENGES #144): the
 base-identity guard never panics, accepts a pack applied onto the
 generation it names, refuses two known generations that disagree, and
-still loads a pre-30b pack (identity 0 on either side). -/
+still loads a legacy pack (identity 0 on either side). -/
 theorem k7dl_base_identity_ok_rust (pack base : Std.U64) :
     ∃ r, tree_model.k7dl_base_identity_ok pack base = ok r
       ∧ (pack.bv = base.bv → r = true)

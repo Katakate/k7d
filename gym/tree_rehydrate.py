@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""35a-inc4: kill -9 k7d mid Ubuntu tree, restart, rehydrate, resume, fork.
+"""kill -9 k7d mid Ubuntu tree, restart, rehydrate, resume, fork.
 
 Import Cluster. Do not call teardown() before the crash. Talks to
 `/run/k7d/k7d.sock`. Do not resurrect live KVM — resume from the
@@ -341,9 +341,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = parse_args(argv)
-    tree_id = ns.tree_id or f"rh-35a-{os.getpid()}"
-    if not tree_id.startswith("rh-35a-"):
-        raise RuntimeError(f"tree_id must start with rh-35a-, got {tree_id}")
+    tree_id = ns.tree_id or f"rh-{os.getpid()}"
+    if not tree_id.startswith("rh-"):
+        raise RuntimeError(f"tree_id must start with rh-, got {tree_id}")
     run(tree_id)
     return 0
 

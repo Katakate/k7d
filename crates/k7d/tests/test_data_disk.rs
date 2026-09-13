@@ -1,5 +1,5 @@
-//! Integration tests for the **named persistent data disk** primitive
-//! : a disk whose lifetime is not the VM's, so an inner
+//! Integration tests for the **named persistent data disk** primitive:
+//! a disk whose lifetime is not the VM's, so an inner
 //! node's `/var/lib/longhorn` is still there for the next VM that claims
 //! the same id, and a warm fork gives the child its own reflinked clone.
 //!
@@ -17,8 +17,10 @@ mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use k7d::control::{Client, Request, Response, VmConfig};
 use k7d::disks::{data_disk_path, DataDisk};
 use k7d::fork::fork_cluster_warm;
+use k7d::guest::Backend;
 use k7d::latency::FORK_UBUNTU_NODE_1VM;
 use k7d::network::ClusterNetwork;
 use k7d::vm::Vm;
@@ -347,4 +349,293 @@ fn test_data_disk_forks_copy_on_write() {
     drop(fork_net);
     source.shutdown();
     drop(src_net);
+}
+
+/// Daemon `create_vm` refuses a data-disk id held by a live VM.
+/// After `stop_vm` the same id attaches; a warm fork still
+/// gets its own reflink.
+#[test]
+fn test_data_disk_exclusive_while_live() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let pid = std::process::id();
+    let socket_dir = std::env::temp_dir().join(format!("k7d-test-ddexcl-{pid}"));
+    let _ = std::fs::remove_dir_all(&socket_dir);
+    std::fs::create_dir_all(&socket_dir).expect("socket parent");
+    let socket = socket_dir.join("k7d.sock");
+    let tree_root = std::env::temp_dir().join(format!("k7d-test-trees-ddexcl-{pid}"));
+    let sandbox_root = std::env::temp_dir().join(format!("k7d-test-sandboxes-ddexcl-{pid}"));
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_k7d"))
+        .arg("--socket")
+        .arg(&socket)
+        .env("RUST_LOG", "info")
+        .env("K7D_TREE_ROOT", &tree_root)
+        .env("K7D_SANDBOX_ROOT", &sandbox_root)
+        .spawn()
+        .expect("spawn k7d");
+    struct Guard {
+        child: std::process::Child,
+        socket_dir: std::path::PathBuf,
+        tree_root: std::path::PathBuf,
+        sandbox_root: std::path::PathBuf,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.socket_dir);
+            let _ = std::fs::remove_dir_all(&self.tree_root);
+            let _ = std::fs::remove_dir_all(&self.sandbox_root);
+        }
+    }
+    let _guard = Guard {
+        child,
+        socket_dir: socket_dir.clone(),
+        tree_root,
+        sandbox_root,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace")
+        .to_path_buf();
+    let id = format!("test-excl-{pid}");
+    let _ = std::fs::remove_file(data_disk_path(&id));
+    let config = VmConfig {
+        kernel: Some(
+            root.join("guest/kernel/vmlinux")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        initrd: Some(
+            root.join("guest/rootfs/initramfs.cpio.gz")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        data_disks: vec![k7d::control::DataDiskConfig {
+            id: id.clone(),
+            size_bytes: 64 * 1024 * 1024,
+            guest_mount: "/run/k7d/data".to_string(),
+        }],
+        ..VmConfig::default()
+    };
+
+    let call = |req: &Request| -> Response {
+        let mut c = Client::connect(socket.to_str().expect("utf8")).expect("connect");
+        c.call(req).expect("call")
+    };
+
+    let vm_id = match call(&Request::CreateVm {
+        config: config.clone(),
+    }) {
+        Response::VmCreated { vm_id, .. } => vm_id,
+        other => panic!("first create_vm: {other:?}"),
+    };
+
+    match call(&Request::CreateVm {
+        config: config.clone(),
+    }) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("attached to live VM") && message.contains(&vm_id),
+                "refusal must name the holder, got: {message}"
+            );
+        }
+        other => panic!("second create_vm while live must fail, got {other:?}"),
+    }
+
+    assert!(matches!(call(&Request::StopVm { vm_id }), Response::Ok));
+
+    let (vm_id2, cid2) = match call(&Request::CreateVm {
+        config: config.clone(),
+    }) {
+        Response::VmCreated {
+            vm_id, guest_cid, ..
+        } => (vm_id, guest_cid),
+        other => panic!("create_vm after stop must succeed, got {other:?}"),
+    };
+
+    let mut agent =
+        k7d::api::AgentClient::connect_vsock(cid2, Duration::from_secs(90)).expect("agent");
+    let ready = agent.exec(&["echo", "ready"]).expect("exec");
+    assert_eq!(ready.exit_code, 0, "{}", ready.stderr);
+
+    match call(&Request::ForkVm {
+        vm_id: vm_id2.clone(),
+        sandbox_id: None,
+        dilation: None,
+    }) {
+        Response::VmForked { vm_id: fork_id, .. } => {
+            assert!(matches!(
+                call(&Request::StopVm { vm_id: fork_id }),
+                Response::Ok
+            ));
+        }
+        other => panic!("warm fork of a VM with a data disk must succeed, got {other:?}"),
+    }
+
+    assert!(matches!(
+        call(&Request::StopVm { vm_id: vm_id2 }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        call(&Request::DeleteDataDisk { id }),
+        Response::Ok
+    ));
+}
+
+/// Firecracker is a holder of its data disks: a second
+/// FC `create_vm` with the same id fails naming the first, native-vs-FC
+/// and FC-vs-native both refuse, and `delete_data_disk` while the FC VM
+/// is live fails — after `stop_vm` it succeeds.
+#[test]
+fn test_fc_data_disk_exclusive_while_live() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    common::ensure_firecracker_installed();
+    let pid = std::process::id();
+    let socket_dir = std::env::temp_dir().join(format!("k7d-test-fcddexcl-{pid}"));
+    let _ = std::fs::remove_dir_all(&socket_dir);
+    std::fs::create_dir_all(&socket_dir).expect("socket parent");
+    let socket = socket_dir.join("k7d.sock");
+    let tree_root = std::env::temp_dir().join(format!("k7d-test-trees-fcddexcl-{pid}"));
+    let sandbox_root = std::env::temp_dir().join(format!("k7d-test-sandboxes-fcddexcl-{pid}"));
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace")
+        .to_path_buf();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_k7d"))
+        .arg("--socket")
+        .arg(&socket)
+        .env("RUST_LOG", "info")
+        .env("K7D_KERNEL", root.join("guest/kernel/vmlinux"))
+        .env("K7D_INITRD", root.join("guest/rootfs/initramfs.cpio.gz"))
+        .env("K7D_TREE_ROOT", &tree_root)
+        .env("K7D_SANDBOX_ROOT", &sandbox_root)
+        .spawn()
+        .expect("spawn k7d");
+    struct Guard {
+        child: std::process::Child,
+        socket_dir: std::path::PathBuf,
+        tree_root: std::path::PathBuf,
+        sandbox_root: std::path::PathBuf,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.socket_dir);
+            let _ = std::fs::remove_dir_all(&self.tree_root);
+            let _ = std::fs::remove_dir_all(&self.sandbox_root);
+        }
+    }
+    let _guard = Guard {
+        child,
+        socket_dir: socket_dir.clone(),
+        tree_root,
+        sandbox_root,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let id = format!("test-fc-excl-{pid}");
+    let _ = std::fs::remove_file(data_disk_path(&id));
+    let disks = vec![k7d::control::DataDiskConfig {
+        id: id.clone(),
+        size_bytes: 64 * 1024 * 1024,
+        guest_mount: "/run/k7d/data".to_string(),
+    }];
+    let native = VmConfig {
+        kernel: Some(
+            root.join("guest/kernel/vmlinux")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        initrd: Some(
+            root.join("guest/rootfs/initramfs.cpio.gz")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        data_disks: disks.clone(),
+        ..VmConfig::default()
+    };
+    let fc = VmConfig {
+        memory_mb: 512,
+        vcpus: 1,
+        backend: Backend::Firecracker,
+        data_disks: disks,
+        ..VmConfig::default()
+    };
+
+    let call = |req: &Request| -> Response {
+        let mut c = Client::connect(socket.to_str().expect("utf8")).expect("connect");
+        c.call(req).expect("call")
+    };
+    let refuse = |holder: &str, got: Response, what: &str| match got {
+        Response::Error { message } => {
+            assert!(
+                message.contains("attached to live VM") && message.contains(holder),
+                "{what}: refusal must name the holder {holder}, got: {message}"
+            );
+        }
+        other => panic!("{what}: must fail, got {other:?}"),
+    };
+
+    let native_id = match call(&Request::CreateVm {
+        config: native.clone(),
+    }) {
+        Response::VmCreated { vm_id, .. } => vm_id,
+        other => panic!("native create_vm: {other:?}"),
+    };
+    refuse(
+        &native_id,
+        call(&Request::CreateVm { config: fc.clone() }),
+        "FC-steals-from-native",
+    );
+    assert!(matches!(
+        call(&Request::StopVm { vm_id: native_id }),
+        Response::Ok
+    ));
+
+    let fc_id = match call(&Request::CreateVm { config: fc.clone() }) {
+        Response::VmCreated { vm_id, .. } => vm_id,
+        other => panic!("FC create_vm: {other:?}"),
+    };
+    refuse(
+        &fc_id,
+        call(&Request::CreateVm { config: fc.clone() }),
+        "second FC create_vm",
+    );
+    refuse(
+        &fc_id,
+        call(&Request::CreateVm {
+            config: native.clone(),
+        }),
+        "native-steals-from-FC",
+    );
+    match call(&Request::DeleteDataDisk { id: id.clone() }) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("attached to live VM") && message.contains(&fc_id),
+                "delete while FC live must name the holder, got: {message}"
+            );
+        }
+        other => panic!("delete_data_disk while FC live must fail, got {other:?}"),
+    }
+    assert!(matches!(
+        call(&Request::StopVm { vm_id: fc_id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        call(&Request::DeleteDataDisk { id }),
+        Response::Ok
+    ));
 }

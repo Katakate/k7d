@@ -49,6 +49,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::guest::Guest;
 use crate::snapshot::{self, VmState};
 use crate::tree_model::{
     self, k7dl_base_identity, k7dl_encode_entry, k7dl_header_bytes, k7dl_parse_entry,
@@ -87,7 +88,7 @@ pub struct NodeInfo {
     pub dirty_page_count: u32,
     /// Whether this node **owns** a `memory.bin` (checkpoint). Distinct
     /// from `Vm::fork_source_base_path`: an in-tree child can `fork_warm`
-    /// against an ancestor file without owning a keyframe .
+    /// against an ancestor file without owning a keyframe.
     /// For a cluster payload, every member's `members/{i}/memory.bin`
     /// exists if and only if `has_base_snapshot` is true.
     pub has_base_snapshot: bool,
@@ -113,7 +114,8 @@ pub struct NodeInfo {
     /// Suspend takes them out of the `Vm` before Drop — they ARE the
     /// node's disk state; resume reflinks fresh copies from them and
     /// then removes them; prune of a suspended node removes them
-    /// (CHALLENGES.md #130). Empty for live nodes and legacy files.
+    /// (CHALLENGES.md #130); eviction does too (bug-candidates #52).
+    /// Empty for live, Evicted, and legacy files.
     #[serde(default)]
     pub parked_disk_dirs: Vec<PathBuf>,
     /// Generation of this node's `memory.bin`, minted afresh every time
@@ -125,7 +127,7 @@ pub struct NodeInfo {
     pub base_identity: u64,
     /// Physical bytes this node's `memory.bin` cost the filesystem.
     ///
-    /// An incremental keyframe  is a reflink clone of its
+    /// An incremental keyframe is a reflink clone of its
     /// ancestor plus the dirty pages, so its *logical* length is the
     /// full guest-physical span while it physically adds only the dirt.
     /// `st_blocks` does not help — XFS counts a shared extent in every
@@ -148,8 +150,8 @@ pub struct PrepareOutcome {
     /// was already a fork source (idempotent no-op).
     pub wrote_base: bool,
     /// `true` when the keyframe was written incrementally — `FICLONE` of
-    /// the nearest ancestor's `memory.bin` plus the dirty pages (spec
-    /// 30b) — rather than as a full O(guest RAM) dump.
+    /// the nearest ancestor's `memory.bin` plus the dirty pages —
+    /// rather than as a full O(guest RAM) dump.
     pub incremental: bool,
     /// Physical bytes the keyframe added to the filesystem: the dirty
     /// set on the incremental path, the whole guest span on the full
@@ -201,17 +203,23 @@ pub enum TreeError {
     BudgetExhausted { reason: String },
     #[error("invalid delta file: {0}")]
     InvalidDelta(String),
-    /// The tree's cgroup jail  could not be built or
+    /// The tree's cgroup jail could not be built or
     /// could not take one of the tree's VMs. Loud on purpose: a tree
     /// silently running outside its jail is the failure this increment
     /// exists to prevent.
     #[error("tree jail: {0}")]
     Jail(String),
+    /// A Firecracker-backend failure surfaced through a shared `Guest`
+    /// verb. Its own variant rather than folded into
+    /// `InvalidDelta` so the message blames the VMM it came from
+    /// instead of a delta file the caller never wrote.
+    #[error("firecracker: {0}")]
+    Firecracker(String),
     #[error(
         "node {node} has no checkpoint ancestor to resume from \
          (restore-chain depth {depth}, limit {max}); resume maps exactly one \
          `memory.bin` and applies this node's delta.pack — unprepared hops \
-         in between are not extra packs "
+         in between are not extra packs"
     )]
     ChainTooDeep {
         node: NodeId,
@@ -230,6 +238,30 @@ impl From<crate::cgroup::CgroupError> for TreeError {
     fn from(e: crate::cgroup::CgroupError) -> Self {
         TreeError::Jail(e.to_string())
     }
+}
+
+impl From<crate::guest::GuestError> for TreeError {
+    fn from(e: crate::guest::GuestError) -> Self {
+        match e {
+            crate::guest::GuestError::Vm(inner) => Self::Vm(inner),
+            crate::guest::GuestError::Fork(inner) => Self::Fork(inner),
+            crate::guest::GuestError::Snapshot(inner) => Self::Snapshot(inner),
+            crate::guest::GuestError::Unsupported { backend, op } => {
+                Self::InvalidDelta(format!("{op} is not supported on backend {backend:?}"))
+            }
+            crate::guest::GuestError::Fc(inner) => Self::Firecracker(inner.to_string()),
+        }
+    }
+}
+
+impl From<crate::fc::FcError> for TreeError {
+    fn from(e: crate::fc::FcError) -> Self {
+        Self::Firecracker(e.to_string())
+    }
+}
+
+fn fc_err(e: &crate::fc::FcError) -> TreeError {
+    TreeError::Firecracker(e.to_string())
 }
 
 /// Stamp `last_active_at_unix` on a node from the wall clock.
@@ -255,8 +287,8 @@ pub struct SnapshotTree {
     root_dir: PathBuf,
     budget: TreeBudget,
     nodes: HashMap<NodeId, NodeInfo>,
-    /// Live VMs owned by the tree, keyed by node id.
-    live_vms: HashMap<NodeId, Vm>,
+    /// Live guests owned by the tree, keyed by node id.
+    live_vms: HashMap<NodeId, Guest>,
     created_at_unix: u64,
     next_id: u64,
     /// Orchestrator `String → u64` id map into the pure model.
@@ -269,13 +301,13 @@ pub struct SnapshotTree {
     /// For each live node: the node whose `memory.bin` its VM is a
     /// `MAP_PRIVATE` mapping of, and the generation of that keyframe.
     ///
-    /// This is what makes an incremental keyframe  sound —
+    /// This is what makes an incremental keyframe sound —
     /// "the pages that differ from the ancestor base" is only the VM's
     /// accumulated dirty set if the VM really was materialized from that
     /// exact generation. Runtime-only: a suspended node has no mapping,
     /// and a rebuilt tree re-records at resume.
     cow_base: HashMap<NodeId, (NodeId, u64)>,
-    /// Whether this tree's storage can `FICLONE` .
+    /// Whether this tree's storage can `FICLONE`.
     ///
     /// Probed once at construction rather than discovered per keyframe,
     /// because the disk budget has to *project* a keyframe's cost before
@@ -284,7 +316,7 @@ pub struct SnapshotTree {
     /// `max_disk_bytes`. The per-write `EXDEV`/`EOPNOTSUPP` fallback
     /// stays as the backstop.
     reflink_root: bool,
-    /// This tree's cgroup jail . `None` only when
+    /// This tree's cgroup jail. `None` only when
     /// `K7D_TREE_CGROUP=off`. Declared after `live_vms` so the VMs (and
     /// their threads) are gone before the cgroup is removed.
     jail: Option<crate::cgroup::TreeCgroup>,
@@ -302,17 +334,50 @@ impl SnapshotTree {
             .live_vms
             .get(node_id)
             .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-        jail.add_vm(vm)?;
+        if let Guest::Firecracker(fc) = vm {
+            // The jailer already put this VMM in its own cgroup with
+            // the pod's `cpu.max` and a `memory.max`; the tree jail
+            // holds *daemon threads*, and this VM has none.
+            log::info!(
+                "tree: node '{node_id}' runs on Firecracker (pid {}) — capped by the \
+                 jailer's cgroup {}, not the tree jail",
+                fc.pid(),
+                fc.cgroup_dir().display()
+            );
+            return Ok(());
+        }
+        jail.add_vm(vm.as_native()?)?;
         Ok(())
     }
 
-    /// Create a new tree rooted at a running VM.
+    /// Whether `node_id`'s live guest is a Firecracker VM.
+    fn is_fc(&self, node_id: &NodeId) -> bool {
+        matches!(self.live_vms.get(node_id), Some(Guest::Firecracker(_)))
+    }
+
+    /// Create a new tree rooted at a running native VM.
     ///
     /// The root VM is prepared as a fork source (cold snapshot + restore +
     /// dirty tracking). The returned root `NodeId` is a checkpoint (owns a
     /// `base.mem`) and starts in state `Live`.
     pub fn new(
-        mut root_vm: Vm,
+        root_vm: Vm,
+        root_dir: PathBuf,
+        budget: TreeBudget,
+    ) -> Result<(Self, NodeId), TreeError> {
+        Self::new_guest(Guest::from(root_vm), root_dir, budget)
+    }
+
+    /// Create a new tree rooted at a running guest of either backend.
+    /// A tree is single-backend: every node forked
+    /// from this root runs on the root's VMM.
+    ///
+    /// Native roots take the cold snapshot + restore into the node
+    /// directory; Firecracker roots take a snapshot point in their
+    /// chroot ([`crate::fc::FcVm::prepare_fork_source`]). Either way
+    /// the root is a checkpoint and starts `Live`.
+    pub fn new_guest(
+        mut root: Guest,
         root_dir: PathBuf,
         budget: TreeBudget,
     ) -> Result<(Self, NodeId), TreeError> {
@@ -326,18 +391,32 @@ impl SnapshotTree {
         let root_node_dir = root_dir.join("nodes").join(&root_id);
         fs::create_dir_all(&root_node_dir)?;
 
-        // Prepare the VM as a fork source into the node's directory. This
-        // writes base.mem, cpu.json, devices.json, metadata.json, irqchip.json
-        // into `root_node_dir` and restores the VM from them.
-        //
-        // Tree roots with virtiofs shares knowingly take the slow
-        // (full-memfd) fork path — the explicit opt-in
-        // requires (loud warn inside `allow_slow_fork`).
-        if !root_vm.virtiofs_shares().is_empty() {
-            root_vm.allow_slow_fork();
-        }
-        root_vm.prepare_fork_source_in(&root_node_dir)?;
-        let root_span = root_vm.mem_span();
+        let root_span = match &mut root {
+            Guest::Native(root_vm) => {
+                // Prepare the VM as a fork source into the node's
+                // directory. This writes base.mem, cpu.json,
+                // devices.json, metadata.json, irqchip.json into
+                // `root_node_dir` and restores the VM from them.
+                //
+                // Tree roots with virtiofs shares knowingly take the
+                // slow (full-memfd) fork path — the explicit opt-in
+                // requires (loud warn inside `allow_slow_fork`).
+                if !root_vm.virtiofs_shares().is_empty() {
+                    root_vm.allow_slow_fork();
+                }
+                root_vm.prepare_fork_source_in(&root_node_dir)?;
+                root_vm.mem_span()
+            }
+            Guest::Firecracker(fc) => {
+                let report = fc.prepare_fork_source().map_err(|e| fc_err(&e))?;
+                log::info!(
+                    "tree: Firecracker root point {} ({} bytes)",
+                    report.restore_mem.display(),
+                    report.diff_bytes
+                );
+                report.diff_bytes
+            }
+        };
 
         let info = NodeInfo {
             id: root_id.clone(),
@@ -364,7 +443,7 @@ impl SnapshotTree {
         nodes.insert(root_id.clone(), info);
 
         let mut live_vms = HashMap::new();
-        live_vms.insert(root_id.clone(), root_vm);
+        live_vms.insert(root_id.clone(), root);
 
         let mut pure_ids = HashMap::new();
         pure_ids.insert(root_id.clone(), 0);
@@ -471,7 +550,10 @@ impl SnapshotTree {
                 Some(p) => Some(self.lookup_pure_id(p)?),
                 None => None,
             };
-            let est_ram_bytes = self.live_vms.get(&info.id).map_or(0, estimate_vm_ram);
+            let est_ram_bytes = self
+                .live_vms
+                .get(&info.id)
+                .map_or(0, Guest::est_private_bytes);
             nodes.push(tree_model::NodeInfo {
                 id: self.lookup_pure_id(&info.id)?,
                 parent,
@@ -497,10 +579,10 @@ impl SnapshotTree {
     /// reads the guest console of tree members, which carry no daemon
     /// `vm_id`). Returns the owning node id alongside the VM.
     #[must_use]
-    pub fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Vm)> {
+    pub fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Guest)> {
         self.live_vms
             .iter()
-            .find(|(_, vm)| vm.guest_cid() == cid)
+            .find(|(_, vm)| vm.guest_cid() == Some(cid))
             .map(|(id, vm)| (id.as_str(), vm))
     }
 
@@ -568,7 +650,7 @@ impl SnapshotTree {
                 .get(source_id)
                 .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
             (
-                vm.fork_source_base_path().is_some(),
+                vm.as_native()?.fork_source_base_path().is_some(),
                 !vm.virtiofs_shares().is_empty(),
             )
         };
@@ -588,12 +670,12 @@ impl SnapshotTree {
                             .live_vms
                             .get_mut(source_id)
                             .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
-                        let dirty = vm.accumulated_dirty_pages().unwrap_or(0);
+                        let dirty = vm.as_native()?.accumulated_dirty_pages().unwrap_or(0);
                         log::info!(
                             "tree: inherit {ckpt}/memory.bin on {source_id} \
                              ({dirty} dirty pages, no new keyframe)"
                         );
-                        vm.set_fork_source_base_path(mem);
+                        vm.as_native_mut()?.set_fork_source_base_path(mem);
                         return Ok(());
                     }
                 }
@@ -607,25 +689,28 @@ impl SnapshotTree {
     /// against *this* node's `memory.bin` (dirty set reset).
     ///
     /// Root is prepared at [`Self::new`]. In-tree children inherit an
-    /// ancestor path at fork  and are not checkpoints until
+    /// ancestor path at fork and are not checkpoints until
     /// this runs. Idempotent on `has_base_snapshot` — an inherited
     /// `fork_source_base_path` is not a keyframe this node owns, so a
     /// later explicit prepare still writes (CHALLENGES.md #59, #182).
     ///
-    /// A child with a checkpoint ancestor takes the **incremental** path
-    /// : `FICLONE` that ancestor's `memory.bin` and overwrite
-    /// only the pages this node has dirtied since it was forked off it,
+    /// A child with a checkpoint ancestor takes the **incremental**
+    /// path: `FICLONE` that ancestor's `memory.bin` and overwrite only
+    /// the pages this node has dirtied since it was forked off it,
     /// so a fork point down the tree costs O(divergence). Root, virtiofs
     /// VMs, and any node whose ancestor keyframe is on a different (or
     /// non-reflink) filesystem fall back to the full dump — loudly.
     pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
         self.ensure_live(node_id)?;
+        if self.is_fc(node_id) {
+            return self.prepare_fork_source_fc(node_id);
+        }
         if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
             return Ok(PrepareOutcome::already_prepared());
         }
         let dir = self.node_dir(node_id);
         let ancestor_mem = self.cow_base_keyframe(node_id);
-        // Make disk headroom BEFORE writing  — `usage()`
+        // Make disk headroom BEFORE writing — `usage()`
         // only sees the keyframe after the fact, so without this the
         // write silently blows `max_disk_bytes` until the next
         // auto_evict. On the incremental path the projection is the
@@ -637,9 +722,9 @@ impl SnapshotTree {
                 .get(node_id)
                 .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
             let projected = if ancestor_mem.is_some() {
-                vm.accumulated_dirty_pages().unwrap_or(0) * 4096
+                vm.est_private_bytes()
             } else {
-                vm.mem_span()
+                vm.as_native()?.mem_span()
             };
             self.evict_disk_for_incoming(projected)?;
         }
@@ -648,14 +733,16 @@ impl SnapshotTree {
             .get_mut(node_id)
             .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
         if !vm.virtiofs_shares().is_empty() {
-            vm.allow_slow_fork();
+            vm.as_native_mut()?.allow_slow_fork();
         }
         log::info!("tree: prepare_fork_source({node_id})");
         let prepared = if let Some(ancestor) = &ancestor_mem {
-            vm.prepare_fork_source_incremental_in(&dir, ancestor)?
+            vm.as_native_mut()?
+                .prepare_fork_source_incremental_in(&dir, ancestor)?
         } else {
-            let span = vm.mem_span();
-            crate::vm::PreparedBase::full(vm.prepare_fork_source_in(&dir)?, span)
+            let native = vm.as_native_mut()?;
+            let span = native.mem_span();
+            crate::vm::PreparedBase::full(native.prepare_fork_source_in(&dir)?, span)
         };
         let identity = self.mint_base_identity();
         if let Some(info) = self.nodes.get_mut(node_id) {
@@ -672,6 +759,124 @@ impl SnapshotTree {
         })
     }
 
+    /// Firecracker half of [`Self::prepare_fork_source`]: a snapshot
+    /// point in the VM's chroot. Not idempotent on
+    /// `has_base_snapshot` the way the native path is — an FC fork
+    /// always loads a *file*, so the point has to be re-taken whenever
+    /// the guest has dirtied anything; the VM reports `wrote: false`
+    /// itself when it has not.
+    fn prepare_fork_source_fc(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
+        let projected = self
+            .live_vms
+            .get(node_id)
+            .map_or(0, Guest::est_private_bytes);
+        self.evict_disk_for_incoming(projected)?;
+        let Some(Guest::Firecracker(fc)) = self.live_vms.get_mut(node_id) else {
+            return Err(TreeError::NodeNotFound(node_id.clone()));
+        };
+        log::info!("tree: prepare_fork_source({node_id}) on Firecracker");
+        let report = fc.prepare_fork_source().map_err(|e| fc_err(&e))?;
+        if report.wrote {
+            let identity = self.mint_base_identity();
+            if let Some(info) = self.nodes.get_mut(node_id) {
+                info.has_base_snapshot = true;
+                info.base_identity = identity;
+                info.base_disk_bytes = Some(report.diff_bytes);
+                touch(info);
+            }
+            self.save_metadata()?;
+        }
+        Ok(PrepareOutcome {
+            wrote_base: report.wrote,
+            incremental: report.incremental,
+            disk_bytes: report.diff_bytes,
+        })
+    }
+
+    /// Firecracker half of [`Self::fork_batch`] and [`Self::rollback`]:
+    /// take a point (unless `from_point` says to reuse the current one)
+    /// and load one child per label from it. The same `NodeInfo`
+    /// bookkeeping as the native path; none of its dirty-bitmap or
+    /// `cow_base` state, which describes `MAP_PRIVATE` mappings this
+    /// backend does not have.
+    fn fork_batch_fc(
+        &mut self,
+        source_id: &NodeId,
+        labels: &[&str],
+        dilation: Option<u32>,
+        from_point: bool,
+    ) -> Result<Vec<NodeId>, TreeError> {
+        if dilation.is_some() {
+            return Err(TreeError::Firecracker(
+                "time dilation is not supported on Firecracker nodes".to_string(),
+            ));
+        }
+        let children = {
+            let Some(Guest::Firecracker(fc)) = self.live_vms.get_mut(source_id) else {
+                return Err(TreeError::NodeNotFound(source_id.clone()));
+            };
+            if from_point {
+                let mut out = Vec::with_capacity(labels.len());
+                for _ in labels {
+                    out.push(fc.rollback_child().map_err(|e| fc_err(&e))?);
+                }
+                out
+            } else {
+                fc.fork_batch(labels.len()).map_err(|e| fc_err(&e))?.1
+            }
+        };
+        // The point the children loaded is the source's checkpoint. A
+        // fresh point is a new generation; a rollback reuses the old one.
+        let point_bytes = match self.live_vms.get(source_id) {
+            Some(Guest::Firecracker(fc)) => fc.point_diff_bytes(),
+            _ => 0,
+        };
+        let identity = self.mint_base_identity();
+        if let Some(info) = self.nodes.get_mut(source_id) {
+            if !from_point || !info.has_base_snapshot {
+                info.base_identity = identity;
+            }
+            info.has_base_snapshot = true;
+            info.base_disk_bytes = Some(point_bytes);
+        }
+
+        let mut new_ids = Vec::with_capacity(children.len());
+        let now = now_unix();
+        for (child, label) in children.into_iter().zip(labels.iter()) {
+            let new_id = self.mint_id(label);
+            self.mint_pure_id(&new_id);
+            fs::create_dir_all(self.node_dir(&new_id))?;
+            let info = NodeInfo {
+                id: new_id.clone(),
+                parent: Some(source_id.clone()),
+                children: Vec::new(),
+                state: NodeState::Live,
+                dirty_page_count: 0,
+                has_base_snapshot: false,
+                label: (*label).to_string(),
+                created_at_unix: now,
+                last_active_at_unix: now,
+                protected: false,
+                kind: PayloadKind::Vm,
+                vm_count: 1,
+                parked_disk_dirs: Vec::new(),
+                base_identity: 0,
+                base_disk_bytes: None,
+            };
+            self.nodes.insert(new_id.clone(), info);
+            self.live_vms.insert(new_id.clone(), Guest::from(child));
+            self.jail_vm(&new_id)?;
+            if let Some(src) = self.nodes.get_mut(source_id) {
+                src.children.push(new_id.clone());
+                touch(src);
+            }
+            new_ids.push(new_id);
+        }
+        self.save_metadata()?;
+        self.evict_post_fork(source_id, &new_ids)?;
+        Ok(new_ids)
+    }
+
     /// Fork a new branch from any live or suspended node.
     pub fn fork(&mut self, source_id: &NodeId, label: &str) -> Result<NodeId, TreeError> {
         let ids = self.fork_batch(source_id, &[label], None)?;
@@ -686,14 +891,17 @@ impl SnapshotTree {
         dilation: Option<u32>,
     ) -> Result<Vec<NodeId>, TreeError> {
         self.ensure_live(source_id)?;
-        // Make headroom for the `labels.len()` incoming live VMs (spec
-        // 9g-inc1 / CHALLENGES #115): suspend LRU non-protected live VMs
+        // Make headroom for the `labels.len()` incoming live VMs
+        // (CHALLENGES #115): suspend LRU non-protected live VMs
         // until `live_vm_count + incoming` fits `max_live_vms`, exempting
         // the source. Fails loud (`BudgetExhausted`) if everything else is
         // protected — never hangs the caller.
         self.evict_for_incoming(source_id, labels.len())?;
         // evict_for_incoming may have suspended things; re-verify.
         self.ensure_live(source_id)?;
+        if self.is_fc(source_id) {
+            return self.fork_batch_fc(source_id, labels, dilation, false);
+        }
         // In-tree forks inherit the ancestor keyframe + dirty bitmap.
         // Do not write a new memory.bin / restore-swap on the source.
         self.ensure_forkable(source_id)?;
@@ -703,13 +911,17 @@ impl SnapshotTree {
                 .live_vms
                 .get_mut(source_id)
                 .ok_or_else(|| TreeError::NodeNotFound(source_id.clone()))?;
-            let forks = source_vm.fork_warm_batch(labels, dilation)?;
+            let forks = source_vm.fork_batch(labels, dilation)?;
             // Snapshot the source's accumulated dirty bitmap AFTER
             // fork_warm_batch returns (updated in place). Children seed
             // this so their suspend delta covers pre-fork dirty pages
             // memcpy'd into the CoW mapping.
-            let bitmap = source_vm.accumulated_dirty_bitmap().unwrap_or_default();
+            let bitmap = source_vm
+                .as_native()?
+                .accumulated_dirty_bitmap()
+                .unwrap_or_default();
             let base = source_vm
+                .as_native()?
                 .fork_source_base_path()
                 .map(std::path::Path::to_path_buf);
             (forks, bitmap, base)
@@ -744,12 +956,16 @@ impl SnapshotTree {
             // Start the fork's vCPU; the tree owns it from here.
             let mut fork_vm = fork_vm;
             fork_vm.start()?;
-            fork_vm.enable_dirty_tracking()?;
+            fork_vm.as_native_mut()?.enable_dirty_tracking()?;
             // Seed the fork's accumulated bitmap with the source's bitmap
             // at fork time — see comment above on the source.
-            fork_vm.seed_accumulated_dirty(&source_bitmap_at_fork)?;
+            fork_vm
+                .as_native_mut()?
+                .seed_accumulated_dirty(&source_bitmap_at_fork)?;
             if let Some(base) = &source_base {
-                fork_vm.set_fork_source_base_path(base.clone());
+                fork_vm
+                    .as_native_mut()?
+                    .set_fork_source_base_path(base.clone());
             }
 
             self.nodes.insert(new_id.clone(), info);
@@ -775,9 +991,9 @@ impl SnapshotTree {
                 "fork_batch child {id} has no checkpoint ancestor"
             );
             debug_assert!(
-                self.live_vms
-                    .get(id)
-                    .is_some_and(|vm| vm.fork_source_base_path().is_some()),
+                self.live_vms.get(id).is_some_and(|vm| vm
+                    .as_native()
+                    .is_ok_and(|n| n.fork_source_base_path().is_some())),
                 "fork_batch child {id} is not forkable"
             );
         }
@@ -829,19 +1045,39 @@ impl SnapshotTree {
         Ok(())
     }
 
-    /// Non-destructive rollback: create a new branch from `node_id`'s state.
-    /// Equivalent to `fork` semantically (the original node is untouched).
+    /// Non-destructive rollback: create a new branch from `node_id`'s
+    /// **restore point**. The original node is untouched.
+    ///
+    /// Native: equivalent to `fork` (a warm fork always captures the
+    /// current state, and the native node's state *is* its keyframe
+    /// plus dirty pages). Firecracker: a child of the node's latest
+    /// snapshot point without taking a new one, so a source that has
+    /// diverged since `prepare_fork_source` yields a child equal to the
+    /// point, not to the source.
     pub fn rollback(&mut self, node_id: &NodeId, label: &str) -> Result<NodeId, TreeError> {
+        self.ensure_live(node_id)?;
+        if self.is_fc(node_id) {
+            self.evict_for_incoming(node_id, 1)?;
+            self.ensure_live(node_id)?;
+            let ids = self.fork_batch_fc(node_id, &[label], None, true)?;
+            return Ok(ids.into_iter().next().expect("single rollback"));
+        }
         self.fork(node_id, label)
     }
 
     /// Suspend a live VM: save dirty delta + CPU state to disk, free RAM.
+    ///
+    /// Firecracker: pause → Full snapshot into the node dir → drop the
+    /// process. Native: `delta.pack` + `vm_state.json`.
     ///
     /// Fails loud for virtiofs-backed VMs: virtiofsd writes FUSE
     /// completions through its own mapping, invisible to KVM dirty
     /// tracking, so `delta.pack` would silently miss device DMA and the
     /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        if self.is_fc(node_id) {
+            return self.suspend_fc(node_id);
+        }
         if let Some(vm) = self.live_vms.get(node_id) {
             if !vm.virtiofs_shares().is_empty() {
                 return Err(TreeError::InvalidDelta(format!(
@@ -861,11 +1097,12 @@ impl SnapshotTree {
 
         // Pause, capture dirty bitmap + state.
         vm.pause()?;
-        let bitmap = vm.get_and_accumulate_dirty()?.to_vec();
-        let state = snapshot::capture_vm_state(&vm)?;
-        let src_mem = vm.mem_host_addr();
-        // Deltas index pages of the guest physical span, not of RAM (19a).
-        let mem_size = vm.mem_span();
+        let native = vm.as_native_mut()?;
+        let bitmap = native.get_and_accumulate_dirty()?.to_vec();
+        let state = snapshot::capture_vm_state(native)?;
+        let src_mem = native.mem_host_addr();
+        // Deltas index pages of the guest physical span, not of RAM.
+        let mem_size = native.mem_span();
 
         // Name the keyframe this pack is a diff against, so a resume
         // onto a base that has since re-prepared fails loud instead of
@@ -894,7 +1131,7 @@ impl SnapshotTree {
         // `vm_state.json` above records their paths for resume's
         // reflink. Park ownership on the node record before dropping
         // the Vm (CHALLENGES.md #130).
-        let parked = vm.take_fork_state_dir();
+        let parked = vm.as_native_mut()?.take_fork_state_dir();
         drop(vm);
         // No mapping, no CoW base — resume re-records one.
         self.cow_base.remove(node_id);
@@ -910,6 +1147,32 @@ impl SnapshotTree {
         Ok(())
     }
 
+    fn suspend_fc(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        let mut vm = self
+            .live_vms
+            .remove(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        let node_dir = self.node_dir(node_id);
+        fs::create_dir_all(&node_dir)?;
+        if let Err(e) = vm.snapshot(&node_dir) {
+            self.live_vms.insert(node_id.clone(), vm);
+            return Err(e.into());
+        }
+        let exported = crate::fc::exported_snapshot_bytes(&node_dir);
+        drop(vm);
+        self.cow_base.remove(node_id);
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.state = NodeState::Suspended;
+            info.dirty_page_count = 0;
+            info.parked_disk_dirs = Vec::new();
+            info.base_disk_bytes = Some(exported);
+            touch(info);
+        }
+        self.save_metadata()?;
+        log::info!("tree: suspended Firecracker '{node_id}' ({exported} bytes exported)");
+        Ok(())
+    }
+
     /// Resume a suspended VM: restore from parent's `base.mem` + this node's delta.
     pub fn resume(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
         let info = self
@@ -922,6 +1185,13 @@ impl SnapshotTree {
                 info.state,
                 "resume (must be Suspended)",
             ));
+        }
+        if self
+            .node_dir(node_id)
+            .join(crate::fc::SUSPEND_META)
+            .is_file()
+        {
+            return self.resume_fc(node_id);
         }
 
         // Resume applies exactly one delta.pack onto the nearest
@@ -991,7 +1261,7 @@ impl SnapshotTree {
         // so a later prepare is still a no-op (CHALLENGES #144).
         vm.set_fork_source_base_path(base_path.clone());
 
-        self.live_vms.insert(node_id.clone(), vm);
+        self.live_vms.insert(node_id.clone(), Guest::from(vm));
         self.record_cow_base(node_id, &base_node);
         self.jail_vm(node_id)?;
         if let Some(info) = self.nodes.get_mut(node_id) {
@@ -1006,6 +1276,24 @@ impl SnapshotTree {
         }
         self.save_metadata()?;
         log::info!("tree: resumed node '{node_id}'");
+        Ok(())
+    }
+
+    fn resume_fc(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        self.evict_for_incoming_no_exempt(1)?;
+        let node_dir = self.node_dir(node_id);
+        let fc = crate::fc::FcVm::load_exported(&node_dir, None)?;
+        self.live_vms.insert(node_id.clone(), Guest::from(fc));
+        self.jail_vm(node_id)?;
+        if let Some(info) = self.nodes.get_mut(node_id) {
+            info.state = NodeState::Live;
+            for dir in std::mem::take(&mut info.parked_disk_dirs) {
+                fs::remove_dir_all(&dir)?;
+            }
+            touch(info);
+        }
+        self.save_metadata()?;
+        log::info!("tree: resumed Firecracker '{node_id}'");
         Ok(())
     }
 
@@ -1076,15 +1364,18 @@ impl SnapshotTree {
     pub fn usage(&self) -> TreeUsage {
         let mut live_ram_bytes: u64 = 0;
         for vm in self.live_vms.values() {
-            live_ram_bytes = live_ram_bytes.saturating_add(estimate_vm_ram(vm));
+            live_ram_bytes = live_ram_bytes.saturating_add(vm.est_private_bytes());
         }
         let mut disk_bytes: u64 = 0;
         for info in self.nodes.values() {
             let dir = self.node_dir(&info.id);
-            disk_bytes = disk_bytes.saturating_add(keyframe_disk_bytes(
-                &dir.join("memory.bin"),
-                info.base_disk_bytes,
-            ));
+            // A Firecracker node's point lives in its chroot, not in
+            // the node directory, and costs its Diff's data extents.
+            let keyframe = match self.live_vms.get(&info.id) {
+                Some(Guest::Firecracker(fc)) => fc.point_diff_bytes(),
+                _ => keyframe_disk_bytes(&dir.join("memory.bin"), info.base_disk_bytes),
+            };
+            disk_bytes = disk_bytes.saturating_add(keyframe);
             if let Ok(md) = fs::metadata(dir.join("delta.pack")) {
                 disk_bytes = disk_bytes.saturating_add(md.len());
             }
@@ -1285,7 +1576,12 @@ impl SnapshotTree {
             ] {
                 let _ = fs::remove_file(dir.join(f));
             }
-            // Keep metadata.json so `tree.json` reflects that the node existed.
+            // Leftovers prune would have dropped with remove_dir_all of
+            // the node dir: FC `vmstate` / `fc.json` / `disk-*`. Keep the
+            // directory so the Evicted record still has a home; do not
+            // name those files (bug-candidates #13).
+            reap_dir_contents(&dir);
+            // Keep the node in tree.json so the Evicted record remains.
             if let Some(info) = self.nodes.get_mut(&id) {
                 info.state = NodeState::Evicted;
                 info.has_base_snapshot = false;
@@ -1293,6 +1589,13 @@ impl SnapshotTree {
                 // generation any pack may still claim.
                 info.base_disk_bytes = None;
                 info.base_identity = 0;
+                // Suspend parks RW disk-clone dirs on the record (see
+                // `suspend`); eviction must reap them the way prune does
+                // or usage() reports the space free while XFS still holds
+                // the clones (bug-candidates #52 / CHALLENGES #130).
+                for parked in std::mem::take(&mut info.parked_disk_dirs) {
+                    let _ = fs::remove_dir_all(&parked);
+                }
                 touch(info);
             }
             evicted.push(id);
@@ -1319,12 +1622,12 @@ impl SnapshotTree {
 
     /// Get a shared reference to the live VM for a node.
     #[must_use]
-    pub fn get_vm(&self, node_id: &NodeId) -> Option<&Vm> {
+    pub fn get_vm(&self, node_id: &NodeId) -> Option<&Guest> {
         self.live_vms.get(node_id)
     }
 
-    /// Get a mutable reference to the live VM for a node.
-    pub fn get_vm_mut(&mut self, node_id: &NodeId) -> Option<&mut Vm> {
+    /// Get a mutable reference to the live guest for a node.
+    pub fn get_vm_mut(&mut self, node_id: &NodeId) -> Option<&mut Guest> {
         if let Some(info) = self.nodes.get_mut(node_id) {
             touch(info);
         }
@@ -1400,12 +1703,11 @@ impl SnapshotTree {
 
     /// Unprepared hops between `node_id` (inclusive) and its nearest
     /// `has_base_snapshot` ancestor. Resume applies **one** `delta.pack`
-    /// onto that ancestor ; this hop-count is not a
-    /// correctness cap. 0 for a checkpoint node. Not tree-graph depth
-    /// .
+    /// onto that ancestor; this hop-count is not a
+    /// correctness cap. 0 for a checkpoint node. Not tree-graph depth.
     ///
     /// The walk itself is the verified pure function
-    /// [`tree_model::restore_chain_depth`] ; this wrapper only
+    /// [`tree_model::restore_chain_depth`]; this wrapper only
     /// builds the model view and maps `None` (no checkpoint ancestor —
     /// corrupt tree metadata) to a loud error.
     fn restore_chain_depth(&mut self, node_id: &NodeId) -> Result<usize, TreeError> {
@@ -1467,15 +1769,7 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Rough estimate of non-reclaimable RAM for a live VM: 4 KiB × popcount of
-/// the accumulated dirty bitmap. This is a lower bound — pages dirtied before
-/// dirty tracking was enabled aren't counted, but `prepare_fork_source_in`
-/// enables tracking immediately, so the lower bound is tight in practice.
-fn estimate_vm_ram(vm: &Vm) -> u64 {
-    vm.accumulated_dirty_pages().unwrap_or(0) * 4096
-}
-
-/// Can this tree's storage `FICLONE`? Probed once per tree .
+/// Can this tree's storage `FICLONE`? Probed once per tree.
 ///
 /// A `false` here is not an error — the tree works, every keyframe just
 /// costs a full guest-RAM dump — but it is the difference between a
@@ -1494,7 +1788,7 @@ pub(crate) fn probe_reflink_root(root_dir: &Path) -> bool {
             log::warn!(
                 "tree: {} cannot FICLONE ({e}) — every keyframe costs a FULL guest-RAM \
                  dump instead of O(divergence). Put the tree root on the reflink XFS \
-                 (`disks::ensure_reflink_tree_root`, the referenced work §3).",
+                 (`disks::ensure_reflink_tree_root`).",
                 root_dir.display()
             );
             false
@@ -1502,9 +1796,29 @@ pub(crate) fn probe_reflink_root(root_dir: &Path) -> bool {
     }
 }
 
+/// Best-effort drop of leftover files in `dir` — the ones
+/// [`SnapshotTree::prune`] would have removed with `remove_dir_all`.
+/// Eviction keeps the directory so an Evicted node still has a home
+/// under `nodes/{id}/`. Missing dir is not a failure. This is how FC
+/// exports (`vmstate`, `fc.json`, `disk-*`) get reaped without a second
+/// named file list (bug-candidates #13).
+pub(crate) fn reap_dir_contents(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let _ = if p.is_dir() {
+            fs::remove_dir_all(&p)
+        } else {
+            fs::remove_file(&p)
+        };
+    }
+}
+
 /// Physical disk a node's `memory.bin` costs.
 ///
-/// `recorded` is the daemon's write-time measurement  —
+/// `recorded` is the daemon's write-time measurement —
 /// the only honest number for an incremental keyframe, whose logical
 /// length is the full guest-physical span and whose `st_blocks` counts
 /// extents it merely shares with its ancestor. A node written before
@@ -1647,7 +1961,7 @@ fn bitmap_words(mem_size: u64) -> usize {
 /// the base it was diffed from, so applying it elsewhere would scatter
 /// one VM's pages through another's memory and resume a plausible-looking
 /// corrupt guest (CHALLENGES #144). A pack or a base with identity 0 is
-/// pre-30b and loads with a warning rather than failing.
+/// legacy and loads with a warning rather than failing.
 pub fn apply_delta(
     path: &Path,
     target_addr: u64,
@@ -1679,7 +1993,7 @@ pub fn apply_delta(
     if pack_identity == 0 || expected_base_identity == 0 {
         log::warn!(
             "{}: applying a delta with no base identity (pack {pack_identity}, base \
-             {expected_base_identity}) — pre-30b metadata, the base-skew check is off \
+             {expected_base_identity}) — legacy metadata, the base-skew check is off \
              for this resume",
             path.display(),
         );

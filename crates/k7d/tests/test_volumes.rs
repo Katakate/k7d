@@ -1,4 +1,4 @@
-//! Chunks 2a + 2b.1: kubelet volume support end-to-end.
+//! Kubelet volume support end-to-end.
 //!
 //! Boots `runtimeClassName: k7` pods with real Kubernetes
 //! volumes via `kubectl apply` and asserts the volume contents
@@ -7,19 +7,19 @@
 //!
 //! ## Coverage
 //!
-//! Chunk 2a (PR #31) shipped:
+//! The kubelet-volume pass shipped:
 //! - `configMap` ro at a mount path, RO enforcement
 //! - `emptyDir` shared rw between two containers in the same pod
 //!
-//! Chunk 2b.1 (this file) adds:
+//! The etc-files pass (this file) adds:
 //! - `secret` (same materialization shape as configMap — ro)
 //! - `downwardAPI` (kubelet writes pod metadata to files)
 //! - `projected` (combined sources, including `serviceAccountToken`
 //!   which every well-behaved pod uses)
 //!
-//! Chunk 2b.2 deferred: `hostPath`, `local-path` PVCs (different
-//! enumeration path — kubelet doesn't materialize them under
-//! `volumes/`).
+//! The `hostPath` pass, further down, covers `hostPath` and
+//! `local-path` PVCs: a different enumeration path, because kubelet
+//! doesn't materialize them under `volumes/`.
 //!
 //! Pattern matches `tests/test_shim.rs` and `tests/test_cni.rs` —
 //! `ensure_shim_installed` + `pin_to_local_node` so kubelet
@@ -53,6 +53,11 @@ const POD_PVC: &str = "test-vol-pvc";
 const PVC_NAME: &str = "test-vol-pvc-claim";
 const POD_K7D_DISK: &str = "test-vol-k7d-disk";
 const POD_K7D_DISK_2: &str = "test-vol-k7d-disk-2";
+const POD_HOSTPATH_SYMLINK: &str = "test-vol-symlink";
+const POD_HOSTPATH_DENY: &str = "test-vol-deny";
+const POD_BLOCK_DENY: &str = "test-vol-block";
+const CONFIGMAP_DENY: &str = "test-vol-block-cfg";
+const CANARY_PATH: &str = "/tmp/k7d-vol-canary";
 
 fn ensure_shim_installed() -> common::LeakGuard {
     use std::process::Command;
@@ -150,7 +155,7 @@ fn kubectl_apply(yaml: &str) -> Result<(), String> {
 /// still owns, orphaning sandboxes and triggering kubelet's
 /// `CreatePodSandbox` retry storm. The retry storm starved later
 /// volume pods of virtiofsd socket budget and wedged the node in
-/// the original 10g bring-up.
+/// the original volume bring-up.
 ///
 /// Graceful semantics:
 ///   1. `kubectl delete pod <name> --ignore-not-found --wait=true
@@ -485,11 +490,11 @@ spec:
 }
 
 // ----------------------------------------------------------------
-// Chunk 2b.1 — Secret, downwardAPI, projected.
+// Etc-files pass — Secret, downwardAPI, projected.
 //
 // Materialization-wise these are identical to ConfigMap (kubelet
 // writes files into `/var/lib/kubelet/pods/<uid>/volumes/
-// kubernetes.io~<plugin>/<name>/`), so chunk 2a's existing
+// kubernetes.io~<plugin>/<name>/`), so the existing
 // enumeration + rewrite path already handles them — the
 // `classify_kubelet_plugin` enum was wired for all four
 // classes from day one. These tests just exercise the contract
@@ -847,12 +852,12 @@ spec:
 }
 
 // ----------------------------------------------------------------
-// Chunk 2b.2 — hostPath + local-path PVC.
+// hostPath pass — hostPath + local-path PVC.
 //
 // hostPath volumes are user-supplied bind mounts of arbitrary host
 // paths. Unlike ConfigMap/Secret/etc., kubelet doesn't materialize
 // them under `/var/lib/kubelet/pods/<uid>/volumes/` — it just emits
-// an OCI bind with the user's path as `source`. The chunk-2b.2
+// an OCI bind with the user's path as `source`. The `hostPath`
 // enumerator in `PodVolumes::add_hostpath_mounts_for_workload`
 // walks workload mounts at Create time and binds anything that
 // isn't otherwise accounted for.
@@ -950,7 +955,7 @@ spec:
 /// writes a file, host reads it back.
 ///
 /// Exercises the dir→dir `mount --bind` path AND the rw scratch-
-/// tree placement (chunk 2a's `host_volumes_rw` instead of
+/// tree placement (`host_volumes_rw` instead of
 /// `host_volumes_ro`).
 #[test]
 fn test_hostpath_directory_rw() {
@@ -1030,12 +1035,12 @@ spec:
 
 /// `local-path` PVC — k3s' default storage class. Backed by
 /// `hostPath` mounts under `/var/lib/rancher/k3s/storage/<pvc>/`,
-/// which is the path the chunk-2b.2 `add_hostpath_mounts_for_workload`
+/// which is the path the `add_hostpath_mounts_for_workload`
 /// enumerator carves out from the CRI-internal filter
 /// (`is_cri_internal_source`'s `/var/lib/rancher/k3s/storage/`
 /// special case).
 ///
-/// **This is the chunk-2b.2 closer test**: it proves the whole
+/// **This is the `hostPath` closer test**: it proves the whole
 /// volume-support pipeline composes for the de facto "Kubernetes
 /// stateful workload" pattern (PVC + PV + StorageClass), and is
 /// the test the "boot inner k3s + fork it"
@@ -1222,4 +1227,430 @@ spec:
     kubectl_delete_pod(&pod_k7d_disk_2);
     let _ = std::fs::remove_file(format!("/var/lib/k7d/disks/{vol_name}.img"));
     let _ = std::fs::remove_dir_all(format!("/var/lib/k7d/disks/{vol_name}"));
+}
+
+// ----------------------------------------------------------------
+// no symlink-following under guest-writable shares.
+// ----------------------------------------------------------------
+
+fn hostpath_spec(src: &std::path::Path, dest: &str, ro: bool) -> serde_json::Value {
+    let opts = if ro {
+        serde_json::json!(["rbind", "ro"])
+    } else {
+        serde_json::json!(["rbind", "rw"])
+    };
+    serde_json::json!({
+        "mounts": [{
+            "destination": dest,
+            "type": "bind",
+            "source": src.to_string_lossy(),
+            "options": opts
+        }]
+    })
+}
+
+fn findmnt_mounted(path: &str) -> bool {
+    std::process::Command::new("findmnt")
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Plant a symlink at the placeholder, then wire that hostPath:
+/// Create returns `Err` and `/tmp/k7d-vol-canary` has no mount.
+#[test]
+fn test_hostpath_symlink_at_placeholder_is_rejected() {
+    let canary = std::path::Path::new(CANARY_PATH);
+    let _ = k7d::volumes::umount_path(canary);
+    let _ = std::fs::remove_dir_all(canary);
+    std::fs::create_dir_all(canary).unwrap();
+
+    let tmp = std::env::temp_dir().join(format!("k7d-vol-symlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("host-src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let mut pv =
+        k7d::volumes::PodVolumes::from_scratch_dirs(tmp.join("volumes-ro"), tmp.join("volumes-rw"))
+            .unwrap();
+    let name = k7d::volumes::hostpath_placeholder_name(&src);
+    std::os::unix::fs::symlink(canary, pv.host_volumes_rw.join(&name)).unwrap();
+
+    let err = pv
+        .add_hostpath_mounts_for_workload(&hostpath_spec(&src, "/data", false))
+        .unwrap_err();
+    match err {
+        k7d::volumes::VolumeError::PlaceholderExists { name: n } => assert_eq!(n, name),
+        other => panic!("expected PlaceholderExists, got {other:?}"),
+    }
+    assert!(
+        !findmnt_mounted(CANARY_PATH),
+        "symlink-follow must not leave a mount on {CANARY_PATH}"
+    );
+    assert!(
+        std::fs::read_dir(canary).unwrap().next().is_none(),
+        "nothing must be created through the symlink"
+    );
+    pv.cleanup();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(canary);
+}
+
+/// A regular directory already at the placeholder is also an error
+/// (never reuse a guest-visible entry).
+#[test]
+fn test_hostpath_existing_dir_placeholder_is_rejected() {
+    let tmp = std::env::temp_dir().join(format!("k7d-vol-exist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("host-src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut pv =
+        k7d::volumes::PodVolumes::from_scratch_dirs(tmp.join("volumes-ro"), tmp.join("volumes-rw"))
+            .unwrap();
+    let name = k7d::volumes::hostpath_placeholder_name(&src);
+    std::fs::create_dir(pv.host_volumes_rw.join(&name)).unwrap();
+    let err = pv
+        .add_hostpath_mounts_for_workload(&hostpath_spec(&src, "/data", false))
+        .unwrap_err();
+    assert!(
+        matches!(err, k7d::volumes::VolumeError::PlaceholderExists { .. }),
+        "existing dir must be PlaceholderExists, got {err:?}"
+    );
+    pv.cleanup();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Clean share: bind succeeds; a second call for the same `(source, ro)`
+/// is a no-op via `rewrites`.
+#[test]
+fn test_hostpath_clean_share_and_rewrite_idempotency() {
+    let tmp = std::env::temp_dir().join(format!("k7d-vol-clean-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("host-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("marker"), "ok").unwrap();
+    let mut pv =
+        k7d::volumes::PodVolumes::from_scratch_dirs(tmp.join("volumes-ro"), tmp.join("volumes-rw"))
+            .unwrap();
+    pv.add_hostpath_mounts_for_workload(&hostpath_spec(&src, "/data", false))
+        .expect("clean share must bind");
+    let dest = pv
+        .host_volumes_rw
+        .join(k7d::volumes::hostpath_placeholder_name(&src));
+    assert!(
+        findmnt_mounted(&dest.to_string_lossy()),
+        "bind must be visible at {}",
+        dest.display()
+    );
+    let n = pv.rewrites.len();
+    pv.add_hostpath_mounts_for_workload(&hostpath_spec(&src, "/data", false))
+        .expect("rewrite-map idempotency");
+    assert_eq!(
+        pv.rewrites.len(),
+        n,
+        "second call must not create another bind"
+    );
+    pv.cleanup();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Host-enforced RO share: `touch` after remount fails `EROFS`.
+#[test]
+fn test_ro_share_root_is_erofs_from_host() {
+    let tmp = std::env::temp_dir().join(format!("k7d-vol-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let ro = tmp.join("volumes-ro");
+    std::fs::create_dir_all(&ro).unwrap();
+    assert!(
+        k7d::volumes::remount_share_readonly(&ro).expect("RO remount"),
+        "first remount must create the bind"
+    );
+    let err = std::fs::File::create(ro.join("x")).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EROFS),
+        "host write after RO remount must be EROFS, got {err}"
+    );
+    k7d::volumes::umount_path(&ro).expect("undo RO remount");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn wait_for_create_error(pod: &str, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let out = std::process::Command::new("kubectl")
+            .args(["get", "pod", pod, "-o", "json"])
+            .output()
+            .expect("kubectl get pod");
+        last = String::from_utf8_lossy(&out.stdout).into_owned();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&last) {
+            for key in ["containerStatuses", "initContainerStatuses"] {
+                let Some(arr) = v["status"][key].as_array() else {
+                    continue;
+                };
+                for cs in arr {
+                    for state_key in ["state", "lastState"] {
+                        let waiting = &cs[state_key]["waiting"];
+                        let msg = waiting["message"].as_str().unwrap_or("");
+                        if msg.contains(needle) {
+                            return msg.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        let desc = std::process::Command::new("kubectl")
+            .args(["describe", "pod", pod])
+            .output()
+            .expect("kubectl describe");
+        let text = String::from_utf8_lossy(&desc.stdout);
+        if text.contains(needle) {
+            return text.into_owned();
+        }
+        last = text.into_owned();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    panic!("pod {pod} did not surface {needle:?} within {timeout:?}:\n{last}");
+}
+
+fn wait_k7d_socket() {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::os::unix::net::UnixStream::connect("/run/k7d/k7d.sock").is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "k7d socket did not accept after restart"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct DenyFallbackGuard {
+    dropin: std::path::PathBuf,
+}
+
+impl DenyFallbackGuard {
+    fn apply() -> Self {
+        let dir = std::path::PathBuf::from("/etc/systemd/system/k7d.service.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dropin = dir.join("deny-virtiofs.conf");
+        std::fs::write(
+            &dropin,
+            "[Service]\nEnvironment=K7D_DENY_VIRTIOFS_FALLBACK=1\n",
+        )
+        .unwrap();
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "k7d"])
+            .status();
+        wait_k7d_socket();
+        Self { dropin }
+    }
+}
+
+impl Drop for DenyFallbackGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.dropin);
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "k7d"])
+            .status();
+        wait_k7d_socket();
+    }
+}
+
+/// Two-container hostPath pod: init container A plants a symlink at
+/// B's placeholder under the live RW share; B's Create fails and the
+/// canary path has no host mount.
+#[test]
+fn test_hostpath_guest_symlink_second_container_create_fails() {
+    let _leak_guard = ensure_shim_installed();
+    let pod = common::unique_name(POD_HOSTPATH_SYMLINK);
+    kubectl_delete_pod(&pod);
+    let _ = k7d::volumes::umount_path(std::path::Path::new(CANARY_PATH));
+    let _ = std::fs::remove_dir_all(CANARY_PATH);
+    std::fs::create_dir_all(CANARY_PATH).unwrap();
+    std::fs::create_dir_all("/var/lib/k7d/pods").unwrap();
+
+    let src_a = format!("/tmp/k7d-vol-src-a-{}", std::process::id());
+    let src_b = format!("/tmp/k7d-vol-src-b-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&src_a);
+    let _ = std::fs::remove_dir_all(&src_b);
+    std::fs::create_dir_all(&src_a).unwrap();
+    std::fs::create_dir_all(&src_b).unwrap();
+    let marker = k7d::volumes::hostpath_placeholder_name(std::path::Path::new(&src_a));
+    let want = k7d::volumes::hostpath_placeholder_name(std::path::Path::new(&src_b));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod}
+spec:
+  runtimeClassName: k7
+  initContainers:
+  - name: a
+    image: alpine:3.20
+    command:
+    - sh
+    - -c
+    - |
+      set -eu
+      for d in /k7d-pods/*/volumes-rw; do
+        if [ -e "$d/{marker}" ]; then
+          ln -sfn {CANARY_PATH} "$d/{want}"
+          ls -l "$d/{want}"
+          exit 0
+        fi
+      done
+      echo "no volumes-rw with marker {marker}" >&2
+      ls -la /k7d-pods >&2
+      exit 1
+    volumeMounts:
+    - name: k7d-pods
+      mountPath: /k7d-pods
+    - name: hp-a
+      mountPath: /shared
+  containers:
+  - name: b
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: hp-b
+      mountPath: /data
+  volumes:
+  - name: k7d-pods
+    hostPath:
+      path: /var/lib/k7d/pods
+      type: Directory
+  - name: hp-a
+    hostPath:
+      path: {src_a}
+      type: Directory
+  - name: hp-b
+    hostPath:
+      path: {src_b}
+      type: Directory
+"#
+    )))
+    .expect("kubectl apply two-container hostPath pod");
+
+    let msg = wait_for_create_error(
+        &pod,
+        "refusing to reuse a guest-visible entry",
+        Duration::from_secs(120),
+    );
+    eprintln!("Create error: {msg}");
+    assert!(
+        !findmnt_mounted(CANARY_PATH),
+        "guest-planted symlink must not leave a mount on {CANARY_PATH}"
+    );
+
+    kubectl_delete_pod(&pod);
+    let _ = std::fs::remove_dir_all(&src_a);
+    let _ = std::fs::remove_dir_all(&src_b);
+    let _ = std::fs::remove_dir_all(CANARY_PATH);
+}
+
+/// `K7D_DENY_VIRTIOFS_FALLBACK=1` fails a hostPath pod at the first
+/// container; a block-path (configMap) pod is unaffected.
+#[test]
+fn test_deny_virtiofs_fallback_knob() {
+    let _leak_guard = ensure_shim_installed();
+    let _deny = DenyFallbackGuard::apply();
+    let pod_hp = common::unique_name(POD_HOSTPATH_DENY);
+    let pod_blk = common::unique_name(POD_BLOCK_DENY);
+    let cfg = common::unique_name(CONFIGMAP_DENY);
+    kubectl_delete_pod(&pod_hp);
+    kubectl_delete_pod(&pod_blk);
+    kubectl_delete_configmap(&cfg);
+
+    let src = format!("/tmp/k7d-vol-deny-src-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod_hp}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: hp
+      mountPath: /data
+  volumes:
+  - name: hp
+    hostPath:
+      path: {src}
+      type: Directory
+"#
+    )))
+    .expect("kubectl apply deny hostPath pod");
+    let msg = wait_for_create_error(
+        &pod_hp,
+        "K7D_DENY_VIRTIOFS_FALLBACK",
+        Duration::from_secs(90),
+    );
+    eprintln!("deny Create error: {msg}");
+    kubectl_delete_pod(&pod_hp);
+
+    kubectl_apply(&format!(
+        r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {cfg}
+data:
+  greeting: "block-path-ok"
+"#
+    ))
+    .expect("kubectl apply ConfigMap");
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod_blk}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: cfg
+      mountPath: /etc/app
+      readOnly: true
+  volumes:
+  - name: cfg
+    configMap:
+      name: {cfg}
+"#
+    )))
+    .expect("kubectl apply block-path pod");
+    wait_for_pod_running(&pod_blk, Duration::from_secs(90))
+        .expect("block-path pod must be unaffected by the deny knob");
+    let vm = common::pod_vm_state(&pod_blk);
+    assert_eq!(
+        vm.virtiofs_shares, 0,
+        "configMap pod must stay block-backed"
+    );
+
+    kubectl_delete_pod(&pod_blk);
+    kubectl_delete_configmap(&cfg);
+    let _ = std::fs::remove_dir_all(&src);
 }

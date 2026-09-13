@@ -16,8 +16,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_tree::{ClusterPayload, ClusterSnapshotTree};
+use crate::guest::{native_vms_mut, AgentEndpoint, Backend, Guest, GuestError};
 use crate::network::{ClusterNetwork, TapDevice};
 use crate::pool::Pool;
 use crate::tree::{NodeInfo, SnapshotTree, TreeBudget, TreeUsage};
@@ -102,6 +105,10 @@ pub struct TreeEvent {
     /// Wall time of a fork/rollback/batch, when the op measured one.
     #[serde(default)]
     pub latency_ns: Option<u64>,
+    /// Firecracker cluster-fork pause skew (`max − min` pause Instant),
+    /// when the op measured one. Absent on native lockstep forks.
+    #[serde(default)]
+    pub pause_skew_ns: Option<u64>,
 }
 
 /// Current state of one tree, sent as the `tree_watch` snapshot.
@@ -121,6 +128,9 @@ pub struct TreeWatchSnapshot {
     /// Not persisted in `tree.json`.
     #[serde(default)]
     pub live_guest_cids: HashMap<String, Vec<u64>>,
+    /// Last Firecracker cluster-fork pause skew on this tree, if any.
+    #[serde(default)]
+    pub pause_skew_ns: Option<u64>,
 }
 
 /// One subscriber on the control-socket `tree_watch` stream.
@@ -187,6 +197,18 @@ fn apply_block_devices(
     Ok(builder)
 }
 
+/// Fail Create when the node has disabled the virtiofs hostPath
+/// fallback and the request still carries virtiofs shares.
+fn deny_virtiofs_if_configured(config: &VmConfig) -> Result<(), String> {
+    if config.virtiofs.is_empty() {
+        return Ok(());
+    }
+    if crate::volumes::virtiofs_fallback_denied()? {
+        return Err(crate::volumes::DENY_VIRTIOFS_FALLBACK_MSG.to_string());
+    }
+    Ok(())
+}
+
 /// Network parameters for a VM.
 ///
 /// When present, the daemon creates (or joins) the shared cluster
@@ -206,9 +228,10 @@ pub struct NetConfig {
     pub vm_index: Option<u32>,
     /// CNI-assigned pod netns path to attach the TAP into.
     /// The daemon reads the pod IP from `eth0` inside the netns.
-    /// Attach failures fall back to host-bridge networking with a
-    /// warning (matching the historical shim behaviour) and are
-    /// reported via `pod_netns_attached` in the response.
+    /// When set, a failed attach fails `create_vm` (the VM and
+    /// bridge slot are torn down). Omit the field (`None`) when
+    /// there is no CNI — host-bridge networking is then correct
+    /// and `pod_netns_attached` is `false`.
     #[serde(default)]
     pub pod_netns: Option<String>,
 }
@@ -290,16 +313,28 @@ pub struct VmConfig {
     #[serde(default)]
     pub container_scratch: Vec<ContainerScratchConfig>,
     /// **Named persistent** disks to attach, in declaration order after
-    /// `block_devices` . Unlike `scratch_size_bytes`
+    /// `block_devices`. Unlike `scratch_size_bytes`
     /// these outlive the VM: `stop_vm` leaves the image on the reflink
     /// XFS, and only an explicit `delete_data_disk` (or the age-gated
     /// sweep of a vanished test run) removes it. Empty (the default)
     /// reproduces today's all-ephemeral behaviour exactly.
     ///
+    /// An `id` is exclusive while a VM holding it is live: a second
+    /// `create_vm` with the same id fails until `stop_vm`. Warm forks
+    /// are unaffected — they reflink the image into the child and never
+    /// share the parent's file.
+    ///
     /// Each entry costs one virtio-blk device out of the guest's MMIO
     /// budget, like a per-container scratch disk.
     #[serde(default)]
     pub data_disks: Vec<DataDiskConfig>,
+    /// When `Some`, attach a per-VM Docker graph scratch disk
+    /// as the last read-write virtio-blk device, mounted at
+    /// [`crate::disks::DOCKER_GRAPH_GUEST_MOUNT`], and put `k7d.docker=1`
+    /// on the kernel cmdline so the agent supervises dockerd. `None`
+    /// (the default) is today's behaviour.
+    #[serde(default)]
+    pub docker: Option<DockerConfig>,
     /// Optional caller-supplied sandbox identity, echoed in
     /// `list_vms` so a shim can find its VM after a restart.
     #[serde(default)]
@@ -307,7 +342,7 @@ pub struct VmConfig {
     /// Optional network attachment (bridge + TAP + pod netns).
     #[serde(default)]
     pub network: Option<NetConfig>,
-    /// Continuous time dilation : guest time runs this
+    /// Continuous time dilation: guest time runs this
     /// many times faster than wall time, for the whole life of the VM.
     /// Absent or 1 is stock. Every member of a cluster is created from
     /// one `VmConfig`, so a cluster is dilated in lockstep by
@@ -317,9 +352,15 @@ pub struct VmConfig {
     /// of running the guest at 1x.
     #[serde(default)]
     pub dilation: Option<u32>,
+    /// VMM engine. Omitted / `"native"` is the in-process KVM VMM;
+    /// `"firecracker"` is stock Firecracker under the stock jailer.
+    /// A Firecracker VM has no network, no disks
+    /// and no virtiofs — those fields are rejected rather than ignored.
+    #[serde(default)]
+    pub backend: Backend,
 }
 
-/// One **named persistent** data disk .
+/// One **named persistent** data disk.
 ///
 /// `id` is the identity that outlives the VM: the image is
 /// `<disks>/data/<id>.img` on the reflink XFS, created sparse and
@@ -336,6 +377,14 @@ pub struct DataDiskConfig {
     /// Absolute guest path the agent mounts it at (ext4), before
     /// containers start.
     pub guest_mount: String,
+}
+
+/// Per-VM Docker graph disk. Ephemeral scratch, reflinked
+/// on fork, deleted with the VM — never a named [`DataDiskConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerConfig {
+    /// Capacity in bytes of the ext4 graph image.
+    pub graph_size_bytes: u64,
 }
 
 /// One container's own writable capacity.
@@ -369,9 +418,11 @@ impl Default for VmConfig {
             scratch_size_bytes: None,
             container_scratch: Vec::new(),
             data_disks: Vec::new(),
+            docker: None,
             sandbox_id: None,
             network: None,
             dilation: None,
+            backend: Backend::default(),
         }
     }
 }
@@ -388,7 +439,7 @@ fn default_dilation_one() -> u32 {
     1
 }
 
-/// the referenced work: `0` is never a factor. `None` inherits the source.
+/// `0` is never a factor. `None` inherits the source.
 fn validate_fork_dilation(dilation: Option<u32>) -> Result<Option<u32>, String> {
     match dilation {
         Some(0) => Err(
@@ -437,6 +488,15 @@ pub struct SandboxRecord {
     /// CNI pod netns the TAP was attached into, when it was.
     #[serde(default)]
     pub pod_netns: Option<String>,
+    /// How to reach the guest agent. A Firecracker sandbox is not
+    /// reachable through `guest_cid` at all, so a shim that reattaches
+    /// to one has to read this. Absent in records written before
+    /// the Firecracker backend; those are native by definition.
+    #[serde(default)]
+    pub agent_endpoint: Option<AgentEndpoint>,
+    /// VMM engine this sandbox's VM runs on.
+    #[serde(default)]
+    pub backend: Backend,
     /// Unix timestamp of the `create_vm` that wrote this record.
     pub created_at_unix: u64,
 }
@@ -478,7 +538,7 @@ pub enum Request {
         /// VM identifier from `create_vm`.
         vm_id: String,
     },
-    /// Delete a **named persistent** data disk's image .
+    /// Delete a **named persistent** data disk's image.
     ///
     /// The only way a data disk's data goes away: `stop_vm` deliberately
     /// retains it. Fails loudly when the image does not exist, or when
@@ -487,6 +547,27 @@ pub enum Request {
     DeleteDataDisk {
         /// Persistent identity given in `VmConfig.data_disks`.
         id: String,
+    },
+    /// Repoint a running VM's block device at another host file
+    /// for the image-slot late fill.
+    ///
+    /// Firecracker only, and deliberately so. On the native backend the
+    /// shim fills the slot's backing file in place, through the very
+    /// inode the daemon's block backend opened at boot; there is no
+    /// daemon call because there is nothing for the daemon to do. An
+    /// out-of-process VMM has its own fd table, so the equivalent is
+    /// asking it to re-open a path (`PATCH /drives`). Sending this to a
+    /// native VM is an error, not a no-op — a shim that got the backend
+    /// wrong must find out here and not from a guest mounting an empty
+    /// device.
+    UpdateDrive {
+        /// VM identifier from `create_vm`.
+        vm_id: String,
+        /// Position of the device in `VmConfig.block_devices`, i.e. the
+        /// `i` in the guest's `/dev/vd{a+i}`.
+        device_index: usize,
+        /// Host path of the file to serve the device from.
+        host_path: String,
     },
     /// Resolve a sandbox to its live VM.
     LookupSandbox {
@@ -519,8 +600,8 @@ pub enum Request {
         /// `reattach_sandbox` (and `k7 pause` on the fork) work.
         #[serde(default)]
         sandbox_id: Option<String>,
-        /// Child dilation factor . `None` inherits the
-        /// source's (inc9). `0` is a loud error.
+        /// Child dilation factor. `None` inherits the
+        /// source's. `0` is a loud error.
         #[serde(default)]
         dilation: Option<u32>,
     },
@@ -541,7 +622,7 @@ pub enum Request {
         vm_id: String,
     },
     /// Advance the guest-visible clock of every VM on one cluster
-    /// bridge by the same delta , so the guests' backoffs,
+    /// bridge by the same delta, so the guests' backoffs,
     /// probe periods and lease TTLs behave as if `delta_ms` had passed.
     ///
     /// The whole cluster is paused for the write and resumed after it:
@@ -560,7 +641,7 @@ pub enum Request {
         delta_ms: u64,
     },
     /// Change the continuous dilation factor of every VM on one cluster
-    /// bridge , so a cluster that is running out of CPU
+    /// bridge, so a cluster that is running out of CPU
     /// can be slowed back down without being restarted.
     ///
     /// The whole cluster is paused for the write and resumed after it,
@@ -584,8 +665,8 @@ pub enum Request {
         /// Needs the carried patch in `utils/kvm-dilation` above 1.
         factor: u32,
     },
-    /// Start, switch or stop the auto-warp policy loop on one cluster
-    /// : instead of being told "+90 s", the daemon
+    /// Start, switch or stop the auto-warp policy loop on one cluster:
+    /// instead of being told "+90 s", the daemon
     /// watches the cluster and deletes its idle wall time itself.
     ///
     /// Idempotent in the sense that matters: setting a mode replaces
@@ -605,7 +686,7 @@ pub enum Request {
         cluster_id: String,
     },
     /// Take or release the auto-warp hold on a cluster — the explicit
-    /// form of the referenced work's fifth safety check.
+    /// form of the fifth safety check.
     ///
     /// Daemon ops need no hold: they all run under the VM registry
     /// lock, which the policy loop takes for the whole of each cycle,
@@ -648,7 +729,7 @@ pub enum Request {
         /// Caller-supplied tree identity; generated when omitted.
         #[serde(default)]
         tree_id: Option<String>,
-        /// Egress posture for the tree's bridges .
+        /// Egress posture for the tree's bridges.
         /// Omitted = `Open` (the product default); forks inherit it.
         /// RoCEv2/Soft-RoCE note: RDMA leaving the tree is UDP/4791 —
         /// a `whitelist` policy that needs it must name port 4791.
@@ -682,7 +763,7 @@ pub enum Request {
         /// Caller-supplied tree identity; generated when omitted.
         #[serde(default)]
         tree_id: Option<String>,
-        /// Egress posture applied to the adopted bridge .
+        /// Egress posture applied to the adopted bridge.
         /// Omitted keeps the bridge's current posture (sandbox bridges
         /// are born `Open`); forks inherit whatever is set here.
         #[serde(default)]
@@ -696,8 +777,8 @@ pub enum Request {
         source_id: String,
         /// Human label for the new branch (also seeds its node id).
         label: String,
-        /// Child dilation factor . `None` inherits the
-        /// source's (inc9). A cluster applies one factor to every
+        /// Child dilation factor. `None` inherits the
+        /// source's. A cluster applies one factor to every
         /// member. `0` is a loud error.
         #[serde(default)]
         dilation: Option<u32>,
@@ -713,8 +794,8 @@ pub enum Request {
         /// One human label per new branch (also seeds each node id).
         /// Empty is a loud error — never a silent no-op.
         labels: Vec<String>,
-        /// One child factor for every branch in the batch
-        /// . `None` inherits the source's.
+        /// One child factor for every branch in the batch.
+        /// `None` inherits the source's.
         #[serde(default)]
         dilation: Option<u32>,
     },
@@ -805,7 +886,7 @@ pub enum Request {
         tree_id: String,
     },
     /// Re-open an on-disk cluster tree left by `tree_drop` or a daemon
-    /// crash . Nodes come back [`crate::tree::NodeState::Suspended`]
+    /// crash. Nodes come back [`crate::tree::NodeState::Suspended`]
     /// — live KVM is not resurrected. Fails loud if `tree.json` is
     /// missing, unparseable, or the id is already in memory.
     TreeOpen {
@@ -821,6 +902,71 @@ pub enum Request {
     Doctor,
 }
 
+impl Request {
+    /// Wire `op` name for the peer-cred audit log.
+    fn op_name(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::CreateVm { .. } => "create_vm",
+            Self::VmStatus { .. } => "vm_status",
+            Self::DumpSerial { .. } => "dump_serial",
+            Self::ListVms => "list_vms",
+            Self::StopVm { .. } => "stop_vm",
+            Self::DeleteDataDisk { .. } => "delete_data_disk",
+            Self::UpdateDrive { .. } => "update_drive",
+            Self::LookupSandbox { .. } => "lookup_sandbox",
+            Self::ReattachSandbox { .. } => "reattach_sandbox",
+            Self::ForkVm { .. } => "fork_vm",
+            Self::PauseVm { .. } => "pause_vm",
+            Self::ResumeVm { .. } => "resume_vm",
+            Self::WarpClock { .. } => "warp_clock",
+            Self::SetDilation { .. } => "set_dilation",
+            Self::AutoWarp { .. } => "auto_warp",
+            Self::AutoWarpStatus { .. } => "auto_warp_status",
+            Self::AutoWarpHold { .. } => "auto_warp_hold",
+            Self::TreeCreate { .. } => "tree_create",
+            Self::TreeCreateCluster { .. } => "tree_create_cluster",
+            Self::TreeAdoptCluster { .. } => "tree_adopt_cluster",
+            Self::TreeFork { .. } => "tree_fork",
+            Self::TreeForkBatch { .. } => "tree_fork_batch",
+            Self::TreePrepareForkSource { .. } => "tree_prepare_fork_source",
+            Self::TreeRollback { .. } => "tree_rollback",
+            Self::TreeProtect { .. } => "tree_protect",
+            Self::TreeUnprotect { .. } => "tree_unprotect",
+            Self::TreeSuspend { .. } => "tree_suspend",
+            Self::TreeResume { .. } => "tree_resume",
+            Self::TreePrune { .. } => "tree_prune",
+            Self::TreeAutoEvict { .. } => "tree_auto_evict",
+            Self::TreeNodes { .. } => "tree_nodes",
+            Self::TreeList => "tree_list",
+            Self::TreeWatch { .. } => "tree_watch",
+            Self::TreeDrop { .. } => "tree_drop",
+            Self::TreeOpen { .. } => "tree_open",
+            Self::PoolStatus => "pool_status",
+            Self::Doctor => "doctor",
+        }
+    }
+
+    /// VM / tree writes that get an `info` peer-cred line.
+    /// Reads log at `debug`.
+    fn is_mutating(&self) -> bool {
+        !matches!(
+            self,
+            Self::Ping
+                | Self::VmStatus { .. }
+                | Self::DumpSerial { .. }
+                | Self::ListVms
+                | Self::LookupSandbox { .. }
+                | Self::AutoWarpStatus { .. }
+                | Self::TreeNodes { .. }
+                | Self::TreeList
+                | Self::TreeWatch { .. }
+                | Self::PoolStatus
+                | Self::Doctor
+        )
+    }
+}
+
 /// One branch produced by [`Request::TreeForkBatch`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TreeForkedBranch {
@@ -828,6 +974,11 @@ pub struct TreeForkedBranch {
     pub node_id: String,
     /// Guest vsock CIDs of the new branch's members.
     pub guest_cids: Vec<u64>,
+    /// How to reach each member's agent, in the same order. The only
+    /// handle on a Firecracker member, whose `guest_cids` entry is
+    /// absent.
+    #[serde(default)]
+    pub agent_endpoints: Vec<AgentEndpoint>,
     /// Per-member `CoW` vs full-copy flag (see [`Response::TreeForked`]).
     #[serde(default)]
     pub fork_memory_full_copy: Vec<bool>,
@@ -836,9 +987,12 @@ pub struct TreeForkedBranch {
     /// dirty-bitmap capture.
     #[serde(default)]
     pub latency_ns: u64,
-    /// Child dilation factor after the fork .
+    /// Child dilation factor after the fork.
     #[serde(default = "default_dilation_one")]
     pub dilation: u32,
+    /// Firecracker cluster-fork pause skew for this batch, when measured.
+    #[serde(default)]
+    pub pause_skew_ns: Option<u64>,
 }
 
 /// Summary of one VM in a `list_vms` response.
@@ -852,6 +1006,26 @@ pub struct VmInfo {
     pub state: String,
     /// Caller-supplied sandbox identity, if any.
     pub sandbox_id: Option<String>,
+    /// VMM engine this VM runs on.
+    #[serde(default)]
+    pub backend: Backend,
+    /// Host pid of the jailed Firecracker process, and the uid and
+    /// chroot it runs under. `None` for native VMs, whose VMM is the
+    /// daemon itself. `k7d doctor` prints these — for a jailed VMM
+    /// they are the only handles an operator has on it.
+    #[serde(default)]
+    pub jail: Option<JailInfo>,
+}
+
+/// Where a Firecracker VM's VMM process lives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JailInfo {
+    /// Host pid (pid 1 of its own pid namespace).
+    pub pid: u32,
+    /// Unprivileged uid == gid the jailer dropped it to.
+    pub uid: u32,
+    /// Host path of the directory it sees as `/`.
+    pub chroot: String,
 }
 
 /// A control-plane response.
@@ -862,6 +1036,13 @@ pub enum Response {
     Pong {
         /// Daemon version.
         version: String,
+        /// Process-wide count of forks that took a full dump because a
+        /// virtio-blk worker missed the 200 ms park deadline.
+        #[serde(default)]
+        fork_nonquiescent_blk: u64,
+        /// Same, for virtio-net.
+        #[serde(default)]
+        fork_nonquiescent_net: u64,
     },
     /// Reply to `create_vm`.
     VmCreated {
@@ -874,10 +1055,11 @@ pub enum Response {
         /// `10.200.0.{2 + vm_index}`.
         #[serde(default)]
         vm_index: Option<u32>,
-        /// Whether the TAP was successfully attached to the requested
-        /// CNI pod netns. `false` means host-bridge fallback (or no
-        /// netns was requested) — the client must not configure the
-        /// in-netns gateway route in the guest.
+        /// Whether the TAP was attached into the CNI pod netns.
+        /// `true` only when `NetConfig.pod_netns` was set and attach
+        /// succeeded; `false` when no netns was requested (host-bridge
+        /// is then correct). A requested attach that fails is an
+        /// error, not `false`.
         #[serde(default)]
         pod_netns_attached: bool,
         /// Whether this VM was served from the warm pool instead
@@ -886,6 +1068,12 @@ pub enum Response {
         /// from timing.
         #[serde(default)]
         pooled: bool,
+        /// How to reach this VM's guest agent. `Vsock { cid }` for
+        /// native VMs (the same value as `guest_cid`), `FcUds { path }`
+        /// for Firecracker ones, whose `guest_cid` is meaningless to
+        /// the host. `None` only from a daemon without Firecracker support.
+        #[serde(default)]
+        agent_endpoint: Option<AgentEndpoint>,
     },
     /// Reply to `vm_status`.
     VmState {
@@ -914,6 +1102,9 @@ pub enum Response {
         /// daemon chose it (CHALLENGES #72).
         #[serde(default)]
         kernel: String,
+        /// VMM engine this VM runs on.
+        #[serde(default)]
+        backend: Backend,
     },
     /// Reply to `list_vms`.
     VmList {
@@ -950,20 +1141,33 @@ pub enum Response {
         /// Whether the VM's TAP sits inside the CNI pod netns.
         #[serde(default)]
         pod_netns_attached: bool,
+        /// How to reach the guest agent — what a reattaching shim
+        /// dials. `None` only from a daemon without Firecracker support.
+        #[serde(default)]
+        agent_endpoint: Option<AgentEndpoint>,
+        /// VMM engine this sandbox's VM runs on.
+        #[serde(default)]
+        backend: Backend,
     },
     /// Reply to `fork_vm`.
     VmForked {
         /// New VM identifier.
         vm_id: String,
-        /// The fork's guest vsock CID.
+        /// The fork's guest vsock CID. Firecracker forks are not
+        /// reachable over `AF_VSOCK`; this is 0 (`VMADDR_CID_HYPERVISOR`)
+        /// and the shim must use `agent_endpoint`.
         guest_cid: u64,
         /// The source's guest vsock CID. Preserved across the first
         /// fork's prepare swap — echoed back so
         /// clients can assert it, not because it changes.
         source_guest_cid: u64,
-        /// Child dilation factor after the fork .
+        /// Child dilation factor after the fork.
         #[serde(default = "default_dilation_one")]
         dilation: u32,
+        /// How to reach the child's guest agent. Required for
+        /// Firecracker (`FcUds`); native is `Vsock`.
+        #[serde(default)]
+        agent_endpoint: Option<AgentEndpoint>,
     },
     /// Reply to `tree_create` / `tree_create_cluster` / `tree_adopt_cluster`.
     TreeCreated {
@@ -974,6 +1178,10 @@ pub enum Response {
         /// Guest vsock CIDs of the root payload's members, ordered by
         /// `vm_index` (one entry for a single-VM tree).
         guest_cids: Vec<u64>,
+        /// Agent endpoints of the same members, same order. Empty
+        /// `guest_cids` plus `FcUds` entries here is a Firecracker tree.
+        #[serde(default)]
+        agent_endpoints: Vec<AgentEndpoint>,
     },
     /// Reply to `tree_fork` / `tree_rollback`.
     TreeForked {
@@ -981,6 +1189,9 @@ pub enum Response {
         node_id: String,
         /// Guest vsock CIDs of the new branch's members.
         guest_cids: Vec<u64>,
+        /// Agent endpoints of the same members, same order.
+        #[serde(default)]
+        agent_endpoints: Vec<AgentEndpoint>,
         /// Per-member (same order as `guest_cids`): whether the fork's
         /// memory is a full memfd copy rather than `CoW` `MAP_PRIVATE`
         /// (block-path cluster forks must be all-false;
@@ -991,9 +1202,13 @@ pub enum Response {
         /// measurement; not stored in `tree.json`).
         #[serde(default)]
         latency_ns: u64,
-        /// Child dilation factor after the fork .
+        /// Child dilation factor after the fork.
         #[serde(default = "default_dilation_one")]
         dilation: u32,
+        /// Firecracker cluster-fork pause skew (`max − min`), when this
+        /// fork paused members in parallel. `None` on native lockstep.
+        #[serde(default)]
+        pause_skew_ns: Option<u64>,
     },
     /// Reply to `tree_fork_batch`.
     TreeForkBatch {
@@ -1004,6 +1219,9 @@ pub enum Response {
         /// [`TreeForkedBranch::latency_ns`].
         #[serde(default)]
         latency_ns: u64,
+        /// Firecracker cluster-fork pause skew for the batch.
+        #[serde(default)]
+        pause_skew_ns: Option<u64>,
     },
     /// Reply to `tree_prepare_fork_source`.
     TreePrepared {
@@ -1014,7 +1232,7 @@ pub enum Response {
         wrote_base: bool,
         /// `true` when the keyframe was written **incrementally** —
         /// `FICLONE` of the nearest ancestor's `memory.bin` plus this
-        /// node's dirty pages , costing O(divergence) instead
+        /// node's dirty pages, costing O(divergence) instead
         /// of O(guest RAM). `false` for a root, a virtiofs payload, an
         /// idempotent no-op, or a loud fallback to the full dump because
         /// the tree root is not on a reflink filesystem.
@@ -1033,6 +1251,9 @@ pub enum Response {
         latency_ns: u64,
         /// Guest vsock CIDs after prepare (CID is preserved).
         guest_cids: Vec<u64>,
+        /// Agent endpoints after prepare, same order.
+        #[serde(default)]
+        agent_endpoints: Vec<AgentEndpoint>,
     },
     /// Reply to `warp_clock`.
     Warped {
@@ -1045,7 +1266,7 @@ pub enum Response {
         /// The delta every guest's clock advanced by.
         delta_ms: u64,
         /// Daemon-side wall time of pause-all → warp-all → resume-all
-        /// .
+        /// (measured here, not around the socket).
         latency_ns: u64,
     },
     /// Reply to `set_dilation`.
@@ -1081,6 +1302,9 @@ pub enum Response {
         node_id: String,
         /// Fresh guest vsock CIDs of the resumed members.
         guest_cids: Vec<u64>,
+        /// Agent endpoints of the resumed members, same order.
+        #[serde(default)]
+        agent_endpoints: Vec<AgentEndpoint>,
     },
     /// Reply to `tree_open`.
     TreeOpened {
@@ -1111,7 +1335,10 @@ pub enum Response {
         /// payload. Not persisted in `tree.json`.
         #[serde(default)]
         live_guest_cids: HashMap<String, Vec<u64>>,
-        /// Time dilation factor of each live node (the referenced work; a
+        /// Live agent endpoints keyed by node id, same shape.
+        #[serde(default)]
+        live_agent_endpoints: HashMap<String, Vec<AgentEndpoint>>,
+        /// Time dilation factor of each live node (a
         /// cluster's members all share one). Absent for nodes with no
         /// live payload. The gym reads this to check a reused source
         /// tree runs at the factor its config promises.
@@ -1142,6 +1369,9 @@ pub enum Response {
         /// Fork/rollback/batch wall time, when measured.
         #[serde(default)]
         latency_ns: Option<u64>,
+        /// Firecracker cluster-fork pause skew, when measured.
+        #[serde(default)]
+        pause_skew_ns: Option<u64>,
     },
     /// Reply to `pool_status`.
     PoolStatus {
@@ -1166,6 +1396,12 @@ pub enum Response {
         cgroup_v2: bool,
         /// All four checks passed.
         ok: bool,
+        /// `snapshot_type` Firecracker fork points are taken with
+        /// (`diff` | `full`, from `K7D_FC_FORK_SNAPSHOT`).
+        /// Reported here because a pin-around must be visible, not a
+        /// silent fallback.
+        #[serde(default)]
+        fc_fork_mode: String,
         /// One line per check (`ok`/`FAIL` + name + detail).
         details: Vec<String>,
     },
@@ -1196,19 +1432,19 @@ pub struct TreeSummary {
 }
 
 /// One VM owned by the daemon. The `vm` field is load-bearing even
-/// though the control plane never reads it back yet: holding the `Vm`
+/// though the control plane never reads it back yet: holding the `Guest`
 /// keeps the guest alive, and dropping the entry (on `stop_vm` /
-/// `shutdown_all`) runs `Vm::drop`, which tears down the vCPU thread,
-/// device workers, virtiofsd children, and TAP. The fork, snapshot
-/// and tree paths read it.
+/// `shutdown_all`) runs `Guest`/`Vm::drop`, which tears down the vCPU
+/// thread, device workers, virtiofsd children, and TAP. The fork,
+/// snapshot and tree paths read it.
 struct VmEntry {
     #[allow(dead_code)]
-    vm: Vm,
+    vm: Guest,
     /// The threaded CPU cgroup capping this VM's vCPU
     /// threads at the pod's CFS quota. Held only for its `Drop`
     /// (like `vm`): declared AFTER `vm` — struct fields drop in
     /// declaration order, so the vCPU thread is joined (by
-    /// `Vm::drop`) before the cgroup directory is removed.
+    /// `Guest`/`Vm::drop`) before the cgroup directory is removed.
     #[allow(dead_code)]
     cpu_cgroup: Option<crate::cgroup::VmCpuCgroup>,
     /// Create-time CFS quota (µs). Carried so `fork_vm` can re-apply
@@ -1250,6 +1486,7 @@ struct CreatedVm {
     guest_cid: u64,
     vm_index: Option<u32>,
     pod_netns_attached: bool,
+    agent_endpoint: AgentEndpoint,
 }
 
 /// One snapshot tree owned by the daemon — single-VM or
@@ -1261,7 +1498,7 @@ enum TreePayload {
 }
 
 impl TreePayload {
-    fn live_cluster_members_mut(&mut self, node_id: &str) -> Option<&mut [crate::vm::Vm]> {
+    fn live_cluster_members_mut(&mut self, node_id: &str) -> Option<&mut [Guest]> {
         match self {
             Self::Cluster(t) => t.live_members_mut(node_id),
             Self::Single(_) => None,
@@ -1312,7 +1549,7 @@ impl TreePayload {
 
     /// Find a live VM by guest CID (debug introspection for
     /// `dump_serial` — tree members carry no daemon `vm_id`).
-    fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Vm)> {
+    fn find_live_vm_by_cid(&self, cid: u64) -> Option<(&str, &Guest)> {
         match self {
             Self::Single(t) => t.find_live_vm_by_cid(cid),
             Self::Cluster(t) => t.find_live_vm_by_cid(cid),
@@ -1392,18 +1629,55 @@ impl TreePayload {
         }
     }
 
+    /// Live guests of a node, ordered by member index. Empty when the
+    /// node has no live payload. Works for Firecracker, whose
+    /// [`Self::node_cids`] is empty.
+    fn node_guests(&self, node_id: &str) -> Vec<&Guest> {
+        let key = node_id.to_string();
+        match self {
+            Self::Single(t) => t.get_vm(&key).into_iter().collect(),
+            Self::Cluster(t) => t
+                .get_payload(&key)
+                .map(|p| p.members.iter().collect())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Guest vsock CIDs of a node's live members, ordered by member
     /// index. Empty when the node has no live payload.
     fn node_cids(&self, node_id: &String) -> Vec<u64> {
         match self {
             Self::Single(t) => t
                 .get_vm(node_id)
-                .map(|vm| vec![vm.guest_cid()])
+                .map(|g| g.guest_cid().into_iter().collect())
                 .unwrap_or_default(),
             Self::Cluster(t) => t
                 .get_payload(node_id)
-                .map(|p| p.members.iter().map(Vm::guest_cid).collect())
+                .map(|p| p.members.iter().filter_map(Guest::guest_cid).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Agent endpoints of a node's live members, ordered like
+    /// [`Self::node_cids`]. Non-empty for a live Firecracker node whose
+    /// `node_cids` is empty.
+    fn node_endpoints(&self, node_id: &String) -> Vec<AgentEndpoint> {
+        match self {
+            Self::Single(t) => t
+                .get_vm(node_id)
+                .map(|g| vec![g.agent_endpoint()])
+                .unwrap_or_default(),
+            Self::Cluster(t) => t
+                .get_payload(node_id)
+                .map(|p| p.members.iter().map(Guest::agent_endpoint).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn last_pause_skew_ns(&self) -> Option<u64> {
+        match self {
+            Self::Cluster(t) => t.last_pause_skew_ns(),
+            Self::Single(_) => None,
         }
     }
 
@@ -1412,10 +1686,14 @@ impl TreePayload {
     /// forked from one state, so the first member speaks for all.
     fn node_dilation(&self, node_id: &String) -> Option<u32> {
         match self {
-            Self::Single(t) => t.get_vm(node_id).map(Vm::dilation),
-            Self::Cluster(t) => t
-                .get_payload(node_id)
-                .and_then(|p| p.members.first().map(Vm::dilation)),
+            Self::Single(t) => t
+                .get_vm(node_id)
+                .and_then(|g| g.as_native().ok().map(Vm::dilation)),
+            Self::Cluster(t) => t.get_payload(node_id).and_then(|p| {
+                p.members
+                    .first()
+                    .and_then(|g| g.as_native().ok().map(Vm::dilation))
+            }),
         }
     }
 
@@ -1426,11 +1704,16 @@ impl TreePayload {
         match self {
             Self::Single(t) => t
                 .get_vm(node_id)
-                .map(|vm| vec![vm.fork_memory_is_full_copy()])
+                .map(|g| vec![g.fork_memory_is_full_copy()])
                 .unwrap_or_default(),
             Self::Cluster(t) => t
                 .get_payload(node_id)
-                .map(|p| p.members.iter().map(Vm::fork_memory_is_full_copy).collect())
+                .map(|p| {
+                    p.members
+                        .iter()
+                        .map(Guest::fork_memory_is_full_copy)
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     }
@@ -1465,6 +1748,15 @@ impl TreePayload {
             .collect()
     }
 
+    /// Live agent endpoints keyed by node id ([`Self::live_guest_cids`]'s
+    /// backend-agnostic twin).
+    fn live_agent_endpoints(&self) -> HashMap<String, Vec<AgentEndpoint>> {
+        self.list_nodes()
+            .into_iter()
+            .map(|n| (n.id.clone(), self.node_endpoints(&n.id)))
+            .collect()
+    }
+
     fn node_list_response(&self) -> Response {
         let nodes = self.list_nodes();
         let live_dilation = nodes
@@ -1476,6 +1768,7 @@ impl TreePayload {
             usage: self.usage().into(),
             budget: self.budget(),
             live_guest_cids: self.live_guest_cids(),
+            live_agent_endpoints: self.live_agent_endpoints(),
             live_dilation,
         }
     }
@@ -1488,14 +1781,15 @@ impl TreePayload {
             usage: self.usage().into(),
             budget: self.budget(),
             live_guest_cids: self.live_guest_cids(),
+            pause_skew_ns: self.last_pause_skew_ns(),
         }
     }
 }
 
 /// The daemon's VM registry and request dispatcher.
 pub struct Daemon {
-    /// Live VMs. `Arc` because the auto-warp policy loop (spec
-    /// 34a-inc3) runs on its own thread and takes this same lock for
+    /// Live VMs. `Arc` because the auto-warp policy loop runs on its
+    /// own thread and takes this same lock for
     /// the whole of each cycle — that lock is what makes "no daemon op
     /// is in flight against a member" true rather than hoped for.
     vms: Arc<Mutex<HashMap<String, VmEntry>>>,
@@ -1519,7 +1813,7 @@ pub struct Daemon {
     pool: Option<Pool>,
     /// `tree_watch` subscribers. Dead senders are dropped on emit.
     watchers: Mutex<Vec<WatchSub>>,
-    /// Auto-warp policy loops, keyed by `cluster_id` .
+    /// Auto-warp policy loops, keyed by `cluster_id`.
     auto_warps: Mutex<HashMap<String, AutoWarpLoop>>,
     /// Auto-warp holds, keyed by `cluster_id`. Read by every cycle of
     /// every loop, so it is its own lock and never nested inside
@@ -1565,7 +1859,7 @@ impl AutoWarpLoop {
 fn tree_cluster_members_mut<'a>(
     trees: &'a mut HashMap<String, TreePayload>,
     cluster_id: &str,
-) -> Option<&'a mut [crate::vm::Vm]> {
+) -> Option<&'a mut [Guest]> {
     for (tid, tree) in trees.iter_mut() {
         let node_id = if cluster_id == tid.as_str() {
             "root"
@@ -1582,6 +1876,398 @@ fn tree_cluster_members_mut<'a>(
         }
     }
     None
+}
+
+/// What a tree payload VM may not carry, on either backend: it is
+/// owned by the `SnapshotTree` and forked repeatedly, so everything a
+/// sandbox VM gets for its own writable layer or persistent identity is
+/// refused here by name.
+fn deny_tree_payload_extras(config: &VmConfig) -> Result<(), String> {
+    if config.scratch_size_bytes.is_some() || !config.container_scratch.is_empty() {
+        // A tree payload VM is owned by the SnapshotTree, not by a
+        // sandbox, and its whole point is to be forked repeatedly.
+        // Rather than quietly drop the request (the failure
+        // mode is exactly a writable layer that isn't where the
+        // caller thinks), refuse it.
+        return Err(
+            "scratch_size_bytes / container_scratch are not supported for tree payload \
+             VMs — a tree node's writable layer comes from the sandbox VMs it adopts \
+"
+            .to_string(),
+        );
+    }
+    if config.docker.is_some() {
+        return Err(
+            "docker is not supported for tree payload VMs — attach it to the sandbox \
+             VMs the tree adopts instead"
+                .to_string(),
+        );
+    }
+    if !config.data_disks.is_empty() {
+        // Same refusal, sharper reason: a tree payload is forked
+        // repeatedly, and every branch would want *its own* copy of a
+        // disk whose whole identity is that it is shared across VMs.
+        // A node that wants persistent storage gets it from the
+        // sandbox VMs the tree adopts.
+        return Err(
+            "data_disks are not supported for tree payload VMs — a tree node is forked \
+             repeatedly and a persistent disk has one identity; attach it to the sandbox \
+             VMs the tree adopts instead"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Fields `create_vm` cannot honour on Firecracker.
+///
+/// Both of these are permanent, not increments: Firecracker has no
+/// vhost-user-fs device, and time dilation is a property of k7d owning
+/// the guest's kvmclock. Rejecting them is the
+/// point — a pod that asked for a hostPath mount and silently got a VM
+/// without one would fail much later, inside the guest, as an empty
+/// directory.
+fn deny_fc_unsupported(config: &VmConfig) -> Result<(), String> {
+    let unsupported: &[(bool, &'static str)] = &[
+        (!config.virtiofs.is_empty(), "virtiofs"),
+        (config.dilation.is_some(), "dilation"),
+    ];
+    for (present, op) in unsupported {
+        if *present {
+            return Err(GuestError::Unsupported {
+                backend: Backend::Firecracker,
+                op,
+            }
+            .to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Everything a Firecracker VM's chroot has to be given, in guest
+/// device order, plus the host-side handles that must outlive it.
+struct FcAttachments {
+    drives: Vec<crate::fc::FcDrive>,
+    disks: Vec<crate::fc::FcDisk>,
+    /// `vd{letter}:{mount}:{fstype}:{ro|rw}` for every drive the guest
+    /// agent has to mount, built in the same loop as `drives` so the
+    /// letters cannot drift from the device order.
+    blk_mounts: Vec<String>,
+}
+
+/// A failed FC start, carrying the bridge slot to free.
+///
+/// The `vm_index` is the only thing the caller cannot recover for
+/// itself: the TAP allocation happens inside the start, so a failure
+/// after it has to say which slot on the bridge is now unused, or the
+/// identity leaks and the next pod on that cluster gets the one after.
+struct FcStartError {
+    message: String,
+    vm_index: Option<u32>,
+}
+
+/// What a successful [`Daemon::spawn_fc`] hands back: the live VM (which
+/// owns its TAP) and its slot on the cluster bridge.
+type SpawnedFc = (crate::fc::FcVm, Option<u32>);
+
+/// `a`..`z` for a block device index, or `?` past the 26 the guest can
+/// name. Log-only: the create path rejects an over-long device list.
+fn device_letter(index: usize) -> char {
+    u8::try_from(index)
+        .ok()
+        .filter(|i| *i < 26)
+        .map_or('?', |i| char::from(b'a' + i))
+}
+
+/// Build the drive list for `config` in exactly the order the native
+/// backend attaches devices, so `/dev/vdX` means the same thing on both
+/// backends.
+///
+/// That order is not incidental: the shim computes a guest device name
+/// from a device's index in `VmConfig.block_devices` (and the daemon
+/// documents scratch / container-scratch / data / docker disks as
+/// coming after them, in that sequence) at a point where it has no
+/// other handle on the device. Any divergence here would surface as a
+/// container mounting the wrong disk, silently.
+#[allow(clippy::too_many_lines)]
+fn fc_attachments(vm_id: &str, config: &VmConfig, live: &Daemon) -> Result<FcAttachments, String> {
+    let mut drives = Vec::new();
+    let mut disks = Vec::new();
+    let mut blk_mounts = Vec::new();
+
+    for (i, blk) in config.block_devices.iter().enumerate() {
+        let host_path = PathBuf::from(&blk.host_path);
+        let mount = match (&blk.guest_mount, &blk.fstype) {
+            (Some(gm), Some(fstype)) => Some((gm.as_str(), fstype.as_str())),
+            (None, None) => None,
+            _ => {
+                return Err(format!(
+                    "block device {}: guest_mount and fstype must be set together",
+                    blk.host_path
+                ))
+            }
+        };
+        // A writable caller-declared image is not one of k7d's own
+        // disks, so it has no `ScratchDisk`/`DataDisk` handle; the
+        // caller owns its lifetime, as on the native backend.
+        push_drive(
+            &mut drives,
+            &mut blk_mounts,
+            crate::fc::FcDrive {
+                name: format!("blk{i}-{}", file_stem_for_jail(&host_path)),
+                host_path,
+                read_only: blk.readonly,
+            },
+            mount,
+        )?;
+    }
+
+    if let Some(size) = config.scratch_size_bytes {
+        let disk = crate::disks::ScratchDisk::create(vm_id, size)
+            .map_err(|e| format!("provision scratch disk for {vm_id}: {e}"))?;
+        push_drive(
+            &mut drives,
+            &mut blk_mounts,
+            crate::fc::FcDrive {
+                name: "scratch.ext4".to_string(),
+                host_path: disk.path().to_path_buf(),
+                read_only: false,
+            },
+            Some((crate::disks::SCRATCH_GUEST_MOUNT, "ext4")),
+        )?;
+        disks.push(crate::fc::FcDisk::Scratch(disk));
+    }
+
+    for (i, cs) in config.container_scratch.iter().enumerate() {
+        if config.container_scratch[..i]
+            .iter()
+            .any(|prev| prev.name == cs.name)
+        {
+            return Err(format!(
+                "container_scratch names container {:?} twice",
+                cs.name
+            ));
+        }
+        let disk =
+            crate::disks::ScratchDisk::create(&format!("{vm_id}-c-{}", cs.name), cs.size_bytes)
+                .map_err(|e| format!("provision scratch disk for container {}: {e}", cs.name))?;
+        let mount = crate::disks::container_scratch_mount(&cs.name);
+        push_drive(
+            &mut drives,
+            &mut blk_mounts,
+            crate::fc::FcDrive {
+                name: format!("cscratch-{i}.ext4"),
+                host_path: disk.path().to_path_buf(),
+                read_only: false,
+            },
+            Some((&mount, "ext4")),
+        )?;
+        disks.push(crate::fc::FcDisk::Scratch(disk));
+    }
+
+    for (i, dd) in config.data_disks.iter().enumerate() {
+        if config.data_disks[..i].iter().any(|prev| prev.id == dd.id) {
+            return Err(format!("data_disks names disk {:?} twice", dd.id));
+        }
+        if config.data_disks[..i]
+            .iter()
+            .any(|prev| prev.guest_mount == dd.guest_mount)
+        {
+            return Err(format!(
+                "data_disks mounts two disks at {:?}",
+                dd.guest_mount
+            ));
+        }
+        if let Some(holder) = live.live_data_disk_holder(&dd.id) {
+            return Err(format!(
+                "data disk {:?} is attached to live VM {holder} — stop it or use another id",
+                dd.id
+            ));
+        }
+        let disk = crate::disks::DataDisk::attach(&dd.id, dd.size_bytes, &dd.guest_mount)
+            .map_err(|e| format!("attach data disk {}: {e}", dd.id))?;
+        push_drive(
+            &mut drives,
+            &mut blk_mounts,
+            crate::fc::FcDrive {
+                name: format!("data-{i}.ext4"),
+                host_path: disk.path().to_path_buf(),
+                read_only: false,
+            },
+            Some((disk.guest_mount(), "ext4")),
+        )?;
+        disks.push(crate::fc::FcDisk::Data(disk));
+    }
+
+    if let Some(ref docker) = config.docker {
+        let disk =
+            crate::disks::ScratchDisk::create(&format!("{vm_id}-docker"), docker.graph_size_bytes)
+                .map_err(|e| format!("provision docker graph disk for {vm_id}: {e}"))?;
+        push_drive(
+            &mut drives,
+            &mut blk_mounts,
+            crate::fc::FcDrive {
+                name: "docker.ext4".to_string(),
+                host_path: disk.path().to_path_buf(),
+                read_only: false,
+            },
+            Some((crate::disks::DOCKER_GRAPH_GUEST_MOUNT, "ext4")),
+        )?;
+        disks.push(crate::fc::FcDisk::Scratch(disk));
+    }
+
+    Ok(FcAttachments {
+        drives,
+        disks,
+        blk_mounts,
+    })
+}
+
+/// Append one drive, and — when the guest agent has to mount it — the
+/// `k7d.blk=` entry naming the `/dev/vdX` this position gives it.
+///
+/// Both in one call because the guest device letter *is* the drive's
+/// index: building the mount list anywhere else would be a second
+/// ordering to keep in step with the first, and the failure mode of
+/// them drifting is a container quietly mounting the wrong disk. The
+/// validation mirrors the native builder's so a spec the native backend
+/// rejects does not boot on Firecracker.
+fn push_drive(
+    drives: &mut Vec<crate::fc::FcDrive>,
+    blk_mounts: &mut Vec<String>,
+    drive: crate::fc::FcDrive,
+    mount: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let index = drives.len();
+    if let Some((guest_mount, fstype)) = mount {
+        if index >= 26 || guest_mount.contains([':', ',']) || fstype.contains([':', ',']) {
+            return Err(format!(
+                "invalid block mount spec for device {index} (max 26 mounted devices; \
+                 mount/fstype must not contain ':' or ','): {guest_mount:?} {fstype:?}"
+            ));
+        }
+        blk_mounts.push(format!(
+            "vd{}:{guest_mount}:{fstype}:{}",
+            device_letter(index),
+            if drive.read_only { "ro" } else { "rw" }
+        ));
+    }
+    drives.push(drive);
+    Ok(())
+}
+
+/// The boot args a Firecracker guest needs on top of the caller's
+/// cmdline: the same `k7d.blk=` / `k7d.mkdir=` / `k7d.docker=1` tokens
+/// [`crate::vm::VmBuilder::build`] appends while it attaches devices.
+///
+/// The native backend can append them there because it builds the
+/// cmdline and the devices together. Firecracker takes `boot_args` as
+/// one opaque string before any drive is declared, so the equivalent
+/// has to be assembled here — and it is the *only* thing that tells the
+/// agent a device exists. `virtio_mmio.device=` is absent on purpose:
+/// Firecracker emits its own, and `k7d.virtiofs=` cannot appear because
+/// this backend refuses virtiofs outright.
+fn fc_cmdline(base: &str, blk_mounts: &[String], config: &VmConfig) -> Result<String, String> {
+    let mut cmdline = base.to_string();
+    if !blk_mounts.is_empty() {
+        cmdline.push_str(&format!(" k7d.blk={}", blk_mounts.join(",")));
+    }
+    for dir in &config.guest_dirs {
+        if !dir.starts_with('/') || dir.contains([',', ' ']) {
+            return Err(format!(
+                "invalid guest dir {dir:?}: must be absolute and contain no ',' or space"
+            ));
+        }
+    }
+    if !config.guest_dirs.is_empty() {
+        cmdline.push_str(&format!(" k7d.mkdir={}", config.guest_dirs.join(",")));
+    }
+    if config.docker.is_some() {
+        cmdline.push_str(" k7d.docker=1");
+    }
+    Ok(cmdline)
+}
+
+/// A file name safe to use inside a jail: the source's stem, stripped
+/// of anything that is not `[A-Za-z0-9._-]`.
+///
+/// The name is cosmetic (the drive is addressed by `drive_id`), but it
+/// is the only thing an operator staring at `/proc/<pid>/fd` has to go
+/// on, so it keeps enough of the host name to be recognisable.
+fn file_stem_for_jail(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .map_or_else(|| "img".to_string(), |n| n.to_string_lossy().into_owned());
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    cleaned
+        .chars()
+        .rev()
+        .take(48)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// CID stored in the registry and the sandbox record.
+///
+/// Native guests are reachable at a host-global `AF_VSOCK` CID.
+/// Firecracker guests are not reachable over `AF_VSOCK` at all, so
+/// theirs is `0` — `VMADDR_CID_HYPERVISOR`, which is never a guest —
+/// and the response's `agent_endpoint` is what a client must use.
+const NO_HOST_CID: u64 = 0;
+
+fn registry_cid(g: &Guest) -> u64 {
+    g.guest_cid().unwrap_or(NO_HOST_CID)
+}
+
+fn native(g: &Guest) -> Result<&Vm, String> {
+    g.as_native().map_err(|e| e.to_string())
+}
+
+fn native_mut(g: &mut Guest) -> Result<&mut Vm, String> {
+    g.as_native_mut().map_err(|e| e.to_string())
+}
+
+/// Refuse a native-only cluster verb, naming the verb.
+///
+/// The `as_native_mut` these handlers reach for further down does
+/// refuse, but it says "native VMM access is not supported" — true, and
+/// useless to the caller, who asked for `warp_clock` and gets told
+/// about an accessor it has never heard of. The op has to be named,
+/// so the check happens here, before the collect.
+fn deny_non_native_members<'a, I>(vms: I, op: &'static str) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a Guest)>,
+{
+    let (vm_id, backend) = vms
+        .into_iter()
+        .map(|(id, g)| (id, g.backend()))
+        .find(|(_, b)| *b != Backend::Native)?;
+    Some(format!(
+        "{}: VM {vm_id} runs on it",
+        GuestError::Unsupported { backend, op }
+    ))
+}
+
+/// Daemon-unique suffix for a Firecracker tree root's jailer id.
+fn fc_tree_root_seq() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
+
+fn guest_cid_u64(g: &Guest) -> Result<u64, String> {
+    g.guest_cid()
+        .ok_or_else(|| format!("{:?} guest has no vsock CID", g.backend()))
 }
 
 impl Default for Daemon {
@@ -1722,9 +2408,14 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     pub fn handle(&self, req: Request) -> Response {
         match req {
-            Request::Ping => Response::Pong {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
+            Request::Ping => {
+                let c = crate::virtio_mmio::fork_nonquiescent_counts();
+                Response::Pong {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    fork_nonquiescent_blk: c.virtio_blk,
+                    fork_nonquiescent_net: c.virtio_net,
+                }
+            }
             Request::CreateVm { config } => self.create_vm(config),
             Request::VmStatus { vm_id } => self.vm_status(&vm_id),
             Request::DumpSerial { vm_id, guest_cid } => {
@@ -1733,6 +2424,11 @@ impl Daemon {
             Request::ListVms => self.list_vms(),
             Request::StopVm { vm_id } => self.stop_vm(&vm_id),
             Request::DeleteDataDisk { id } => self.delete_data_disk(&id),
+            Request::UpdateDrive {
+                vm_id,
+                device_index,
+                host_path,
+            } => self.update_drive(&vm_id, device_index, Path::new(&host_path)),
             Request::LookupSandbox { sandbox_id } => self.lookup_sandbox(&sandbox_id),
             Request::ReattachSandbox { sandbox_id } => self.reattach_sandbox(&sandbox_id),
             Request::ForkVm {
@@ -1790,14 +2486,18 @@ impl Daemon {
                                 let latency_ns =
                                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                                 let guest_cids = t.node_cids(&node_id);
+                                let agent_endpoints = t.node_endpoints(&node_id);
                                 let fork_memory_full_copy = t.node_fork_full_copy(&node_id);
                                 let dilation = t.node_dilation(&node_id).unwrap_or(1);
+                                let pause_skew_ns = t.last_pause_skew_ns();
                                 Response::TreeForked {
                                     node_id,
                                     guest_cids,
+                                    agent_endpoints,
                                     fork_memory_full_copy,
                                     latency_ns,
                                     dilation,
+                                    pause_skew_ns,
                                 }
                             }
                             Err(message) => Response::Error { message },
@@ -1821,17 +2521,24 @@ impl Daemon {
                             Ok(node_ids) => {
                                 let latency_ns =
                                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                                let pause_skew_ns = t.last_pause_skew_ns();
                                 let forks = node_ids
                                     .into_iter()
                                     .map(|node_id| TreeForkedBranch {
                                         guest_cids: t.node_cids(&node_id),
+                                        agent_endpoints: t.node_endpoints(&node_id),
                                         fork_memory_full_copy: t.node_fork_full_copy(&node_id),
                                         dilation: t.node_dilation(&node_id).unwrap_or(1),
                                         node_id,
                                         latency_ns,
+                                        pause_skew_ns,
                                     })
                                     .collect();
-                                Response::TreeForkBatch { forks, latency_ns }
+                                Response::TreeForkBatch {
+                                    forks,
+                                    latency_ns,
+                                    pause_skew_ns,
+                                }
                             }
                             Err(message) => Response::Error { message },
                         }
@@ -1849,6 +2556,7 @@ impl Daemon {
                                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                             Response::TreePrepared {
                                 guest_cids: t.node_cids(&node_id),
+                                agent_endpoints: t.node_endpoints(&node_id),
                                 latency_ns,
                                 node_id: node_id.clone(),
                                 wrote_base: outcome.wrote_base,
@@ -1888,10 +2596,12 @@ impl Daemon {
                             let dilation = t.node_dilation(&node_id).unwrap_or(1);
                             Response::TreeForked {
                                 guest_cids: t.node_cids(&node_id),
+                                agent_endpoints: t.node_endpoints(&node_id),
                                 fork_memory_full_copy: t.node_fork_full_copy(&node_id),
                                 node_id,
                                 latency_ns,
                                 dilation,
+                                pause_skew_ns: t.last_pause_skew_ns(),
                             }
                         }
                         Err(message) => Response::Error { message },
@@ -1934,6 +2644,7 @@ impl Daemon {
                 let resp = self.with_tree(&tree_id, |t| match t.resume(&node_id) {
                     Ok(()) => Response::TreeResumed {
                         guest_cids: t.node_cids(&node_id),
+                        agent_endpoints: t.node_endpoints(&node_id),
                         node_id: node_id.clone(),
                     },
                     Err(message) => Response::Error { message },
@@ -1985,6 +2696,8 @@ impl Daemon {
                     tun: report.tun(),
                     cgroup_v2: report.cgroup_v2(),
                     ok: report.ok(),
+                    fc_fork_mode: crate::fc::snapshot::fork_mode()
+                        .map_or_else(|e| format!("invalid ({e})"), |m| m.env_name().to_string()),
                     details: report.lines(),
                 }
             }
@@ -1992,16 +2705,15 @@ impl Daemon {
     }
 
     fn create_vm(&self, config: VmConfig) -> Response {
-        // Pool fast path. A pool-compatible
-        // request is served from the warm pool when it has an idle VM;
-        // a miss (incompatible or empty) cold-boots — never an error.
+        // Pool first for either backend. A miss
+        // (incompatible, empty, or no matching engine) cold-boots —
+        // never an error.
         if let Some(ref pool) = self.pool {
             if pool.compatible(&config) {
-                if let Some(vm) = pool.acquire() {
-                    let guest_cid = vm.guest_cid();
+                if let Some(vm) = pool.acquire(config.backend) {
+                    let guest_cid = registry_cid(&vm);
                     let vm_id = self.mint_vm_id();
-                    // Pool VMs are never CPU-capped: `Pool::compatible`
-                    // rejects configs carrying a `cpu_quota`.
+                    let agent_endpoint = vm.agent_endpoint();
                     return match self.register_vm(
                         vm_id,
                         vm,
@@ -2021,6 +2733,7 @@ impl Daemon {
                                 vm_index: None,
                                 pod_netns_attached: false,
                                 pooled: true,
+                                agent_endpoint: Some(agent_endpoint),
                             }
                         }
                         Err(message) => Response::Error { message },
@@ -2030,6 +2743,22 @@ impl Daemon {
                 pool.note_miss();
             }
         }
+        if config.backend == Backend::Firecracker {
+            return match self.build_and_start_fc(config) {
+                Ok(created) => Response::VmCreated {
+                    vm_id: created.vm_id,
+                    guest_cid: created.guest_cid,
+                    vm_index: created.vm_index,
+                    pod_netns_attached: created.pod_netns_attached,
+                    pooled: false,
+                    agent_endpoint: Some(created.agent_endpoint),
+                },
+                Err(message) => Response::Error { message },
+            };
+        }
+        if let Err(message) = deny_virtiofs_if_configured(&config) {
+            return Response::Error { message };
+        }
         match self.build_and_start(config) {
             Ok(created) => Response::VmCreated {
                 vm_id: created.vm_id,
@@ -2037,8 +2766,209 @@ impl Daemon {
                 vm_index: created.vm_index,
                 pod_netns_attached: created.pod_netns_attached,
                 pooled: false,
+                agent_endpoint: Some(created.agent_endpoint),
             },
             Err(message) => Response::Error { message },
+        }
+    }
+
+    /// Boot `config` on stock Firecracker under the stock jailer.
+    ///
+    /// The warm pool is tried in [`Self::create_vm`] before this path;
+    /// a miss lands here. Everything else a `runtimeClassName: k7` pod
+    /// needs is here — erofs and image-slot drives, scratch /
+    /// container-scratch / data / docker disks, and a TAP on the
+    /// cluster bridge.
+    #[allow(clippy::too_many_lines)]
+    fn build_and_start_fc(&self, config: VmConfig) -> Result<CreatedVm, String> {
+        deny_fc_unsupported(&config)?;
+        let artifacts = Self::resolve_vm_guest(&config)?;
+        let vm_id = self.mint_vm_id();
+        let base_cmdline = config
+            .cmdline
+            .clone()
+            .unwrap_or_else(|| crate::vm::DEFAULT_GUEST_CMDLINE.to_string());
+        if base_cmdline.trim().is_empty() {
+            return Err(
+                "config.cmdline is empty; omit the field to keep the builder default".to_string(),
+            );
+        }
+        log::info!(
+            "guest artifacts: kernel={} initrd={} backend=firecracker (from {})",
+            artifacts.kernel,
+            artifacts.initrd.as_deref().unwrap_or("(none)"),
+            if config.kernel.is_some() {
+                "the client's request"
+            } else {
+                "the daemon environment"
+            }
+        );
+
+        // Disks first, network second: a disk that cannot be
+        // provisioned must not leave a bridge reference behind, and the
+        // native path orders it the same way for the same reason.
+        let attachments = fc_attachments(&vm_id, &config, self)?;
+        // The guest agent learns what to mount and what to create from
+        // the cmdline, not from the VMM. On the native backend the
+        // `VmBuilder` appends these while it attaches the devices;
+        // Firecracker takes the boot args as one string, so the same
+        // tokens are appended here — without them the agent boots with
+        // no rootfs, no scratch and no `/run/k7d/tools/runc`, and the
+        // first container start fails with a bare ENOENT on runc.
+        let cmdline = fc_cmdline(&base_cmdline, &attachments.blk_mounts, &config)?;
+        log::info!("firecracker {vm_id} boot_args: {cmdline}");
+        let attachment = match config.network {
+            Some(ref net_cfg) => Some(self.acquire_network(net_cfg, true)?),
+            None => None,
+        };
+        let cluster_id = config.network.as_ref().map(|n| n.cluster_id.clone());
+
+        // From here on every failure must release the bridge reference.
+        let started = Self::spawn_fc(
+            &vm_id,
+            &config,
+            &artifacts,
+            cmdline,
+            attachments,
+            attachment,
+        );
+        let (fc, vm_index) = match started {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(ref cid) = cluster_id {
+                    Self::release_bridge_locked(&mut self.bridges.lock().unwrap(), cid, e.vm_index);
+                }
+                return Err(e.message);
+            }
+        };
+        let pid = fc.pid();
+
+        // Only now: Firecracker resolves the TAP by name in its own
+        // netns, so the device had to still be in the root one when it
+        // opened it. It holds the fd across the move, exactly as the
+        // native backend's VMM does.
+        let pod_netns = match (&config.network, vm_index) {
+            (Some(net_cfg), Some(idx)) => {
+                match self.attach_pod_netns(&net_cfg.cluster_id, idx, net_cfg.pod_netns.as_deref())
+                {
+                    Ok(path) => path,
+                    Err(e) => {
+                        drop(fc);
+                        if let Some(ref cid) = cluster_id {
+                            Self::release_bridge_locked(
+                                &mut self.bridges.lock().unwrap(),
+                                cid,
+                                vm_index,
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let guest: Guest = fc.into();
+        let agent_endpoint = guest.agent_endpoint();
+        let pod_netns_attached = pod_netns.is_some();
+        let registered = self.register_vm(
+            vm_id.clone(),
+            guest,
+            // The jailer's `--cgroup cpu.max=` already caps this VM;
+            // `VmCpuCgroup` caps threads of the *daemon*, which owns no
+            // vCPU on this backend.
+            None,
+            config.cpu_quota,
+            config.cpu_period,
+            config.sandbox_id,
+            cluster_id.clone(),
+            vm_index,
+            pod_netns,
+        );
+        if let Err(e) = registered {
+            if let Some(ref cid) = cluster_id {
+                Self::release_bridge_locked(&mut self.bridges.lock().unwrap(), cid, vm_index);
+            }
+            return Err(e);
+        }
+        log::info!("created {vm_id} on firecracker (pid={pid}, vm_index={vm_index:?})");
+        Ok(CreatedVm {
+            vm_id,
+            guest_cid: NO_HOST_CID,
+            vm_index,
+            pod_netns_attached,
+            agent_endpoint,
+        })
+    }
+
+    /// Stage, spawn, configure and boot the jailed VMM. Split out of
+    /// [`Self::build_and_start_fc`] so the bridge-release path above is
+    /// one `match` instead of a release call per failure.
+    fn spawn_fc(
+        vm_id: &str,
+        config: &VmConfig,
+        artifacts: &crate::config::GuestArtifacts,
+        cmdline: String,
+        attachments: FcAttachments,
+        attachment: Option<NetAttachment>,
+    ) -> Result<SpawnedFc, FcStartError> {
+        let (net, vm_index, tap) = match attachment {
+            Some(att) => {
+                let net = crate::fc::FcNet {
+                    host_dev_name: att.tap.name().to_string(),
+                    guest_mac: att.tap.mac(),
+                };
+                (Some(net), Some(att.vm_index), Some(att.tap))
+            }
+            None => (None, None, None),
+        };
+        let fail = |message: String| FcStartError { message, vm_index };
+
+        let fc_config = crate::fc::FcConfig {
+            vm_id: vm_id.to_string(),
+            memory_mb: config.memory_mb,
+            vcpus: config.vcpus,
+            kernel: PathBuf::from(&artifacts.kernel),
+            initrd: artifacts.initrd.as_ref().map(PathBuf::from),
+            cmdline,
+            cpu_quota_us: config.cpu_quota,
+            cpu_period_us: config.cpu_period,
+            drives: attachments.drives,
+            net,
+            // k7 fork (`ForkVm`) snapshots this VM; Diff
+            // needs dirty-page tracking. Tree roots already set this.
+            track_dirty_pages: true,
+        };
+        // `create` takes the TAP: it gives the device to the VM's uid
+        // and releases k7d's descriptor before Firecracker opens it, so
+        // a failure from here on drops the device with the VM.
+        let mut fc = crate::fc::FcVm::create(&fc_config, tap).map_err(|e| fail(e.to_string()))?;
+        fc.adopt_disks(attachments.disks);
+        fc.start()
+            .map_err(|e| fail(format!("start Firecracker VM: {e}")))?;
+        Ok((fc, vm_index))
+    }
+
+    /// `PATCH /drives` on a live Firecracker VM.
+    fn update_drive(&self, vm_id: &str, device_index: usize, host_path: &Path) -> Response {
+        let mut vms = self.vms.lock().unwrap();
+        let Some(entry) = vms.get_mut(vm_id) else {
+            return Response::Error {
+                message: format!("no such VM: {vm_id}"),
+            };
+        };
+        match entry.vm.update_drive(device_index, host_path) {
+            Ok(()) => {
+                log::info!(
+                    "update_drive: {vm_id} /dev/vd{} -> {}",
+                    device_letter(device_index),
+                    host_path.display()
+                );
+                Response::Ok
+            }
+            Err(e) => Response::Error {
+                message: format!("update_drive({vm_id}, {device_index}): {e}"),
+            },
         }
     }
 
@@ -2059,11 +2989,23 @@ impl Daemon {
     /// CNI pod netns. On any hard failure the bridge reference taken
     /// here is released again so a failed create never leaks a bridge.
     ///
-    /// The pod-netns attach itself is best-effort (warn + host-bridge
-    /// fallback), matching the historical shim behaviour: a pod
-    /// without CNI plumbing still boots and is reachable via the host
-    /// bridge.
-    fn acquire_network(&self, cfg: &NetConfig) -> Result<NetAttachment, String> {
+    /// A requested pod-netns attach (`cfg.pod_netns = Some`) that
+    /// cannot complete is a hard error — the TAP and bridge slot are
+    /// released with the `Err`. `pod_netns: None` means no CNI and
+    /// host-bridge is the intended network.
+    ///
+    /// `defer_pod_netns` holds that attach back for the caller to run
+    /// later ([`Self::attach_pod_netns`]). The Firecracker backend
+    /// needs it: its VMM opens the TAP **by name**, and `TUNSETIFF`
+    /// resolves that name in the *caller's* netns, so a TAP already
+    /// moved into the pod's namespace is invisible to it — the ioctl
+    /// then tries to create a new device and fails `EPERM` in the jail.
+    /// The native backend has the fd from creation and does not care.
+    fn acquire_network(
+        &self,
+        cfg: &NetConfig,
+        defer_pod_netns: bool,
+    ) -> Result<NetAttachment, String> {
         let mut bridges = self.bridges.lock().unwrap();
         if !bridges.contains_key(&cfg.cluster_id) {
             let net = ClusterNetwork::create(&cfg.cluster_id)
@@ -2099,47 +3041,96 @@ impl Daemon {
         };
         let vm_index = tap.vm_index();
 
-        let entry = bridges
-            .get_mut(&cfg.cluster_id)
-            .expect("bridge entry just ensured");
-        entry.refcount += 1;
+        {
+            let entry = bridges
+                .get_mut(&cfg.cluster_id)
+                .expect("bridge entry just ensured");
+            entry.refcount += 1;
+        }
 
         // Move the TAP into the CNI pod netns and install
-        // pod_ip ↔ guest_ip NAT. Best-effort — on failure the VM
-        // falls back to host-bridge networking (the TAP fd stays valid
-        // across the netns move).
-        let mut attached = None;
-        if let Some(ref netns) = cfg.pod_netns {
-            let netns_path = PathBuf::from(netns);
-            match crate::netns::link_addrs_v4(&netns_path, "eth0") {
-                Ok(addrs) => match addrs.into_iter().next() {
-                    Some(pod_ip) => {
-                        match entry.net.attach_to_pod_netns(vm_index, &netns_path, pod_ip) {
-                            Ok(()) => attached = Some(netns_path),
-                            Err(e) => log::warn!(
-                                "attach_to_pod_netns({vm_index}, {}, {pod_ip}) failed: {e}; \
-                                 falling back to host-bridge networking",
-                                netns_path.display()
-                            ),
-                        }
-                    }
-                    None => log::warn!(
-                        "pod netns {} eth0 has no IPv4 address; skipping CNI attach",
-                        netns_path.display()
-                    ),
-                },
-                Err(e) => log::warn!(
-                    "failed to read pod IP from {} eth0: {e}; skipping CNI attach",
-                    netns_path.display()
-                ),
+        // pod_ip ↔ guest_ip NAT. A requested attach that fails
+        // releases the TAP and the bridge reference taken above.
+        let attached = if defer_pod_netns {
+            None
+        } else {
+            let attach = {
+                let entry = bridges
+                    .get_mut(&cfg.cluster_id)
+                    .expect("bridge entry just ensured");
+                Self::attach_pod_netns_locked(&mut entry.net, vm_index, cfg.pod_netns.as_deref())
+            };
+            match attach {
+                Ok(path) => path,
+                Err(e) => {
+                    drop(tap);
+                    Self::release_bridge_locked(&mut bridges, &cfg.cluster_id, Some(vm_index));
+                    return Err(e);
+                }
             }
-        }
+        };
 
         Ok(NetAttachment {
             tap,
             vm_index,
             pod_netns: attached,
         })
+    }
+
+    /// Run the CNI attach `acquire_network` deferred: move the TAP into
+    /// the pod netns and install the `pod_ip` ↔ `guest_ip` NAT.
+    ///
+    /// `pod_netns: None` → `Ok(None)` (no CNI). A requested path that
+    /// cannot attach is `Err`.
+    fn attach_pod_netns(
+        &self,
+        cluster_id: &str,
+        vm_index: u32,
+        pod_netns: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        let Some(path) = pod_netns else {
+            return Ok(None);
+        };
+        let mut bridges = self.bridges.lock().unwrap();
+        let entry = bridges
+            .get_mut(cluster_id)
+            .ok_or_else(|| format!("CNI attach failed: no bridge for cluster {cluster_id}"))?;
+        Self::attach_pod_netns_locked(&mut entry.net, vm_index, Some(path))
+    }
+
+    /// Attach the TAP for `vm_index` into `pod_netns`.
+    ///
+    /// `pod_netns: None` → `Ok(None)` (host-bridge is correct). Any of
+    /// missing eth0 IPv4, `link_addrs_v4` error, or `attach_to_pod_netns`
+    /// error is `Err` naming the cause — never a silent host-bridge.
+    fn attach_pod_netns_locked(
+        net: &mut ClusterNetwork,
+        vm_index: u32,
+        pod_netns: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        let Some(pod_netns) = pod_netns else {
+            return Ok(None);
+        };
+        let netns_path = PathBuf::from(pod_netns);
+        let addrs = crate::netns::link_addrs_v4(&netns_path, "eth0").map_err(|e| {
+            format!(
+                "CNI attach failed: failed to read pod IP from {} eth0: {e}",
+                netns_path.display()
+            )
+        })?;
+        let Some(pod_ip) = addrs.into_iter().next() else {
+            return Err(format!(
+                "CNI attach failed: pod netns {} eth0 has no IPv4 address",
+                netns_path.display()
+            ));
+        };
+        match net.attach_to_pod_netns(vm_index, &netns_path, pod_ip) {
+            Ok(()) => Ok(Some(netns_path)),
+            Err(e) => Err(format!(
+                "CNI attach failed: attach_to_pod_netns({vm_index}, {}, {pod_ip}): {e}",
+                netns_path.display()
+            )),
+        }
     }
 
     /// Drop one reference on `cluster_id`'s bridge; destroy the bridge
@@ -2279,13 +3270,31 @@ impl Daemon {
                     dd.guest_mount
                 ));
             }
+            if let Some(holder) = self.live_data_disk_holder(&dd.id) {
+                return Err(format!(
+                    "data disk {:?} is attached to live VM {holder} — stop it or use another id",
+                    dd.id
+                ));
+            }
             let disk = crate::disks::DataDisk::attach(&dd.id, dd.size_bytes, &dd.guest_mount)
                 .map_err(|e| format!("attach data disk {}: {e}", dd.id))?;
             builder = builder.data_disk(disk);
         }
 
+        // Docker graph disk last of all, so every caller-computed
+        // `/dev/vdX` from `block_devices` / scratch / data disks still
+        // holds. The agent mounts it at `/var/lib/docker` via `k7d.blk=`.
+        if let Some(ref docker) = config.docker {
+            let disk = crate::disks::ScratchDisk::create(
+                &format!("{vm_id}-docker"),
+                docker.graph_size_bytes,
+            )
+            .map_err(|e| format!("provision docker graph disk for {vm_id}: {e}"))?;
+            builder = builder.docker_disk(disk);
+        }
+
         let attachment = match config.network {
-            Some(ref net_cfg) => Some(self.acquire_network(net_cfg)?),
+            Some(ref net_cfg) => Some(self.acquire_network(net_cfg, false)?),
             None => None,
         };
         let cluster_id = config.network.as_ref().map(|n| n.cluster_id.clone());
@@ -2328,10 +3337,11 @@ impl Daemon {
         };
         let guest_cid = vm.guest_cid();
         let pod_netns_attached = pod_netns.is_some();
+        let agent_endpoint = AgentEndpoint::Vsock { cid: guest_cid };
 
         self.register_vm(
             vm_id.clone(),
-            vm,
+            Guest::from(vm),
             cpu_cgroup,
             config.cpu_quota,
             config.cpu_period,
@@ -2346,6 +3356,7 @@ impl Daemon {
             guest_cid,
             vm_index,
             pod_netns_attached,
+            agent_endpoint,
         })
     }
 
@@ -2411,7 +3422,7 @@ impl Daemon {
     fn register_vm(
         &self,
         vm_id: String,
-        vm: Vm,
+        vm: Guest,
         cpu_cgroup: Option<crate::cgroup::VmCpuCgroup>,
         cpu_quota: Option<u64>,
         cpu_period: Option<u64>,
@@ -2420,8 +3431,10 @@ impl Daemon {
         vm_index: Option<u32>,
         pod_netns: Option<PathBuf>,
     ) -> Result<String, String> {
-        let guest_cid = vm.guest_cid();
+        let guest_cid = registry_cid(&vm);
         let vcpus = vm.vcpu_count();
+        let backend = vm.backend();
+        let agent_endpoint = vm.agent_endpoint();
         self.vms.lock().unwrap().insert(
             vm_id.clone(),
             VmEntry {
@@ -2448,6 +3461,8 @@ impl Daemon {
                 vm_index,
                 cluster_id,
                 pod_netns: pod_netns.map(|p| p.to_string_lossy().into_owned()),
+                agent_endpoint: Some(agent_endpoint),
+                backend,
                 created_at_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -2475,8 +3490,31 @@ impl Daemon {
     /// VM's first fork is the slow path (cold snapshot + restore). The
     /// source's vsock CID is preserved across prepare
     /// and echoed back as `source_guest_cid`.
-    #[allow(clippy::too_many_lines)]
     fn fork_vm(
+        &self,
+        vm_id: &str,
+        fork_sandbox_id: Option<String>,
+        dilation: Option<u32>,
+    ) -> Response {
+        let backend = {
+            let vms = self.vms.lock().unwrap();
+            match vms.get(vm_id) {
+                Some(entry) => entry.vm.backend(),
+                None => {
+                    return Response::Error {
+                        message: format!("no such VM: {vm_id}"),
+                    };
+                }
+            }
+        };
+        match backend {
+            Backend::Firecracker => self.fork_vm_fc(vm_id, fork_sandbox_id, dilation),
+            Backend::Native => self.fork_vm_native(vm_id, fork_sandbox_id, dilation),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fork_vm_native(
         &self,
         vm_id: &str,
         fork_sandbox_id: Option<String>,
@@ -2491,50 +3529,56 @@ impl Daemon {
                     message: format!("no such VM: {vm_id}"),
                 };
             };
-            if entry.vm.fork_source_base_path().is_none() {
-                // Daemon policy: sandbox VMs that still
-                // carry virtiofs shares are explicitly slow-fork — every
-                // fork is a full memfd copy. The opt-in is loud
-                // (`allow_slow_fork` warns) so nothing degrades silently.
-                if !entry.vm.virtiofs_shares().is_empty() {
-                    entry.vm.allow_slow_fork();
-                }
-                if let Err(e) = entry.vm.prepare_fork_source() {
-                    return Response::Error {
-                        message: format!("prepare_fork_source({vm_id}): {e}"),
-                    };
-                }
-                // prepare_fork_source swapped in a restored VM with
-                // fresh vCPU threads — a capped VM must land back in
-                // its CPU cgroup with ALL N kernel TIDs,
-                // or the quota silently stops applying.
-                if let Some(cg) = &entry.cpu_cgroup {
-                    let Some(tids) = entry.vm.vcpu_kernel_tids(Duration::from_secs(5)) else {
+            {
+                let native = match native_mut(&mut entry.vm) {
+                    Ok(v) => v,
+                    Err(message) => return Response::Error { message },
+                };
+                if native.fork_source_base_path().is_none() {
+                    // Daemon policy: sandbox VMs that still
+                    // carry virtiofs shares are explicitly slow-fork — every
+                    // fork is a full memfd copy. The opt-in is loud
+                    // (`allow_slow_fork` warns) so nothing degrades silently.
+                    if !native.virtiofs_shares().is_empty() {
+                        native.allow_slow_fork();
+                    }
+                    if let Err(e) = native.prepare_fork_source() {
                         return Response::Error {
-                            message: format!(
-                                "prepare_fork_source({vm_id}): restored vCPU threads never \
-                                 published kernel TIDs — cannot re-apply the CPU cap"
-                            ),
+                            message: format!("prepare_fork_source({vm_id}): {e}"),
                         };
-                    };
-                    for tid in tids {
-                        if let Err(e) = cg.add_thread(tid) {
+                    }
+                    // prepare_fork_source swapped in a restored VM with
+                    // fresh vCPU threads — a capped VM must land back in
+                    // its CPU cgroup with ALL N kernel TIDs,
+                    // or the quota silently stops applying.
+                    if let Some(cg) = &entry.cpu_cgroup {
+                        let Some(tids) = native.vcpu_kernel_tids(Duration::from_secs(5)) else {
                             return Response::Error {
                                 message: format!(
-                                    "prepare_fork_source({vm_id}): re-attach vCPU TID {tid} \
-                                     to CPU cgroup: {e}"
+                                    "prepare_fork_source({vm_id}): restored vCPU threads never \
+                                     published kernel TIDs — cannot re-apply the CPU cap"
                                 ),
                             };
+                        };
+                        for tid in tids {
+                            if let Err(e) = cg.add_thread(tid) {
+                                return Response::Error {
+                                    message: format!(
+                                        "prepare_fork_source({vm_id}): re-attach vCPU TID {tid} \
+                                         to CPU cgroup: {e}"
+                                    ),
+                                };
+                            }
                         }
                     }
+                    entry.guest_cid = native.guest_cid();
+                    log::info!(
+                        "{vm_id} prepared as fork source (guest_cid={} preserved)",
+                        entry.guest_cid
+                    );
                 }
-                entry.guest_cid = entry.vm.guest_cid();
-                log::info!(
-                    "{vm_id} prepared as fork source (guest_cid={} preserved)",
-                    entry.guest_cid
-                );
             }
-            let mut fork = match entry.vm.fork_warm_batch(&[&fork_id], dilation) {
+            let mut fork = match entry.vm.fork_batch(&[&fork_id], dilation) {
                 Ok(mut forks) => forks.pop().expect("single fork"),
                 Err(e) => {
                     return Response::Error {
@@ -2561,7 +3605,7 @@ impl Daemon {
                     cpu_period: Some(period),
                     ..VmConfig::default()
                 };
-                match Self::apply_cpu_cap(&fork_id, &fork, &cap_cfg) {
+                match native(&fork).and_then(|n| Self::apply_cpu_cap(&fork_id, n, &cap_cfg)) {
                     Ok(cg) => cg,
                     Err(message) => {
                         drop(fork);
@@ -2571,9 +3615,21 @@ impl Daemon {
             }
             _ => None,
         };
-        let guest_cid = fork.guest_cid();
+        let guest_cid = match guest_cid_u64(&fork) {
+            Ok(c) => c,
+            Err(message) => {
+                drop(fork);
+                return Response::Error { message };
+            }
+        };
         let vcpus = fork.vcpu_count();
-        let dilation = fork.dilation();
+        let dilation = match native(&fork) {
+            Ok(n) => n.dilation(),
+            Err(message) => {
+                drop(fork);
+                return Response::Error { message };
+            }
+        };
         vms.insert(
             fork_id.clone(),
             VmEntry {
@@ -2603,6 +3659,8 @@ impl Daemon {
                 vm_index: None,
                 cluster_id: None,
                 pod_netns: None,
+                agent_endpoint: Some(AgentEndpoint::Vsock { cid: guest_cid }),
+                backend: Backend::Native,
                 created_at_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -2628,6 +3686,170 @@ impl Daemon {
             guest_cid,
             source_guest_cid,
             dilation,
+            agent_endpoint: Some(AgentEndpoint::Vsock { cid: guest_cid }),
+        }
+    }
+
+    /// Firecracker `fork_vm`: snapshot point + `LoadSnapshot` child,
+    /// with a new TAP on the source's cluster bridge when the source
+    /// is networked. Children are already running (`resume_vm: true`).
+    #[allow(clippy::too_many_lines)]
+    fn fork_vm_fc(
+        &self,
+        vm_id: &str,
+        fork_sandbox_id: Option<String>,
+        dilation: Option<u32>,
+    ) -> Response {
+        if dilation.is_some() {
+            return Response::Error {
+                message: GuestError::Unsupported {
+                    backend: Backend::Firecracker,
+                    op: "fork_vm with dilation",
+                }
+                .to_string(),
+            };
+        }
+        let fork_id = self.mint_vm_id();
+        let (cluster_id, cpu_quota, cpu_period, source_guest_cid) = {
+            let vms = self.vms.lock().unwrap();
+            let Some(entry) = vms.get(vm_id) else {
+                return Response::Error {
+                    message: format!("no such VM: {vm_id}"),
+                };
+            };
+            (
+                entry.cluster_id.clone(),
+                entry.cpu_quota,
+                entry.cpu_period,
+                entry.guest_cid,
+            )
+        };
+
+        let attachment = match cluster_id.as_deref() {
+            Some(cid) => match self.acquire_network(
+                &NetConfig {
+                    cluster_id: cid.to_string(),
+                    vm_index: None,
+                    pod_netns: None,
+                },
+                true,
+            ) {
+                Ok(a) => Some(a),
+                Err(message) => return Response::Error { message },
+            },
+            None => None,
+        };
+        let child_vm_index = attachment.as_ref().map(|a| a.vm_index);
+        let tap = attachment.map(|a| a.tap);
+
+        let release_tap = |tap: Option<crate::network::TapDevice>| {
+            drop(tap);
+            if let Some(cid) = cluster_id.as_deref() {
+                Self::release_bridge_locked(&mut self.bridges.lock().unwrap(), cid, child_vm_index);
+            }
+        };
+
+        let child = {
+            let mut vms = self.vms.lock().unwrap();
+            let Some(entry) = vms.get_mut(vm_id) else {
+                release_tap(tap);
+                return Response::Error {
+                    message: format!("no such VM: {vm_id}"),
+                };
+            };
+            let fc = match entry.vm.as_fc_mut() {
+                Ok(fc) => fc,
+                Err(e) => {
+                    release_tap(tap);
+                    return Response::Error {
+                        message: e.to_string(),
+                    };
+                }
+            };
+            if let Err(e) = fc.prepare_fork_source() {
+                release_tap(tap);
+                return Response::Error {
+                    message: format!("prepare_fork_source({vm_id}): {e}"),
+                };
+            }
+            match fc.spawn_child(tap) {
+                Ok(child) => child,
+                Err(e) => {
+                    if let Some(cid) = cluster_id.as_deref() {
+                        Self::release_bridge_locked(
+                            &mut self.bridges.lock().unwrap(),
+                            cid,
+                            child_vm_index,
+                        );
+                    }
+                    return Response::Error {
+                        message: format!("fork_vm({vm_id}): {e}"),
+                    };
+                }
+            }
+        };
+
+        let guest = Guest::from(child);
+        let agent_endpoint = guest.agent_endpoint();
+        let guest_cid = registry_cid(&guest);
+        let vcpus = guest.vcpu_count();
+        {
+            let mut vms = self.vms.lock().unwrap();
+            vms.insert(
+                fork_id.clone(),
+                VmEntry {
+                    vm: guest,
+                    cpu_cgroup: None,
+                    cpu_quota,
+                    cpu_period,
+                    guest_cid,
+                    sandbox_id: fork_sandbox_id.clone(),
+                    cluster_id: cluster_id.clone(),
+                    vm_index: child_vm_index,
+                    pod_netns: None,
+                },
+            );
+        }
+        if let Some(sandbox_id) = fork_sandbox_id {
+            let record = SandboxRecord {
+                sandbox_id: sandbox_id.clone(),
+                vm_id: fork_id.clone(),
+                guest_cid,
+                vcpus,
+                cpu_quota,
+                cpu_period,
+                vm_index: child_vm_index,
+                cluster_id: cluster_id.clone(),
+                pod_netns: None,
+                agent_endpoint: Some(agent_endpoint.clone()),
+                backend: Backend::Firecracker,
+                created_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = write_sandbox_record(&record) {
+                let mut vms = self.vms.lock().unwrap();
+                if let Some(entry) = vms.remove(&fork_id) {
+                    drop(vms);
+                    self.teardown_entry(&fork_id, entry);
+                }
+                return Response::Error {
+                    message: format!("persist sandbox record for fork {sandbox_id}: {e}"),
+                };
+            }
+            self.sandboxes
+                .lock()
+                .unwrap()
+                .insert(sandbox_id, fork_id.clone());
+        }
+        log::info!("forked {vm_id} -> {fork_id} (firecracker, guest_cid={guest_cid})");
+        Response::VmForked {
+            vm_id: fork_id,
+            guest_cid,
+            source_guest_cid,
+            dilation: 1,
+            agent_endpoint: Some(agent_endpoint),
         }
     }
 
@@ -2654,7 +3876,7 @@ impl Daemon {
 
     /// Resume a paused `vm_id`. Fresh vCPU threads of a CFS-capped VM
     /// are re-attached to its CPU cgroup — same invariant as the
-    /// fork-source prepare swap (/17c).
+    /// fork-source prepare swap.
     fn resume_vm(&self, vm_id: &str) -> Response {
         let mut vms = self.vms.lock().unwrap();
         let Some(entry) = vms.get_mut(vm_id) else {
@@ -2696,7 +3918,7 @@ impl Daemon {
     }
 
     /// Advance every VM on `cluster_id`'s guest clock by `delta_ms`,
-    /// atomically under pause .
+    /// atomically under pause.
     ///
     /// The registry lock is held across the whole cycle, so no VM on the
     /// cluster can be stopped, forked or paused mid-warp.
@@ -2723,8 +3945,24 @@ impl Daemon {
         members.sort_by(|a, b| (a.1.vm_index, a.0).cmp(&(b.1.vm_index, b.0)));
         let vm_ids: Vec<String> = members.iter().map(|(id, _)| (*id).clone()).collect();
 
-        let mut targets: Vec<&mut crate::vm::Vm> =
-            members.iter_mut().map(|(_, e)| &mut e.vm).collect();
+        if let Some(message) = deny_non_native_members(
+            members.iter().map(|(id, e)| (id.as_str(), &e.vm)),
+            "warp_clock",
+        ) {
+            return Response::Error { message };
+        }
+        let mut targets: Vec<&mut crate::vm::Vm> = match members
+            .iter_mut()
+            .map(|(_, e)| e.vm.as_native_mut())
+            .collect()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Response::Error {
+                    message: e.to_string(),
+                }
+            }
+        };
         let latency =
             match crate::vm::warp_clock_lockstep(&mut targets, Duration::from_millis(delta_ms)) {
                 Ok(latency) => latency,
@@ -2756,7 +3994,7 @@ impl Daemon {
     }
 
     /// Change the dilation factor of every VM on `cluster_id`, atomically
-    /// under pause .
+    /// under pause.
     ///
     /// Members come from the `CreateVm` registry *or* from the cluster
     /// tree: `tree_create_cluster` / `tree_fork_batch` own their VMs
@@ -2793,8 +4031,15 @@ impl Daemon {
             let vm_ids: Vec<String> = (0..tree_members.len())
                 .map(|i| format!("{cluster_id}#{i}"))
                 .collect();
-            let mut targets: Vec<&mut Vm> = tree_members.iter_mut().collect();
-            return match crate::vm::set_dilation_lockstep(&mut targets, factor) {
+            let mut natives = match native_vms_mut(tree_members) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Response::Error {
+                        message: e.to_string(),
+                    }
+                }
+            };
+            return match crate::vm::set_dilation_lockstep(&mut natives, factor) {
                 // Tree members have no CreateVm CFS cgroup to reattach.
                 Ok(latency) => Self::dilation_set(cluster_id, vm_ids, factor, latency),
                 Err(e) => Response::Error {
@@ -2806,8 +4051,24 @@ impl Daemon {
         members.sort_by(|a, b| (a.1.vm_index, a.0).cmp(&(b.1.vm_index, b.0)));
         let vm_ids: Vec<String> = members.iter().map(|(id, _)| (*id).clone()).collect();
 
-        let mut targets: Vec<&mut crate::vm::Vm> =
-            members.iter_mut().map(|(_, e)| &mut e.vm).collect();
+        if let Some(message) = deny_non_native_members(
+            members.iter().map(|(id, e)| (id.as_str(), &e.vm)),
+            "set_dilation",
+        ) {
+            return Response::Error { message };
+        }
+        let mut targets: Vec<&mut crate::vm::Vm> = match members
+            .iter_mut()
+            .map(|(_, e)| e.vm.as_native_mut())
+            .collect()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Response::Error {
+                    message: e.to_string(),
+                }
+            }
+        };
         let latency = match crate::vm::set_dilation_lockstep(&mut targets, factor) {
             Ok(latency) => latency,
             Err(e) => {
@@ -2846,8 +4107,7 @@ impl Daemon {
         }
     }
 
-    /// Start, switch or stop `cluster_id`'s auto-warp policy loop
-    /// .
+    /// Start, switch or stop `cluster_id`'s auto-warp policy loop.
     ///
     /// A mode change always stops the loop in flight first, and stopping
     /// joins it: a cycle owns the registry lock and may have the whole
@@ -2893,6 +4153,20 @@ impl Daemon {
             return Response::Error {
                 message: format!("auto_warp: no VM on cluster {cluster_id}"),
             };
+        }
+        // Refuse here rather than inside the loop: a loop that discovers
+        // the backend on its first cycle logs an error nobody is reading
+        // and leaves the caller believing auto-warp is on.
+        if let Some(message) = deny_non_native_members(
+            self.vms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, e)| e.cluster_id.as_deref() == Some(cluster_id))
+                .map(|(id, e)| (id.as_str(), &e.vm)),
+            "auto_warp",
+        ) {
+            return Response::Error { message };
         }
 
         let mut driver = Driver::new(mode);
@@ -2977,11 +4251,24 @@ impl Daemon {
                         );
                         break;
                     };
-                    let mut targets: Vec<&mut Vm> = members.iter_mut().collect();
-                    driver.cycle(&mut targets, in_flight.as_deref())
+                    let mut natives = match native_vms_mut(members) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!("auto-warp: {e}");
+                            break;
+                        }
+                    };
+                    driver.cycle(&mut natives, in_flight.as_deref())
                 } else {
                     members.sort_by_key(|e| e.vm_index);
-                    let mut targets: Vec<&mut Vm> = members.iter_mut().map(|e| &mut e.vm).collect();
+                    let mut targets: Vec<&mut Vm> =
+                        match members.iter_mut().map(|e| e.vm.as_native_mut()).collect() {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::error!("auto-warp: {e}");
+                                break;
+                            }
+                        };
                     let cycle = driver.cycle(&mut targets, in_flight.as_deref());
                     drop(targets);
                     // A resumed VM runs on fresh vCPU threads, and a
@@ -3101,32 +4388,8 @@ impl Daemon {
         config: &VmConfig,
         tap: Option<TapDevice>,
     ) -> Result<(Vm, crate::api::AgentClient), String> {
-        if config.scratch_size_bytes.is_some() || !config.container_scratch.is_empty() {
-            // A tree payload VM is owned by the SnapshotTree, not by a
-            // sandbox, and its whole point is to be forked repeatedly.
-            // Rather than quietly drop the request (the failure
-            // mode is exactly a writable layer that isn't where the
-            // caller thinks), refuse it.
-            return Err(
-                "scratch_size_bytes / container_scratch are not supported for tree payload \
-                 VMs — a tree node's writable layer comes from the sandbox VMs it adopts \
-"
-                .to_string(),
-            );
-        }
-        if !config.data_disks.is_empty() {
-            // Same refusal, sharper reason: a tree payload is forked
-            // repeatedly, and every branch would want *its own* copy of a
-            // disk whose whole identity is that it is shared across VMs.
-            // A node that wants persistent storage gets it from the
-            // sandbox VMs the tree adopts.
-            return Err(
-                "data_disks are not supported for tree payload VMs — a tree node is forked \
-                 repeatedly and a persistent disk has one identity; attach it to the sandbox \
-                 VMs the tree adopts instead"
-                    .to_string(),
-            );
-        }
+        deny_virtiofs_if_configured(config)?;
+        deny_tree_payload_extras(config)?;
         let artifacts = Self::resolve_vm_guest(config)?;
         let mut builder = Vm::builder()
             .kernel(&artifacts.kernel)
@@ -3166,6 +4429,89 @@ impl Daemon {
         Ok((vm, agent))
     }
 
+    /// Firecracker twin of [`Self::boot_tree_member`]:
+    /// boot `config` on stock Firecracker with `track_dirty_pages` on,
+    /// so the root's Diff points are exactly the pages written since
+    /// the previous one, and wait for the agent.
+    ///
+    /// The open agent connection is returned for the same reason as
+    /// the native path's, with the opposite effect: Firecracker resets
+    /// it at the root's first snapshot point, and holding it across
+    /// that point is what proves the reconnect path before any client
+    /// depends on it.
+    fn boot_fc_tree_member(
+        config: &VmConfig,
+        tap: Option<TapDevice>,
+    ) -> Result<(Guest, crate::api::AgentClient), String> {
+        deny_fc_unsupported(config)?;
+        deny_tree_payload_extras(config)?;
+        let artifacts = Self::resolve_vm_guest(config)?;
+        let base_cmdline = config
+            .cmdline
+            .clone()
+            .unwrap_or_else(|| crate::vm::DEFAULT_GUEST_CMDLINE.to_string());
+        if base_cmdline.trim().is_empty() {
+            return Err(
+                "config.cmdline is empty; omit the field to keep the builder default".to_string(),
+            );
+        }
+        let vm_id = format!("fct-{}-{}", std::process::id(), fc_tree_root_seq());
+        // A tree payload has no scratch / data / docker disks (refused
+        // above), so this is the caller's `block_devices`, in guest
+        // device order, and nothing else.
+        let mut drives = Vec::new();
+        let mut blk_mounts = Vec::new();
+        for (i, blk) in config.block_devices.iter().enumerate() {
+            let host_path = PathBuf::from(&blk.host_path);
+            let mount = match (&blk.guest_mount, &blk.fstype) {
+                (Some(gm), Some(fstype)) => Some((gm.as_str(), fstype.as_str())),
+                (None, None) => None,
+                _ => {
+                    return Err(format!(
+                        "block device {}: guest_mount and fstype must be set together",
+                        blk.host_path
+                    ))
+                }
+            };
+            push_drive(
+                &mut drives,
+                &mut blk_mounts,
+                crate::fc::FcDrive {
+                    name: format!("blk{i}-{}", file_stem_for_jail(&host_path)),
+                    host_path,
+                    read_only: blk.readonly,
+                },
+                mount,
+            )?;
+        }
+        let cmdline = fc_cmdline(&base_cmdline, &blk_mounts, config)?;
+        log::info!("firecracker tree root {vm_id} boot_args: {cmdline}");
+        let net = tap.as_ref().map(|t| crate::fc::FcNet {
+            host_dev_name: t.name().to_string(),
+            guest_mac: t.mac(),
+        });
+        let fc_config = crate::fc::FcConfig {
+            vm_id,
+            memory_mb: config.memory_mb,
+            vcpus: config.vcpus,
+            kernel: PathBuf::from(&artifacts.kernel),
+            initrd: artifacts.initrd.as_ref().map(PathBuf::from),
+            cmdline,
+            cpu_quota_us: config.cpu_quota,
+            cpu_period_us: config.cpu_period,
+            drives,
+            net,
+            track_dirty_pages: true,
+        };
+        let mut fc = crate::fc::FcVm::create(&fc_config, tap).map_err(|e| e.to_string())?;
+        fc.start()
+            .map_err(|e| format!("start Firecracker tree root: {e}"))?;
+        let agent = fc
+            .connect_agent(Duration::from_secs(90))
+            .map_err(|e| format!("guest agent never became ready: {e}"))?;
+        Ok((Guest::from(fc), agent))
+    }
+
     /// Verify the restored/live members of `node_id` answer on their
     /// (new) CIDs before we hand those CIDs to the client. Fails loudly
     /// — returning a dead CID would surface later as an inscrutable
@@ -3176,17 +4522,18 @@ impl Daemon {
                 let vm = t
                     .get_vm(node_id)
                     .ok_or_else(|| format!("node {node_id} has no live VM"))?;
+                let endpoint = vm.agent_endpoint();
                 vm.connect_agent(Duration::from_secs(30))
-                    .map_err(|e| format!("agent on restored CID {}: {e}", vm.guest_cid()))?;
+                    .map_err(|e| format!("agent on restored {endpoint:?}: {e}"))?;
             }
             TreePayload::Cluster(t) => {
                 let p = t
                     .get_payload(node_id)
                     .ok_or_else(|| format!("node {node_id} has no live payload"))?;
                 for (i, vm) in p.members.iter().enumerate() {
-                    vm.connect_agent(Duration::from_secs(30)).map_err(|e| {
-                        format!("agent on member {i} (CID {}): {e}", vm.guest_cid())
-                    })?;
+                    let endpoint = vm.agent_endpoint();
+                    vm.connect_agent(Duration::from_secs(30))
+                        .map_err(|e| format!("agent on member {i} ({endpoint:?}): {e}"))?;
                 }
             }
         }
@@ -3225,6 +4572,7 @@ impl Daemon {
     /// concurrent `tree_create`s with the same explicit id).
     fn insert_tree(&self, tree_id: String, payload: TreePayload, guest_cids: Vec<u64>) -> Response {
         use std::collections::hash_map::Entry;
+        let agent_endpoints = payload.node_endpoints(&"root".to_string());
         match self.trees.lock().unwrap().entry(tree_id.clone()) {
             Entry::Occupied(_) => Response::Error {
                 message: format!("tree {tree_id} already exists (created concurrently)"),
@@ -3236,6 +4584,7 @@ impl Daemon {
                     tree_id,
                     root_id: "root".to_string(),
                     guest_cids,
+                    agent_endpoints,
                 }
             }
         }
@@ -3262,20 +4611,29 @@ impl Daemon {
             Ok(id) => id,
             Err(message) => return Response::Error { message },
         };
-        let (vm, agent) = match Self::boot_tree_member(config, None) {
+        let booted = match config.backend {
+            Backend::Native => {
+                Self::boot_tree_member(config, None).map(|(vm, agent)| (Guest::from(vm), agent))
+            }
+            Backend::Firecracker => Self::boot_fc_tree_member(config, None),
+        };
+        let (root, agent) = match booted {
             Ok(v) => v,
             Err(message) => return Response::Error { message },
         };
         let root_dir = tree_root_dir().join(&tree_id);
-        let (tree, root_id) =
-            match SnapshotTree::new(vm, root_dir, budget.unwrap_or_else(default_tree_budget)) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Response::Error {
-                        message: format!("SnapshotTree::new: {e}"),
-                    }
+        let (tree, root_id) = match SnapshotTree::new_guest(
+            root,
+            root_dir,
+            budget.unwrap_or_else(default_tree_budget),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("SnapshotTree::new: {e}"),
                 }
-            };
+            }
+        };
         // The pre-snapshot connection has served its purpose (see
         // boot_tree_member) — the snapshot has been taken.
         drop(agent);
@@ -3481,7 +4839,7 @@ impl Daemon {
         };
 
         // Apply the requested egress posture before anything becomes
-        // irreversible : sandbox bridges are born Open, and
+        // irreversible: sandbox bridges are born Open, and
         // an adopt into a contained tree re-installs the jail ruleset
         // atomically. On failure everything goes back where it was.
         let mut bridge = bridge;
@@ -3620,8 +4978,12 @@ impl Daemon {
                 let tap = net
                     .add_tap()
                     .map_err(|e| format!("add_tap (member {i}): {e}"))?;
-                let (vm, agent) = Self::boot_tree_member(config, Some(tap))
-                    .map_err(|e| format!("member {i}: {e}"))?;
+                let (vm, agent) = match config.backend {
+                    Backend::Native => Self::boot_tree_member(config, Some(tap))
+                        .map(|(vm, agent)| (Guest::from(vm), agent)),
+                    Backend::Firecracker => Self::boot_fc_tree_member(config, Some(tap)),
+                }
+                .map_err(|e| format!("member {i}: {e}"))?;
                 members.push(vm);
                 agents.push(agent);
             }
@@ -3727,6 +5089,7 @@ impl Daemon {
             op: op.to_string(),
             node_id: node_id.map(str::to_string),
             latency_ns,
+            pause_skew_ns: None,
         };
         let mut subs = self.watchers.lock().unwrap();
         subs.retain(|s| {
@@ -3743,15 +5106,44 @@ impl Daemon {
             Response::TreeForked {
                 node_id,
                 latency_ns,
+                pause_skew_ns,
                 ..
-            } => self.emit_tree_event(tree_id, "fork", Some(node_id), Some(*latency_ns)),
-            Response::TreeForkBatch { forks, latency_ns } => {
+            } => self.emit_fork_event(tree_id, node_id, *latency_ns, *pause_skew_ns),
+            Response::TreeForkBatch {
+                forks,
+                latency_ns,
+                pause_skew_ns,
+            } => {
                 for f in forks {
-                    self.emit_tree_event(tree_id, "fork", Some(&f.node_id), Some(*latency_ns));
+                    self.emit_fork_event(tree_id, &f.node_id, *latency_ns, *pause_skew_ns);
                 }
             }
             _ => {}
         }
+    }
+
+    fn emit_fork_event(
+        &self,
+        tree_id: &str,
+        node_id: &str,
+        latency_ns: u64,
+        pause_skew_ns: Option<u64>,
+    ) {
+        let ev = TreeEvent {
+            tree_id: tree_id.to_string(),
+            op: "fork".to_string(),
+            node_id: Some(node_id.to_string()),
+            latency_ns: Some(latency_ns),
+            pause_skew_ns,
+        };
+        let mut subs = self.watchers.lock().unwrap();
+        subs.retain(|s| {
+            if s.tree_id.as_deref().is_none_or(|id| id == tree_id) {
+                s.tx.send(ev.clone()).is_ok()
+            } else {
+                true
+            }
+        });
     }
 
     /// Re-open an on-disk cluster tree. See [`Request::TreeOpen`].
@@ -3832,6 +5224,8 @@ impl Daemon {
                 vm_index: entry.vm_index,
                 cluster_id: entry.cluster_id.clone(),
                 pod_netns_attached: entry.pod_netns.is_some(),
+                agent_endpoint: Some(entry.vm.agent_endpoint()),
+                backend: entry.vm.backend(),
             },
             // Index says the VM exists but the registry disagrees —
             // should be unreachable (both are updated under stop_vm).
@@ -3849,7 +5243,7 @@ impl Daemon {
         let found = self.lookup_sandbox(sandbox_id);
         let Response::SandboxFound {
             ref vm_id,
-            guest_cid,
+            ref agent_endpoint,
             ..
         } = found
         else {
@@ -3875,15 +5269,20 @@ impl Daemon {
             return found;
         };
 
-        // Liveness check outside any lock — the vsock connect can
+        // Liveness check outside any lock — the connect can
         // legitimately take a moment and must not stall the control
-        // plane. CIDs are kernel-global so the daemon dials the guest
-        // the same way any client does.
-        let ping = crate::api::AgentClient::connect_vsock(guest_cid, Duration::from_secs(10))
+        // plane. The daemon dials the guest the same way any client
+        // does: over the endpoint the VM's backend published.
+        let Some(endpoint) = agent_endpoint.clone() else {
+            return Response::Error {
+                message: format!("sandbox {sandbox_id}: VM has no agent endpoint"),
+            };
+        };
+        let ping = crate::api::AgentClient::connect_endpoint(&endpoint, Duration::from_secs(10))
             .and_then(|mut agent| agent.ping().map(|_| ()));
         if let Err(e) = ping {
             log::error!(
-                "reattach_sandbox({sandbox_id}): VM {vm_id} (cid {guest_cid}) is \
+                "reattach_sandbox({sandbox_id}): VM {vm_id} ({endpoint:?}) is \
                  unresponsive: {e}; tearing it down"
             );
             let vm_id = vm_id.clone();
@@ -3901,14 +5300,33 @@ impl Daemon {
     fn vm_status(&self, vm_id: &str) -> Response {
         let vms = self.vms.lock().unwrap();
         match vms.get(vm_id) {
-            Some(entry) => Response::VmState {
-                vm_id: vm_id.to_string(),
-                state: "running".to_string(),
-                guest_cid: entry.guest_cid,
-                virtiofs_shares: entry.vm.virtiofs_shares().len(),
-                block_devices: entry.vm.block_devices().len(),
-                fork_memory_full_copy: entry.vm.fork_memory_is_full_copy(),
-                kernel: entry.vm.kernel_path().to_string_lossy().into_owned(),
+            // A Firecracker VM has no in-process VMM to interrogate, so
+            // the native-only fields answer for the engine rather than
+            // failing the whole call: `fork_memory_full_copy` is a
+            // property of k7d's `MAP_PRIVATE` fork (Firecracker has its
+            // own), and the kernel path is one the jailed process was
+            // handed rather than one this process opened.
+            Some(entry) => match &entry.vm {
+                Guest::Native(native) => Response::VmState {
+                    vm_id: vm_id.to_string(),
+                    state: "running".to_string(),
+                    guest_cid: entry.guest_cid,
+                    virtiofs_shares: entry.vm.virtiofs_shares().len(),
+                    block_devices: native.block_devices().len(),
+                    fork_memory_full_copy: native.fork_memory_is_full_copy(),
+                    kernel: native.kernel_path().to_string_lossy().into_owned(),
+                    backend: Backend::Native,
+                },
+                Guest::Firecracker(fc) => Response::VmState {
+                    vm_id: vm_id.to_string(),
+                    state: if fc.paused() { "paused" } else { "running" }.to_string(),
+                    guest_cid: entry.guest_cid,
+                    virtiofs_shares: 0,
+                    block_devices: fc.drive_count(),
+                    fork_memory_full_copy: false,
+                    kernel: String::new(),
+                    backend: Backend::Firecracker,
+                },
             },
             None => Response::Error {
                 message: format!("no such VM: {vm_id}"),
@@ -3921,50 +5339,35 @@ impl Daemon {
             let vms = self.vms.lock().unwrap();
             if let Some(id) = vm_id {
                 if let Some(entry) = vms.get(id) {
-                    return Response::SerialDump {
-                        vm_id: id.to_string(),
-                        guest_cid: entry.vm.guest_cid(),
-                        console: entry.vm.serial_output(Duration::ZERO),
-                    };
+                    return serial_dump_guest(id.to_string(), &entry.vm);
                 }
             }
-            if let Some(cid) = guest_cid {
+            // `registry_cid` is 0 for every Firecracker VM
+            // (`NO_HOST_CID`); a dump by CID 0 must not match them.
+            if let Some(cid) = guest_cid.filter(|&c| c != NO_HOST_CID) {
                 if let Some((id, entry)) = vms
                     .iter()
-                    .find(|(_, e)| e.guest_cid == cid || e.vm.guest_cid() == cid)
+                    .find(|(_, e)| e.guest_cid == cid || e.vm.guest_cid() == Some(cid))
                 {
-                    return Response::SerialDump {
-                        vm_id: id.clone(),
-                        guest_cid: entry.vm.guest_cid(),
-                        console: entry.vm.serial_output(Duration::ZERO),
-                    };
+                    return serial_dump_guest(id.clone(), &entry.vm);
                 }
             }
         }
 
         let trees = self.trees.lock().unwrap();
         // Composite id `{tree_id}/{node_id}` is what we echo for tree
-        // members — looking it back up must work without a CID.
+        // members — looking it back up must work without a CID, including
+        // Firecracker nodes whose `node_cids` is empty.
         if let Some(id) = vm_id {
             if let Some((tree_id, node_id)) = id.split_once('/') {
                 if let Some(tree) = trees.get(tree_id) {
-                    if let Some(cid) = guest_cid {
-                        if let Some((nid, vm)) = tree.find_live_vm_by_cid(cid) {
-                            if nid == node_id {
-                                return serial_dump_tree(tree_id, nid, vm);
-                            }
-                        }
-                    }
-                    let key = node_id.to_string();
-                    if let Some(&cid) = tree.node_cids(&key).first() {
-                        if let Some((nid, vm)) = tree.find_live_vm_by_cid(cid) {
-                            return serial_dump_tree(tree_id, nid, vm);
-                        }
+                    if let Some(guest) = dump_node_guest(tree, node_id, guest_cid) {
+                        return serial_dump_tree(tree_id, node_id, guest);
                     }
                 }
             }
         }
-        if let Some(cid) = guest_cid {
+        if let Some(cid) = guest_cid.filter(|&c| c != NO_HOST_CID) {
             for (tree_id, tree) in trees.iter() {
                 if let Some((node_id, vm)) = tree.find_live_vm_by_cid(cid) {
                     return serial_dump_tree(tree_id, node_id, vm);
@@ -3985,6 +5388,15 @@ impl Daemon {
                 guest_cid: entry.guest_cid,
                 state: "running".to_string(),
                 sandbox_id: entry.sandbox_id.clone(),
+                backend: entry.vm.backend(),
+                jail: match &entry.vm {
+                    Guest::Native(_) => None,
+                    Guest::Firecracker(fc) => Some(JailInfo {
+                        pid: fc.pid(),
+                        uid: fc.uid(),
+                        chroot: fc.chroot_root().to_string_lossy().into_owned(),
+                    }),
+                },
             })
             .collect();
         list.sort_by(|a, b| a.vm_id.cmp(&b.vm_id));
@@ -4008,6 +5420,18 @@ impl Daemon {
         }
     }
 
+    /// Live VM (if any) whose attached data disks include `id`.
+    fn live_data_disk_holder(&self, id: &str) -> Option<String> {
+        self.vms.lock().unwrap().iter().find_map(|(vm_id, entry)| {
+            entry
+                .vm
+                .data_disks()
+                .iter()
+                .any(|d| d.id() == id)
+                .then(|| vm_id.clone())
+        })
+    }
+
     /// Delete a persistent data disk's image, refusing while a VM the
     /// daemon owns still has it attached.
     ///
@@ -4021,15 +5445,7 @@ impl Daemon {
                 message: e.to_string(),
             };
         }
-        let holder = self.vms.lock().unwrap().iter().find_map(|(vm_id, entry)| {
-            entry
-                .vm
-                .data_disks()
-                .iter()
-                .any(|d| d.id() == id)
-                .then(|| vm_id.clone())
-        });
-        if let Some(vm_id) = holder {
+        if let Some(vm_id) = self.live_data_disk_holder(id) {
             return Response::Error {
                 message: format!(
                     "data disk {id} is attached to live VM {vm_id} — stop it before deleting \
@@ -4186,12 +5602,39 @@ fn remove_sandbox_record(sandbox_id: &str) {
     }
 }
 
-fn serial_dump_tree(tree_id: &str, node_id: &str, vm: &Vm) -> Response {
-    Response::SerialDump {
-        vm_id: format!("{tree_id}/{node_id}"),
-        guest_cid: vm.guest_cid(),
-        console: vm.serial_output(Duration::ZERO),
+fn serial_dump_guest(vm_id: String, guest: &Guest) -> Response {
+    match guest.serial_output(Duration::ZERO) {
+        Ok(console) => Response::SerialDump {
+            vm_id,
+            guest_cid: guest.guest_cid().unwrap_or(NO_HOST_CID),
+            console,
+        },
+        Err(e) => Response::Error {
+            message: format!("dump_serial({vm_id}): {e}"),
+        },
     }
+}
+
+/// Pick a live guest of `node_id` to dump. Cluster nodes dump member 0
+/// unless `guest_cid` names a native member. Firecracker members have
+/// no CID — they are found by node id, not invented one.
+fn dump_node_guest<'a>(
+    tree: &'a TreePayload,
+    node_id: &str,
+    guest_cid: Option<u64>,
+) -> Option<&'a Guest> {
+    let guests = tree.node_guests(node_id);
+    let first = guests.first().copied()?;
+    if let Some(cid) = guest_cid.filter(|&c| c != NO_HOST_CID) {
+        if let Some(g) = guests.iter().copied().find(|g| g.guest_cid() == Some(cid)) {
+            return Some(g);
+        }
+    }
+    Some(first)
+}
+
+fn serial_dump_tree(tree_id: &str, node_id: &str, guest: &Guest) -> Response {
+    serial_dump_guest(format!("{tree_id}/{node_id}"), guest)
 }
 
 /// Synchronous control-plane client (one Unix connection, JSON-lines).
@@ -4250,7 +5693,15 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let path = PathBuf::from(socket_path);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o750)
+                .create(parent)?;
+            // Mode on create applies only to newly created components;
+            // tighten an existing dedicated parent (never a shared tmp).
+            tighten_socket_parent(parent)?;
+        }
     }
     // A socket file that exists is either a live daemon's or a dead one's
     // leftover, and only a connect can tell them apart. Removing it blind
@@ -4277,7 +5728,10 @@ pub fn serve(
     }
 
     let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
     listener.set_nonblocking(true)?;
+    let allowed_uids = parse_allowed_uids()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     log::info!("k7d listening on {socket_path}");
 
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -4285,8 +5739,9 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let daemon = Arc::clone(daemon);
+                let allowed = allowed_uids.clone();
                 workers.push(std::thread::spawn(move || {
-                    handle_connection(&stream, &daemon);
+                    handle_connection(&stream, &daemon, allowed.as_deref());
                 }));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4308,7 +5763,25 @@ pub fn serve(
 /// Handle one client connection: read request lines, dispatch, write
 /// response lines, until EOF. `tree_watch` takes over the connection
 /// (snapshot, then events) until the client hangs up.
-fn handle_connection(stream: &UnixStream, daemon: &Daemon) {
+fn handle_connection(stream: &UnixStream, daemon: &Daemon, allowed_uids: Option<&[u32]>) {
+    let cred = match peer_cred(stream) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("SO_PEERCRED failed: {e}");
+            return;
+        }
+    };
+    if let Some(allow) = allowed_uids {
+        if !allow.contains(&cred.uid) {
+            log::error!(
+                "control socket: rejected uid={} gid={} pid={} (K7D_ALLOWED_UIDS)",
+                cred.uid,
+                cred.gid,
+                cred.pid
+            );
+            return;
+        }
+    }
     let reader = BufReader::new(stream);
     let mut writer = stream;
     for line in reader.lines() {
@@ -4336,6 +5809,18 @@ fn handle_connection(stream: &UnixStream, daemon: &Daemon) {
                 continue;
             }
         };
+        let peer = format!(
+            "control {} uid={} gid={} pid={}",
+            req.op_name(),
+            cred.uid,
+            cred.gid,
+            cred.pid
+        );
+        if req.is_mutating() {
+            log::info!("{peer}");
+        } else {
+            log::debug!("{peer}");
+        }
         if let Request::TreeWatch { tree_id } = req {
             serve_tree_watch(&mut writer, daemon, tree_id.as_deref());
             return;
@@ -4344,6 +5829,75 @@ fn handle_connection(stream: &UnixStream, daemon: &Daemon) {
             return;
         }
     }
+}
+
+/// `SO_PEERCRED` of an accepted Unix client. Linux-only.
+fn peer_cred(stream: &UnixStream) -> std::io::Result<libc::ucred> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `stream` is a live Unix socket; `cred` / `len` match
+    // SO_PEERCRED's `struct ucred`.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred)
+}
+
+/// Optional `K7D_ALLOWED_UIDS=0,1000` allowlist. Unset / empty = any
+/// uid that can connect (mode bits). A malformed token fails loudly.
+fn parse_allowed_uids() -> Result<Option<Vec<u32>>, String> {
+    match std::env::var("K7D_ALLOWED_UIDS") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(s) if s.trim().is_empty() => Ok(None),
+        Ok(s) => {
+            let mut uids = Vec::new();
+            for part in s.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let uid: u32 = part
+                    .parse()
+                    .map_err(|_| format!("K7D_ALLOWED_UIDS: {part:?} is not a uid"))?;
+                uids.push(uid);
+            }
+            if uids.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(uids))
+            }
+        }
+        Err(e) => Err(format!("K7D_ALLOWED_UIDS: {e}")),
+    }
+}
+
+/// Set the control-socket parent to `0750`, skipping a world-writable
+/// sticky dir (`/tmp`) so a test socket of the form `/tmp/foo.sock`
+/// cannot steal the host temp root.
+fn tighten_socket_parent(parent: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(parent)?;
+    let mode = meta.permissions().mode();
+    if mode & 0o1002 == 0o1002 {
+        log::warn!(
+            "not tightening {}: world-writable sticky (shared tmp); put k7d.sock in a dedicated directory",
+            parent.display()
+        );
+        return Ok(());
+    }
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750))
 }
 
 fn write_response(writer: &mut &UnixStream, response: &Response) -> bool {
@@ -4378,9 +5932,68 @@ fn serve_tree_watch(writer: &mut &UnixStream, daemon: &Daemon, tree_id: Option<&
             op: ev.op,
             node_id: ev.node_id,
             latency_ns: ev.latency_ns,
+            pause_skew_ns: ev.pause_skew_ns,
         };
         if !write_response(writer, &resp) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_config_missing_backend_deserialises_to_native() {
+        let cfg: VmConfig = serde_json::from_str(r#"{"memory_mb":256}"#).unwrap();
+        assert_eq!(cfg.backend, Backend::Native);
+    }
+
+    #[test]
+    fn create_vm_firecracker_rejects_devices_it_cannot_honour() {
+        // Every one of these must be named in the error rather than
+        // dropped: a pod that asked for a disk and got a VM without one
+        // fails later, in the guest, as a missing mount.
+        for (cfg, want) in [
+            (
+                VmConfig {
+                    virtiofs: vec![ShareConfig {
+                        host_dir: "/tmp".to_string(),
+                        guest_mount: "/mnt".to_string(),
+                        readonly: true,
+                    }],
+                    ..VmConfig::default()
+                },
+                "virtiofs",
+            ),
+            (
+                VmConfig {
+                    dilation: Some(4),
+                    ..VmConfig::default()
+                },
+                "dilation",
+            ),
+        ] {
+            let err = deny_fc_unsupported(&cfg).expect_err("must be refused");
+            assert_eq!(
+                err,
+                format!("{want} is not supported on backend Firecracker")
+            );
+        }
+        deny_fc_unsupported(&VmConfig::default()).expect("a plain FC VM is fine");
+
+        // Disks are drives on this backend — they must
+        // no longer be refused.
+        deny_fc_unsupported(&VmConfig {
+            scratch_size_bytes: Some(1 << 20),
+            data_disks: vec![DataDiskConfig {
+                id: "d0".to_string(),
+                size_bytes: 1 << 20,
+                guest_mount: "/mnt/d0".to_string(),
+            }],
+            ..VmConfig::default()
+        })
+        .expect("scratch and data disks are Firecracker drives");
     }
 }

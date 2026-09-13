@@ -1,4 +1,4 @@
-"""No-op injector — inc0 behaviour. Vacuous contain + restore."""
+"""No-op injector. Vacuous contain + restore."""
 
 from __future__ import annotations
 

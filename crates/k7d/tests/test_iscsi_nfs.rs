@@ -1,7 +1,7 @@
 //! Integration test: the guest's iSCSI and NFSv4 *userspace*, proven
 //! against real host-side services.
 //!
-//! the referenced work could assert `test -d /sys/class/iscsi_transport/tcp`
+//! A cheaper test could assert `test -d /sys/class/iscsi_transport/tcp`
 //! and stop there: `ISCSI_TCP=y` registers a transport at boot with no
 //! userspace at all. That proves the module initialised — not that a
 //! session can be established, not that a LUN becomes a block device,
@@ -22,7 +22,7 @@
 //! Guest side: the whole alpine root from
 //! `guest/rootfs/Dockerfile.nodeusr`, packed with `build_erofs_image`
 //! and attached read-only on virtio-blk, entered with `chroot`. Not the
-//! initramfs (every VM pays its decompression, and 24a-inc1 measured
+//! initramfs (every VM pays its decompression, and we measured
 //! 2.4 MB of iproute2 costing ~16 ms against a 250 ms budget) and not
 //! virtiofs (a warm fork does not inherit its source's virtiofsd
 //! connection, so reads on the fork hang).
@@ -805,7 +805,7 @@ fn compare_boot(net: &mut ClusterNetwork, img: &Path) -> (Duration, Duration, Du
 
 /// Attaching the ~60 MB userspace as a second read-only virtio-blk
 /// device must not move boot-to-agent measurably — the whole reason
-/// this is an erofs image and not initramfs content, where 24a-inc1
+/// this is an erofs image and not initramfs content, where we
 /// measured 2.4 MB of iproute2 costing ~16 ms.
 ///
 /// The assertion is on the *delta* against the same VM with no block
@@ -814,7 +814,7 @@ fn compare_boot(net: &mut ClusterNetwork, img: &Path) -> (Duration, Duration, Du
 /// [`VM_BOOT_TO_AGENT`] shape `test_latency` measures, and folding that
 /// in would make this test fail for someone else's reasons. Both
 /// numbers are printed; a regression in either is a finding to report,
-/// not a budget to edit (24a-inc1 precedent).
+/// not a budget to edit.
 #[test]
 fn test_nodeusr_image_does_not_regress_boot() {
     let _ = env_logger::builder().is_test(true).try_init();

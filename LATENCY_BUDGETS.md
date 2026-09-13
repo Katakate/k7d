@@ -61,7 +61,7 @@ widen `FORK_INNER_K3S_CLUSTER_3VM` to absorb suite-tail queueing.
 TreeFork elapsed on the 3-VM inner-k3s fixture. Every typical is the
 value the merged increment wrote into the table above - this unit
 does not re-measure. Deltas subtract the lean baseline (~104 ms,
-2026-08-08). inc2-inc5 profiles also enable CoreDNS, so those deltas
+2026-08-08). The larger profiles also enable CoreDNS, so those deltas
 include CoreDNS's share; isolated add-on cost (profile minus the
 CoreDNS-only row) was not a required recording.
 
@@ -361,7 +361,7 @@ The fork is the product, not a Ray image pull. Reused
 ceiling. `FORK_UBUNTU_NODE_1VM` and every minimal-guest budget are
 untouched.
 
-## Ubuntu Redis mid-write fork 
+## Ubuntu Redis mid-write fork
 
 Same 3-node Ubuntu k3s substrate, with `redis:7-alpine` (AOF on,
 128 MiB, pinned to `k7d-10-200-0-2`) and an `rinc` INCR loop on a
@@ -383,3 +383,80 @@ The fork is the product, not a Redis image pull. Reused
 `FORK_UBUNTU_K3S_CLUSTER_3VM` rather than adding a Redis-specific
 ceiling. `FORK_UBUNTU_NODE_1VM` and every minimal-guest budget are
 untouched.
+
+## Firecracker snapshot-tree fork
+
+`backend: firecracker` trees have no `MAP_PRIVATE` mapping to fork from.
+A point is `PUT /snapshot/create` (Diff by default, Full with
+`K7D_FC_FORK_SNAPSHOT=full`) materialised onto a root-owned `base.mem`
+with `FICLONERANGE`, then `restore-N.mem = FICLONE(base.mem)`; a child is
+a fresh jailed Firecracker `LoadSnapshot`ed from its own reflink of
+`restore-N.mem` (`mem_backend: File`, `clock_realtime`), with its writable
+disks reflinked from clones taken at the same paused instant. **No new
+constant** in `latency.rs`: the ceilings are asserted in
+`crates/k7d/tests/test_fc_tree.rs` (500 ms
+per child; children answer `ping` within 500 ms of the call returning).
+
+Measured on an exclusive bare-metal node (2026-09-08, `<node-ip>`,
+Firecracker v1.16.1), one 256 MiB / 1 vCPU busybox guest with a 64 MiB
+ext4 disk, debug build, daemon `latency_ns`:
+
+| Operation | Ceiling asserted | Typical | Test |
+|---|---|---|---|
+| Root point at `tree_create` (first Diff = every page touched since boot, 43 MiB) | none (creation) | **169 ms** (create 167 ms, base 0.2 ms) | `test_fc_tree_fork_cow_isolation_diff` |
+| `prepare_fork_source` (Diff, ~1–2 MiB dirtied, applied onto `base.mem`) | recorded finding | **140–157 ms** (create ~70 ms, base ~30 ms) | `test_fc_tree_rollback_is_the_point_and_clock_is_realtime`, `test_fc_tree_latency_table` |
+| `fork_batch` n=1 (point + 1 load) | 500 ms | **190 ms**; child `ping` 5 ms after return | `test_fc_tree_latency_table` |
+| `fork_batch` n=2 (point + 2 loads) | 500 ms per child | **280 ms** = 140 ms per child; `ping` 2.5 / 4.0 ms after return | `test_fc_tree_fork_cow_isolation_diff` |
+| `fork_batch` n=8 (point + 8 loads) | 500 ms per child | **607 ms** = 76 ms per child; slowest `ping` 56 ms after return | `test_fc_tree_latency_table` |
+| `rollback` (load the existing point, no snapshot) | 500 ms | **75–90 ms** (stage 51 ms, `LoadSnapshot` 3.6 ms) | `test_fc_tree_rollback_is_the_point_and_clock_is_realtime`, `test_fc_tree_latency_table` |
+| Root point, `K7D_FC_FORK_SNAPSHOT=full` (256 MiB written) | none | **638 ms** | `test_fc_tree_fork_cow_isolation_full` |
+| `fork_batch` n=2, `full` mode | recorded finding (not asserted) | **632 ms** = 316 ms per child idle; **1.02 s** under suite load | same |
+
+What the numbers say:
+
+- **A load is ~4 ms; the child's cost is the jailer.** `LoadSnapshot`
+  of a 256 MiB `File` backend is a `mmap` plus vmstate restore. The
+  50–75 ms per child is staging a chroot, cloning the uid's lease,
+  spawning `jailer` (which `clone`s into new namespaces, `pivot_root`s
+  and writes a cgroup) and waiting for its API socket. That is the
+  headroom a warm pool of pre-staged jails would recover.
+- **The point is O(dirty), the base is O(1).** `create` is Firecracker
+  writing the dirty pages; `base` is `FICLONERANGE` of those extents
+  onto `base.mem` and a `FICLONE` of the result — 30 ms for ~400 dirty
+  pages, 0.2 ms when the first Diff simply *becomes* the base. A busy
+  guest's point costs its dirty set, exactly like the native
+  incremental keyframe.
+- **`full` is honest, not competitive.** It writes guest RAM on every
+  point (638 ms for 256 MiB) and exists so the two mechanisms can be
+  checked against each other; it is not a fallback the daemon picks.
+- **Do not measure a child with `du`.** Its `load.mem` reports a full
+  256 MiB of `st_blocks` while owning no extent; the test's proof is
+  `FIEMAP_EXTENT_SHARED` on every extent (CHALLENGES #152).
+
+## Firecracker cluster fork / suspend / pool
+
+Cluster fork is the same primitive on every member, after a **parallel**
+`PATCH /vm Paused` (no lockstep). `pause_skew_ns` is max−min of those
+completion Instants. Suspend is a Full point exported out of the jail
+(`vmstate` + `memory.bin` + `fc.json`) then `FcVm::drop`; resume
+re-stages and `LoadSnapshot {track_dirty_pages, clock_realtime,
+network_overrides}`. **No new constant** in `latency.rs`: ceilings live
+in `crates/k7d/tests/test_fc_cluster.rs`.
+
+Measured on an exclusive bare-metal node during `make remote-check`
+(debug build, 256 MiB / 1 vCPU busybox members). Typicals are filled
+from `FC-LATENCY` lines in that run; the pause-skew ceiling is 50 ms
+p99 (a bound that means "the pause is not actually parallel", not the
+product target — native lockstep has none).
+
+| Operation | Ceiling asserted | Typical | Test |
+|---|---|---|---|
+| Cluster `fork_batch` n=1 (3 members) | recorded (`latency_ns`) | **~0.67 s** (debug) | `test_fc_cluster_fork_ping_and_skew_p99` |
+| Pause skew p50 / p99 over 20 runs | p99 < 50 ms | **27 µs / 125 µs** | same |
+| Cluster suspend (2 members, Full export) | recorded | **~2.1 s** (debug, 2 × 256 MiB Full) | `test_fc_cluster_suspend_resume` |
+| Cluster resume (LoadSnapshot + re-stage) | recorded | **~512 ms** (debug; EXDEV copy onto jail FS) | same |
+| Pool acquire (`K7D_POOL_BACKEND=firecracker`) | warm hand-off < 2 s | **~100 ms** | `test_fc_pool_acquire` |
+
+In-flight intra-cluster frames at the skew boundary can be lost; the
+TCP test asserts bytes recover (`test_fc_cluster_tcp_survives_fork`),
+not that no frame is dropped.

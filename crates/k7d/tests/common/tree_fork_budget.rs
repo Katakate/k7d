@@ -1,4 +1,4 @@
-//! Assert daemon `TreeFork` / `TreeForkBatch` `latency_ns` .
+//! Assert daemon `TreeFork` / `TreeForkBatch` `latency_ns`.
 //!
 //! Cluster-tree budgets are the daemon's own clock, not the client
 //! `Instant` around the Unix-socket call. Suite-tail queueing can make

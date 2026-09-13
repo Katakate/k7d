@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Print "patched" or "stock" for the KVM modules currently loaded, and exit
-# 0 / 1 respectively.  Every arm of the inc5 bench asserts this before it runs.
+# 0 / 1 respectively.  Every arm of the dilation bench asserts this before it runs.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

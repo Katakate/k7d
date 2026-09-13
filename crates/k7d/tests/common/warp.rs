@@ -1,12 +1,12 @@
-//! Shared machinery for the time-warp tests .
+//! Shared machinery for the time-warp tests.
 //!
 //! Everything here is evidence-gathering rather than plumbing: the three
 //! guest clocks, the preconditions a warp is only meaningful under, and
 //! the CrashLoopBackOff pod that is the only functional proof that a
 //! guest whose clock moved also re-armed its timers.
 //!
-//! It lives in `common/` because `test_warp_clock.rs` (inc2, the warp
-//! primitive) and `test_auto_warp.rs` (inc3, the policy that drives it)
+//! It lives in `common/` because `test_warp_clock.rs` (the warp
+//! primitive) and `test_auto_warp.rs` (the policy that drives it)
 //! have to agree on all of it. Two copies would drift, and the one that
 //! drifted would be the one whose assertions quietly stopped meaning
 //! anything.
@@ -98,14 +98,14 @@ pub fn check_clocksource(agent: &mut AgentClient, whose: &str) {
 
 /// Name the clockevent device the guest actually arms its timers on.
 ///
-/// the referenced work measured `IA32_TSC_DEADLINE` at zero on every vCPU of
+/// The clock survey measured `IA32_TSC_DEADLINE` at zero on every vCPU of
 /// every node, because `KVM_GET_SUPPORTED_CPUID` does not report
 /// `CPUID.1:ECX[24]` on this host kernel. The consequence is here, in
 /// the guest: without that bit Linux registers `lapic` (the one-shot
 /// count-down timer), not `lapic-deadline`. So the deadline-MSR
 /// write-back in `Vm::warp_clock` re-arms nothing on this guest, and
 /// the CrashLoopBackOff proof is the only evidence that timers re-arm —
-/// and inc3's jump target has to come from `KVM_GET_LAPIC` instead.
+/// and the policy's jump target has to come from `KVM_GET_LAPIC` instead.
 /// Asserted rather than commented: the day the bit is advertised, this
 /// fails and says so instead of leaving the proof quietly resting on it.
 ///
@@ -114,7 +114,7 @@ pub fn check_clocksource(agent: &mut AgentClient, whose: &str) {
 /// divided bus clock, so a deeply idle NOHZ CPU whose next timer is
 /// further out than that hands the wakeup to `tick_broadcast` — here the
 /// PIT. A warp has to be survived by whichever of the two is armed, and
-/// inc3's safety predicate declines whenever the PIT's expiry is the one
+/// The safety predicate declines whenever the PIT's expiry is the one
 /// KVM will not export.
 pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> String {
     let per_cpu = sh_ok(
@@ -126,7 +126,7 @@ pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> String {
         per_cpu.trim(),
         "lapic",
         "{whose} arms its timers on something other than the LAPIC one-shot timer — \
-         34a-inc0's survey (IA32_TSC_DEADLINE never armed) no longer describes this guest, \
+         the clock survey (IA32_TSC_DEADLINE never armed) no longer describes this guest, \
          so re-read what the warp has to re-arm"
     );
     let broadcast = sh_ok(
@@ -152,7 +152,7 @@ pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> String {
 /// with no hint why (CHALLENGES #180). `build-node-image.sh` masks it;
 /// this is the guardrail that says so if it ever comes back.
 ///
-/// It matters more to inc3 than to inc2: a policy loop warping at 20 Hz
+/// It matters more to the policy than to the primitive: a loop warping at 20 Hz
 /// does not merely have one warp undone, it is fought continuously, and
 /// the two clocks diverge without bound.
 pub fn check_no_ntp_client(agent: &mut AgentClient, whose: &str) {

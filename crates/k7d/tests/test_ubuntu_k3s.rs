@@ -1,5 +1,5 @@
 //! 3-node k3s on Ubuntu bare-VM nodes, then a warm fork of the running
-//! cluster .
+//! cluster.
 //!
 //! This is the inner-k3s matrix on a substrate where the nodes are
 //! ordinary Linux machines: one image, role from `k7d.k3s=` on the
@@ -117,14 +117,14 @@ fn assert_role_from_cmdline(cluster: &mut UbuntuCluster) {
     );
     assert!(
         !cmd.contains("k7d.cni="),
-        "inc2 must leave k7d.cni= off the cmdline (absent == flannel): {cmd}"
+        "flannel must leave k7d.cni= off the cmdline (absent == flannel): {cmd}"
     );
     let cfg = sh_ok(&mut sag, "cat /etc/rancher/k3s/config.yaml");
     assert!(
         !cfg.contains("flannel-backend: none")
             && !cfg.contains("disable-kube-proxy: true")
             && !cfg.contains("disable-network-policy: true"),
-        "inc2 server config must not disable flannel/kube-proxy:\n{cfg}"
+        "the flannel server config must not disable flannel/kube-proxy:\n{cfg}"
     );
     assert!(
         sh_ok(&mut sag, "test -x /usr/local/bin/k3s && echo ok").contains("ok"),
@@ -417,9 +417,7 @@ fn test_ubuntu_k3s_cluster_warm_fork_no_restart() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

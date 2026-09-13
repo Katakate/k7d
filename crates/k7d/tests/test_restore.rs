@@ -208,17 +208,17 @@ fn test_legacy_snapshot_readable() {
 
     let snapshot_dir = create_snapshot_of_booted_vm();
 
-    // Down-convert cpu.json: [state] → bare object without the 17b
+    // Down-convert cpu.json: [state] → bare object without the newer
     // per-vCPU fields, moving the LAPIC into irqchip.json's legacy
     // VM-scoped slot (exactly what a legacy snapshot looks like).
     let cpu_path = snapshot_dir.path().join("cpu.json");
     let cpu_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cpu_path).unwrap()).unwrap();
-    let states = cpu_json.as_array().expect("17b cpu.json is an array");
+    let states = cpu_json.as_array().expect("cpu.json is an array");
     assert_eq!(states.len(), 1, "single-vCPU snapshot expected");
     let mut state = states[0].clone();
     let obj = state.as_object_mut().unwrap();
-    let lapic = obj.remove("lapic").expect("17b snapshots carry lapic");
+    let lapic = obj.remove("lapic").expect("snapshots carry lapic");
     obj.remove("mp_state");
     std::fs::write(&cpu_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
@@ -247,8 +247,8 @@ fn test_legacy_snapshot_readable() {
     restored.shutdown();
 }
 
-/// A snapshot records the time dilation its source ran at (spec
-/// 34a-inc9), and a host without the carried KVM patch refuses to
+/// A snapshot records the time dilation its source ran at, and a host
+/// without the carried KVM patch refuses to
 /// restore a dilated one instead of silently resuming the guest at 1x.
 /// Runs on stock modules — which is exactly the host that must say no.
 /// Synthesized by editing a stock snapshot's `metadata.json`, since a

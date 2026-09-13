@@ -1,5 +1,4 @@
-//! Kueue on the 31a-inc1 fake GPU fixture, then a warm fork
-//! .
+//! Kueue on the fake GPU fixture, then a warm fork.
 //!
 //! Digest-pinned Kueue v0.19.2, a ClusterQueue whose
 //! `nvidia.com/gpu` quota is 1, a LocalQueue, and two busybox Jobs
@@ -604,7 +603,7 @@ fn test_ubuntu_ml_kueue_gpu_fork() {
         );
         assert!(
             text.contains(BUSYBOX),
-            "{name} operand must be the inc1 busybox pin"
+            "{name} operand must be the busybox pin"
         );
     }
 
@@ -685,9 +684,7 @@ fn test_ubuntu_ml_kueue_gpu_fork() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,

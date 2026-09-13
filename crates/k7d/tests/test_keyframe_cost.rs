@@ -1,7 +1,7 @@
-//! the referenced work: what an incremental keyframe costs on a real Ubuntu cluster.
+//! What an incremental keyframe costs on a real Ubuntu cluster.
 //!
 //! Runs `gym/keyframe_cost.py` against the live daemon on an Ubuntu
-//! 3x2 GiB bare-VM cluster at the 28a divergence levels, and pins the
+//! 3x2 GiB bare-VM cluster at the fork-under-load divergence levels, and pins the
 //! result: every child keyframe must clone, must land inside the
 //! latency budget, and must cost a small fraction of the full dump the
 //! root pays. No `#[ignore]`.
@@ -31,7 +31,7 @@ fn wipe_stale_keyframe_trees() {
         return;
     };
     for t in trees {
-        if t.tree_id.starts_with("kf-30b-") {
+        if t.tree_id.starts_with("kf-") {
             let _ = c.call(&Request::TreePrune {
                 tree_id: t.tree_id.clone(),
                 node_id: "root".to_string(),
@@ -48,7 +48,7 @@ fn test_keyframe_cost_ubuntu_divergence_levels() {
     wipe_stale_keyframe_trees();
 
     let root = workspace_root();
-    let out = std::env::temp_dir().join(format!("k7-30b-{}", std::process::id()));
+    let out = std::env::temp_dir().join(format!("k7-kf-{}", std::process::id()));
     std::fs::create_dir_all(&out).expect("out dir");
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -59,7 +59,7 @@ fn test_keyframe_cost_ubuntu_divergence_levels() {
         .arg("--out")
         .arg(&out)
         .arg("--tree-id")
-        .arg(format!("kf-30b-{}", std::process::id()))
+        .arg(format!("kf-{}", std::process::id()))
         .arg("--diverge-s")
         .arg("30")
         .current_dir(&root)
@@ -69,7 +69,7 @@ fn test_keyframe_cost_ubuntu_divergence_levels() {
         .expect("spawn gym/keyframe_cost.py");
     let elapsed = started.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
-    eprintln!("---- 30b harness ({elapsed:?}) ----\n{log_text}\n---- end ----");
+    eprintln!("---- keyframe harness ({elapsed:?}) ----\n{log_text}\n---- end ----");
     assert!(
         status.success(),
         "gym/keyframe_cost.py failed (status {status}); see {}",
@@ -100,8 +100,8 @@ fn test_keyframe_cost_ubuntu_divergence_levels() {
     // A keyframe costs its node's divergence, so the ceiling is a
     // property of the workload, not of the code: 30 s of page-cache
     // churn on three k3s nodes dirties a quarter of guest RAM even when
-    // the cluster is doing nothing, and over half of it under Kafka
-    // . These are ~1.5x the measured shares.
+    // the cluster is doing nothing, and over half of it under Kafka.
+    // These are ~1.5x the measured shares.
     let share_ceiling = [("idle", 0.35), ("k8s", 0.50), ("kafka", 0.80)];
 
     for (workload, ceiling) in share_ceiling {

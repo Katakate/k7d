@@ -35,8 +35,8 @@ pub fn new_sessions() -> PtySessions {
 
 /// Everything the bridge thread needs, captured at `Start` time.
 pub struct PtyBridgeParams {
-    /// Guest vsock CID of the sandbox VM.
-    pub guest_cid: u64,
+    /// How to reach the sandbox VM's guest agent.
+    pub endpoint: k7d::guest::AgentEndpoint,
     /// Container name inside the guest.
     pub container: String,
     /// containerd exec id (registry key).
@@ -171,7 +171,7 @@ pub fn run_pty_exec_bridge(sessions: &PtySessions, p: &PtyBridgeParams) {
 
     let args: Vec<&str> = p.args.iter().map(String::as_str).collect();
     let mut session = match AgentClient::connect_pty_exec(
-        p.guest_cid,
+        &p.endpoint,
         Duration::from_secs(10),
         &p.container,
         &p.exec_id,

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Configure this VM's network from the kernel command line .
+# Configure this VM's network from the kernel command line.
 #
 #   k7d.ip=<addr>/<prefix>,<gateway>[,<iface>]
 #

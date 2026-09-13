@@ -1,4 +1,4 @@
-//! the referenced work: dual-child write isolation at Ubuntu cluster fidelity.
+//! Dual-child write isolation at Ubuntu cluster fidelity.
 //!
 //! Runs `gym/dual_child.py` against the live daemon on an Ubuntu bare-VM
 //! 3-node cluster. No `#[ignore]`. No new `crates/k7d/src` primitives.
@@ -48,7 +48,7 @@ fn wipe_stale_dci_trees() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("dci-35a-") {
+        if t.tree_id.starts_with("dci-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -80,8 +80,8 @@ fn test_dual_child_ubuntu_isolation() {
     wipe_stale_dci_trees();
 
     let root = workspace_root();
-    let tree_id = format!("dci-35a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-35a-inc1-{}", std::process::id()));
+    let tree_id = format!("dci-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-dual-child-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -101,7 +101,7 @@ fn test_dual_child_ubuntu_isolation() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 35a-inc1 harness {} ({elapsed:?}) ----\n{log_text}\n---- end 35a-inc1 harness ----",
+        "---- dual-child harness {} ({elapsed:?}) ----\n{log_text}\n---- end dual-child harness ----",
         log_path.display()
     );
     assert!(

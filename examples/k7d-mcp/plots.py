@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the five inc1 plots from harness JSONL ."""
+"""Render the five plots from harness JSONL."""
 
 from __future__ import annotations
 

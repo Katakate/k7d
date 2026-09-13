@@ -1,4 +1,4 @@
-//! the referenced work: held Ubuntu apiserver watch + ClusterIP TCP across
+//! Held Ubuntu apiserver watch + ClusterIP TCP across
 //! `tree_fork_batch`. A new curl after the pause is not this assertion
 //! (CHALLENGES #42). No `#[ignore]`.
 
@@ -47,7 +47,7 @@ fn wipe_stale_hs_trees() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("hs-35a-") {
+        if t.tree_id.starts_with("hs-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -79,8 +79,8 @@ fn test_held_session_ubuntu_watch_and_clusterip() {
     wipe_stale_hs_trees();
 
     let root = workspace_root();
-    let tree_id = format!("hs-35a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-35a-hs-{}", std::process::id()));
+    let tree_id = format!("hs-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-hs-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -98,7 +98,7 @@ fn test_held_session_ubuntu_watch_and_clusterip() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 35a-inc3 harness {} ({elapsed:?}) ----\n{log_text}\n---- end 35a-inc3 ----",
+        "---- held-session harness {} ({elapsed:?}) ----\n{log_text}\n---- end held-session ----",
         log_path.display()
     );
     assert!(

@@ -117,7 +117,7 @@ const MIN_TREE_PIDS: usize = 128;
 /// domain-only controller).
 const HELPER_ROOT: &str = "/sys/fs/cgroup/k7d-jail";
 
-/// One tree's cgroup jail .
+/// One tree's cgroup jail.
 ///
 /// k7d is a single process, so a tree's VMs are *threads*: cgroup v2
 /// charges memory per process, and a threaded subtree may only enable

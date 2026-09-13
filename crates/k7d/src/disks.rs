@@ -28,13 +28,25 @@ pub const DISKS_IMAGE: &str = "/var/lib/k7d/disks.img";
 /// Where snapshot trees live on the reflink XFS: a subdirectory of
 /// [`DISKS_DIR`], so an incremental keyframe's `FICLONE` of its
 /// ancestor's `memory.bin` has source and destination on one
-/// reflink-capable filesystem . The node's root FS is ext4
+/// reflink-capable filesystem. The node's root FS is ext4
 /// and cannot clone at all.
 pub const TREES_SUBDIR: &str = "trees";
 
 /// The conventional tree root the daemon and every test path use.
 /// [`ensure_reflink_tree_root`] makes this a symlink onto the XFS.
 pub const TREES_LINK: &str = "/var/lib/k7d/trees";
+
+/// Where Firecracker jailer chroots live on the reflink XFS: a
+/// subdirectory of [`DISKS_DIR`], so hard-linking a
+/// VM's scratch / data / docker image into its jail — and
+/// `FICLONE`ing a child's memory file next to its parent's — stays on
+/// one filesystem.
+pub const FC_SUBDIR: &str = "fc";
+
+/// The jailer chroot base every FC VM is staged under
+/// (`fc::stage::chroot_base`'s default, `K7D_FC_CHROOT_BASE`'s).
+/// [`ensure_reflink_fc_root`] makes this a symlink onto the XFS.
+pub const FC_LINK: &str = "/var/lib/k7d/fc";
 
 /// Default size of the sparse XFS backing image: 96 GiB. Sparse — real
 /// disk usage grows with actual volume writes only.
@@ -93,6 +105,14 @@ pub const DEFAULT_SCRATCH_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 /// a filesystem with no usable space after metadata, which would
 /// surface as an inscrutable ENOSPC on the first container write.
 pub const MIN_SCRATCH_SIZE: u64 = 16 * 1024 * 1024;
+
+/// In-VM mount point of a sandbox's Docker graph disk.
+/// Overlay2's data-root; a dedicated scratch image, not a `DataDisk`.
+pub const DOCKER_GRAPH_GUEST_MOUNT: &str = "/var/lib/docker";
+
+/// Documented default capacity of the Docker graph disk: 20 GiB,
+/// sparse. Override per pod with `k7d.katakate.org/docker-disk`.
+pub const DEFAULT_DOCKER_DISK_SIZE: u64 = 20 * 1024 * 1024 * 1024;
 
 /// A sandbox's writable scratch image on the reflink-capable
 /// [`DISKS_DIR`], owned by the VM it is attached to and
@@ -187,7 +207,7 @@ impl Drop for ScratchDisk {
 }
 
 /// Subdirectory of [`DISKS_DIR`] holding **persistent** data-disk
-/// images, one per `id` .
+/// images, one per `id`.
 ///
 /// A subdirectory and not [`DISKS_DIR`] itself for the same reason the
 /// Ubuntu base images live in one (CHALLENGES #106): everything directly
@@ -215,7 +235,7 @@ pub fn data_disk_path(id: &str) -> PathBuf {
 }
 
 /// A **named, persistent** read-write disk that outlives the VM it is
-/// attached to .
+/// attached to.
 ///
 /// The image is `<DISKS_DIR>/data/<id>.img` on the reflink XFS — never
 /// the node's root FS, which is ext4 on md RAID and cannot `FICLONE`, so
@@ -227,7 +247,7 @@ pub fn data_disk_path(id: &str) -> PathBuf {
 /// Unlike [`ScratchDisk`] there is **no `Drop`**: retention is the whole
 /// point. Deleting the data is the explicit [`DataDisk::delete`]
 /// (the daemon's `delete_data_disk`), and orphans are reaped by the
-/// age-gated spec-22d sweep. Attach it with
+/// age-gated orphan sweep. Attach it with
 /// [`crate::vm::VmBuilder::data_disk`].
 ///
 /// A warm fork clones each attached image into the child's own file
@@ -591,7 +611,7 @@ pub fn ensure_loopback_xfs(
     grow_loopback_to(image, mount_point, size_bytes)
 }
 
-/// Put the snapshot-tree root on the reflink XFS .
+/// Put the snapshot-tree root on the reflink XFS.
 ///
 /// Ensures the loopback XFS behind [`DISKS_DIR`] is mounted, creates
 /// `<DISKS_DIR>/trees` on it, and points [`TREES_LINK`] at that
@@ -609,15 +629,108 @@ pub fn ensure_loopback_xfs(
 /// ever starts (`your node provisioning`); this is the
 /// programmatic equivalent for the daemon and the integration tests.
 pub fn ensure_reflink_tree_root() -> Result<PathBuf, DiskError> {
+    let target = link_onto_reflink_xfs(
+        Path::new(TREES_LINK),
+        TREES_SUBDIR,
+        StaleDir::Keep,
+        "every snapshot-tree keyframe there costs a FULL guest-RAM dump instead of \
+         O(divergence)",
+    )?;
+    if target == Path::new(TREES_LINK) {
+        return Ok(target);
+    }
+    assert_reflink_capable(&target)?;
+    log::info!(
+        "disks: snapshot-tree root {} is reflink-capable — incremental keyframes on",
+        target.display()
+    );
+    Ok(target)
+}
+
+/// Put the Firecracker jailer chroot base on the reflink XFS.
+///
+/// The jail is not merely a directory: every file the jailed
+/// Firecracker opens has to be *inside* it, so each VM's disks are
+/// linked in from wherever k7d keeps them. Both link operations are
+/// single-filesystem by construction — `link(2)` returns `EXDEV`
+/// across mounts and so does `FICLONE` — and the disks k7d hands a VM
+/// live on the loopback XFS at [`DISKS_DIR`], not on the node's ext4
+/// root. So the chroot base has to be on that XFS too, which is what
+/// this does: [`FC_LINK`] (the path `K7D_FC_CHROOT_BASE` defaults to)
+/// becomes a symlink onto `<DISKS_DIR>/fc`.
+///
+/// [`FC_LINK`] could once be a plain ext4 directory, because the
+/// only things staged were the guest kernel and initrd, which sit
+/// on the ext4 root next to it. Staging disks too makes those two
+/// requirements point at different filesystems; this resolves it in
+/// favour of the disks, and `fc::stage` carries the read-only
+/// artifacts across the remaining boundary through a node-wide cache.
+pub fn ensure_reflink_fc_root() -> Result<PathBuf, DiskError> {
+    let target = link_onto_reflink_xfs(
+        Path::new(FC_LINK),
+        FC_SUBDIR,
+        StaleDir::Park,
+        "a Firecracker VM there cannot be given a disk at all — `link(2)` of a \
+         disk image on the XFS into an ext4 jail is EXDEV",
+    )?;
+    if target == Path::new(FC_LINK) {
+        return Ok(target);
+    }
+    assert_reflink_capable(&target)?;
+    log::info!(
+        "disks: Firecracker jailer chroot base {} is on the reflink XFS",
+        target.display()
+    );
+    Ok(target)
+}
+
+/// What to do with a non-empty real directory found where the symlink
+/// onto the XFS belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleDir {
+    /// Leave it, warn, and keep using it. For content that is the
+    /// operator's — snapshot trees hold guest state nothing else has.
+    Keep,
+    /// Rename it aside and put the symlink in its place. For content
+    /// that cannot outlive the daemon that made it: a jailer chroot
+    /// belongs to one Firecracker process, and that process died with
+    /// the previous daemon.
+    Park,
+}
+
+/// Seconds since the epoch, for naming a parked directory.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Point `link` at `<DISKS_DIR>/<subdir>` on the reflink XFS, mounting
+/// the loopback filesystem first. Returns the directory that is
+/// actually in use.
+///
+/// Idempotent, and never moves data behind the operator's back: an
+/// existing **non-empty** real directory at `link` is left exactly
+/// where it is and returned unchanged, with a warning that quotes
+/// `consequence`. An empty one is replaced by the symlink.
+///
+/// The node-reset script does the same provisioning before the daemon
+/// ever starts (`your node provisioning`); this is the
+/// programmatic equivalent for the daemon and the integration tests.
+fn link_onto_reflink_xfs(
+    link: &Path,
+    subdir: &str,
+    stale: StaleDir,
+    consequence: &str,
+) -> Result<PathBuf, DiskError> {
     ensure_loopback_xfs(
         Path::new(DISKS_IMAGE),
         Path::new(DISKS_DIR),
         DISKS_IMAGE_SIZE,
     )?;
-    let target = Path::new(DISKS_DIR).join(TREES_SUBDIR);
+    let target = Path::new(DISKS_DIR).join(subdir);
     std::fs::create_dir_all(&target).map_err(|e| io_err(&target, e))?;
 
-    let link = Path::new(TREES_LINK);
     match std::fs::symlink_metadata(link) {
         // Already a symlink: accept it if it points at the XFS, replace
         // it if it points somewhere stale.
@@ -643,16 +756,26 @@ pub fn ensure_reflink_tree_root() -> Result<PathBuf, DiskError> {
                 std::fs::remove_dir(link).map_err(|e| io_err(link, e))?;
                 std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
                 log::info!(
-                    "disks: moved the empty tree root {} onto the reflink XFS at {}",
+                    "disks: moved the empty {} onto the reflink XFS at {}",
                     link.display(),
+                    target.display()
+                );
+            } else if stale == StaleDir::Park {
+                let parked = link.with_extension(format!("ext4-{}", unix_now()));
+                std::fs::rename(link, &parked).map_err(|e| io_err(link, e))?;
+                std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
+                log::warn!(
+                    "disks: parked the old off-XFS {} at {} and pointed it at {} — \
+                     otherwise {consequence}",
+                    link.display(),
+                    parked.display(),
                     target.display()
                 );
             } else {
                 log::warn!(
-                    "disks: {} is a non-empty directory on {}, not the reflink XFS — \
-                     leaving it alone, but every snapshot-tree keyframe there costs a \
-                     FULL guest-RAM dump instead of O(divergence) . Move or \
-                     remove it and re-run `your node provisioning`.",
+                    "disks: {} is a non-empty real directory, so it is NOT on the \
+                     reflink XFS at {} — leaving it alone, but {consequence}. Move \
+                     or remove it and re-run `your node provisioning`.",
                     link.display(),
                     DISKS_DIR
                 );
@@ -665,17 +788,12 @@ pub fn ensure_reflink_tree_root() -> Result<PathBuf, DiskError> {
             }
             std::os::unix::fs::symlink(&target, link).map_err(|e| io_err(link, e))?;
             log::info!(
-                "disks: tree root {} -> reflink XFS {}",
+                "disks: {} -> reflink XFS {}",
                 link.display(),
                 target.display()
             );
         }
     }
-    assert_reflink_capable(&target)?;
-    log::info!(
-        "disks: snapshot-tree root {} is reflink-capable — incremental keyframes on",
-        target.display()
-    );
     Ok(target)
 }
 

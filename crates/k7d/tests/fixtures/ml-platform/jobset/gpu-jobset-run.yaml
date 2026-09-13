@@ -1,4 +1,4 @@
-# In-flight 2-worker JobSet . Still Running at fork time.
+# In-flight 2-worker JobSet. Still Running at fork time.
 # Same fake GPU request as gpu-jobset-done. Not CUDA.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet

@@ -203,7 +203,7 @@ impl Drop for PipeSerialDevice {
         // (`AgentClient::new`) dup it rather than taking ownership, and the
         // device is not Clone, so this is the single close. Without it every
         // dropped VM leaked the pipe pair — a fork-heavy daemon hit EMFILE
-        // after ~500 forks (found by the the referenced work repro loop).
+        // after ~500 forks (found by the fork repro loop).
         unsafe { libc::close(self.read_fd) };
     }
 }

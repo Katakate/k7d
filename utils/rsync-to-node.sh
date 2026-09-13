@@ -42,6 +42,8 @@ rsync -azc --delete \
     --exclude "guest/kernel/linux-*" --exclude "guest/kernel/vmlinux" \
     --exclude "guest/rootfs/initramfs.cpio.gz" \
     --exclude "guest/rootfs/runc.amd64" \
+    --exclude "guest/docker/payload" \
+    --exclude "guest/docker/.cache" \
     --exclude "verif/.lake" --exclude "verif/build" \
     --out-format='%n' \
     -e "ssh ${SSH_OPTS[*]}" \

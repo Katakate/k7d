@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stdio MCP server wrapping the k7d tree API .
+"""stdio MCP server wrapping the k7d tree API.
 
 k7d itself grows no TCP — this is a node-local sidecar talking to
 `/run/k7d/k7d.sock` via `k7d_client.py`. Unknown tools / bad node ids

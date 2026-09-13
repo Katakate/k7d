@@ -1,4 +1,4 @@
-"""28a plot/derive unit tests — no KVM."""
+"""Fork-under-load plot/derive unit tests — no KVM."""
 
 from __future__ import annotations
 

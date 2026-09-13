@@ -333,7 +333,7 @@ spec:
 /// reaches Ready, reports the matching `MemTotal`, and can actually use
 /// the memory past 4 GiB.
 ///
-/// Before 19a the initrd was placed at the top of guest RAM and its
+/// The initrd used to be placed at the top of guest RAM and its
 /// address truncated to the 32-bit `boot_params.hdr.ramdisk_image`, so
 /// any pod over ~4 GiB booted a kernel with no initramfs
 /// ("VFS: Unable to mount root fs"), the agent never started, and the

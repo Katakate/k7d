@@ -1,4 +1,4 @@
-//! the referenced work — "it is now N seconds later", said to a live cluster.
+//! "It is now N seconds later", said to a live cluster.
 //!
 //! A warp advances the guest-visible clock of every VM of a cluster by
 //! the same delta while all of them are paused, so the guests' backoffs,
@@ -16,7 +16,7 @@
 //!    parked in a CrashLoopBackOff wait longer than 60 s restarts within
 //!    seconds of the warp instead of a minute later.
 //!
-//! the referenced work measured that `IA32_TSC_DEADLINE` is never armed on
+//! The clock survey measured that `IA32_TSC_DEADLINE` is never armed on
 //! this guest — it uses the LAPIC one-shot timer, because
 //! `KVM_GET_SUPPORTED_CPUID` on host kernels before 6.14 does not report
 //! `CPUID.1:ECX[24]`. So the deadline-MSR write-back in
@@ -69,7 +69,7 @@ fn warp_cluster(cluster: &mut common::ubuntu_k3s::UbuntuCluster, delta: Duration
     ];
     let latency = warp_clock_lockstep(&mut vms, delta).expect("the cluster warps");
     eprintln!(
-        "MEASUREMENT 34a-inc2 warp_clock 3-node Ubuntu cluster: +{}s in {latency:?} \
+        "MEASUREMENT warp_clock 3-node Ubuntu cluster: +{}s in {latency:?} \
          (budget {WARP_CLUSTER_3VM:?})",
         delta.as_secs()
     );
@@ -124,7 +124,7 @@ fn test_warp_clock_moves_a_live_cluster_in_lockstep() {
     for (i, agent) in agents.iter_mut().enumerate() {
         let now = guest_clocks(agent, whose[i]);
         eprintln!(
-            "MEASUREMENT 34a-inc2 {} clocks moved by +{}s warp: realtime {:+.3}s, \
+            "MEASUREMENT {} clocks moved by +{}s warp: realtime {:+.3}s, \
              monotonic {:+.3}s, boottime {:+.3}s",
             whose[i],
             WARP.as_secs(),
@@ -153,7 +153,7 @@ fn test_warp_clock_moves_a_live_cluster_in_lockstep() {
     let spread = after.iter().copied().fold(f64::MIN, f64::max)
         - after.iter().copied().fold(f64::MAX, f64::min);
     eprintln!(
-        "MEASUREMENT 34a-inc2 lockstep spread after +{}s: {spread:.3}s",
+        "MEASUREMENT lockstep spread after +{}s: {spread:.3}s",
         WARP.as_secs()
     );
     assert!(
@@ -195,7 +195,7 @@ fn test_warp_clock_moves_a_live_cluster_in_lockstep() {
         let now = pod_restarts(&kubeconfig, CRASHLOOP_POD);
         if now > restarts {
             eprintln!(
-                "MEASUREMENT 34a-inc2 CrashLoopBackOff restart after a +{}s warp: {:?} \
+                "MEASUREMENT CrashLoopBackOff restart after a +{}s warp: {:?} \
                  (was ~{pending:?} away)",
                 BACKOFF_WARP.as_secs(),
                 warped_at.elapsed()
@@ -226,7 +226,7 @@ fn test_warp_clock_moves_a_live_cluster_in_lockstep() {
     let readiness_recovered = Instant::now();
     wait_nodes_ready(&kubeconfig, &names, CONVERGE);
     eprintln!(
-        "MEASUREMENT 34a-inc2 all nodes Ready again after the +{}s warp expired their \
+        "MEASUREMENT all nodes Ready again after the +{}s warp expired their \
          40s leases: {:?}",
         BACKOFF_WARP.as_secs(),
         readiness_recovered.elapsed()

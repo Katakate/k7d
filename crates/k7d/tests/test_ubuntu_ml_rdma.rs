@@ -1,5 +1,5 @@
-//! Soft-RoCE (`rdma_rxe`) on a 25a-inc2 Ubuntu flannel cluster, then
-//! a warm fork .
+//! Soft-RoCE (`rdma_rxe`) on an Ubuntu flannel cluster, then
+//! a warm fork.
 //!
 //! Verbs device only — not NCCL, not GPUDirect, not CUDA. A real NCCL
 //! job would set `NCCL_SOCKET_IFNAME=eth0` `NCCL_IB_HCA=<rxe device>`
@@ -20,7 +20,7 @@ use common::ubuntu::{failed_units, sh, sh_ok, NODE_MEMORY_MB};
 use common::ubuntu_k3s::{bring_up_cluster, nodes_ready_via, wait_nodes_ready, CONVERGE};
 
 /// A real NCCL job would wire Soft-RoCE with these. We document them
-/// and do not run NCCL .
+/// and do not run NCCL.
 const NCCL_SOCKET_IFNAME: &str = "eth0";
 const NCCL_IB_DISABLE: &str = "0";
 
@@ -172,7 +172,7 @@ fn test_ubuntu_ml_rdma_soft_roce_fork() {
 
     wait_nodes_ready(&cluster.kubeconfig, &names, Duration::from_secs(120));
 
-    // the referenced work: the rest of this lab — k3s convergence, the warm fork,
+    // The rest of this lab — k3s convergence, the warm fork,
     // the rxe1 divergence — runs under a realistic Whitelist policy,
     // proving the jail posture is usable for a multi-node RDMA lab, not
     // just restrictive. Intra-tree traffic (k3s control plane, RoCEv2
@@ -237,9 +237,7 @@ fn test_ubuntu_ml_rdma_soft_roce_fork() {
          target=1s budget={FORK_UBUNTU_K3S_CLUSTER_3VM:?}"
     );
     if fork_latency >= Duration::from_secs(1) {
-        eprintln!(
-            "FINDING the referenced work: cluster fork {fork_latency:?} missed the sub-second target"
-        );
+        eprintln!("FINDING cluster fork {fork_latency:?} missed the sub-second target");
     }
     assert!(
         fork_latency < FORK_UBUNTU_K3S_CLUSTER_3VM,
@@ -247,8 +245,8 @@ fn test_ubuntu_ml_rdma_soft_roce_fork() {
          do not widen FORK_UBUNTU_K3S_CLUSTER_3VM"
     );
 
-    // the referenced work: a contained tree must not mint an Open child — the
-    // fork inherits the source's Whitelist posture.
+    // A contained tree must not mint an Open child — the fork inherits
+    // the source's Whitelist posture.
     assert_eq!(
         fork_net.egress(),
         &whitelist,

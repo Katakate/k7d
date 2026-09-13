@@ -1,7 +1,7 @@
-"""Cilium + Tetragon on an Ubuntu gym cluster (26a-inc5).
+"""Cilium + Tetragon on an Ubuntu gym cluster.
 
 Install only when `GYM_SCOREBOARD=tetragon`. Health bring-up stays
-flannel and does not pay Helm. Flags and pins match 25a-inc3/inc4
+flannel and does not pay Helm. Flags and pins match the Rust fixture
 and `examples/k7d-mcp/cluster.py`. Helm stays a host tool.
 
 Host kubectl/helm talk to https://10.200.0.2:6443. Pin a /32 via
@@ -275,7 +275,7 @@ spec:
 def pull_inject_image(kube: Path, ceiling_s: float = 360) -> None:
     """Pre-pull busybox on the inject node so a child IfNotPresent hits.
 
-    25a-inc4: a host `touch` is invisible to Tetragon; the kprobe fires
+    A host `touch` is invisible to Tetragon; the kprobe fires
     on a pinned busybox pod. Pulling here also seeds the source stream.
     """
     phase = kubectl(
@@ -319,7 +319,7 @@ def pull_inject_image(kube: Path, ceiling_s: float = 360) -> None:
 
 
 def install_cilium_tetragon(bridge: str, kube: Path, server_ip: str) -> None:
-    """Cilium 1.16.10 + Tetragon 1.7.0 + 25a-inc4 kprobe policy."""
+    """Cilium 1.16.10 + Tetragon 1.7.0 + the kprobe policy."""
     helm = ensure_helm()
     with pin_api_route(bridge):
         helm_install_cilium(helm, kube, server_ip)

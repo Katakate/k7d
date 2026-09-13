@@ -1,4 +1,4 @@
-"""Red as a gym agent — a granted foothold, living off the land (26a-inc11).
+"""Red as a gym agent — a granted foothold, living off the land.
 
 Red plays through the **same** act surface blue uses (`gym/server.py`
 `act`: exec / kubectl), but from a *defined foothold*, never the gym's
@@ -11,7 +11,7 @@ admin certs:
   and only when the foothold was granted `node_exec`.
 
 Bounds are enforced *structurally*, not by an enum of allowed moves
-(26a-inc9 §Curriculum): (1) the foothold has **no egress** to fetch
+(the curriculum): (1) the foothold has **no egress** to fetch
 tooling (`assert_no_egress`, `assert_no_egress` is `assert_guest_egress`
 inverted — CHALLENGES #150); (2) a microVM **escape is a bug, not a
 win** (`assert_no_escape` fails the harvest loudly if red state leaks to
@@ -38,7 +38,7 @@ ExecFn = Callable[[int, list[str], float], dict[str, Any]]
 EGRESS_PROBE_IP = "8.8.8.8"
 # Actions that fetch external tooling — living-off-the-land red never
 # needs them, and rewarding a red that downloads an exploit would be
-# scoring offensive-security research (out of bounds, 26a-inc9).
+# scoring offensive-security research (out of bounds).
 _EGRESS_FETCH_TOKENS = (
     "crictl pull",
     "ctr image pull",
@@ -159,7 +159,7 @@ def assert_no_admin_creds(body: dict[str, Any]) -> None:
 def refuse_egress_fetch(args: list[str]) -> None:
     """Loud if a red exec fetches external tooling. Living-off-the-land
     red abuses legitimate machinery already present; it never downloads
-    an exploit (no weaponisation supply line, 26a-inc9 guardrail 2)."""
+    an exploit (no weaponisation supply line — guardrail 2)."""
     joined = " ".join(args)
     for tok in _EGRESS_FETCH_TOKENS:
         if tok in joined:
@@ -202,7 +202,7 @@ def assert_no_escape(
     """Escape/residue check. Any host bridge/tap that appeared while red
     acted and is not owned by the lease is red state that leaked outside
     the microVM — an isolation regression to fix, never a score
-    (26a-inc11 guardrail 2; the disposable microVM is the safety
+    (guardrail 2; the disposable microVM is the safety
     boundary)."""
     before_br = set(host_before.get("bridges") or [])
     after_br = set(host_after.get("bridges") or [])

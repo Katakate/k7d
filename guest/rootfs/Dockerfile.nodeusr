@@ -3,16 +3,16 @@
 # (`crates/k7d/tests/test_iscsi_nfs.rs`). Longhorn v1 attaches every
 # volume to the node as an iSCSI target and serves RWX volumes over
 # NFSv4, so `iscsiadm`/`iscsid` and `mount.nfs4` are the userspace half
-# of the kernel support the referenced work added.
+# of that kernel support.
 #
 # Three delivery mechanisms were available and two are wrong:
 #
 #   * the initramfs is decompressed on every VM's boot path, and
-#     24a-inc1 measured 2.4 MB of iproute2 alone costing ~16 ms against
+#     we measured 2.4 MB of iproute2 alone costing ~16 ms against
 #     a 250 ms VM_BOOT_TO_AGENT budget. This root is ~65 MB.
 #   * virtiofs does not survive a warm fork — the child does not
 #     inherit its source's vhost-user connection to virtiofsd, so any
-#     read under the share blocks forever (24a-inc1 hit this in
+#     read under the share blocks forever (we hit this in
 #     test_fork_carries_ebpf_state).
 #
 # erofs on virtio-blk has neither problem, which is why this is a whole

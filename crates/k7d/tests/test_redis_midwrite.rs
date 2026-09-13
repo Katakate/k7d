@@ -1,4 +1,4 @@
-//! the referenced work: Redis mid-write across Ubuntu TreeFork.
+//! Redis mid-write across Ubuntu TreeFork.
 //!
 //! Runs `gym/redis_midwrite.py` against the live daemon on an Ubuntu
 //! 3-node bare-VM tree. No `#[ignore]`. No new `crates/k7d/src`
@@ -49,7 +49,7 @@ fn wipe_stale_rd_trees() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("rd-35a-") {
+        if t.tree_id.starts_with("rd-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -81,8 +81,8 @@ fn test_redis_midwrite_ubuntu_fork() {
     wipe_stale_rd_trees();
 
     let root = workspace_root();
-    let tree_id = format!("rd-35a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-35a-inc5-{}", std::process::id()));
+    let tree_id = format!("rd-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-redis-midwrite-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -102,7 +102,7 @@ fn test_redis_midwrite_ubuntu_fork() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 35a-inc5 harness {} ({elapsed:?}) ----\n{log_text}\n---- end 35a-inc5 ----",
+        "---- redis-midwrite harness {} ({elapsed:?}) ----\n{log_text}\n---- end redis-midwrite ----",
         log_path.display()
     );
     assert!(

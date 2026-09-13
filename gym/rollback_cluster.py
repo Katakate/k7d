@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""35a-inc2: tree_rollback after a dirty Ubuntu child.
+"""tree_rollback after a dirty Ubuntu child.
 
 Talks to `/run/k7d/k7d.sock`. Imports `Cluster` from fork_under_load;
 does not edit that file. Zero new k7d primitives.
@@ -262,9 +262,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = parse_args(argv)
-    tree_id = ns.tree_id or f"rb-35a-{os.getpid()}"
-    if not tree_id.startswith("rb-35a-"):
-        raise RuntimeError(f"tree_id must start with rb-35a-, got {tree_id}")
+    tree_id = ns.tree_id or f"rb-{os.getpid()}"
+    if not tree_id.startswith("rb-"):
+        raise RuntimeError(f"tree_id must start with rb-, got {tree_id}")
     run(tree_id)
     return 0
 

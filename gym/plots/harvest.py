@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Lease/act/score harvest for the four gym-only 27a-inc2 plots.
+"""Lease/act/score harvest for the four gym-only plots.
 
 *****************************************************************************
 THIS DOES NOT TRAIN A MODEL. NO GPU. NO GRPO.
 
 Policies are scripted: `noop` (score after inject) and `oracle`
 (apply the fault's good_fix_hint, then score). `--scoreboard playbook`
-runs the same 20-page SRE exam on every member (26a-inc8).
+runs the same 20-page SRE exam on every member.
 `--scoreboard incident` peels `relay` until a soak stays clean
 (`R = 1 - t_solve/T`). Rows are
 eval_kind=gym-scripted with a live_run_id. The renderer stamps
@@ -15,7 +15,7 @@ eval_kind=gym-scripted with a live_run_id. The renderer stamps
 
 There is no learning curve. Default scoreboard is `health`.
 `--scoreboard tetragon` requires pinned helm and installs
-Cilium+Tetragon on the Ubuntu gym source (26a-inc5). See README.md.
+Cilium+Tetragon on the Ubuntu gym source. See README.md.
 *****************************************************************************
 """
 
@@ -453,7 +453,7 @@ def _payload_productive(base: str, env_id: str) -> bool:
     """Poll: miner Running AND burning CPU over a short window. The relay
     miner forks a fresh sha256sum each iteration, so instantaneous %cpu
     misses the children; the parent reaps them, so utime+stime+cutime+
-    cstime over the window captures the real burn (26a-inc11)."""
+    cstime over the window captures the real burn."""
     from faults.relay import RELAY_MINER
 
     probe = (

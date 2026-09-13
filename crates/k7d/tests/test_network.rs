@@ -209,7 +209,7 @@ fn test_create_is_idempotent() {
     drop(net1);
 }
 
-/// the referenced work: `ClusterNetwork::create` no longer installs (and actively
+/// `ClusterNetwork::create` no longer installs (and actively
 /// drains) the iptables `INPUT -i <bridge> -j ACCEPT` — the jail's
 /// `input` chain owns the guest→host decision. Also: the egress policy
 /// threads through create → fork_from (inheritance) → set_egress, and
@@ -239,7 +239,7 @@ fn test_egress_policy_threading_and_input_drain() {
     let rules = String::from_utf8_lossy(&out.stdout);
     assert!(
         !rules.contains(&format!("-i {} -j ACCEPT", src.bridge_name())),
-        "the INPUT -i <bridge> ACCEPT must be drained :\n{rules}"
+        "the INPUT -i <bridge> ACCEPT must be drained:\n{rules}"
     );
 
     // Every TAP carries its per-TAP anti-spoof table.
@@ -279,4 +279,105 @@ fn test_egress_policy_threading_and_input_drain() {
         "dropping the TAP must remove its anti-spoof table"
     );
     drop(src);
+}
+
+// --- Hostile virtqueue geometry ---
+
+// Virtio-MMIO register offsets a driver writes (virtio 1.x, non-legacy).
+const MMIO_QUEUE_SEL: u64 = 0x030;
+const MMIO_QUEUE_NUM: u64 = 0x038;
+const MMIO_QUEUE_READY: u64 = 0x044;
+const MMIO_STATUS: u64 = 0x070;
+const MMIO_QUEUE_DESC_LOW: u64 = 0x080;
+const MMIO_QUEUE_AVAIL_LOW: u64 = 0x090;
+const MMIO_QUEUE_USED_LOW: u64 = 0x0a0;
+const STATUS_DRIVER: u32 = 2;
+const STATUS_DRIVER_OK: u32 = 4;
+const STATUS_FAILED: u32 = 128;
+
+/// Program both virtio-net queues the way a guest driver would and take
+/// the device to `DRIVER_OK`. Returns the status register afterwards.
+fn drive_net_activation(mem: &[u8], tap: &k7d::network::TapDevice, size: u32, desc: u32) -> u32 {
+    use std::sync::{Arc, Mutex};
+
+    let backend = k7d::network::TapNetBackend::new(
+        tap.mac(),
+        tap.fd(),
+        mem.as_ptr() as u64,
+        mem.len() as u64,
+    );
+    let irq_evt =
+        Arc::new(vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("irq eventfd"));
+    let dev = Arc::new(Mutex::new(k7d::virtio_mmio::MmioDevice::new(
+        0x1000_0000,
+        5,
+        irq_evt,
+        Box::new(backend),
+    )));
+
+    let write = |off: u64, val: u32| dev.lock().unwrap().mmio_write(off, &val.to_le_bytes());
+    write(MMIO_STATUS, STATUS_DRIVER);
+    for q in 0..2u32 {
+        write(MMIO_QUEUE_SEL, q);
+        write(MMIO_QUEUE_NUM, size);
+        write(MMIO_QUEUE_DESC_LOW, desc + q * 0x4000);
+        write(MMIO_QUEUE_AVAIL_LOW, 0x8000 + q * 0x1000);
+        write(MMIO_QUEUE_USED_LOW, 0xc000 + q * 0x1000);
+        write(MMIO_QUEUE_READY, 1);
+    }
+    write(MMIO_STATUS, STATUS_DRIVER | STATUS_DRIVER_OK);
+
+    let mut status = [0u8; 4];
+    dev.lock().unwrap().mmio_read(MMIO_STATUS, &mut status);
+    u32::from_le_bytes(status)
+}
+
+/// A guest that programs a hostile virtqueue gets a failed device
+/// activation and a log line; nothing in the daemon walks its rings.
+///
+/// `size = 0` used to reach the worker, which divides by it on the first
+/// notify (`docs/bug-candidates.md` #42); ring GPAs past the end of RAM
+/// used to become host writes at an offset the guest chose (#40).
+#[test]
+fn hostile_virtqueue_geometry_fails_net_activation() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    // 512 KiB of plain host memory standing in for guest RAM: with a
+    // valid geometry the worker reads `avail.idx` out of it, finds 0, and
+    // does nothing. With a hostile one no worker is ever started.
+    let mem = vec![0u8; 512 * 1024];
+    let span = mem.len() as u32;
+
+    let mut net = ClusterNetwork::create("vqgeom").expect("bridge");
+    let tap = net.add_tap().expect("tap");
+
+    assert_eq!(
+        drive_net_activation(&mem, &tap, 0, 0x1000) & STATUS_FAILED,
+        STATUS_FAILED,
+        "QUEUE_NUM = 0 must fail activation, not divide by zero in the worker"
+    );
+    assert_eq!(
+        drive_net_activation(&mem, &tap, 100, 0x1000) & STATUS_FAILED,
+        STATUS_FAILED,
+        "a queue size that is not a power of two must fail activation"
+    );
+    assert_eq!(
+        drive_net_activation(&mem, &tap, 65535, 0x1000) & STATUS_FAILED,
+        STATUS_FAILED,
+        "a queue size above the advertised QUEUE_NUM_MAX must fail activation"
+    );
+    assert_eq!(
+        drive_net_activation(&mem, &tap, 256, span - 16) & STATUS_FAILED,
+        STATUS_FAILED,
+        "a descriptor table that runs past the end of guest RAM must fail activation"
+    );
+    assert_eq!(
+        drive_net_activation(&mem, &tap, 256, 0x1000) & STATUS_FAILED,
+        0,
+        "a well-formed geometry must still activate"
+    );
+
+    drop(tap);
+    drop(net);
 }

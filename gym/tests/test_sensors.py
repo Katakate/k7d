@@ -1,4 +1,4 @@
-"""26a-inc5 sensor install guards — no KVM."""
+"""Sensor install guards — no KVM."""
 
 from __future__ import annotations
 

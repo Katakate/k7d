@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch OpenAI Codex CLI (Apache-2.0) as the inc1 incident agent.
+"""Launch OpenAI Codex CLI (Apache-2.0) as the incident agent.
 
 A drop-in for the `cursor-agent` CLI shape that `scenario_incident.py
 --policy cursor-agent` launches (`agent --mcp-config CFG --print

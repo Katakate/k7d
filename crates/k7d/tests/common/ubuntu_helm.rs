@@ -1,7 +1,7 @@
-//! Host Helm helpers for the Ubuntu k3s fixture .
+//! Host Helm helpers for the Ubuntu k3s fixture.
 //!
 //! Helm stays a host tool — never baked into the guest. Cilium install
-//! flags are the load-bearing inc3 set (native routing + kubernetes
+//! flags are the load-bearing set (native routing + kubernetes
 //! IPAM); Tetragon reuses them so it does not copy `bring_up_cluster`
 //! or drift the CNI.
 
@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 use super::ubuntu_k3s::{kubectl, POD_CIDR, POD_CIDR_PREFIX};
 
 /// Pinned so a node with some other helm cannot silently change the
-/// chart renderer. Same pin as the referenced work.
+/// chart renderer.
 pub const HELM_VERSION: &str = "v3.16.4";
 const HELM_TGZ: &str = "helm-v3.16.4-linux-amd64.tar.gz";
 const HELM_URL: &str = "https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz";
 
-/// Pinned to 24a-inc3 / 25a-inc3 so the two substrates stay comparable.
+/// Pinned so the two substrates stay comparable.
 pub const CILIUM_CHART: &str = "1.16.10";
 pub const CILIUM_NS: &str = "kube-system";
 /// Cilium must be told the same pod CIDR k3s was given, or it

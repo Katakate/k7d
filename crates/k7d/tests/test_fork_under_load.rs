@@ -1,4 +1,4 @@
-//! the referenced work: fork-under-load correctness + dirty-page divergence.
+//! Fork-under-load correctness + dirty-page divergence.
 //!
 //! Runs `gym/fork_under_load.py` against the live daemon on an Ubuntu
 //! bare-VM cluster. No `#[ignore]`. No new `crates/k7d/src` primitives.
@@ -48,7 +48,7 @@ fn wipe_stale_ful_trees() {
         _ => return,
     };
     for t in trees {
-        if t.tree_id.starts_with("ful-28a-") {
+        if t.tree_id.starts_with("ful-") {
             wipe_tree(&t.tree_id);
         }
     }
@@ -80,8 +80,8 @@ fn test_fork_under_load_ubuntu_k8s_kafka_divergence() {
     wipe_stale_ful_trees();
 
     let root = workspace_root();
-    let tree_id = format!("ful-28a-{}", std::process::id());
-    let out = std::env::temp_dir().join(format!("k7-28a-{}", std::process::id()));
+    let tree_id = format!("ful-{}", std::process::id());
+    let out = std::env::temp_dir().join(format!("k7-ful-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
     let log_path = out.join("harness.log");
     let log = File::create(&log_path).expect("harness log");
@@ -105,7 +105,7 @@ fn test_fork_under_load_ubuntu_k8s_kafka_divergence() {
     let elapsed = t0.elapsed();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprintln!(
-        "---- 28a harness {} ({elapsed:?}) ----\n{log_text}\n---- end 28a harness ----",
+        "---- fork-under-load harness {} ({elapsed:?}) ----\n{log_text}\n---- end fork-under-load harness ----",
         log_path.display()
     );
     assert!(

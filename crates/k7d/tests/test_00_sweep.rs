@@ -1,4 +1,4 @@
-//! the referenced work: loud stranded-resource sweep + per-run isolation helpers.
+//! Loud stranded-resource sweep + per-run isolation helpers.
 //!
 //! This binary sorts first (`test_00_*`) so a suite run reaps leftovers
 //! before any kubectl test creates new ones. The plant test is the
@@ -97,7 +97,7 @@ fn test_stranded_resource_sweep_reports_and_removes() {
     );
 }
 
-/// Persistent data disks  are reaped by **age**, not by
+/// Persistent data disks are reaped by **age**, not by
 /// "no live VM holds it": between two VMs, a correctly retained disk is
 /// held by nobody, so the ephemeral rule would delete exactly the disks
 /// the primitive exists to keep.

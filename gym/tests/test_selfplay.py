@@ -1,4 +1,4 @@
-"""Scripted red <-> blue integration (26a-inc11) — no model, no KVM.
+"""Scripted red <-> blue integration — no model, no KVM.
 
 Proves the self-play game is two-sided and honest with scripted policies
 only. A small in-memory `SimCluster` models the relay incident's causal

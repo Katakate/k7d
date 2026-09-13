@@ -388,7 +388,7 @@ fn tcp_oneshot(
     }
 }
 
-/// / 9d TCP claim — source side:
+/// TCP claim — source side:
 /// 1. eth0 stays usable after `prepare_fork_source` (TapNetBackend seed);
 /// 2. a held TCP session opened *after* prepare survives `fork_cluster_warm`
 ///    without reconnect (prepare itself is a cold snapshot+restore blip;
@@ -843,6 +843,7 @@ fn test_cluster_fork_activate_drains_pending_tx_without_kick() {
         "kick-fork",
         tap,
         None,
+        false,
     );
     // Undo the crafted post on the source before it resumes (its own worker
     // must not emit the stale frame).
