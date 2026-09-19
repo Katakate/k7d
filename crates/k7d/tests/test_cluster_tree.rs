@@ -577,6 +577,13 @@ fn test_cluster_tree_fork_of_fork_with_rw_disks() {
         .expect("fork-of-fork with RW disks (CHALLENGES #130)");
     assert_member_disks_exist(&tree, &child);
     assert_member_disks_exist(&tree, &grand);
+    // `great` must outlive the eviction the `after-resume` fork below
+    // forces (live budget full, `grand` exempt as the source).
+    // `last_active_at_unix` is whole seconds and `nodes` is a HashMap,
+    // so if root, child and `great` land in the same second the LRU
+    // tie-break is hash order and `great` is sometimes the victim.
+    // Make `great` strictly newer than its ancestors.
+    std::thread::sleep(Duration::from_millis(1100));
     let great = tree.fork(&grand, "great").expect("depth-3 fork");
     assert_member_disks_exist(&tree, &great);
     assert_eq!(

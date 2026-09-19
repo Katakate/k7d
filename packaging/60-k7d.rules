@@ -1,0 +1,9 @@
+# Privilege separation — the VM broker opens /dev/vhost-vsock as uid k7d, once per VM,
+# on the fork hot path. Ubuntu ships the device root:root 0600, so without
+# this rule the split daemon cannot give a guest its agent transport and
+# the only symptom is EACCES on the first create_vm.
+#
+# `kvm` rather than a k7d-specific group: /dev/kvm is already root:kvm 0660
+# from systemd's 50-udev-default.rules, and the VM broker is in that group
+# for exactly this pair of devices. One group, two devices, no new name.
+KERNEL=="vhost-vsock", GROUP="kvm", MODE="0660"

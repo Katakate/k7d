@@ -153,11 +153,83 @@ UNITS
 
 die() { echo "build-node-image: $*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "must run as root (loop mount + chroot)"
+# True if any process holds `img` open. A FICLONE clone does not pin
+# its source; anything booted directly off the base would.
+img_is_open() {
+    local want target fd
+    want=$(readlink -f "$1" 2>/dev/null) || return 1
+    for fd in /proc/[0-9]*/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null) || continue
+        if [[ "$target" == "$want" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Evict old content-keyed sets from OUT_DIR. Keep K7D_KEEP_BASE_IMAGES
+# (default 2) most recently modified sets. Skip a set whose .img is
+# open rather than deleting it. Deletes all four files of each evicted
+# set (.img, .initrd, .vmlinuz, .json).
+gc_old_base_images() {
+    local out_dir="${1:-$OUT_DIR}"
+    local keep="${K7D_KEEP_BASE_IMAGES:-2}"
+    [[ "$keep" =~ ^[0-9]+$ ]] || die "K7D_KEEP_BASE_IMAGES must be an integer, got ${keep}"
+    (( keep >= 1 )) || die "K7D_KEEP_BASE_IMAGES must be >= 1, got ${keep}"
+    [[ -d "$out_dir" ]] || return 0
+
+    local -a sets=()
+    local img
+    shopt -s nullglob
+    for img in "$out_dir"/ubuntu-*.img; do
+        sets+=("${img%.img}")
+    done
+    shopt -u nullglob
+    ((${#sets[@]})) || return 0
+
+    local sorted base i=0
+    # GNU `stat %N` is the quoted filename, not nanoseconds. Same-second
+    # mtimes then sort by path and can evict the set just built. `%T@`
+    # is seconds with a fractional part.
+    sorted=$(
+        for base in "${sets[@]}"; do
+            printf '%s\t%s\n' "$(find "${base}.img" -maxdepth 0 -printf '%T@')" "$base"
+        done | sort -nr | cut -f2-
+    )
+    while IFS= read -r base; do
+        [[ -n "$base" ]] || continue
+        i=$((i + 1))
+        if (( i <= keep )); then
+            continue
+        fi
+        if [[ -e "${base}.img" ]] && img_is_open "${base}.img"; then
+            echo "gc-base-images: skip ${base}.img (.img is open)" >&2
+            continue
+        fi
+        echo "gc-base-images: deleting set $(basename "$base")" >&2
+        rm -f "${base}.img" "${base}.initrd" "${base}.vmlinuz" "${base}.json"
+    done <<< "$sorted"
+}
+
+if [[ "${1:-}" == --gc-only ]]; then
+    gc_old_base_images "$OUT_DIR"
+    exit 0
+fi
+
+PRINT_KEY=0
+[[ "${1:-}" == --print-key ]] && PRINT_KEY=1
+
+if [[ $PRINT_KEY -eq 0 ]]; then
+    [[ $EUID -eq 0 ]] || die "must run as root (loop mount + chroot)"
+fi
 [[ -f "$AGENT_BIN" ]] || die "k7-agent not found at $AGENT_BIN — run 'make build-agent'"
-for tool in mkfs.ext4 tar curl chroot sha256sum; do
-    command -v "$tool" >/dev/null || die "missing required tool: $tool"
-done
+if [[ $PRINT_KEY -eq 0 ]]; then
+    for tool in mkfs.ext4 tar curl chroot sha256sum; do
+        command -v "$tool" >/dev/null || die "missing required tool: $tool"
+    done
+else
+    command -v sha256sum >/dev/null || die "missing required tool: sha256sum"
+fi
 
 # --- Content key ----------------------------------------------------
 KEY=$(
@@ -186,10 +258,16 @@ KERNEL_OUT="${OUT_DIR}/${BASE}.vmlinuz"
 INITRD_OUT="${OUT_DIR}/${BASE}.initrd"
 MANIFEST="${OUT_DIR}/${BASE}.json"
 
+if [[ "${1:-}" == --print-key ]]; then
+    echo "$KEY"
+    exit 0
+fi
+
 mkdir -p "$OUT_DIR" "$CACHE_DIR"
 
 # The manifest is written last, so its presence is what proves the whole
 # build finished. A half-built image with no manifest is rebuilt.
+# A cache hit is a read-only fast path: do not GC here.
 if [[ -f "$MANIFEST" && -f "$IMG" && -f "$KERNEL_OUT" && -f "$INITRD_OUT" ]]; then
     echo "==> cache hit: $IMG"
     cat "$MANIFEST"
@@ -469,3 +547,4 @@ JSON
 
 echo "==> built $IMG"
 cat "$MANIFEST"
+gc_old_base_images "$OUT_DIR"

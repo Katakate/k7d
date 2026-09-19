@@ -11,7 +11,6 @@ use kvm_bindings::{
     KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VcpuFd};
-use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::{create_serial_device_with_trigger, PipeSerialDevice, SerialTrigger};
 use crate::network::{ClusterNetwork, TapDevice, TapNetBackend};
@@ -145,7 +144,7 @@ fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<(), ForkError> {
         return Ok(());
     }
 
-    let output = std::process::Command::new("cp")
+    let output = crate::spawner::command("cp")
         .args(["--reflink=auto", "-a"])
         .arg(src)
         .arg(dst)
@@ -407,7 +406,8 @@ fn restore_vm_inner(
             let irq = dev_state.irq;
             let base = dev_state.base_addr;
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
@@ -443,7 +443,8 @@ fn restore_vm_inner(
             let irq = dev_state.irq;
             let base = dev_state.base_addr;
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
@@ -489,7 +490,8 @@ fn restore_vm_inner(
             let irq = dev_state.irq;
             let base = dev_state.base_addr;
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
@@ -524,14 +526,16 @@ fn restore_vm_inner(
     // Create serial devices (same as fresh boot). COM1 gets real THRE
     // interrupts (IRQ 4) — without them guest userspace console writes
     // block once the 8250 xmit buffer fills (`SerialDevice::with_trigger`).
-    let com1_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+    let com1_irq_evt =
+        crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
     vm_fd
         .register_irqfd(&com1_irq_evt, crate::devices::SERIAL_IRQ)
         .map_err(|e| RestoreError::Kvm(format!("register irqfd for COM1: {e}")))?;
     let serial =
         create_serial_device_with_trigger(SerialTrigger::with_eventfd(Arc::new(com1_irq_evt)));
 
-    let com2_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+    let com2_irq_evt =
+        crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
     vm_fd
         .register_irqfd(&com2_irq_evt, 3)
         .map_err(|e| RestoreError::Kvm(format!("register irqfd for COM2: {e}")))?;
@@ -627,7 +631,7 @@ fn restore_dilation(vm_fd: &kvm_ioctls::VmFd, dilation: u32) -> Result<(), Resto
 /// vCPU-index order.
 ///
 /// Per vCPU the fixed order is CPUID → SREGS → XCRS → XSAVE → REGS →
-/// LAPIC → MSRs → `MP_STATE` last, followed by `KVM_KVMCLOCK_CTRL`.
+/// LAPIC → MSRs → SSP → `MP_STATE` last, followed by `KVM_KVMCLOCK_CTRL`.
 /// VM-scoped IRQ chip state (IOAPIC / PIC / PIT) is applied during vCPU
 /// 0's restore, preserving the legacy single-vCPU ioctl sequence.
 fn create_and_restore_vcpus(
@@ -648,6 +652,24 @@ fn create_and_restore_vcpus(
         let vcpu_fd = vm_fd
             .create_vcpu(i as u64)
             .map_err(|e| RestoreError::Kvm(format!("create vCPU {i}: {e}")))?;
+        log::debug!(
+            "restore: vCPU {i} captured RIP={:#x} RSP={:#x} CS={:#x} CR0={:#x} CR3={:#x} \
+             CR4={:#x} EFER={:#x} APIC_BASE={:#x} mp_state={:?} msrs={} lapic={}B xsave={} \
+             cpuid_entries={:?}",
+            cpu_state.regs.rip,
+            cpu_state.regs.rsp,
+            cpu_state.sregs.cs.selector,
+            cpu_state.sregs.cr0,
+            cpu_state.sregs.cr3,
+            cpu_state.sregs.cr4,
+            cpu_state.sregs.efer,
+            cpu_state.sregs.apic_base,
+            cpu_state.mp_state,
+            cpu_state.msrs.len(),
+            cpu_state.lapic.len(),
+            cpu_state.xsave.as_ref().map_or(0, |x| x.data.len()),
+            cpu_state.cpuid_entries.as_ref().map(Vec::len),
+        );
         restore_vcpu_cpuid(kvm, &vcpu_fd, cpu_state, i as u32, cpu_states.len() as u32)?;
         restore_cpu_state(
             vm_fd,
@@ -788,7 +810,8 @@ fn restore_vcpu_cpuid(
 
 /// Restore CPU state in the exact order used by zeroboot/Firecracker.
 ///
-/// Order: SREGS → XCRS → XSAVE → REGS → LAPIC → IOAPIC → MSRs → `MP_STATE` (last).
+/// Order: SREGS → XCRS → XSAVE → REGS → LAPIC → IOAPIC → MSRs → SSP →
+/// `MP_STATE` (last).
 ///
 /// The LAPIC comes from the per-vCPU [`CpuState::lapic`],
 /// falling back to the legacy VM-scoped `irqchip.lapic` for older
@@ -998,7 +1021,15 @@ fn restore_cpu_state(
         }
     }
 
-    // 5. MSRs (syscall, GS_BASE, etc.).
+    // 5. MSRs, in capture order (`snapshot::msr_indices`): the syscall
+    // and segment-base set, the kvmclock handshake, then IA32_XSS and
+    // the CET MSRs — those live in the guest FPU state, so they come
+    // after KVM_SET_XSAVE above — then everything else KVM reports as
+    // to-be-saved. Every value was read from KVM on a live vCPU, so a
+    // refused write is a vCPU that is not the source's: fail the restore
+    // rather than resume a guest whose supervisor state differs from
+    // what its kernel believes (CHALLENGES #260 — a silently skipped
+    // IA32_XSS was a panic on the first context switch).
     for msr in &state.msrs {
         let entries = [kvm_bindings::kvm_msr_entry {
             index: msr.index,
@@ -1007,9 +1038,29 @@ fn restore_cpu_state(
         }];
         let msrs =
             kvm_bindings::Msrs::from_entries(&entries).expect("single MSR entry should succeed");
-        if let Err(e) = vcpu_fd.set_msrs(&msrs) {
-            log::warn!("restore: MSR {:#x} set failed: {e}", msr.index);
+        match vcpu_fd.set_msrs(&msrs) {
+            Ok(1) => {}
+            Ok(n) => {
+                return Err(RestoreError::Kvm(format!(
+                    "KVM_SET_MSRS {:#x} = {:#x}: wrote {n} of 1",
+                    msr.index, msr.data
+                )))
+            }
+            Err(e) => {
+                return Err(RestoreError::Kvm(format!(
+                    "KVM_SET_MSRS {:#x} = {:#x}: {e}",
+                    msr.index, msr.data
+                )))
+            }
         }
+    }
+
+    // 5a. Shadow stack pointer — a register, not an MSR, so it has its
+    // own ioctl. Captured only where KVM virtualizes CET; on those hosts
+    // a refused write leaves a shadow-stack guest one `ret` away from
+    // #CP, so it is an error, not a warning.
+    if let Some(ssp) = state.ssp {
+        crate::snapshot::set_guest_ssp(vcpu_fd, ssp).map_err(RestoreError::Kvm)?;
     }
 
     // 5b. Re-queue the event injection the pause interrupted.
@@ -1939,7 +1990,8 @@ fn build_vm_from_state_and_mem_inner(
                 let irq = dev_state.irq;
                 let base = dev_state.base_addr;
 
-                let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+                let irq_evt =
+                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
                 vm_fd
                     .register_irqfd(&irq_evt, irq)
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
@@ -1977,7 +2029,8 @@ fn build_vm_from_state_and_mem_inner(
                 let irq = dev_state.irq;
                 let base = dev_state.base_addr;
 
-                let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+                let irq_evt =
+                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
                 vm_fd
                     .register_irqfd(&irq_evt, irq)
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
@@ -2059,7 +2112,8 @@ fn build_vm_from_state_and_mem_inner(
 
                 let irq = dev_state.irq;
                 let base = dev_state.base_addr;
-                let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+                let irq_evt =
+                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
                 vm_fd
                     .register_irqfd(&irq_evt, irq)
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for fs: {e}")))?;
@@ -2167,7 +2221,8 @@ fn build_vm_from_state_and_mem_inner(
 
                 let irq = dev_state.irq;
                 let base = dev_state.base_addr;
-                let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+                let irq_evt =
+                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
                 vm_fd
                     .register_irqfd(&irq_evt, irq)
                     .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
@@ -2211,14 +2266,16 @@ fn build_vm_from_state_and_mem_inner(
         // COM1 console with real THRE interrupts (IRQ 4) — same wiring
         // as cold boot; without it guest userspace console writes block
         // once the 8250 xmit buffer fills (see `SerialDevice::with_trigger`).
-        let com1_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+        let com1_irq_evt =
+            crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
         vm_fd
             .register_irqfd(&com1_irq_evt, crate::devices::SERIAL_IRQ)
             .map_err(|e| RestoreError::Kvm(format!("register irqfd for COM1: {e}")))?;
         let serial =
             create_serial_device_with_trigger(SerialTrigger::with_eventfd(Arc::new(com1_irq_evt)));
 
-        let com2_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
+        let com2_irq_evt =
+            crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
         vm_fd
             .register_irqfd(&com2_irq_evt, 3)
             .map_err(|e| RestoreError::Kvm(format!("register irqfd for COM2: {e}")))?;

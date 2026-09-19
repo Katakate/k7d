@@ -59,9 +59,54 @@ fn uid_base() -> Result<u32, FcError> {
     }
 }
 
+/// Whether `uid` is one this allocator hands to a jail.
+///
+/// Range membership, not liveness: the caller
+/// ([`crate::broker::paths`]) is asking about a *file*, and a writable
+/// drive keeps the uid of the last jail it was attached to long after
+/// that lease is gone ([`Chroot::link_read_write`] re-owns the inode,
+/// which the host file shares). No account exists in this range.
+/// A malformed `K7D_FC_UID_BASE` answers `false` and says so: the same
+/// variable fails [`UidLease::acquire`] outright, so no jail can be
+/// holding a uid this cannot name, and refusing is the safe direction.
+#[must_use]
+pub fn is_jail_uid(uid: u32) -> bool {
+    let base = match uid_base() {
+        Ok(base) => base,
+        Err(e) => {
+            log::error!("fc: cannot decide whether uid {uid} is a jail's: {e}");
+            return false;
+        }
+    };
+    uid >= base && uid < base.saturating_add(MAX_LIVE_UIDS)
+}
+
 fn live_uids() -> &'static Mutex<BTreeSet<u32>> {
     static LIVE: OnceLock<Mutex<BTreeSet<u32>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// uids the allocator must never hand out again in this daemon's
+/// lifetime: a [`super::spawn::SpawnReaper`] could not confirm that the
+/// process running as one of them was dead (`SIGKILL` delivered, still
+/// in `/proc` after the wait — a VMM stuck in the kernel). Leaking a
+/// uid is loud and bounded; recycling one under a live process is the
+/// hole bug-candidates #51 describes.
+fn quarantined_uids() -> &'static Mutex<BTreeSet<u32>> {
+    static QUARANTINED: OnceLock<Mutex<BTreeSet<u32>>> = OnceLock::new();
+    QUARANTINED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Retire `uid` from the allocator for the rest of this process's life.
+pub(super) fn quarantine_uid(uid: u32) {
+    log::error!(
+        "fc: uid {uid} still owns a process after SIGKILL — retiring it from the \
+         allocator; it will not be reused until the daemon restarts"
+    );
+    quarantined_uids()
+        .lock()
+        .expect("fc uid quarantine poisoned")
+        .insert(uid);
 }
 
 /// An allocated uid/gid, released when dropped.
@@ -78,9 +123,12 @@ impl UidLease {
     /// Take the lowest free uid in the configured range.
     pub fn acquire() -> Result<Self, FcError> {
         let base = uid_base()?;
+        let quarantined = quarantined_uids()
+            .lock()
+            .expect("fc uid quarantine poisoned");
         let mut live = live_uids().lock().expect("fc uid allocator poisoned");
         for uid in base..base.saturating_add(MAX_LIVE_UIDS) {
-            if live.insert(uid) {
+            if !quarantined.contains(&uid) && live.insert(uid) {
                 return Ok(Self { uid });
             }
         }
@@ -174,6 +222,22 @@ impl Chroot {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `<base>/<exec_name>/<vm_id>` — the directory holding both the
+    /// chroot and k7d's own [`Self::snap_dir`], and the one whose
+    /// `O_PATH` descriptor crosses to the VM broker under the split
+    /// (`super::super::broker::jail`).
+    #[must_use]
+    pub fn vm_dir(&self) -> &Path {
+        &self.vm_dir
+    }
+
+    /// Host path of the read-only image staged under `name`
+    /// (`<root>/img/<name>`).
+    #[must_use]
+    pub fn img_path(&self, name: &str) -> PathBuf {
+        self.root.join(IMG_SUBDIR).join(name)
     }
 
     /// Host path of the API socket Firecracker will create.
@@ -595,7 +659,17 @@ fn link_same_fs(src: &Path, dst: &Path) -> Result<(), FcError> {
     })
 }
 
-pub(super) fn chown(path: &Path, uid: u32) -> Result<(), FcError> {
+pub fn chown(path: &Path, uid: u32) -> Result<(), FcError> {
+    chown_gid(path, uid, uid)
+}
+
+/// `chown(path, uid, gid)` with the two halves chosen separately.
+///
+/// The split needs the asymmetric form: the jail's `<root>` and
+/// `<root>/run` stay owned by the jail uid — Firecracker writes in them
+/// — while their *group* becomes `k7d`, which is the only thing that
+/// lets the unprivileged half reach the API socket at all.
+pub fn chown_gid(path: &Path, uid: u32, gid: u32) -> Result<(), FcError> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| {
         FcError::Stage {
             path: path.to_path_buf(),
@@ -603,14 +677,24 @@ pub(super) fn chown(path: &Path, uid: u32) -> Result<(), FcError> {
         }
     })?;
     // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
-    let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
+    let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
     if rc != 0 {
         return Err(FcError::Stage {
             path: path.to_path_buf(),
-            message: format!("chown to {uid}:{uid}: {}", std::io::Error::last_os_error()),
+            message: format!("chown to {uid}:{gid}: {}", std::io::Error::last_os_error()),
         });
     }
     Ok(())
+}
+
+/// `chmod(path, mode)`, loud, with the path in the message.
+pub fn chmod(path: &Path, mode: u32) -> Result<(), FcError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        FcError::Stage {
+            path: path.to_path_buf(),
+            message: format!("chmod {mode:o}: {e}"),
+        }
+    })
 }
 
 /// `"<fs type> at <mount point>"` for the filesystem holding `path`, so

@@ -9,13 +9,17 @@
 //!
 //! Two measured facts shape it, and neither is negotiable:
 //!
-//! 1. **There is no deadline MSR to jump to.** `IA32_TSC_DEADLINE` reads
-//!    zero on every vCPU of every node in every sample,
-//!    because `KVM_GET_SUPPORTED_CPUID` does not report
-//!    `CPUID.1:ECX[24]` on this host kernel; we confirmed it from
-//!    inside the guest (`/proc/timer_list` says `lapic`, never
-//!    `lapic-deadline`). The timer the guest actually arms is the LAPIC
-//!    one-shot, read here through `KVM_GET_LAPIC`'s live `TMCCT`.
+//! 1. **Which timer the guest arms is the host's choice, not ours.** On
+//!    the AMD nodes (host kernel 6.8) `KVM_GET_SUPPORTED_CPUID` does not
+//!    report `CPUID.1:ECX[24]`, `IA32_TSC_DEADLINE` reads zero on every
+//!    vCPU in every sample, `/proc/timer_list` says `lapic`, and the
+//!    timer the guest arms is the LAPIC one-shot, read here through
+//!    `KVM_GET_LAPIC`'s live `TMCCT` — which needs the APIC bus cycle
+//!    calibrated first. On the Intel node (host kernel 7.0) the bit is
+//!    advertised, the guest says `lapic-deadline`, `TMCCT` never counts,
+//!    and the deadline is read from `IA32_TSC_DEADLINE` in TSC units
+//!    with nothing to calibrate. `Vm::sample_timers` reports both; the
+//!    calibration cycle is spent only when there is a count to convert.
 //! 2. **A jump wider than a node lease flaps the cluster.** Leases are
 //!    40 s with 10 s kubelet renewal, and we measured a +90 s warp
 //!    taking every agent `NotReady` for ~9 s. Correct for a caller who
@@ -863,10 +867,28 @@ impl Driver {
         // `TMCCT` is a count, not a duration, until the length of an
         // APIC bus cycle is known. Measure it here, in an idle pause
         // that has already passed the predicate, and keep the answer:
-        // that is one 2 ms pause per driver, not one per cycle.
-        let Some(bus_cycle_fs) = self.bus_cycle_fs else {
-            return Err(self.calibrate(vms[0]));
-        };
+        // that is one 2 ms pause per driver, not one per cycle. Only
+        // worth measuring when some vCPU actually has a one-shot count
+        // running: a guest on the TSC-deadline timer (Intel hosts that
+        // advertise CPUID.1:ECX[24]) never does, its deadlines are read
+        // straight from IA32_TSC_DEADLINE in TSC units, and a policy
+        // that insisted on calibrating first would decline every cycle
+        // forever. The survey below reports any count it meets while
+        // uncalibrated as unmodelled, so this is never a guess.
+        if self.bus_cycle_fs.is_none() {
+            for (i, vm) in vms.iter().enumerate() {
+                let armed = vm.has_armed_lapic_one_shot().map_err(|e| {
+                    Decline::new(
+                        DeclineReason::KvmError,
+                        format!("reading member {i}'s LAPIC timers: {e}"),
+                    )
+                })?;
+                if armed {
+                    return Err(self.calibrate(vm));
+                }
+            }
+        }
+        let bus_cycle_fs = self.bus_cycle_fs;
 
         let mut survey = TimerSurvey::default();
         for (i, vm) in vms.iter().enumerate() {

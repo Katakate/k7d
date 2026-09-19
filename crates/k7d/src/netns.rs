@@ -50,7 +50,6 @@
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Errors produced by the netns helpers.
 #[derive(Debug, thiserror::Error)]
@@ -126,151 +125,37 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), NetnsError> {
     Ok(())
 }
 
-/// Spawn a command, read its stdout + stderr to EOF, then wait for it
-/// to exit — but use `pidfd_open(2)` + `poll(2)` to wait instead of
-/// the libc `waitpid(2)` that `std::process::Command::output()` uses.
+/// Run a command through [`crate::spawner`], read its stdout + stderr
+/// to EOF, and return `(ExitStatus, stdout, stderr)`.
 ///
-/// ## Why
+/// ## Why not `std::process::Command::output()`
 ///
-/// When this code runs inside the shim, the shim's Tokio runtime
-/// installs a SIGCHLD handler that reaps every child via
-/// `waitpid(-1, …, WNOHANG)`. If our child exits between the moment
-/// it starts and the moment our thread calls `waitpid(pid)`, Tokio
-/// has already collected the exit status and `waitpid(pid)` fails
-/// with `ECHILD` ("No child processes") — manifesting in our error
-/// messages as `"netns IO: No child processes (os error 10)"`. The
-/// pod's CNI flow then breaks silently because every `ip` /
-/// `nsenter` invocation we make appears to fail.
+/// Two independent reasons, both about *who* the child is.
 ///
-/// `pidfd_open(2)` (Linux 5.3+) returns a file descriptor that
-/// becomes readable when the child exits, regardless of whether
-/// SIGCHLD has been delivered or reaped. We open the pidfd
-/// immediately after spawn and `poll()` it; the child's exit status
-/// is then retrievable via `waitid(P_PIDFD, …, WEXITED | WNOHANG)`,
-/// which does NOT race with SIGCHLD reapers. The whole pidfd path is
-/// race-free under arbitrary signal-handling regimes.
+/// In the daemon it is not a child at all: `spawner.rs` execs helpers
+/// from a process forked before the daemon's seccomp filter, so an `ip`
+/// invocation is the daemon's *grand*child and `waitpid` on it would
+/// fail with `ECHILD` even without a reaper in play. The spawner owns
+/// the wait.
 ///
-/// Returns `(ExitStatus, stdout, stderr)` on success.
+/// In the shim it is a child, but the shim's Tokio runtime installs a
+/// SIGCHLD handler that reaps every child via `waitpid(-1, …, WNOHANG)`.
+/// If ours exits before our thread calls `waitpid(pid)`, Tokio has
+/// already collected the status and `waitpid` returns `ECHILD` —
+/// which surfaced as `"netns IO: No child processes (os error 10)"` and
+/// silently broke every `attach_to_pod_netns` call on a live cluster.
+/// `spawner` waits on a `pidfd` for that reason, which is race-free
+/// under any signal-handling regime.
 pub(crate) fn run_capture(
     cmd: &str,
     args: &[&str],
 ) -> Result<(std::process::ExitStatus, String, String), NetnsError> {
-    use std::io::Read as _;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::process::Stdio;
-
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let pid = libc::pid_t::try_from(child.id()).unwrap_or(libc::pid_t::MAX);
-
-    // Open a pidfd for the child IMMEDIATELY after spawn so we have a
-    // race-free handle to wait on. SAFETY: pidfd_open is a Linux
-    // syscall; pid is a valid child PID we just received; flags=0.
-    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    let pidfd = if pidfd_raw >= 0 {
-        // SAFETY: pidfd_open returned a valid fd; we own it.
-        Some(unsafe { OwnedFd::from_raw_fd(pidfd_raw as i32) })
-    } else {
-        // Fall back to the std waitpid path on older kernels (where
-        // we'd lose to the SIGCHLD race) — surface that as an error
-        // so the caller knows the fallback is happening.
-        None
-    };
-
-    // Drain stdout and stderr in this thread. The pipes have small
-    // kernel buffers (~64 KiB); for `ip` / `nsenter` output that's
-    // plenty. If a future caller streams MB of output, switch to
-    // threaded readers.
-    let mut stdout_str = String::new();
-    let mut stderr_str = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout_str);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_str);
-    }
-
-    let status = match pidfd {
-        Some(fd) => {
-            // Wait for the pidfd to become readable, then collect
-            // exit status via waitid(P_PIDFD). This bypasses
-            // waitpid(pid) entirely and is race-free under Tokio's
-            // SIGCHLD reaper.
-            let mut poll_fd = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: pfd valid for one element; timeout -1 = wait
-            // forever.
-            unsafe { libc::poll(&mut poll_fd, 1, -1) };
-            // SAFETY: siginfo_t is plain old data; an all-zero
-            // bit pattern is the documented "uninitialized" value
-            // libc::waitid expects.
-            let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: P_PIDFD is the pidfd waitid mode (Linux 5.4+);
-            // we pass our owned pidfd; WEXITED collects normal exits;
-            // si is a valid &mut siginfo_t for the duration of the call.
-            let rc = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    fd.as_raw_fd() as libc::id_t,
-                    &mut si,
-                    libc::WEXITED,
-                )
-            };
-            if rc < 0 {
-                let e = std::io::Error::last_os_error();
-                // Tokio may have reaped despite our pidfd; treat as
-                // success-of-unknown-status — for idempotent `ip`
-                // commands this is safe and the alternative is to
-                // fall over.
-                if e.raw_os_error() == Some(libc::ECHILD) {
-                    use std::os::unix::process::ExitStatusExt as _;
-                    std::process::ExitStatus::from_raw(0)
-                } else {
-                    return Err(NetnsError::Io(e));
-                }
-            } else {
-                // siginfo_t.si_code tells us how the child exited;
-                // si_status is the exit code or signal. For our
-                // purposes any CLD_EXITED with status 0 is success;
-                // anything else is a failure that should propagate
-                // via the stderr we captured.
-                use std::os::unix::process::ExitStatusExt as _;
-                // SAFETY: after a successful waitid(P_PIDFD, …,
-                // WEXITED), si.si_code and si.si_status() are the
-                // documented fields populated by the kernel — both
-                // are plain integers and safe to read.
-                let raw = unsafe {
-                    let status = si.si_status();
-                    // Pack into a wait-status format ExitStatus
-                    // understands: low 7 bits = signal, bit 7 =
-                    // core-dumped, bits 8-15 = exit code (for
-                    // normal exits).
-                    if si.si_code == libc::CLD_EXITED {
-                        (status & 0xff) << 8
-                    } else {
-                        status & 0x7f
-                    }
-                };
-                std::process::ExitStatus::from_raw(raw)
-            }
-        }
-        None => {
-            // pidfd_open failed (kernel <5.3 or sandboxed). Fall back
-            // to std's wait — this is the path that may hit ECHILD
-            // under Tokio, but it's at least no worse than before.
-            child.wait()?
-        }
-    };
-
-    Ok((status, stdout_str, stderr_str))
+    let out = crate::spawner::command(cmd).args(args).output()?;
+    Ok((
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 /// Run a command inside the given netns via `nsenter --net=<path>`.
@@ -475,8 +360,10 @@ mod tests {
     /// on the bare-metal node.
     fn fresh_netns(name: &str) -> PathBuf {
         // Best-effort cleanup from any prior failed run.
-        let _ = Command::new("ip").args(["netns", "del", name]).output();
-        let out = Command::new("ip")
+        let _ = crate::spawner::command("ip")
+            .args(["netns", "del", name])
+            .output();
+        let out = crate::spawner::command("ip")
             .args(["netns", "add", name])
             .output()
             .expect("ip netns add");
@@ -491,7 +378,9 @@ mod tests {
     struct NetnsGuard<'a>(&'a str);
     impl Drop for NetnsGuard<'_> {
         fn drop(&mut self) {
-            let _ = Command::new("ip").args(["netns", "del", self.0]).output();
+            let _ = crate::spawner::command("ip")
+                .args(["netns", "del", self.0])
+                .output();
         }
     }
 
@@ -593,7 +482,7 @@ mod tests {
 
         let dummy_name = "k7d-mvtest";
         // Best-effort cleanup of any prior dummy.
-        let _ = Command::new("ip")
+        let _ = crate::spawner::command("ip")
             .args(["link", "delete", dummy_name])
             .output();
         run("ip", &["link", "add", dummy_name, "type", "dummy"]).unwrap();

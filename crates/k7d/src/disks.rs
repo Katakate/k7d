@@ -15,7 +15,6 @@
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Where writable raw volume images live on the host. Backed by the
 /// loopback XFS provisioned by [`ensure_loopback_xfs`] (also done at
@@ -24,6 +23,14 @@ pub const DISKS_DIR: &str = "/var/lib/k7d/disks";
 
 /// Default backing image for the loopback XFS behind [`DISKS_DIR`].
 pub const DISKS_IMAGE: &str = "/var/lib/k7d/disks.img";
+
+/// Root-only (`0700`) scratch directory for material the daemon stages
+/// briefly on the host — kubelet Secret and projected-token trees on
+/// their way into an erofs image (`volumes_blk`). Not `/tmp`: a
+/// world-traversable, guessably-named directory downgraded kubelet's
+/// `0400` to the daemon's umask for the length of the pack
+/// (bug-candidates #57).
+pub const STAGE_DIR: &str = "/var/lib/k7d/stage";
 
 /// Where snapshot trees live on the reflink XFS: a subdirectory of
 /// [`DISKS_DIR`], so an incremental keyframe's `FICLONE` of its
@@ -170,6 +177,36 @@ impl ScratchDisk {
             size_bytes / (1024 * 1024)
         );
         Ok(Self { path, size_bytes })
+    }
+
+    /// Take ownership of a scratch image an earlier VM broker created
+    /// for a VM this process is re-adopting (`K7D_VM_BROKER_RESTART`): the file is
+    /// removed when the handle drops, exactly as if this process had
+    /// created it. Only for a path directly under [`DISKS_DIR`] with the
+    /// `scratch-` prefix — anything else is not scratch and must not be
+    /// unlinked at teardown.
+    pub fn adopt(path: &Path) -> Result<Self, DiskError> {
+        let is_scratch = path.parent() == Some(Path::new(DISKS_DIR))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("scratch-"))
+            && path.extension().is_some_and(|ext| ext == "img");
+        if !is_scratch {
+            return Err(DiskError::ScratchKey {
+                key: path.display().to_string(),
+            });
+        }
+        let size_bytes = std::fs::metadata(path)
+            .map_err(|err| DiskError::Io {
+                path: path.to_path_buf(),
+                err,
+            })?
+            .len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            size_bytes,
+        })
     }
 
     /// Reject a key that cannot be a single filename component.
@@ -488,7 +525,7 @@ fn io_err(path: &Path, err: std::io::Error) -> DiskError {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), DiskError> {
-    let output = Command::new(cmd)
+    let output = crate::spawner::command(cmd)
         .args(args)
         .output()
         .map_err(|e| io_err(Path::new(cmd), e))?;
@@ -504,7 +541,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), DiskError> {
 /// Like [`run`], returning the command's stdout for callers that have
 /// to parse it (`losetup -j`).
 fn run_stdout(cmd: &str, args: &[&str]) -> Result<String, DiskError> {
-    let output = Command::new(cmd)
+    let output = crate::spawner::command(cmd)
         .args(args)
         .output()
         .map_err(|e| io_err(Path::new(cmd), e))?;
@@ -552,11 +589,13 @@ pub fn assert_reflink_capable(dir: &Path) -> Result<(), DiskError> {
 /// first use. Idempotent: an already-mounted, reflink-capable
 /// `mount_point` returns immediately.
 ///
-/// Node resets run the same provisioning from
-/// `your node provisioning` (plus an `/etc/fstab` entry so the
-/// mount survives reboots); this function is the programmatic
-/// equivalent that integration tests and the daemon can call to
-/// self-provision. Requires root (mount).
+/// The systemd unit mounts this from `ExecStartPre=+` via
+/// `packaging/k7d-mount-disks.sh` so the mount lives in the **host**
+/// namespace (`ProtectSystem=strict` would otherwise hide a daemon-side
+/// `mount` from the host and from tests). Node resets call that same
+/// script. This function is the programmatic equivalent that
+/// in-process tests use to self-provision, and a fallback if the
+/// unit's `ExecStartPre` has not run. Requires root (mount).
 pub fn ensure_loopback_xfs(
     image: &Path,
     mount_point: &Path,

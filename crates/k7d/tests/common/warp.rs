@@ -98,36 +98,54 @@ pub fn check_clocksource(agent: &mut AgentClient, whose: &str) {
 
 /// Name the clockevent device the guest actually arms its timers on.
 ///
-/// The clock survey measured `IA32_TSC_DEADLINE` at zero on every vCPU of
-/// every node, because `KVM_GET_SUPPORTED_CPUID` does not report
-/// `CPUID.1:ECX[24]` on this host kernel. The consequence is here, in
-/// the guest: without that bit Linux registers `lapic` (the one-shot
-/// count-down timer), not `lapic-deadline`. So the deadline-MSR
-/// write-back in `Vm::warp_clock` re-arms nothing on this guest, and
-/// the CrashLoopBackOff proof is the only evidence that timers re-arm —
-/// and the policy's jump target has to come from `KVM_GET_LAPIC` instead.
-/// Asserted rather than commented: the day the bit is advertised, this
-/// fails and says so instead of leaving the proof quietly resting on it.
+/// Two answers are legitimate, and which one a guest gives is decided
+/// by the host, not the guest image:
+///
+/// * `lapic` — the one-shot count-down timer. What Linux registers when
+///   `KVM_GET_SUPPORTED_CPUID` does not report `CPUID.1:ECX[24]`
+///   (the AMD nodes, host kernel 6.8). `IA32_TSC_DEADLINE` reads zero
+///   on every vCPU, the deadline write-back in `Vm::warp_clock` re-arms
+///   nothing, and the policy's jump target comes from `KVM_GET_LAPIC`
+///   (`TMCCT`).
+/// * `lapic-deadline` — the TSC-deadline timer. What Linux registers
+///   when the bit is advertised (the Intel node, host kernel 7.0). The
+///   LVT mode is 2, `TMCCT` is meaningless, `IA32_TSC_DEADLINE` holds
+///   the armed expiry in guest-TSC units, `Vm::sample_timers` surveys
+///   it as `TimerSource::TscDeadline`, and step 3 of `Vm::warp_vcpus`
+///   rewrites the MSR after the offset write so KVM recomputes its
+///   hrtimer against the advanced TSC.
+///
+/// Anything else is a guest this suite has never measured, and the
+/// assertion says so rather than letting the CrashLoopBackOff proof
+/// quietly rest on an unread re-arm story (that is how the second
+/// answer was found: the assertion below used to admit only `lapic`).
 ///
 /// The broadcast device is returned alongside, because it is the other
 /// half of the same story: the LAPIC one-shot counter is 32 bits over a
 /// divided bus clock, so a deeply idle NOHZ CPU whose next timer is
 /// further out than that hands the wakeup to `tick_broadcast` — here the
 /// PIT. A warp has to be survived by whichever of the two is armed, and
-/// The safety predicate declines whenever the PIT's expiry is the one
+/// the safety predicate declines whenever the PIT's expiry is the one
 /// KVM will not export.
-pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> String {
+pub struct Clockevents {
+    /// `lapic` or `lapic-deadline`.
+    pub per_cpu: String,
+    /// The `tick_broadcast` device (`hpet`, `pit`, or `<NULL>`).
+    pub broadcast: String,
+}
+
+pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> Clockevents {
     let per_cpu = sh_ok(
         agent,
         "grep -A1 '^Per CPU device:' /proc/timer_list \
          | awk '/Clock Event Device:/ {print $4}' | sort -u | paste -sd,",
     );
-    assert_eq!(
-        per_cpu.trim(),
-        "lapic",
-        "{whose} arms its timers on something other than the LAPIC one-shot timer — \
-         the clock survey (IA32_TSC_DEADLINE never armed) no longer describes this guest, \
-         so re-read what the warp has to re-arm"
+    assert!(
+        matches!(per_cpu.trim(), "lapic" | "lapic-deadline"),
+        "{whose} arms its timers on {:?}, which is neither the LAPIC one-shot timer nor \
+         the TSC-deadline timer — the warp re-arm story in `Vm::warp_vcpus` covers only \
+         those two, so re-read what this guest needs re-armed",
+        per_cpu.trim()
     );
     let broadcast = sh_ok(
         agent,
@@ -139,7 +157,10 @@ pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> String {
         per_cpu.trim(),
         broadcast.trim()
     );
-    broadcast.trim().to_string()
+    Clockevents {
+        per_cpu: per_cpu.trim().to_string(),
+        broadcast: broadcast.trim().to_string(),
+    }
 }
 
 /// No in-guest NTP client, because there is no sharing the clock with

@@ -35,8 +35,6 @@ use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, NotQuiescent, SharedMmi
 use crate::virtiofs::{VirtioFsBackend, VirtiofsdProcess};
 use crate::vsock::{allocate_cid, VhostVsockBackend};
 
-use vmm_sys_util::eventfd::EventFd;
-
 /// Errors from VM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum VmError {
@@ -58,8 +56,20 @@ pub enum VmError {
     GetCpuid(kvm_ioctls::Error),
     #[error("failed to set CPUID: {0}")]
     SetCpuid(kvm_ioctls::Error),
-    #[error("failed to open kernel file: {0}")]
-    KernelFile(std::io::Error),
+    /// The kernel is one of the two artifacts no verb pins: the VM
+    /// broker opens it by name as uid `k7d` (privilege separation), so a
+    /// root-only mode on a path the *caller* can read is a real and
+    /// otherwise baffling failure. The uid is in the message for that
+    /// reason (CHALLENGES #250).
+    #[error("failed to read kernel {path} as uid {uid}: {source}")]
+    KernelFile {
+        /// The kernel image that could not be read.
+        path: PathBuf,
+        /// Effective uid of the process that tried.
+        uid: u32,
+        /// What the open or read returned.
+        source: std::io::Error,
+    },
     #[error(
         "{path} is neither an ELF vmlinux (no \\x7fELF at 0) nor a bzImage \
          (no 'HdrS' at 0x202): first bytes {head:02x?}"
@@ -296,8 +306,9 @@ pub enum LapicTimerMode {
     /// Reloads `TMICT` and fires forever — a tick rate, not a deadline.
     Periodic,
     /// Fires when `IA32_TSC` passes `IA32_TSC_DEADLINE`. Needs
-    /// `CPUID.1:ECX[24]`, which this host's `KVM_GET_SUPPORTED_CPUID`
-    /// does not report, so it is never seen here.
+    /// `CPUID.1:ECX[24]`: not reported by the AMD nodes' host kernel
+    /// (6.8), reported by the Intel node's (7.0), so Ubuntu guests there
+    /// register `lapic-deadline` and this is the mode they run in.
     TscDeadline,
     /// Bits 18:17 = 3, reserved by the SDM.
     Reserved,
@@ -1582,7 +1593,10 @@ impl VmBuilder {
         };
         vm_fd.create_pit2(pit_config).map_err(VmError::CreatePit2)?;
 
-        // Allocate guest memory via memfd so we can share the fd with virtiofsd.
+        // Allocate guest memory via memfd so we can share the fd with
+        // virtiofsd. It travels over the vhost-user socket as SCM_RIGHTS
+        // (`set_mem_table`), never by inheritance, so `MFD_CLOEXEC` stays
+        // set: the helpers k7d execs must not hold the guest's RAM.
         // SAFETY: creating a memfd; name is a valid C string literal.
         let mem_fd_raw =
             unsafe { libc::memfd_create(c"k7d-guest-mem".as_ptr(), libc::MFD_CLOEXEC) };
@@ -1598,10 +1612,6 @@ impl VmBuilder {
             unsafe { libc::close(mem_fd_raw) };
             return Err(VmError::Pipe(std::io::Error::last_os_error()));
         }
-
-        // Remove CLOEXEC so virtiofsd can inherit the fd if needed
-        // SAFETY: mem_fd_raw is valid.
-        unsafe { libc::fcntl(mem_fd_raw, libc::F_SETFD, 0) };
 
         // SAFETY: mem_fd_raw is a valid memfd; File takes ownership (for use in FileOffset).
         let mem_file = unsafe { File::from_raw_fd(mem_fd_raw) };
@@ -1682,7 +1692,8 @@ impl VmBuilder {
             let (base, irq) = mmio_slot(next_slot);
             next_slot += 1;
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -1748,7 +1759,8 @@ impl VmBuilder {
                 )
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
 
-                let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+                let irq_evt =
+                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
                 vm_fd
                     .register_irqfd(&irq_evt, irq)
                     .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -1819,7 +1831,8 @@ impl VmBuilder {
             let (base, irq) = mmio_slot(next_slot);
             next_slot += 1;
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -1875,7 +1888,8 @@ impl VmBuilder {
             // `next_slot += 1;` to keep the counter honest.
             let (base, irq) = mmio_slot(next_slot);
 
-            let irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+            let irq_evt =
+                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
             vm_fd
                 .register_irqfd(&irq_evt, irq)
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -2006,7 +2020,8 @@ impl VmBuilder {
         // the 8250 tty path, which blocks forever once its 4 KiB xmit
         // buffer fills unless the device raises TX interrupts (kernel
         // printk polls and never noticed).
-        let com1_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+        let com1_irq_evt =
+            crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
         vm_fd
             .register_irqfd(&com1_irq_evt, crate::devices::SERIAL_IRQ)
             .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -2015,7 +2030,8 @@ impl VmBuilder {
         );
 
         // COM2 for agent communication — use irqfd to deliver IRQ 3 to guest
-        let com2_irq_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
+        let com2_irq_evt =
+            crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
         vm_fd
             .register_irqfd(&com2_irq_evt, 3)
             .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
@@ -2955,10 +2971,12 @@ impl Vm {
 
     /// One paused vCPU's LAPIC timer programming.
     ///
-    /// `IA32_TSC_DEADLINE` reads zero on every vCPU of this guest
-    /// because `KVM_GET_SUPPORTED_CPUID` does not report
-    /// `CPUID.1:ECX[24]`, so this — the LAPIC one-shot
-    /// counter — is the timer an auto-warp policy actually has to read.
+    /// On a host whose `KVM_GET_SUPPORTED_CPUID` does not report
+    /// `CPUID.1:ECX[24]` (AMD, kernel 6.8) `IA32_TSC_DEADLINE` reads
+    /// zero on every vCPU and this — the LAPIC one-shot counter — is the
+    /// timer an auto-warp policy has to read. Where the bit is reported
+    /// (Intel, kernel 7.0) the mode here is [`LapicTimerMode::TscDeadline`],
+    /// `TMCCT` is meaningless, and the deadline MSR is the target.
     pub fn lapic_timer(&self, cpu: usize) -> Result<LapicTimerState, VmError> {
         self.require_paused("lapic_timer")?;
         let regs = self.vcpu_fds[cpu]
@@ -3021,29 +3039,46 @@ impl Vm {
     /// produces it. Passing a guessed one turns every `TMCCT` reading
     /// into a wrong deadline, which is why it is a parameter and not a
     /// constant; femtoseconds because a cycle is ~1 ns here, so
-    /// nanosecond units would round the ratio to nothing.
-    pub fn sample_timers(&self, bus_cycle_fs: u64) -> Result<TimerSurvey, VmError> {
+    /// nanosecond units would round the ratio to nothing. `None` is
+    /// "not calibrated": legitimate for a guest whose vCPUs all run the
+    /// TSC-deadline timer (there is no count to convert), and any
+    /// one-shot or periodic count met without it is reported as
+    /// unmodelled rather than converted by a guess.
+    pub fn sample_timers(&self, bus_cycle_fs: Option<u64>) -> Result<TimerSurvey, VmError> {
         let want = self.require_paused("sample_timers")?;
         let mut survey = TimerSurvey::default();
         // A 32-bit count at divisor 128 is 5.5e11 cycles, so the
         // product stays inside a u64 for any bus cycle under ~30 µs.
-        let bus =
-            |cycles: u64| Duration::from_nanos(cycles.saturating_mul(bus_cycle_fs) / FS_PER_NS);
+        let bus = |cycles: u64| {
+            bus_cycle_fs.map(|fs| Duration::from_nanos(cycles.saturating_mul(fs) / FS_PER_NS))
+        };
 
         for cpu in 0..want {
             let vcpu_fd = &self.vcpu_fds[cpu];
             let lapic = self.lapic_timer(cpu)?;
             if let Some(cycles) = lapic.armed_bus_cycles() {
-                survey.armed.push(ArmedTimer {
-                    source: TimerSource::LapicOneShot,
-                    cpu: Some(cpu),
-                    expires_in: bus(cycles),
-                });
+                match bus(cycles) {
+                    Some(expires_in) => survey.armed.push(ArmedTimer {
+                        source: TimerSource::LapicOneShot,
+                        cpu: Some(cpu),
+                        expires_in,
+                    }),
+                    None => survey.unmodelled.push(format!(
+                        "vCPU {cpu} LAPIC one-shot armed ({cycles} bus cycles) with the APIC \
+                         bus cycle uncalibrated"
+                    )),
+                }
             }
             if let Some(cycles) = lapic.periodic_bus_cycles() {
-                survey
-                    .periodic
-                    .push((format!("vCPU {cpu} LAPIC periodic"), bus(cycles)));
+                match bus(cycles) {
+                    Some(period) => survey
+                        .periodic
+                        .push((format!("vCPU {cpu} LAPIC periodic"), period)),
+                    None => survey.unmodelled.push(format!(
+                        "vCPU {cpu} LAPIC periodic ({cycles} bus cycles) with the APIC bus \
+                         cycle uncalibrated"
+                    )),
+                }
             }
             if lapic.mode == LapicTimerMode::Reserved && !lapic.masked {
                 survey
@@ -3051,9 +3086,9 @@ impl Vm {
                     .push(format!("vCPU {cpu} LVT timer mode 3 (reserved)"));
             }
 
-            // Zero is unarmed, never "a deadline at TSC zero". Kept
-            // because it is correct the day CPUID.1:ECX[24] is
-            // advertised, not because it ever fires today.
+            // Zero is unarmed, never "a deadline at TSC zero". Never
+            // armed on the AMD nodes (CPUID.1:ECX[24] not advertised);
+            // the live timer of every Ubuntu vCPU on the Intel node.
             let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)?;
             if deadline != 0 {
                 let tsc = read_msr(vcpu_fd, cpu, MSR_IA32_TSC)?;
@@ -3087,6 +3122,23 @@ impl Vm {
             )),
         }
         Ok(survey)
+    }
+
+    /// Whether any vCPU of this paused VM has a one-shot LAPIC count
+    /// running — the only thing [`Self::calibrate_apic_bus_cycle_fs`]
+    /// can measure against, and the only reading that needs its result.
+    /// `false` on a guest whose vCPUs all arm the TSC-deadline timer
+    /// (Intel hosts that advertise `CPUID.1:ECX[24]`): there, a
+    /// calibration attempt would fail every cycle, forever, for a
+    /// number nothing would consume.
+    pub fn has_armed_lapic_one_shot(&self) -> Result<bool, VmError> {
+        let want = self.require_paused("has_armed_lapic_one_shot")?;
+        for cpu in 0..want {
+            if self.lapic_timer(cpu)?.armed_bus_cycles().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Measure how long one APIC bus cycle is, in femtoseconds, on this
@@ -3396,15 +3448,23 @@ impl Vm {
 
             // 3. A deadline armed before the warp holds a guest-TSC
             //    value that the advanced offset has just put in the
-            //    past; rewriting it makes KVM recompute the host-side
-            //    hrtimer against the new offset instead of keeping the
-            //    stale expiry. This guest never arms it — it uses the
-            //    LAPIC one-shot timer, because KVM_GET_SUPPORTED_CPUID
-            //    on host kernels before 6.14 does not report
-            //    CPUID.1:ECX[24] and `patch_cpuid_for_kvm_guest` passes
-            //    that through (measured). The write
-            //    is kept because it is correct the day the bit is
-            //    advertised, not because it is the re-arm story here.
+            //    past; rewriting it *unchanged* makes KVM recompute the
+            //    host-side hrtimer (or VMX preemption timer) against the
+            //    new offset, so the timer fires on the next entry — the
+            //    jump lands ε before it, and it goes off. That is the
+            //    semantics `autowarp::EPSILON` is written for.
+            //
+            //    Never armed on the AMD nodes (host kernel 6.8 does not
+            //    advertise CPUID.1:ECX[24], the guest runs the LAPIC
+            //    one-shot, whose KVM hrtimer is host-anchored and is not
+            //    touched here). The live timer of every Ubuntu vCPU on
+            //    the Intel node (kernel 7.0, `lapic-deadline`). It is
+            //    not shifted along with the offset to mirror the
+            //    one-shot's host expiry: measured, that makes every idle
+            //    cycle re-jump the same still-armed deadline, fabricating
+            //    guest time at up to R²/cycle per host wait — a 160 s
+            //    kubelet backoff stamped as 245 s, 5.00× "compression"
+            //    past the 3.76× idleness ceiling (CHALLENGES #261).
             let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)
                 .map_err(|e| (cpu, "reading IA32_TSC_DEADLINE", e.to_string()))?;
             if deadline != 0 {
@@ -4610,11 +4670,34 @@ fn vcpu_run_loop(
                     }
                     VcpuExit::Shutdown => {
                         if let Ok(regs) = vcpu_fd.get_regs() {
+                            // Mode context distinguishes a kernel triple
+                            // fault from an AP that resumed outside long
+                            // mode (CHALLENGES #260) — RIP alone does not.
+                            let mode = vcpu_fd.get_sregs().map_or_else(
+                                |e| format!("sregs unavailable: {e}"),
+                                |s| {
+                                    format!(
+                                        "CS={:#x} (base={:#x} l={} db={}) CR0={:#x} CR3={:#x} \
+                                         CR4={:#x} EFER={:#x} APIC_BASE={:#x}",
+                                        s.cs.selector,
+                                        s.cs.base,
+                                        s.cs.l,
+                                        s.cs.db,
+                                        s.cr0,
+                                        s.cr3,
+                                        s.cr4,
+                                        s.efer,
+                                        s.apic_base
+                                    )
+                                },
+                            );
                             log::error!(
                                 "vCPU {cpu_index} shutdown (triple fault) after {exit_count} \
-                                 exits: RIP={:#x} RSP={:#x}",
+                                 exits: RIP={:#x} RSP={:#x} RAX={:#x} RFLAGS={:#x} {mode}",
                                 regs.rip,
                                 regs.rsp,
+                                regs.rax,
+                                regs.rflags,
                             );
                         } else {
                             log::info!("vCPU {cpu_index} shutdown after {exit_count} exits");
@@ -4938,12 +5021,18 @@ fn load_kernel_image(
 ) -> Result<(GuestAddress, Option<setup_header>), VmError> {
     use std::io::Read;
 
-    let mut kernel_file = File::open(kernel_path).map_err(VmError::KernelFile)?;
+    let kernel_err = |source: std::io::Error| VmError::KernelFile {
+        path: kernel_path.to_path_buf(),
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        uid: unsafe { libc::geteuid() },
+        source,
+    };
+    let mut kernel_file = File::open(kernel_path).map_err(kernel_err)?;
     let mut head = vec![0u8; BZIMAGE_MAGIC_OFFSET + 4];
     // A kernel shorter than the magic window is simply not a kernel;
     // `read` filling less than the buffer leaves zeros, which matches
     // neither magic and therefore fails loudly below.
-    let read = kernel_file.read(&mut head).map_err(VmError::KernelFile)?;
+    let read = kernel_file.read(&mut head).map_err(kernel_err)?;
     head.truncate(read);
 
     match KernelFormat::detect(&head) {

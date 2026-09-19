@@ -46,6 +46,12 @@ pub const DEFAULT_TREE_ROOT: &str = "/var/lib/k7d/trees";
 /// `{root}/{sandbox_id}.json`.
 pub const DEFAULT_SANDBOX_ROOT: &str = "/var/lib/k7d/sandboxes";
 
+/// How long `resume_vm` gives a resumed Firecracker guest to answer a
+/// vsock dial. A healthy guest answers in milliseconds
+/// (`test_fc_pause_resume_exec_answers_twenty_times`: worst 30 ms);
+/// containerd's exec probe gives up at 5 s.
+const FC_RESUME_DIAL: Duration = Duration::from_secs(5);
+
 /// Tree budget applied when a `tree_create*` request omits `budget`.
 /// Documented default, not a silent fallback: sized for a node running
 /// a handful of 256 MiB guests.
@@ -207,6 +213,18 @@ fn deny_virtiofs_if_configured(config: &VmConfig) -> Result<(), String> {
         return Err(crate::volumes::DENY_VIRTIOFS_FALLBACK_MSG.to_string());
     }
     Ok(())
+}
+
+/// Hand the config's host paths to the node broker for validation, at
+/// the one point where a refusal is still free: the id is minted, no
+/// disk is provisioned and no bridge reference is held (privilege
+/// separation: path validation before any resource is acquired).
+///
+/// The error keeps the node broker's wording, which names the field and
+/// the index, so `CreateVm` says which `hostPath` was refused.
+fn register_with_broker(vm_id: &str, config: &VmConfig) -> Result<(), String> {
+    crate::broker::client::register_vm(vm_id, config)
+        .map_err(|e| format!("host path validation for {vm_id}: {e}"))
 }
 
 /// Network parameters for a VM.
@@ -2302,6 +2320,264 @@ impl Daemon {
         }
     }
 
+    /// Take over the Firecracker sandboxes the node broker kept back
+    /// from a VM broker that died (`K7D_VM_BROKER_RESTART`).
+    ///
+    /// A no-op in every process but a **successor** VM broker: the
+    /// first generation has nothing to inherit, and an un-split daemon
+    /// has no node broker. Called from `main` **before**
+    /// [`Self::clean_stale_sandbox_records`], which would otherwise
+    /// delete the reattach records these VMs are matched against —
+    /// they are the one piece of the previous VM broker's state that
+    /// outlived it on disk, and a jail with no record is a jail nobody
+    /// can ever name again, so it is killed here rather than kept.
+    ///
+    /// Trees, the warm pool, native VMs and fork children were released
+    /// by the node broker before this process existed
+    /// (`broker::node::survives`); what `fc.list` answers is already
+    /// the set that qualifies, and each entry is re-checked against its
+    /// record anyway.
+    pub fn readopt_fc_sandboxes(&self) {
+        use crate::broker::client;
+        let epoch = client::restart_epoch();
+        if !client::is_split() || epoch == 0 {
+            return;
+        }
+        let held = match client::fc_list() {
+            Ok(held) => held,
+            Err(e) => {
+                log::error!("VM broker generation {epoch}: fc.list: {e} — nothing re-adopted");
+                return;
+            }
+        };
+        log::info!(
+            "VM broker generation {epoch}: the node broker holds {} Firecracker jail(s) from the \
+             previous generation",
+            held.len()
+        );
+        let mut adopted = 0usize;
+        for jail in held {
+            let vm_id = jail.record.vm_id.clone();
+            match self.readopt_one(jail) {
+                Ok(sandbox_id) => {
+                    adopted += 1;
+                    log::warn!(
+                        "survived: {vm_id} (sandbox {sandbox_id}) re-adopted from VM broker \
+                         generation {}",
+                        epoch - 1
+                    );
+                }
+                Err(e) => {
+                    log::error!("cannot re-adopt {vm_id}: {e}; killing it");
+                    Self::discard_jail(&vm_id);
+                }
+            }
+        }
+        log::info!("VM broker generation {epoch}: {adopted} Firecracker sandbox(es) re-adopted");
+    }
+
+    /// `fc.kill` a held jail this process will not adopt, and drop its
+    /// registration. Idempotent on both counts.
+    fn discard_jail(vm_id: &str) {
+        if let Err(e) = crate::broker::client::ok(&crate::broker::Verb::FcKill {
+            vm_id: vm_id.to_string(),
+        }) {
+            log::error!("fc.kill({vm_id}) on a jail that was not re-adopted: {e}");
+        }
+        crate::broker::client::release_vm(vm_id);
+    }
+
+    /// One jail of [`Self::readopt_fc_sandboxes`]: match it to its
+    /// reattach record, rebuild the bridge mirror and the TAP slot when
+    /// it is networked, rebuild the `FcVm`, re-hold its disks, and
+    /// register it under the **same** `vm_id` and sandbox — without
+    /// rewriting the record, whose `created_at_unix` is the pod's, not
+    /// this process's. Returns the sandbox id.
+    fn readopt_one(&self, held: crate::broker::client::HeldJail) -> Result<String, String> {
+        let record = &held.record;
+        let vm_id = record.vm_id.clone();
+        let sandbox_id = record
+            .sandbox_id
+            .clone()
+            .ok_or_else(|| "no sandbox id — nothing can name it again".to_string())?;
+        let path = sandbox_record_path(&sandbox_id);
+        let saved: SandboxRecord = std::fs::read_to_string(&path)
+            .map_err(|e| {
+                format!(
+                    "no reattach record at {} ({e}) — the previous VM broker died before it \
+                     wrote one",
+                    path.display()
+                )
+            })
+            .and_then(|s| {
+                serde_json::from_str(&s).map_err(|e| format!("record {}: {e}", path.display()))
+            })?;
+        if saved.vm_id != vm_id {
+            return Err(format!(
+                "record {} names vm {}, the jail is {vm_id}",
+                path.display(),
+                saved.vm_id
+            ));
+        }
+        if saved.backend != Backend::Firecracker {
+            return Err(format!(
+                "record {} says backend {:?}",
+                path.display(),
+                saved.backend
+            ));
+        }
+        if self.vms.lock().unwrap().contains_key(&vm_id) {
+            return Err(format!("{vm_id} is already registered in this process"));
+        }
+
+        // The bridge mirror and the TAP slot first, so a failure below
+        // releases them the way a failed boot does.
+        let networked = match (record.tap, &saved.cluster_id, saved.vm_index) {
+            (true, Some(cluster_id), Some(vm_index)) => Some((cluster_id.clone(), vm_index)),
+            (false, None, _) => None,
+            (tap, cluster, index) => {
+                return Err(format!(
+                    "the jail {} a TAP but the record says cluster {cluster:?}, vm_index {index:?}",
+                    if tap { "has" } else { "has not" }
+                ))
+            }
+        };
+        let tap = match &networked {
+            Some((cluster_id, vm_index)) => Some(self.readopt_tap(cluster_id, *vm_index)?),
+            None => None,
+        };
+        let release_net = |why: String| -> String {
+            if let Some((cluster_id, vm_index)) = &networked {
+                Self::release_bridge_locked(
+                    &mut self.bridges.lock().unwrap(),
+                    cluster_id,
+                    Some(*vm_index),
+                );
+            }
+            why
+        };
+
+        let mut fc = match crate::fc::FcVm::readopt(held, tap) {
+            Ok(fc) => fc,
+            Err(e) => return Err(release_net(e.to_string())),
+        };
+        let disks = match Self::readopt_disks(&fc) {
+            Ok(disks) => disks,
+            // Dropping `fc` here is the `fc.kill`.
+            Err(e) => return Err(release_net(e)),
+        };
+        fc.adopt_disks(disks);
+
+        let guest: Guest = fc.into();
+        self.vms.lock().unwrap().insert(
+            vm_id.clone(),
+            VmEntry {
+                vm: guest,
+                // As at create: the jailer's cgroup caps this VM, and
+                // no vCPU thread of this process exists to cap.
+                cpu_cgroup: None,
+                cpu_quota: saved.cpu_quota,
+                cpu_period: saved.cpu_period,
+                guest_cid: NO_HOST_CID,
+                sandbox_id: Some(sandbox_id.clone()),
+                cluster_id: saved.cluster_id.clone(),
+                vm_index: saved.vm_index,
+                pod_netns: saved.pod_netns.as_ref().map(PathBuf::from),
+            },
+        );
+        self.sandboxes
+            .lock()
+            .unwrap()
+            .insert(sandbox_id.clone(), vm_id);
+        Ok(sandbox_id)
+    }
+
+    /// The bridge mirror (created if this is the first re-adopted VM on
+    /// it — `net.tree_create` is idempotent on the node broker, which
+    /// still holds the bridge) and the TAP slot of a re-adopted VM.
+    fn readopt_tap(&self, cluster_id: &str, vm_index: u32) -> Result<TapDevice, String> {
+        let mut bridges = self.bridges.lock().unwrap();
+        if !bridges.contains_key(cluster_id) {
+            let net = ClusterNetwork::create(cluster_id)
+                .map_err(|e| format!("ClusterNetwork::create({cluster_id}): {e}"))?;
+            bridges.insert(cluster_id.to_string(), BridgeEntry { net, refcount: 0 });
+        }
+        let entry = bridges
+            .get_mut(cluster_id)
+            .expect("bridge entry just ensured");
+        match entry.net.adopt_tap(vm_index) {
+            Ok(tap) => {
+                entry.refcount += 1;
+                Ok(tap)
+            }
+            Err(e) => {
+                if entry.refcount == 0 {
+                    bridges.remove(cluster_id);
+                }
+                Err(format!("adopt_tap({vm_index}): {e}"))
+            }
+        }
+    }
+
+    /// Re-hold the k7d-owned writable disks of a re-adopted VM, so a
+    /// scratch image is still unlinked when the VM goes and a data disk
+    /// is still refused to a second VM while this one has it. Which is
+    /// which is decided the way [`fc_attachments`] decided it: by where
+    /// the backing file lives. A caller-declared writable block device
+    /// and a restored VM's jail-side clone have no handle, as at create.
+    fn readopt_disks(fc: &crate::fc::FcVm) -> Result<Vec<crate::fc::FcDisk>, String> {
+        // `k7d.blk=vdX:<mount>:<fstype>:<rw|ro>,…`: the guest mount of
+        // each device, by position, which a `DataDisk` has to be
+        // re-attached with.
+        let mounts: HashMap<usize, String> = fc
+            .cmdline()
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("k7d.blk="))
+            .into_iter()
+            .flat_map(|list| list.split(','))
+            .filter_map(|spec| {
+                let mut parts = spec.split(':');
+                let dev = parts.next()?.strip_prefix("vd")?;
+                let letter = dev.chars().next().filter(|_| dev.len() == 1)?;
+                let index = usize::from(u8::try_from(letter).ok()?.checked_sub(b'a')?);
+                Some((index, parts.next()?.to_string()))
+            })
+            .collect();
+        let scratch_dir = Path::new(crate::disks::DISKS_DIR);
+        let data_dir = crate::disks::data_disks_dir();
+        let mut disks = Vec::new();
+        for (index, drive) in fc.writable_drives() {
+            let host = drive.host_path.as_path();
+            let is_scratch = host.parent() == Some(scratch_dir)
+                && host
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("scratch-"));
+            if is_scratch {
+                let disk = crate::disks::ScratchDisk::adopt(host)
+                    .map_err(|e| format!("re-hold scratch {}: {e}", host.display()))?;
+                disks.push(crate::fc::FcDisk::Scratch(disk));
+            } else if host.parent() == Some(data_dir.as_path()) {
+                let id = host
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| format!("data disk {} has no usable name", host.display()))?;
+                let mount = mounts.get(&index).ok_or_else(|| {
+                    format!(
+                        "data disk {id} at drive {index} has no k7d.blk= mount in the boot args"
+                    )
+                })?;
+                let size = std::fs::metadata(host)
+                    .map_err(|e| format!("stat data disk {}: {e}", host.display()))?
+                    .len();
+                let disk = crate::disks::DataDisk::attach(id, size, mount)
+                    .map_err(|e| format!("re-attach data disk {id}: {e}"))?;
+                disks.push(crate::fc::FcDisk::Data(disk));
+            }
+        }
+        Ok(disks)
+    }
+
     /// Startup scan of [`sandbox_root_dir`]:
     /// every record whose `vm_id` is not in the live registry is an
     /// orphan from a previous daemon that died with its VMs — logged
@@ -2784,6 +3060,7 @@ impl Daemon {
         deny_fc_unsupported(&config)?;
         let artifacts = Self::resolve_vm_guest(&config)?;
         let vm_id = self.mint_vm_id();
+        register_with_broker(&vm_id, &config)?;
         let base_cmdline = config
             .cmdline
             .clone()
@@ -3112,7 +3389,7 @@ impl Daemon {
             return Ok(None);
         };
         let netns_path = PathBuf::from(pod_netns);
-        let addrs = crate::netns::link_addrs_v4(&netns_path, "eth0").map_err(|e| {
+        let addrs = crate::broker::client::pod_ip(&netns_path).map_err(|e| {
             format!(
                 "CNI attach failed: failed to read pod IP from {} eth0: {e}",
                 netns_path.display()
@@ -3216,6 +3493,7 @@ impl Daemon {
         // before the disk. Both happen before `acquire_network` so a
         // provisioning failure cannot leak a bridge reference.
         let vm_id = self.mint_vm_id();
+        register_with_broker(&vm_id, &config)?;
 
         // The sandbox's writable layer. Attached after every
         // caller-declared device, so the guest device names the caller
@@ -3891,6 +4169,22 @@ impl Daemon {
         }
         if let Err(message) = Self::reattach_cpu_cgroup(entry, "resume", vm_id) {
             return Response::Error { message };
+        }
+        // Firecracker v1.16.0/v1.16.1 armed the vsock TRANSPORT_RESET
+        // RX gate on a bare `Resumed` with no reset for the guest to
+        // ack, so every host→guest connection after a resume hung
+        // (upstream #6100; guest/fc/pins.env is ≥ v1.16.2). A dial here
+        // turns any recurrence into this error instead of a `kubectl
+        // exec` that never returns.
+        if entry.vm.backend() == Backend::Firecracker {
+            if let Err(e) = entry.vm.connect_agent(FC_RESUME_DIAL) {
+                return Response::Error {
+                    message: format!(
+                        "resume({vm_id}): guest unreachable over vsock after Resumed \
+                         (Firecracker < v1.16.2 gates RX after a bare resume): {e}"
+                    ),
+                };
+            }
         }
         log::info!("resumed {vm_id} (guest_cid={})", entry.guest_cid);
         Response::Ok
@@ -5269,13 +5563,26 @@ impl Daemon {
             return found;
         };
 
-        // Liveness check outside any lock — the connect can
-        // legitimately take a moment and must not stall the control
-        // plane. The daemon dials the guest the same way any client
-        // does: over the endpoint the VM's backend published.
-        let Some(endpoint) = agent_endpoint.clone() else {
+        if agent_endpoint.is_none() {
             return Response::Error {
                 message: format!("sandbox {sandbox_id}: VM has no agent endpoint"),
+            };
+        }
+        // Liveness check outside any lock — the connect can
+        // legitimately take a moment and must not stall the control
+        // plane. Dialled the way *this process* can, not over the
+        // endpoint it published for the shim: under the split the two
+        // differ for a Firecracker VM, and the published one is a path
+        // uid `k7d` cannot walk (`Guest::own_agent_endpoint`).
+        let own = self
+            .vms
+            .lock()
+            .unwrap()
+            .get(vm_id)
+            .map(|entry| entry.vm.own_agent_endpoint());
+        let Some(endpoint) = own else {
+            return Response::Error {
+                message: format!("sandbox {sandbox_id}: VM {vm_id} went away"),
             };
         };
         let ping = crate::api::AgentClient::connect_endpoint(&endpoint, Duration::from_secs(10))
@@ -5490,6 +5797,10 @@ impl Daemon {
         if let Some(ref cid) = cluster_id {
             Self::release_bridge_locked(&mut self.bridges.lock().unwrap(), cid, vm_index);
         }
+        // Last, so the node broker's pinned descriptors and its record of
+        // what to undo outlive everything above that might still name
+        // them. A no-op unless `K7D_PRIVSEP` is on.
+        crate::broker::client::release_vm(vm_id);
         log::debug!("teardown of {vm_id} complete");
     }
 

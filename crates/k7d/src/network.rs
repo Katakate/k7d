@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -99,7 +98,16 @@ pub struct TapDevice {
     /// `K7D_NET_JAIL=off`. Dropping it deletes the netdev table; the
     /// struct's own `Drop` (close fd, delete link) runs first, and
     /// `delete table` tolerates the device already being gone.
+    ///
+    /// Also `None` under privilege separation: the pin belongs to the
+    /// node broker's copy of the device, next to the `CAP_NET_ADMIN`
+    /// that installing and removing it needs.
     anti_spoof: Option<crate::netjail::TapAntiSpoof>,
+    /// Tree this TAP was allocated on, when the **node broker** made it.
+    /// `Some` exactly when the privileged half of this device's
+    /// lifetime — the `ip link delete`, the `TUNSETOWNER` hand-over —
+    /// is a verb rather than a syscall here.
+    tree_id: Option<String>,
 }
 
 impl TapDevice {
@@ -125,13 +133,7 @@ impl TapDevice {
     /// guards before any guest traffic can flow (the VMs don't exist
     /// yet at this point on the fork path).
     fn create_unpinned(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
-        let guest_ip = Ipv4Addr::new(
-            GUEST_SUBNET_BASE[0],
-            GUEST_SUBNET_BASE[1],
-            GUEST_SUBNET_BASE[2],
-            2 + vm_index as u8,
-        );
-        let mac = [0xaa, 0xbb, 0x00, 0x00, 0x00, 2 + vm_index as u8];
+        let (tap_name, mac, guest_ip) = tap_identity(bridge_name, vm_index);
 
         // SAFETY: valid C string path, valid flags.
         let fd = unsafe {
@@ -147,14 +149,6 @@ impl TapDevice {
             ));
         }
 
-        // Derive a per-bridge TAP name so two bridges (source + fork) can host
-        // the same `vm_index` without colliding. Linux IFNAMSIZ is 16 bytes
-        // (including the NUL); cap the suffix at 13 chars to leave room for it.
-        // Bridge names are `k7-br-{cluster_id[..10]}` (≤16 chars). Use a 5-char
-        // hash of the bridge name + `t{vm_index}` (e.g. `t12ab3t0`) so the name
-        // fits and stays unique across bridges.
-        let bridge_short = bridge_short_tag(bridge_name);
-        let tap_name = format!("t{bridge_short}t{vm_index}");
         if tap_name.len() >= libc::IFNAMSIZ {
             // SAFETY: fd is valid.
             unsafe { libc::close(fd) };
@@ -227,7 +221,51 @@ impl TapDevice {
             guest_ip,
             vm_index,
             anti_spoof: None,
+            tree_id: None,
         })
+    }
+
+    /// Adopt a TAP the node broker created: the descriptor came over
+    /// `SCM_RIGHTS`, the name, MAC and address came with it, and the
+    /// device's privileged lifetime stays on the other side.
+    fn adopt(tree_id: &str, info: &crate::broker::TapInfo, fd: std::os::fd::OwnedFd) -> Self {
+        use std::os::fd::IntoRawFd;
+        Self {
+            fd: fd.into_raw_fd(),
+            name: info.name.clone(),
+            mac: info.mac,
+            guest_ip: match info.ip.parse() {
+                Ok(ip) => ip,
+                Err(e) => crate::broker::protocol_abort(&format!(
+                    "the node broker sent {:?} as TAP {}'s address: {e}",
+                    info.ip, info.name
+                )),
+            },
+            vm_index: info.vm_index,
+            anti_spoof: None,
+            tree_id: Some(tree_id.to_string()),
+        }
+    }
+
+    /// The mirror of a TAP the node broker holds and a jailed
+    /// Firecracker already opened — what a successor VM broker rebuilds
+    /// for a re-adopted VM (`K7D_VM_BROKER_RESTART`). No descriptor: the previous VM
+    /// broker's copy was closed at `detach_for_vmm`, which is the state
+    /// this device is in for the rest of its life. The identity is the
+    /// deterministic one [`Self::create_unpinned`] derives from the
+    /// bridge and the index, so it names the same kernel device.
+    /// Dropping it is still `net.tap_destroy`.
+    fn adopt_detached(tree_id: &str, bridge_name: &str, vm_index: u32) -> Self {
+        let (name, mac, guest_ip) = tap_identity(bridge_name, vm_index);
+        Self {
+            fd: -1,
+            name,
+            mac,
+            guest_ip,
+            vm_index,
+            anti_spoof: None,
+            tree_id: Some(tree_id.to_string()),
+        }
     }
 
     /// Get the TAP file descriptor.
@@ -305,6 +343,23 @@ impl TapDevice {
         if self.fd < 0 {
             return Ok(());
         }
+        if let Some(tree_id) = self.tree_id.clone() {
+            // The node broker still holds its own descriptor on this
+            // device — which is why it can make it persistent *after*
+            // this side lets go, instead of having to `TUNSETIFF` its
+            // way back onto a single-queue TAP.
+            crate::broker::client::ok(&crate::broker::Verb::NetTapDetach {
+                tree_id,
+                vm_index: self.vm_index,
+                uid,
+            })
+            .map_err(|e| format!("net.tap_detach({}, {uid}): {e}", self.name))?;
+            // SAFETY: fd is valid and owned by this struct; it is marked
+            // gone immediately after so nothing closes or polls it twice.
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
+            return Ok(());
+        }
         for (ioctl, label) in [(TUNSETOWNER, "TUNSETOWNER"), (TUNSETGROUP, "TUNSETGROUP")] {
             // SAFETY: `self.fd` is this TAP's own live TUN fd; both
             // ioctls take an integer argument and touch no memory.
@@ -350,6 +405,29 @@ impl TapDevice {
     pub fn vm_index(&self) -> u32 {
         self.vm_index
     }
+}
+
+/// `(tap name, guest MAC, guest IP)` of the TAP at `vm_index` on
+/// `bridge_name`. A pure function of its inputs on purpose: the node
+/// broker derives it when it creates the device, and a successor VM
+/// broker derives it again to name a device that already exists
+/// ([`TapDevice::adopt_detached`]).
+///
+/// The name is per-bridge so two bridges (source + fork) can host the
+/// same `vm_index` without colliding. Linux IFNAMSIZ is 16 bytes
+/// (including the NUL); bridge names are `k7-br-{cluster_id[..10]}`, so
+/// a 5-char hash of the bridge name + `t{vm_index}` (e.g. `t12ab3t0`)
+/// fits and stays unique across bridges.
+fn tap_identity(bridge_name: &str, vm_index: u32) -> (String, [u8; 6], Ipv4Addr) {
+    let guest_ip = Ipv4Addr::new(
+        GUEST_SUBNET_BASE[0],
+        GUEST_SUBNET_BASE[1],
+        GUEST_SUBNET_BASE[2],
+        2 + vm_index as u8,
+    );
+    let mac = [0xaa, 0xbb, 0x00, 0x00, 0x00, 2 + vm_index as u8];
+    let name = format!("t{}t{vm_index}", bridge_short_tag(bridge_name));
+    (name, mac, guest_ip)
 }
 
 /// Derive a short, deterministic tag for a bridge name. Used to keep TAP
@@ -560,9 +638,21 @@ impl Drop for TapDevice {
             // SAFETY: fd is valid; closing TAP device.
             unsafe { libc::close(self.fd) };
         }
+        if let Some(tree_id) = &self.tree_id {
+            // Also the only thing that removes a TAP handed to a jailed
+            // Firecracker: `detach_for_vmm` made it `IFF_PERSIST`, so
+            // closing the descriptor above does not take the link down.
+            if let Err(e) = crate::broker::client::ok(&crate::broker::Verb::NetTapDestroy {
+                tree_id: tree_id.clone(),
+                vm_index: self.vm_index,
+            }) {
+                log::error!("net.tap_destroy({}): {e}", self.name);
+            }
+            return;
+        }
         // `ip link delete` removes the device whether or not it was
         // marked persistent for an external VMM.
-        let _ = Command::new("ip")
+        let _ = crate::spawner::command("ip")
             .args(["link", "delete", &self.name])
             .output();
     }
@@ -617,8 +707,20 @@ pub struct ClusterNetwork {
     egress: crate::netjail::EgressPolicy,
     /// The host default-route interface the jail was installed
     /// against — kept so [`ClusterNetwork::set_egress`] can re-render
-    /// without re-detecting a possibly-changed route mid-flight.
+    /// without re-detecting a possibly-changed route mid-flight. Empty
+    /// under privilege separation: the jail lives on the node broker's
+    /// side, and so does the route detection it needs.
     default_iface: String,
+    /// Tree id, when this object is the VM broker's **mirror** of a
+    /// bridge the node broker owns.
+    ///
+    /// The mirror is not a thin handle: it keeps the same `entries`,
+    /// the same allocator and the same derived names as the real thing,
+    /// because every mutation of it is a verb and the two therefore
+    /// cannot drift. What it does not keep is the part that needs
+    /// `CAP_NET_ADMIN` — the `jail` guard and the `ip`/`nft`/`nsenter`
+    /// calls, which are the other side's.
+    tree_id: Option<String>,
 }
 
 impl ClusterNetwork {
@@ -639,11 +741,30 @@ impl ClusterNetwork {
         cluster_id: &str,
         egress: crate::netjail::EgressPolicy,
     ) -> Result<Self, String> {
-        // IFNAMSIZ is 16 (15 chars + NUL). Reserve 6 for the `k7-br-` prefix
-        // and cap the cluster suffix at 9 chars. To keep distinct cluster IDs
-        // mapping to distinct bridges even after truncation, mix in a short
-        // FNV-1a hash for IDs that exceed the budget.
+        // IFNAMSIZ is 16 (15 chars + NUL). Reserve 6 for the `k7-br-`
+        // prefix and cap the cluster suffix at 9 chars.
         const MAX_SUFFIX: usize = 9;
+        if crate::broker::client::is_split() {
+            // The node broker runs this same function on its side and
+            // sends back the name it derived, so the truncation and
+            // hashing below stay in one place rather than two that have
+            // to agree.
+            let bridge_name = crate::broker::client::net_tree_create(cluster_id, &egress)
+                .map_err(|e| format!("net.tree_create({cluster_id}): {e}"))?;
+            return Ok(Self {
+                bridge_name,
+                subnet_base: GUEST_SUBNET_BASE,
+                next_vm_index: 0,
+                entries: HashMap::new(),
+                jail: None,
+                egress,
+                default_iface: String::new(),
+                tree_id: Some(cluster_id.to_string()),
+            });
+        }
+        // To keep distinct cluster IDs mapping to distinct bridges even
+        // after truncation, mix in a short FNV-1a hash for IDs that
+        // exceed the budget.
         let suffix = if cluster_id.len() <= MAX_SUFFIX {
             cluster_id.to_string()
         } else {
@@ -748,6 +869,7 @@ impl ClusterNetwork {
             jail,
             egress,
             default_iface,
+            tree_id: None,
         })
     }
 
@@ -764,6 +886,13 @@ impl ClusterNetwork {
     /// enforced — same contract as `create`.
     pub fn set_egress(&mut self, egress: crate::netjail::EgressPolicy) -> Result<(), String> {
         egress.validate()?;
+        if let Some(tree_id) = &self.tree_id {
+            // `net.tree_create` is an upsert, which is exactly this.
+            crate::broker::client::net_tree_create(tree_id, &egress)
+                .map_err(|e| format!("net.tree_create({tree_id}) re-policy: {e}"))?;
+            self.egress = egress;
+            return Ok(());
+        }
         if let Some(old) = self.jail.take() {
             match crate::netjail::TreeNetJail::install(
                 &self.bridge_name,
@@ -823,10 +952,58 @@ impl ClusterNetwork {
         self.create_tap_at_index(vm_index)
     }
 
-    fn create_tap_at_index(&mut self, vm_index: u32) -> Result<TapDevice, String> {
-        let tap = TapDevice::create(&self.bridge_name, vm_index)?;
+    /// Take over the identity slot of a TAP the node broker already
+    /// holds for `vm_index` on this (mirrored) bridge, for a re-adopted
+    /// VM (`K7D_VM_BROKER_RESTART`). Nothing is created: the device exists and a
+    /// jailed Firecracker is reading from it. Only meaningful on a
+    /// mirror; an un-split process has no node broker holding TAPs
+    /// for it.
+    pub fn adopt_tap(&mut self, vm_index: u32) -> Result<TapDevice, String> {
+        let Some(tree_id) = self.tree_id.clone() else {
+            return Err(format!(
+                "adopt_tap({vm_index}) on bridge {}: not a node-broker mirror",
+                self.bridge_name
+            ));
+        };
+        if self.entries.contains_key(&vm_index) {
+            return Err(format!(
+                "vm_index {vm_index} already allocated on bridge {}",
+                self.bridge_name
+            ));
+        }
+        if vm_index >= self.next_vm_index {
+            self.next_vm_index = vm_index + 1;
+        }
+        let tap = TapDevice::adopt_detached(&tree_id, &self.bridge_name, vm_index);
         self.register_tap_entry(&tap);
         Ok(tap)
+    }
+
+    fn create_tap_at_index(&mut self, vm_index: u32) -> Result<TapDevice, String> {
+        let tap = match self.tree_id.clone() {
+            Some(tree_id) => Self::taps_from_broker(&tree_id, &[vm_index])?
+                .pop()
+                .expect("one index asked for, one TAP checked back"),
+            None => TapDevice::create(&self.bridge_name, vm_index)?,
+        };
+        self.register_tap_entry(&tap);
+        Ok(tap)
+    }
+
+    /// Ask the node broker for one TAP per index and adopt the
+    /// descriptors it sends back.
+    ///
+    /// The anti-spoof pin is *not* installed here in split mode: the
+    /// node broker pins the whole batch in the single `nft` transaction
+    /// [`Self::add_taps_at`] relies on, on the side that has the
+    /// `CAP_NET_ADMIN` for it.
+    fn taps_from_broker(tree_id: &str, indices: &[u32]) -> Result<Vec<TapDevice>, String> {
+        let made = crate::broker::client::net_tap_create(tree_id, indices)
+            .map_err(|e| format!("net.tap_create({tree_id}, {indices:?}): {e}"))?;
+        Ok(made
+            .into_iter()
+            .map(|(info, fd)| TapDevice::adopt(tree_id, &info, fd))
+            .collect())
     }
 
     fn register_tap_entry(&mut self, tap: &TapDevice) {
@@ -856,6 +1033,18 @@ impl ClusterNetwork {
                     self.bridge_name
                 ));
             }
+        }
+        if let Some(tree_id) = self.tree_id.clone() {
+            let taps = Self::taps_from_broker(&tree_id, indices)?;
+            for &idx in indices {
+                if idx >= self.next_vm_index {
+                    self.next_vm_index = idx + 1;
+                }
+            }
+            for tap in &taps {
+                self.register_tap_entry(tap);
+            }
+            return Ok(taps);
         }
         let mut taps = Vec::with_capacity(indices.len());
         for &idx in indices {
@@ -953,6 +1142,9 @@ impl ClusterNetwork {
         pod_ip: Ipv4Addr,
         pod_netns: &Path,
     ) -> Result<(), String> {
+        if self.tree_id.is_some() {
+            return self.pod_verb(vm_index, pod_netns, pod_ip, false);
+        }
         let entry = self
             .entries
             .get_mut(&vm_index)
@@ -1058,6 +1250,9 @@ impl ClusterNetwork {
         pod_netns: &Path,
         pod_ip: Ipv4Addr,
     ) -> Result<(), String> {
+        if self.tree_id.is_some() {
+            return self.pod_verb(vm_index, pod_netns, pod_ip, true);
+        }
         // Resolve the entry first — return early without mutating state
         // if the caller passes a bogus vm_index. Clone the fields we
         // need later so we don't hold a borrow across `install_pod_nat`.
@@ -1220,9 +1415,72 @@ impl ClusterNetwork {
     /// link's original parent context (the per-cluster bridge) is
     /// already torn down by `ClusterNetwork::Drop` if this is the last
     /// VM on the cluster.
-    pub fn detach_from_pod_netns(&self, _vm_index: u32, pod_netns: &Path) -> Result<(), String> {
+    pub fn detach_from_pod_netns(&self, vm_index: u32, pod_netns: &Path) -> Result<(), String> {
+        if let Some(tree_id) = &self.tree_id {
+            // Best-effort on both sides: a failed detach is logged by
+            // the node broker and is not something this caller — which
+            // is already tearing the pod down — can act on.
+            if let Err(e) = crate::broker::client::ok(&crate::broker::Verb::NetPodDetach {
+                tree_id: tree_id.clone(),
+                vm_index,
+                netns: netns_arg(pod_netns),
+            }) {
+                log::warn!("net.pod_detach({tree_id}[{vm_index}]): {e}");
+            }
+            return Ok(());
+        }
         // Best-effort; pod netns is usually gone already.
         let _ = crate::netns::delete_bridge_in_netns(pod_netns, "k7-podbr0");
+        Ok(())
+    }
+
+    /// The split-mode body of [`Self::attach_to_pod_netns`] and
+    /// [`Self::install_pod_nat`]: one verb, then the same bookkeeping
+    /// the privileged version does, so `entry()` answers the same on
+    /// both sides of the boundary.
+    fn pod_verb(
+        &mut self,
+        vm_index: u32,
+        pod_netns: &Path,
+        pod_ip: Ipv4Addr,
+        move_link: bool,
+    ) -> Result<(), String> {
+        let tree_id = self.tree_id.clone().expect("split mode");
+        let netns = netns_arg(pod_netns);
+        let ip = pod_ip.to_string();
+        let verb = if move_link {
+            crate::broker::Verb::NetPodAttach {
+                tree_id: tree_id.clone(),
+                vm_index,
+                netns,
+                pod_ip: ip,
+            }
+        } else {
+            crate::broker::Verb::NetPodNat {
+                tree_id: tree_id.clone(),
+                vm_index,
+                netns,
+                pod_ip: ip,
+            }
+        };
+        crate::broker::client::ok(&verb)
+            .map_err(|e| format!("{verb:?} on {tree_id}[{vm_index}]: {e}"))?;
+        self.record_pod(vm_index, pod_ip, pod_netns)
+    }
+
+    /// Mirror what the node broker just recorded about a pod hand-off.
+    fn record_pod(
+        &mut self,
+        vm_index: u32,
+        pod_ip: Ipv4Addr,
+        pod_netns: &Path,
+    ) -> Result<(), String> {
+        let entry = self
+            .entries
+            .get_mut(&vm_index)
+            .ok_or_else(|| format!("vm_index {vm_index} not allocated"))?;
+        entry.pod_ip = Some(pod_ip);
+        entry.pod_netns = Some(pod_netns.to_path_buf());
         Ok(())
     }
 
@@ -1235,6 +1493,12 @@ impl ClusterNetwork {
     /// `10.200.0.1` ends up bound to a stale bridge so a freshly-created
     /// bridge can't claim it, breaking NAT for the new VMs.
     pub fn destroy(&self) -> Result<(), String> {
+        if let Some(tree_id) = &self.tree_id {
+            return crate::broker::client::ok(&crate::broker::Verb::NetTreeDestroy {
+                tree_id: tree_id.clone(),
+            })
+            .map_err(|e| format!("net.tree_destroy({tree_id}): {e}"));
+        }
         // iptables rules first (best-effort: -D may fail if rule wasn't there).
         let bridge = self.bridge_name.as_str();
         // The jail names this device; a table left behind would filter
@@ -1270,7 +1534,7 @@ impl ClusterNetwork {
         // Guest overlay routes installed with `ip route replace` in
         // the *main* table do not come back: they replaced host
         // `cni0`'s `10.42.0.0/24`. Restore that explicitly.
-        let _ = std::process::Command::new("ip")
+        let _ = crate::spawner::command("ip")
             .args(["link", "set", "dev", bridge, "down"])
             .output();
         run_cmd("ip", &["link", "delete", bridge, "type", "bridge"])?;
@@ -1310,7 +1574,7 @@ fn any_other_k7_bridge_exists(exclude: &str) -> bool {
 
 /// Enumerate `k7-br-*` links currently on the host.
 fn list_k7_bridges() -> Vec<String> {
-    let out = std::process::Command::new("ip")
+    let out = crate::spawner::command("ip")
         .args(["-o", "link", "show"])
         .output();
     let Ok(out) = out else { return Vec::new() };
@@ -1559,11 +1823,11 @@ pub fn cleanup_stale_k7_bridges() -> Vec<String> {
         // Remove the per-bridge ACCEPT / TCPMSS rules first; failure is
         // fine (the rule may already be gone).
         remove_bridge_forward_rules(bridge);
-        let _ = std::process::Command::new("ip")
+        let _ = crate::spawner::command("ip")
             .args(["link", "set", "dev", bridge, "down"])
             .output();
         remove_guest_overlay_routes(bridge);
-        let _ = std::process::Command::new("ip")
+        let _ = crate::spawner::command("ip")
             .args(["link", "delete", bridge, "type", "bridge"])
             .output();
     }
@@ -1664,7 +1928,7 @@ fn assert_no_leftover_shaping(wan: &str) -> Result<(), String> {
 }
 
 fn default_route_iface() -> Result<String, String> {
-    let out = Command::new("ip")
+    let out = crate::spawner::command("ip")
         .args(["route", "show", "default"])
         .output()
         .map_err(|e| format!("ip route show default: {e}"))?;
@@ -1822,6 +2086,17 @@ fn remove_bridge_forward_rules(bridge: &str) {
             ],
         );
     }
+}
+
+/// A network-namespace path as a `net.pod_*` parameter.
+///
+/// Lossy, and safe to be: the node broker re-resolves the string against
+/// the §5 netns allowlist with `RESOLVE_NO_SYMLINKS` and an `fstatfs`
+/// that must say `NSFS_MAGIC` before it hands it to `nsenter`, so a byte
+/// this side mangles is a refusal there rather than a namespace the VM
+/// broker talked the node broker into entering.
+fn netns_arg(pod_netns: &Path) -> String {
+    pod_netns.to_string_lossy().into_owned()
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -2102,7 +2377,8 @@ impl VirtioBackend for TapNetBackend {
         let tx_q = ValidatedQueue::new(&queues[1], self.mem_addr, self.mem_size)
             .map_err(|e| format!("virtio-net TX queue geometry: {e}"))?;
 
-        let tx_kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+        let tx_kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+            .map_err(|e| format!("eventfd: {e}"))?;
         let tx_kick_fd = tx_kick.as_raw_fd();
 
         let tap_fd = self.tap_fd;
@@ -2117,19 +2393,20 @@ impl VirtioBackend for TapNetBackend {
         self.paused.store(false, Ordering::SeqCst);
         self.parked.store(false, Ordering::SeqCst);
 
-        // Dup the TAP fd so the worker thread owns its copy
-        // SAFETY: tap_fd is valid; dup returns a new fd.
-        let worker_tap_fd = unsafe { libc::dup(tap_fd) };
+        // Dup the TAP fd so the worker thread owns its copy. F_DUPFD_CLOEXEC,
+        // not `dup`: a plain dup strips the CLOEXEC the source carries.
+        // SAFETY: tap_fd is valid; F_DUPFD_CLOEXEC returns a new fd.
+        let worker_tap_fd = unsafe { libc::fcntl(tap_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if worker_tap_fd < 0 {
             return Err(format!("dup tap: {}", std::io::Error::last_os_error()));
         }
 
         // Dup irq eventfd for the worker
         // SAFETY: irq_fd is valid.
-        let worker_irq_fd = unsafe { libc::dup(irq_fd) };
+        let worker_irq_fd = unsafe { libc::fcntl(irq_fd, libc::F_DUPFD_CLOEXEC, 0) };
         // Dup tx_kick for the worker
         // SAFETY: tx_kick_fd is valid.
-        let worker_tx_kick_fd = unsafe { libc::dup(tx_kick_fd) };
+        let worker_tx_kick_fd = unsafe { libc::fcntl(tx_kick_fd, libc::F_DUPFD_CLOEXEC, 0) };
 
         // Named so it doesn't inherit the activating vCPU thread's comm
         // (device activation runs on a vCPU thread — see).

@@ -115,7 +115,11 @@ const MIN_TREE_PIDS: usize = 128;
 /// `VmCpuCgroup` has already converted into a *domain threaded* root
 /// (a threaded root may only have threaded children, and `memory` is a
 /// domain-only controller).
-const HELPER_ROOT: &str = "/sys/fs/cgroup/k7d-jail";
+/// Under privilege separation the node broker creates it, enables
+/// `memory`/`pids` in its `subtree_control` and hands it to uid `k7d`
+/// before the drop, so this stays a plain `mkdir` on the fork hot path
+/// (`broker::prepare_delegated_cgroups`).
+pub(crate) const HELPER_ROOT: &str = "/sys/fs/cgroup/k7d-jail";
 
 /// One tree's cgroup jail.
 ///
@@ -403,7 +407,13 @@ pub fn clean_stale_vm_cgroups() {
 
 /// Resolve the calling process's cgroup v2 directory from
 /// `/proc/self/cgroup` (the single `0::<path>` line on a v2 host).
-fn self_cgroup_dir() -> Result<PathBuf, CgroupError> {
+///
+/// This is also what makes privilege-separation's delegation invisible to every
+/// caller in this module: the node broker moves the VM broker into
+/// `<service>/vm` before dropping uid, so the VM broker reads `.../vm`
+/// here and its `mkdir`s land in the subtree it owns. Nothing on the
+/// fork hot path had to learn about the split.
+pub(crate) fn self_cgroup_dir() -> Result<PathBuf, CgroupError> {
     let content = std::fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| CgroupError::SelfCgroup(e.to_string()))?;
     let rel = content

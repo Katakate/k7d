@@ -15,18 +15,30 @@
 //! (`0x94`), socket `SIOC*` (`0x89`), block (`0x12`), loop (`0x4C`),
 //! XFS (`0x58`), and the floppy/CDROM probes `mkfs` issues.
 //!
+//! ## Two filters, because filters survive `execve`
+//!
+//! A seccomp filter is inherited through `execve`, so while the daemon
+//! exec'd its own helpers the filter installed on it had to be
+//! `DAEMON_SYSCALLS ∪ HELPER_SYSCALLS` — the daemon paid for
+//! `virtiofsd`'s `chroot`, the jailer's `capset`/`mknod`/`pivot_root`
+//! and `ip`'s `unshare` because they ran behind its filter.
+//!
+//! The pre-seccomp helper spawner moved exec into [`crate::spawner`], a
+//! child forked from `main` before this filter exists. So there are two
+//! filters and each process gets its own:
+//!
+//! * [`install`] — the daemon: `DAEMON_SYSCALLS`, with no `execve`, no
+//!   uid syscall, no namespace syscall, no `chroot`.
+//! * [`install_for_spawner`] — the spawner: the union, because every
+//!   helper it execs inherits it.
+//!
 //! ## Why the default is `enforce`
 //!
-//! Two reasons the filter used to default to `log`, both still
-//! load-bearing as *reasons to keep the allowlist honest*:
-//!
-//! 1. An allowlist that is missing one syscall does not fail a test —
-//!    it kills the node's entire VM fleet at once, because there is one
-//!    process.
-//! 2. **Seccomp filters survive `execve`.** k7d spawns helpers
-//!    (`virtiofsd`, `nft`, `ip`, `iptables`), and they inherit this
-//!    filter. Their syscall surface is much wider than the daemon's, so
-//!    the allowlist has to cover them too.
+//! The reason the filter used to default to `log` is still
+//! load-bearing as a *reason to keep the allowlist honest*: an
+//! allowlist that is missing one syscall does not fail a test — it
+//! kills the node's entire VM fleet at once, because there is one
+//! process.
 //!
 //! The default flipped to enforce after a full suite run on
 //! k7-node-02 produced no daemon/helper `SECCOMP` audit lines (the
@@ -104,6 +116,14 @@ const IOCTL_TYPE_MASK: u64 = 0x0000_FF00;
 
 /// Syscalls the daemon itself needs: VM setup and run, the control
 /// socket, the tree store on disk, threads, and timers.
+///
+/// Deliberately **not** here, and checked by
+/// `daemon_filter_has_no_privilege_syscalls`: `execve` (the daemon
+/// forks its spawner before this filter exists and never execs again),
+/// `chroot`, `pivot_root`, `unshare`, `setns`, `capset`, the
+/// `setuid`/`setgid`/`setres*` family, `mknod`, `personality` and the
+/// xattr calls. Adding one back means naming the daemon code that
+/// issues it, measured with `K7D_SECCOMP=log`.
 const DAEMON_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_read,
     libc::SYS_write,
@@ -235,7 +255,8 @@ const DAEMON_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_membarrier,
     libc::SYS_clone,
     libc::SYS_clone3,
-    libc::SYS_execve,
+    // `wait4`/`waitid` are for the spawner watchdog, not for helpers:
+    // helpers are the *spawner's* children now.
     libc::SYS_wait4,
     libc::SYS_waitid,
     libc::SYS_kill,
@@ -258,12 +279,30 @@ const DAEMON_SYSCALLS: &[libc::c_long] = &[
     // Volume bind mounts into the virtiofs share.
     libc::SYS_mount,
     libc::SYS_umount2,
+    // `std::fs::set_permissions` on the staged kernel, the jail's
+    // `run/`, a packed Secret (`fc/stage.rs`, `fc/snapshot.rs`,
+    // `volumes_blk.rs`, `control.rs`'s socket mode). glibc routes
+    // `chmod(path)` through `fchmodat`; both spellings are here because
+    // which one you get depends on the libc, and a filter that depends
+    // on that is a filter that kills the fleet after a distro upgrade.
+    libc::SYS_chmod,
+    libc::SYS_fchmod,
+    libc::SYS_fchmodat,
+    // `fc::stage::chown` re-owns a jail's RW disk and `run/` to the
+    // per-VM uid, and hands it back to 0:0 on detach (`fc/mod.rs`).
+    libc::SYS_chown,
+    libc::SYS_fchownat,
 ];
 
-/// Extra syscalls the helper processes k7d spawns need. They inherit
-/// this filter through `execve`, so an allowlist that only covers the
-/// daemon would kill `virtiofsd` the moment it jails itself.
+/// Extra syscalls the helper processes need. They are exec'd by
+/// [`crate::spawner`] and inherit **its** filter, so these are installed
+/// there and nowhere else: an allowlist that only covered the daemon
+/// would kill `virtiofsd` the moment it jails itself, and one that
+/// covered both in one process is what the pre-seccomp helper
+/// spawner removed.
 const HELPER_SYSCALLS: &[libc::c_long] = &[
+    // The spawner's own job, on top of what it shares with the daemon.
+    libc::SYS_execve,
     libc::SYS_chroot,
     libc::SYS_pivot_root,
     libc::SYS_unshare,
@@ -319,10 +358,77 @@ const HELPER_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_getsid,
 ];
 
-/// Build the filter program for `mode`.
-fn build(mode: Mode) -> Result<BpfProgram, String> {
+/// Syscalls [`DAEMON_SYSCALLS`] carries only because the daemon used to
+/// be the process that mounted a share and re-owned a jail. Under
+/// privilege separation those are the node broker's verbs, so the VM broker's filter
+/// is `DAEMON_SYSCALLS` minus this list — and `VM_SYSCALLS` is then a
+/// filter under which the privileged operation is *unreachable* rather
+/// than merely refused by DAC.
+///
+/// `chown`/`fchownat` go because `fc::stage` is the node broker's;
+/// `mount`/`umount2` because `remount_share_readonly` is a verb.
+const VM_BROKER_REMOVED: &[libc::c_long] = &[
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_chown,
+    libc::SYS_fchownat,
+];
+
+/// What the node broker needs on top of the union it inherits from the
+/// daemon's and the helpers' lists.
+///
+/// `openat2` is the path validator ([`crate::broker::paths`]); `fchown`
+/// re-owns a jail socket in place; the rest — `mount`, `execve`, `kill`,
+/// `sendmsg`, `socketpair`, `clone3`, `pidfd_open` — is already in the
+/// union, which is the point of the union: the node broker is the one
+/// process that execs a privileged helper, so it pays for what that
+/// helper needs, exactly as the single-process daemon that exec'd
+/// helpers itself did.
+const NODE_BROKER_EXTRA: &[libc::c_long] = &[libc::SYS_openat2, libc::SYS_fchown];
+
+/// Which process a filter is being built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The daemon, un-split (`K7D_PRIVSEP` off): `DAEMON_SYSCALLS` only.
+    Daemon,
+    /// The spawner, and by `execve` inheritance every helper: the union.
+    Spawner,
+    /// The node broker: the union too, because it execs `virtiofsd`, the
+    /// jailer, `ip`, `iptables`, `nft` and `nsenter` — but in a process
+    /// whose only input is a closed verb table from one peer.
+    NodeBroker,
+    /// The VM broker: the daemon's list minus what became a verb.
+    VmBroker,
+}
+
+impl Scope {
+    fn syscalls(self) -> Vec<libc::c_long> {
+        match self {
+            Self::Daemon => DAEMON_SYSCALLS.to_vec(),
+            Self::Spawner => DAEMON_SYSCALLS
+                .iter()
+                .chain(HELPER_SYSCALLS)
+                .copied()
+                .collect(),
+            Self::NodeBroker => DAEMON_SYSCALLS
+                .iter()
+                .chain(HELPER_SYSCALLS)
+                .chain(NODE_BROKER_EXTRA)
+                .copied()
+                .collect(),
+            Self::VmBroker => DAEMON_SYSCALLS
+                .iter()
+                .filter(|nr| !VM_BROKER_REMOVED.contains(nr))
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+/// Build the filter program for `mode` and `scope`.
+fn build(mode: Mode, scope: Scope) -> Result<BpfProgram, String> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for &syscall in DAEMON_SYSCALLS.iter().chain(HELPER_SYSCALLS) {
+    for syscall in scope.syscalls() {
         // An empty rule vector means "match on the syscall number
         // alone", which is what every entry except `ioctl` wants.
         rules.entry(syscall).or_default();
@@ -354,27 +460,61 @@ fn build(mode: Mode) -> Result<BpfProgram, String> {
         .map_err(|e| format!("compile seccomp filter: {e}"))
 }
 
-/// Install the filter for the calling thread (and, by inheritance,
-/// every thread and child process created afterwards).
+/// Install the **daemon's** filter for the calling thread (and, by
+/// inheritance, every thread created afterwards).
 ///
-/// Call this from `main` **before** the first VM exists. Returns the
-/// mode that was applied.
+/// Call this from `main` **before** the first VM exists and **after**
+/// [`crate::spawner::start`] — the spawner must be forked while `execve`
+/// is still reachable. Returns the mode that was applied.
 pub fn install() -> Result<Mode, String> {
+    install_scope(Scope::Daemon, "daemon")
+}
+
+/// Install the **spawner's** filter: the daemon's allowlist plus every
+/// helper's, because each helper the spawner execs inherits it.
+///
+/// Called from the spawner child only, right after it has shed its
+/// inherited descriptors and before it serves a single request.
+pub fn install_for_spawner() -> Result<Mode, String> {
+    install_scope(Scope::Spawner, "spawner")
+}
+
+/// Install the **node broker's** filter (privilege separation): the union, because
+/// it execs the privileged helpers.
+///
+/// Called from `broker::node::main` after the watchdog thread is up and
+/// before the first verb is served.
+pub fn install_for_node_broker() -> Result<Mode, String> {
+    install_scope(Scope::NodeBroker, "node broker")
+}
+
+/// Install the **VM broker's** filter (privilege separation): the daemon's list
+/// minus `mount`, `umount2` and the `chown` family, all of which became
+/// node-broker verbs.
+///
+/// Called from `main` in the same place [`install`] is called in the
+/// un-split daemon: after `spawner::start()`, before the first VM.
+pub fn install_for_vm_broker() -> Result<Mode, String> {
+    install_scope(Scope::VmBroker, "VM broker")
+}
+
+fn install_scope(scope: Scope, who: &str) -> Result<Mode, String> {
     let mode = Mode::from_env()?;
     if mode == Mode::Off {
-        log::warn!("K7D_SECCOMP=off: daemon runs with no syscall filter");
+        log::warn!("K7D_SECCOMP=off: {who} runs with no syscall filter");
         return Ok(mode);
     }
-    let program = build(mode)?;
+    let program = build(mode, scope)?;
     seccompiler::apply_filter(&program).map_err(|e| format!("apply seccomp filter: {e}"))?;
     match mode {
         Mode::Enforce => log::info!(
-            "seccomp filter enforced ({} syscalls allowed; ioctl limited by type byte)",
+            "seccomp filter enforced on the {who} ({} syscalls allowed; ioctl limited by type \
+             byte)",
             program.len()
         ),
         Mode::Log => log::info!(
-            "seccomp filter installed in LOG mode — mismatches are logged, not blocked \
-             (dmesg | grep -i seccomp)"
+            "seccomp filter installed on the {who} in LOG mode — mismatches are logged, not \
+             blocked (dmesg | grep -i seccomp)"
         ),
         Mode::Off => unreachable!("handled above"),
     }
@@ -423,8 +563,19 @@ mod tests {
     #[test]
     fn filter_builds_for_every_acting_mode() {
         for mode in [Mode::Log, Mode::Enforce] {
-            let program = build(mode).unwrap_or_else(|e| panic!("build {mode:?}: {e}"));
-            assert!(!program.is_empty(), "{mode:?} produced an empty program");
+            for scope in [
+                Scope::Daemon,
+                Scope::Spawner,
+                Scope::NodeBroker,
+                Scope::VmBroker,
+            ] {
+                let program =
+                    build(mode, scope).unwrap_or_else(|e| panic!("build {mode:?} {scope:?}: {e}"));
+                assert!(
+                    !program.is_empty(),
+                    "{mode:?}/{scope:?} produced an empty program"
+                );
+            }
         }
     }
 
@@ -433,11 +584,6 @@ mod tests {
     /// every VM on the node at once.
     #[test]
     fn allowlist_covers_the_vmm_hot_path() {
-        let all: Vec<libc::c_long> = DAEMON_SYSCALLS
-            .iter()
-            .chain(HELPER_SYSCALLS)
-            .copied()
-            .collect();
         for required in [
             libc::SYS_ioctl,
             libc::SYS_futex,
@@ -446,11 +592,197 @@ mod tests {
             libc::SYS_read,
             libc::SYS_write,
             libc::SYS_clone,
-            libc::SYS_execve,
             libc::SYS_pwritev2,
         ] {
-            assert!(all.contains(&required), "missing syscall {required}");
+            assert!(
+                DAEMON_SYSCALLS.contains(&required),
+                "missing syscall {required} from the daemon allowlist"
+            );
         }
+        // The spawner is the only process that execs; without `execve`
+        // on its filter every helper dies with SIGSYS.
+        assert!(Scope::Spawner.syscalls().contains(&libc::SYS_execve));
+    }
+
+    /// The point of the pre-seccomp helper spawner: the daemon's own filter carries none of
+    /// the privilege syscalls it used to inherit from its helpers. Each
+    /// of these is a verb an attacker in the daemon got for free while
+    /// the daemon was the process that exec'd `virtiofsd` and the
+    /// jailer.
+    #[test]
+    fn daemon_filter_has_no_privilege_syscalls() {
+        let forbidden = [
+            ("chroot", libc::SYS_chroot),
+            ("pivot_root", libc::SYS_pivot_root),
+            ("unshare", libc::SYS_unshare),
+            ("setns", libc::SYS_setns),
+            ("capset", libc::SYS_capset),
+            ("setuid", libc::SYS_setuid),
+            ("setgid", libc::SYS_setgid),
+            ("setresuid", libc::SYS_setresuid),
+            ("setresgid", libc::SYS_setresgid),
+            ("setgroups", libc::SYS_setgroups),
+            ("mknod", libc::SYS_mknod),
+            ("mknodat", libc::SYS_mknodat),
+            ("personality", libc::SYS_personality),
+            ("setxattr", libc::SYS_setxattr),
+            ("lsetxattr", libc::SYS_lsetxattr),
+            ("fsetxattr", libc::SYS_fsetxattr),
+            ("execve", libc::SYS_execve),
+        ];
+        let leaked: Vec<&str> = forbidden
+            .iter()
+            .filter(|(_, nr)| DAEMON_SYSCALLS.contains(nr))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the daemon's allowlist leaked helper privilege syscalls: {leaked:?} — they belong \
+             to the spawner's filter (HELPER_SYSCALLS)"
+        );
+        // …and the spawner still has them, or its helpers cannot run.
+        let spawner = Scope::Spawner.syscalls();
+        for (name, nr) in forbidden {
+            assert!(
+                spawner.contains(&nr),
+                "{name} left the spawner's filter too — the helper that needs it will SIGSYS"
+            );
+        }
+    }
+
+    /// The daemon needs exactly two things the helpers also need, and
+    /// they are there on purpose with a named caller: `set_permissions`
+    /// and `fc::stage::chown`.
+    #[test]
+    fn daemon_keeps_only_the_named_helper_overlaps() {
+        let overlap: Vec<libc::c_long> = DAEMON_SYSCALLS
+            .iter()
+            .filter(|nr| HELPER_SYSCALLS.contains(nr))
+            .copied()
+            .collect();
+        let expected = [
+            libc::SYS_chmod,
+            libc::SYS_fchmod,
+            libc::SYS_fchmodat,
+            libc::SYS_chown,
+            libc::SYS_fchownat,
+        ];
+        for nr in &overlap {
+            assert!(
+                expected.contains(nr),
+                "syscall {nr} is on both allowlists without a caller comment in DAEMON_SYSCALLS"
+            );
+        }
+        for nr in expected {
+            assert!(overlap.contains(&nr), "syscall {nr} left the daemon");
+        }
+    }
+
+    /// Privilege separation's claim, as an assertion rather than a paragraph: the
+    /// VM broker's filter makes every privileged operation that became a
+    /// verb *unreachable*, not merely refused. `mount` under an empty
+    /// capability set already returns `EPERM`; a filter that also kills
+    /// on it is what stops a `CAP_SYS_ADMIN`-granting kernel bug from
+    /// being reachable from the process that parses guest traffic.
+    #[test]
+    fn the_vm_broker_filter_has_none_of_the_verb_syscalls() {
+        let vm = Scope::VmBroker.syscalls();
+        let forbidden = [
+            ("mount", libc::SYS_mount),
+            ("umount2", libc::SYS_umount2),
+            ("setns", libc::SYS_setns),
+            ("unshare", libc::SYS_unshare),
+            ("chroot", libc::SYS_chroot),
+            ("pivot_root", libc::SYS_pivot_root),
+            ("mknod", libc::SYS_mknod),
+            ("mknodat", libc::SYS_mknodat),
+            ("capset", libc::SYS_capset),
+            ("setuid", libc::SYS_setuid),
+            ("setgid", libc::SYS_setgid),
+            ("setresuid", libc::SYS_setresuid),
+            ("setresgid", libc::SYS_setresgid),
+            ("setgroups", libc::SYS_setgroups),
+            ("execve", libc::SYS_execve),
+            ("execveat", libc::SYS_execveat),
+            ("init_module", libc::SYS_init_module),
+            ("finit_module", libc::SYS_finit_module),
+            ("reboot", libc::SYS_reboot),
+            ("sethostname", libc::SYS_sethostname),
+            ("chown", libc::SYS_chown),
+            ("fchownat", libc::SYS_fchownat),
+        ];
+        let leaked: Vec<&str> = forbidden
+            .iter()
+            .filter(|(_, nr)| vm.contains(nr))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the VM broker's allowlist leaked node-broker syscalls: {leaked:?}"
+        );
+        // …and it kept the hot path, or the split kills every VM.
+        for required in [
+            libc::SYS_ioctl,
+            libc::SYS_futex,
+            libc::SYS_mmap,
+            libc::SYS_sendmsg,
+            libc::SYS_recvmsg,
+            libc::SYS_socketpair,
+            libc::SYS_memfd_create,
+        ] {
+            assert!(
+                vm.contains(&required),
+                "syscall {required} left the VM broker"
+            );
+        }
+    }
+
+    /// The node broker's list is the union plus the validator's
+    /// `openat2`: it is the process that execs and the process that
+    /// mounts, which is exactly why its *input* is a closed verb table
+    /// and not free argv.
+    #[test]
+    fn the_node_broker_filter_is_the_union_plus_the_validator() {
+        let node = Scope::NodeBroker.syscalls();
+        for required in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_execve,
+            libc::SYS_openat2,
+            libc::SYS_fchown,
+            libc::SYS_pidfd_open,
+            libc::SYS_clone3,
+            libc::SYS_kill,
+        ] {
+            assert!(
+                node.contains(&required),
+                "syscall {required} left the node broker"
+            );
+        }
+        // The lists are per role, not nested: the VM broker's is not a
+        // subset claim, but everything it keeps the node broker also has,
+        // because the node broker's is a superset of the daemon's.
+        for nr in Scope::VmBroker.syscalls() {
+            assert!(node.contains(&nr), "syscall {nr} is the VM broker's only");
+        }
+    }
+
+    /// Every removal has to be something the daemon actually had, or the
+    /// list has drifted from `DAEMON_SYSCALLS` and the "minus" in §8 is
+    /// describing a filter nobody builds.
+    #[test]
+    fn every_vm_broker_removal_was_really_on_the_daemons_list() {
+        for nr in VM_BROKER_REMOVED {
+            assert!(
+                DAEMON_SYSCALLS.contains(nr),
+                "VM_BROKER_REMOVED lists syscall {nr}, which the daemon never had"
+            );
+        }
+        assert_eq!(
+            Scope::VmBroker.syscalls().len(),
+            DAEMON_SYSCALLS.len() - VM_BROKER_REMOVED.len(),
+            "a removal appears twice in DAEMON_SYSCALLS, or one did not take"
+        );
     }
 
     /// Run `f` in a forked child and return its raw wait status. The
@@ -500,7 +832,7 @@ mod tests {
     /// starts failing, the default is no longer safe to ship.
     #[test]
     fn log_mode_does_not_kill_on_a_mismatch() {
-        let program = build(Mode::Log).expect("build log filter");
+        let program = build(Mode::Log, Scope::Daemon).expect("build log filter");
         let status = in_child(|| {
             apply_in_child(&program);
             call_unlisted_syscall();
@@ -515,7 +847,7 @@ mod tests {
     /// flipping the default is a real change and not a no-op.
     #[test]
     fn enforce_mode_kills_on_a_mismatch() {
-        let program = build(Mode::Enforce).expect("build enforce filter");
+        let program = build(Mode::Enforce, Scope::Daemon).expect("build enforce filter");
         let status = in_child(|| {
             apply_in_child(&program);
             call_unlisted_syscall();
@@ -533,7 +865,7 @@ mod tests {
     /// `write` are all allowed.
     #[test]
     fn enforce_mode_allows_the_kvm_ioctl_surface() {
-        let program = build(Mode::Enforce).expect("build enforce filter");
+        let program = build(Mode::Enforce, Scope::Daemon).expect("build enforce filter");
         let status = in_child(|| {
             apply_in_child(&program);
             // SAFETY: open + KVM_GET_API_VERSION (`_IO(0xAE, 0x00)`) on

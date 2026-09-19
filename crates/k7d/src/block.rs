@@ -212,6 +212,35 @@ pub struct BlockBackend {
     idx_seed: u16,
 }
 
+/// Open a virtio-blk backing file, through the node broker when the
+/// shim's `CreateVm` registered it.
+///
+/// Two kinds of file arrive here and they belong on opposite sides of
+/// the privilege-separation split. The shim's images — overlay slots under
+/// `/tmp/k7d-shim-*`, `/var/lib/k7d/images` — are root-owned and were
+/// validated and pinned at `vm.register`, so they come back as a
+/// descriptor over `disk.open`. Everything the VM broker made itself —
+/// scratch disks, data disks, reflinked tree clones — is `k7d`-owned
+/// under `/var/lib/k7d/disks` and is opened right here, with no round
+/// trip, which is what keeps the fork path verb-free.
+fn open_backing_file(host_path: &Path, readonly: bool) -> Result<std::fs::File, String> {
+    if let Some(opened) =
+        crate::broker::client::open_pinned(crate::broker::client::Pin::Block, host_path)
+    {
+        return opened.map(std::fs::File::from).map_err(|e| {
+            format!(
+                "disk.open for block backing file {}: {e}",
+                host_path.display()
+            )
+        });
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(!readonly)
+        .open(host_path)
+        .map_err(|e| format!("open block backing file {}: {e}", host_path.display()))
+}
+
 impl BlockBackend {
     /// Open `host_path` as the backing file (`O_RDONLY` when `readonly`,
     /// `O_RDWR` otherwise) and validate it. No default fallbacks: a missing
@@ -223,11 +252,7 @@ impl BlockBackend {
         mem_addr: u64,
         mem_size: u64,
     ) -> Result<Self, String> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(!readonly)
-            .open(host_path)
-            .map_err(|e| format!("open block backing file {}: {e}", host_path.display()))?;
+        let file = open_backing_file(host_path, readonly)?;
         let len = file
             .metadata()
             .map_err(|e| format!("stat block backing file {}: {e}", host_path.display()))?
@@ -423,7 +448,8 @@ impl VirtioBackend for BlockBackend {
         let vq = ValidatedQueue::new(q, self.mem_addr, self.mem_size)
             .map_err(|e| format!("virtio-blk queue geometry: {e}"))?;
 
-        let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+        let kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+            .map_err(|e| format!("eventfd: {e}"))?;
         let worker_kick = kick.try_clone().map_err(|e| format!("dup kick: {e}"))?;
         let worker_irq = irq_evt.try_clone().map_err(|e| format!("dup irq: {e}"))?;
 

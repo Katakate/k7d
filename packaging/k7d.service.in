@@ -1,0 +1,119 @@
+[Unit]
+Description=k7d microVM runtime daemon
+After=network.target
+# Loop-mount the reflink XFS in the *host* namespace (ProtectSystem=strict).
+# ProtectSystem=strict gives the service its own mount ns; a mount
+# the daemon performs would be invisible on the host.
+RequiresMountsFor=/var/lib/k7d/disks
+
+[Service]
+# `+` = host execution context, not the service sandbox.
+ExecStartPre=+/usr/local/libexec/k7d-mount-disks
+ExecStart=@K7D_BIN@
+Restart=on-failure
+Environment=RUST_LOG=info
+# The daemon is the only process that decides which guest a VM boots
+# (CHALLENGES #72).
+Environment=K7D_KERNEL=@KERNEL@
+Environment=K7D_INITRD=@INITRD@
+# Soft default without this is 1024 — far too low for multi-cluster
+# fork batches (EMFILE on /dev/vhost-vsock; CHALLENGES #49).
+LimitNOFILE=524288
+
+# Privilege separation. The node broker is this unit's main
+# pid and stays root; the VM broker is its child and drops to uid `k7d`
+# in-process, so there is no `User=` here and the bounding set below is
+# the *node broker's* (the VM broker's is empty by construction, not by
+# unit text). Every verb family is served as of `fc.*` verbs and
+# `K7D_PRIVSEP` on — the last
+# one was the Firecracker jail — so the shipped unit opts in. Setting
+# this to `off` runs k7d as the single root process it always has, which
+# is the escape hatch and not the default.
+Environment=K7D_PRIVSEP=on
+# VM-broker restart — `K7D_VM_BROKER_RESTART=on` makes the node broker re-fork
+# a VM broker that dies and hand its successor the standalone
+# Firecracker sandboxes instead of killing them. Deliberately not set:
+# off is the §9.2 behaviour (release everything, exit non-zero, systemd
+# starts a clean pair), and the only thing that turns it on today is
+# the integration test.
+# systemd creates /run/k7d root-owned (no `User=`); the node broker
+# chowns it to k7d so the VM broker can bind k7d.sock in it. Preserve it
+# across a restart so a live socket directory is not the thing that makes
+# an upgrade a reconnect storm.
+RuntimeDirectory=k7d
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+# The node broker creates <this cgroup>/vm and hands it to uid k7d, so
+# the VM broker's per-VM and per-tree cgroups are plain unprivileged
+# mkdirs and the fork hot path needs no round trip. Without
+# `Delegate=` systemd owns the subtree and resets attributes under it.
+Delegate=cpu cpuset memory pids
+
+# Capability bounding — bounding set from the measured cap_capable union.
+# Inherited by jailer, virtiofsd, nft, ip, iptables, losetup, mkfs.*.
+# Measured union (CHALLENGES #244). CAP_SYS_PTRACE is the Firecracker spawn reaper
+# reading /proc/<fc-uid>/status of a jailed Firecracker. CAP_NET_RAW
+# is iptables. CAP_FSETID is the jailer chmod of staged binaries.
+# CAP_SETPCAP is virtiofsd applying child capabilities after cap_set_flag.
+# CAP_SYS_RESOURCE must stay in the set: virtiofsd cap_set_proc includes
+# it, and dropping it fails with "can't apply the child capabilities"
+# even when SETPCAP is present (test_hostpath_directory_rw).
+# CAP_SETFCAP is virtiofsd 1.10's default required list (CHOWN,
+# DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, MKNOD, SETFCAP).
+# It does not show up in kprobe:cap_capable; capng::apply fails
+# without it. CAP_SYS_MODULE (ip's module probe) is a check we drop.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_SETFCAP CAP_SYS_CHROOT CAP_SYS_RESOURCE CAP_MKNOD CAP_CHOWN CAP_KILL CAP_SYS_PTRACE CAP_FSETID CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+# ProtectSystem=strict implies NoNewPrivileges; keep it explicit.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# ProtectHome=yes hid /root/k7d/guest/kernel/vmlinux from the daemon
+# (test_gym_*, gym/server.py default kernel path, CHALLENGES #244).
+# ReadWritePaths: `/var/lib/k7d` plus the nested loop XFS at
+# `/var/lib/k7d/disks` (trees, fc chroots — ProtectSystem=strict does
+# not make nested mounts RW; test_shim prepare_fork_source EROFS,
+# CHALLENGES #244). `/var/lib/rancher/k3s` PVC/resolv.conf;
+# `/proc/sys/net` ip_forward/bridge-nf/rp_filter; `/sys/class/net`
+# bridge sysfs; `/run` socket, nft, xtables, CNI netns.
+ReadWritePaths=/run /tmp /var/lib/k7d /var/lib/k7d/disks /sys/fs/cgroup /sys/class/net /var/lib/kubelet/pods /var/lib/rancher/k3s /dev/shm /proc/sys/net
+# `/tmp` is still product-writable: shim overlay slots, virtiofs
+# sockets, `prepare_fork_source` dumps (`std::env::temp_dir()`,
+# test_shim EROFS under ProtectSystem=strict). PrivateTmp is off.
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=no
+# RestrictSUIDSGID is deliberately absent (`openat2` / jail `run/`
+# setgid). systemd cannot inspect the mode inside `struct open_how`, so
+# it blocks `openat2`
+# outright with ENOSYS — and `openat2(RESOLVE_BENEATH|NO_SYMLINKS|
+# NO_MAGICLINKS)` is the whole of the node broker's path validator
+# (broker/paths.rs). It also refuses the setgid `chmod 02710` the node
+# broker puts on a Firecracker jail's `run/` so the VM broker's group
+# owns the sockets Firecracker binds there. Both were invisible while
+# the shipped unit set `K7D_PRIVSEP=off`, because neither path ran
+# (CHALLENGES #249). Falling back to `openat` when `openat2` says
+# ENOSYS would trade the one race-free resolver for a TOCTOU, so the
+# unit option goes instead. What it bought — no setuid binary created
+# by the daemon — the jail staging enforces itself: every file it
+# links in is chmod'd explicitly and the guest sees a read-only rootfs.
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/vhost-vsock rw
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/loop-control rw
+DeviceAllow=block-loop rw
+# DevicePolicy=closed hides even these; Firecracker and the daemon open them.
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/zero rw
+DeviceAllow=/dev/full rw
+DeviceAllow=/dev/random r
+DeviceAllow=/dev/urandom r
+
+[Install]
+WantedBy=multi-user.target

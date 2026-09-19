@@ -3008,6 +3008,22 @@ fn parse_exec_process_spec(
     (args, terminal, term)
 }
 
+/// One of containerd's exec stdio FIFOs, opened for writing. Containerd
+/// opened the read end before it issued `Exec`, so this does not block;
+/// an empty path is an exec without that stream.
+fn open_exec_fifo(path: &str) -> Option<std::fs::File> {
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            log::warn!("exec bridge: open FIFO {path}: {e}");
+            None
+        }
+    }
+}
+
 fn run_exec_bridge(
     endpoint: &k7d::guest::AgentEndpoint,
     container_name: &str,
@@ -3016,39 +3032,50 @@ fn run_exec_bridge(
     stdout_path: &str,
     stderr_path: &str,
 ) {
-    let mut agent = match k7d::api::AgentClient::connect_endpoint(endpoint, Duration::from_secs(10))
-    {
-        Ok(a) => a,
-        Err(e) => {
-            log::error!("exec bridge: agent connect failed: {e}");
-            let mut ec = exit_code.lock().unwrap();
-            *ec = Some(-1);
-            return;
-        }
-    };
-
-    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match agent.container_exec(container_name, &args_refs) {
-        Ok(result) => {
-            if !stdout_path.is_empty() {
-                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(stdout_path) {
-                    let _ = std::io::Write::write_all(&mut f, result.stdout.as_bytes());
+    // Containerd's `ExecSync` returns only after the exit code *and*
+    // EOF on both FIFOs — and its reader side is a blocking `open(2)`
+    // that nothing but a writer completes. So the FIFOs are opened
+    // before anything can fail and closed on every exit from this
+    // function, like a real exec process's stdio. When a bridge that
+    // could not reach the guest (paused VM) returned without touching
+    // them, kubelet's probe worker sat in `ExecSync` for its two-minute
+    // gRPC deadline and the pod stayed Ready through a whole pause.
+    let mut stdout = open_exec_fifo(stdout_path);
+    let mut stderr = open_exec_fifo(stderr_path);
+    let (code, out, err) =
+        match k7d::api::AgentClient::connect_endpoint(endpoint, Duration::from_secs(10)) {
+            Err(e) => {
+                log::error!("exec bridge: agent connect failed: {e}");
+                (
+                    -1,
+                    String::new(),
+                    format!("exec bridge: agent connect failed: {e}\n"),
+                )
+            }
+            Ok(mut agent) => {
+                let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match agent.container_exec(container_name, &args_refs) {
+                    Ok(r) => (r.exit_code, r.stdout, r.stderr),
+                    Err(e) => {
+                        log::error!("exec bridge: container_exec failed: {e}");
+                        (
+                            -1,
+                            String::new(),
+                            format!("exec bridge: container_exec failed: {e}\n"),
+                        )
+                    }
                 }
             }
-            if !stderr_path.is_empty() {
-                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(stderr_path) {
-                    let _ = std::io::Write::write_all(&mut f, result.stderr.as_bytes());
-                }
-            }
-            let mut ec = exit_code.lock().unwrap();
-            *ec = Some(result.exit_code);
-        }
-        Err(e) => {
-            log::error!("exec bridge: container_exec failed: {e}");
-            let mut ec = exit_code.lock().unwrap();
-            *ec = Some(-1);
-        }
+        };
+    if let Some(f) = stdout.as_mut() {
+        let _ = std::io::Write::write_all(f, out.as_bytes());
     }
+    if let Some(f) = stderr.as_mut() {
+        let _ = std::io::Write::write_all(f, err.as_bytes());
+    }
+    drop((stdout, stderr));
+    let mut ec = exit_code.lock().unwrap();
+    *ec = Some(code);
 }
 
 /// Mount the container rootfs on the host using the mount

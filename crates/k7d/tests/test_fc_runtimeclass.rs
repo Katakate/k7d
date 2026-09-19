@@ -336,6 +336,126 @@ spec:
     );
 }
 
+/// Wait until every container of `name` reports `ready=false` — the
+/// exec readiness probe failing against a frozen guest is the proof
+/// that a pause was real.
+fn wait_for_containers_not_ready(name: &str, timeout: Duration) -> Result<Duration, String> {
+    let start = Instant::now();
+    loop {
+        let ready = kubectl_jsonpath("pod", name, "{.status.containerStatuses[*].ready}");
+        let flags: Vec<&str> = ready.split_whitespace().collect();
+        if !flags.is_empty() && flags.iter().all(|f| *f == "false") {
+            return Ok(start.elapsed());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "pod {name} never went NotReady within {timeout:?} (ready={ready}): {}",
+                pod_diagnosis(name)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn daemon_call(req: &k7d::control::Request) -> k7d::control::Response {
+    let mut client = k7d::control::Client::connect_env().expect("connect k7d daemon");
+    client.call(req).expect("k7d control call")
+}
+
+/// One pause → resume → exec cycle on a pod that carries the exec
+/// readiness probe, driven over `/run/k7d/k7d.sock` the way `k7 pause`
+/// / `k7 resume` drive it. `runtime_class` picks the engine; the
+/// native twin is the control.
+fn pause_resume_exec_on(runtime_class: &str) {
+    let pod = common::unique_name(&format!("test-{runtime_class}-pause-exec"));
+    kubectl_delete_pod(&pod);
+    let _guard = PodGuard(pod.clone());
+    kubectl_apply(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-{runtime_class}-pause-exec
+spec:
+  runtimeClassName: {runtime_class}
+  containers:
+  - name: sandbox
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep infinity"]
+    readinessProbe:
+      exec:
+        command: ["/bin/sh", "-c", "true"]
+      initialDelaySeconds: 0
+      periodSeconds: 2
+      timeoutSeconds: 5
+      failureThreshold: 1
+"#
+    ))
+    .unwrap();
+    wait_for_pod_ready(&pod, POD_READY).unwrap();
+    wait_for_containers_ready(&pod, Duration::from_secs(120))
+        .unwrap_or_else(|e| panic!("{runtime_class}: probe must flip Ready before pause: {e}"));
+    let vm_id = common::pod_vm_id(&pod);
+    if runtime_class == "k7-fc" {
+        assert_on_firecracker(&pod);
+    }
+
+    match daemon_call(&k7d::control::Request::PauseVm {
+        vm_id: vm_id.clone(),
+    }) {
+        k7d::control::Response::Ok => {}
+        other => panic!("{runtime_class}: PauseVm({vm_id}): {other:?}"),
+    }
+    // The probe (period 2 s, timeout 5 s, threshold 1) fails against
+    // the frozen guest: NotReady proves the pause reached the vCPUs
+    // and leaves a probe exec parked in the paused window — the exact
+    // state the k7 symptom resumed out of.
+    let not_ready_after = wait_for_containers_not_ready(&pod, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("{runtime_class}: {e}"));
+    eprintln!("{runtime_class}: probe went NotReady {not_ready_after:?} after pause");
+
+    let resumed_at = Instant::now();
+    match daemon_call(&k7d::control::Request::ResumeVm {
+        vm_id: vm_id.clone(),
+    }) {
+        k7d::control::Response::Ok => {}
+        other => panic!("{runtime_class}: ResumeVm({vm_id}): {other:?}"),
+    }
+    let hello = kubectl_exec_echo_hello(&pod, "sandbox").unwrap_or_else(|e| {
+        panic!(
+            "{runtime_class}: kubectl exec after resume must answer within 15 s: {e}\n{}",
+            pod_diagnosis(&pod)
+        )
+    });
+    assert!(hello.contains("hello"), "{runtime_class}: {hello:?}");
+    eprintln!(
+        "{runtime_class}: resume → exec answered in {:?}",
+        resumed_at.elapsed()
+    );
+    wait_for_containers_ready(&pod, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("{runtime_class}: probe must flip Ready after resume: {e}"));
+    eprintln!(
+        "{runtime_class}: resume → Ready in {:?}",
+        resumed_at.elapsed()
+    );
+}
+
+/// k7-forked CHALLENGES #17 at the RuntimeClass layer: `k7d-fc` pause →
+/// resume → CRI exec hung.
+#[test]
+fn test_k7_fc_pause_resume_exec_answers() {
+    let _guard = ensure_fc_runtimeclass_node();
+    pause_resume_exec_on("k7-fc");
+}
+
+/// The native twin of [`test_k7_fc_pause_resume_exec_answers`] — the
+/// control: the same sequence on `runtimeClassName: k7`.
+#[test]
+fn test_k7_native_pause_resume_exec_answers() {
+    let _guard = ensure_fc_runtimeclass_node();
+    pause_resume_exec_on("k7");
+}
+
 /// `runtimeClassName: k7-fc` with no backend annotation boots Firecracker;
 /// `runtimeClassName: k7` with no annotation stays native.
 #[test]

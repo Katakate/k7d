@@ -432,7 +432,7 @@ fn test_pool_miss_on_data_disks() {
     let guard = spawn_daemon("datadisk", &[("K7D_POOL_SIZE", "1")]);
     wait_for_idle(&guard, 1);
 
-    let id = format!("pool-inc2-{}", std::process::id());
+    let id = format!("pool-compat-{}", std::process::id());
     let image = k7d::disks::data_disk_path(&id);
     let _ = std::fs::remove_file(&image);
 

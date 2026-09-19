@@ -429,7 +429,7 @@ mod tests {
     /// 0.8 of 6 is 4.8 awake: the sweep's N=4 reading (4.67) has headroom,
     /// its N=8 one (5.20) does not.
     #[test]
-    fn the_threshold_sits_between_inc6_n4_and_n8() {
+    fn the_threshold_sits_between_n4_and_n8() {
         let mut free = DilationPolicy::default();
         // 4.67 of 6 ≈ 14 awake over 3 samples of 6.
         assert_eq!(free.observe(5, 6), Verdict::Warming);

@@ -97,6 +97,48 @@ fn test_boot_multi_vcpu() {
         vm.serial_output(Duration::from_secs(1))
     );
 
+    // A helper spawned while this VM is live inherits nothing of it:
+    // every pipe and eventfd k7d makes is CLOEXEC (`fdutil.rs`), and
+    // the pre-seccomp helper spawner execs in `spawner.rs`, which
+    // passes the stdio of the request and closes everything else. So a child sees
+    // only its three stdio slots plus the directory fd `ls` itself opens
+    // on /proc/self/fd (bug-candidates #28).
+    let child = k7d::spawner::command("/bin/sh")
+        .args(["-c", "ls -l /proc/self/fd"])
+        .output()
+        .expect("spawn helper");
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let listing = String::from_utf8_lossy(&child.stdout);
+    let mut inherited: Vec<(u32, &str)> = listing
+        .lines()
+        .filter(|l| l.contains("->"))
+        .filter_map(|l| {
+            let mut cols = l.split_whitespace().skip(8);
+            let fd = cols.next()?.parse().ok()?;
+            Some((fd, l.trim()))
+        })
+        .collect();
+    inherited.sort_unstable();
+    // Exactly what the request asked for: stdin on /dev/null, stdout and
+    // stderr on the `output()` pipes, and the directory `ls` itself
+    // opened on /proc/self/fd. Anything else is a daemon descriptor that
+    // crossed an `execve`.
+    let numbers: Vec<u32> = inherited.iter().map(|(fd, _)| *fd).collect();
+    assert_eq!(
+        numbers,
+        vec![0, 1, 2, 3],
+        "helper saw fds {numbers:?}, not just the ones the request passed:\n{listing}"
+    );
+    let (_, dirfd) = inherited[3];
+    assert!(
+        dirfd.contains("/proc/"),
+        "fd 3 should be the /proc/self/fd directory `ls` opened, got: {dirfd}"
+    );
+
     // Pause joins both threads and recovers both vCPU fds; resume
     // restarts both.
     vm.pause().expect("pause should join both vCPU threads");

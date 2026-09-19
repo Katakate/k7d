@@ -35,7 +35,7 @@ class TestSensors(unittest.TestCase):
         self.assertIn("helm-pin", str(ctx.exception))
         self.assertIn("will not guess", str(ctx.exception))
 
-    def test_kprobe_policy_matches_25a_inc4_prefix(self) -> None:
+    def test_kprobe_policy_matches_path_prefix(self) -> None:
         yaml = kprobe_policy_yaml()
         self.assertIn(KPROBE_POLICY, yaml)
         self.assertIn("fd_install", yaml)

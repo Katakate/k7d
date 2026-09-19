@@ -112,7 +112,7 @@ def _health(**kw) -> ClusterHealth:
 
 
 class TestParseAndDiff(unittest.TestCase):
-    def test_25a_inc4_diverge_shape(self) -> None:
+    def test_diverge_shape(self) -> None:
         src = parse_events(SOURCE)
         br = parse_events(BRANCH)
         self.assertTrue(any(e.key.path == SRC_PATH for e in src))

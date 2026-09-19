@@ -23,6 +23,8 @@ pub mod autowarp;
 #[cfg(not(feature = "verif"))]
 pub mod block;
 #[cfg(not(feature = "verif"))]
+pub mod broker;
+#[cfg(not(feature = "verif"))]
 pub mod cgroup;
 #[cfg(not(feature = "verif"))]
 pub mod cluster_tree;
@@ -42,6 +44,8 @@ pub mod doctor;
 pub mod erofs;
 #[cfg(not(feature = "verif"))]
 pub mod fc;
+#[cfg(not(feature = "verif"))]
+pub mod fdutil;
 #[cfg(not(feature = "verif"))]
 pub mod fork;
 #[cfg(not(feature = "verif"))]
@@ -65,7 +69,11 @@ pub mod quickstart;
 #[cfg(not(feature = "verif"))]
 pub mod seccomp;
 #[cfg(not(feature = "verif"))]
+pub mod seqmsg;
+#[cfg(not(feature = "verif"))]
 pub mod snapshot;
+#[cfg(not(feature = "verif"))]
+pub mod spawner;
 #[cfg(not(feature = "verif"))]
 pub mod tree;
 #[cfg(not(feature = "verif"))]

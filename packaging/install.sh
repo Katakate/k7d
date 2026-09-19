@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.6.0
+# Version: 0.7.0
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"
@@ -15,8 +15,10 @@ usage() {
 Usage: ./install.sh [--with-k3s] [--prefix DIR]
 
 Installs k7d + containerd-shim-k7-v1 to $PREFIX/bin (default /usr/local),
-guest kernel/initramfs to $PREFIX/share/k7d, and a systemd unit that sets
-K7D_KERNEL / K7D_INITRD + RUST_LOG=info + LimitNOFILE=524288.
+guest kernel/initramfs to $PREFIX/share/k7d, k7d-mount-disks to
+/usr/local/libexec, and a systemd unit (from k7d.service.in) that sets
+K7D_KERNEL / K7D_INITRD + RUST_LOG=info + LimitNOFILE=524288 plus the
+capability bounding set and ProtectSystem=strict.
 
   --with-k3s   Also register RuntimeClass k7 and k7-fc in k3s/containerd
                (config-v3.toml.tmpl blocks; no BinaryName options).
@@ -39,7 +41,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz runc.amd64 docker/bin/dockerd; do
+for f in k7d containerd-shim-k7-v1 vmlinux initramfs.cpio.gz runc.amd64 docker/bin/dockerd \
+         k7d-account.sh 60-k7d.rules; do
   if [[ ! -e "$HERE/$f" ]]; then
     echo "missing $HERE/$f — run from the extracted release tarball" >&2
     exit 1
@@ -72,24 +75,75 @@ chmod -R a+rX "$SHARE_DIR/docker"
 KERNEL="$SHARE_DIR/vmlinux"
 INITRD="$SHARE_DIR/initramfs.cpio.gz"
 
+UNIT_IN="$HERE/k7d.service.in"
+[[ -f "$UNIT_IN" ]] || {
+  echo "missing $UNIT_IN — packaging/k7d.service.in is the unit body" >&2
+  exit 1
+}
+MOUNT_SRC="$HERE/k7d-mount-disks.sh"
+[[ -f "$MOUNT_SRC" ]] || MOUNT_SRC="$HERE/k7d-mount-disks"
+[[ -f "$MOUNT_SRC" ]] || {
+  echo "missing k7d-mount-disks next to install.sh" >&2
+  exit 1
+}
+echo "==> installing /usr/local/libexec/k7d-mount-disks"
+install -d /usr/local/libexec
+install -m 755 "$MOUNT_SRC" /usr/local/libexec/k7d-mount-disks
+
+# ProtectSystem=strict bind-mounts every ReadWritePaths= entry when
+# the unit starts. systemd fails with status=226/NAMESPACE if a path
+# is missing — kubelet and k3s have not created theirs yet when this
+# runs on a join node (k7 install HA, before k3s). Empty dirs are
+# enough; kubelet reuses them (CHALLENGES #262).
+echo "==> creating systemd ReadWritePaths that k3s/kubelet own later"
+install -d -m 0755 /var/lib/kubelet/pods /var/lib/rancher/k3s
+
+# Privilege separation — the VM broker's uid, the vhost-vsock udev rule and the
+# ownership of the state it writes. Shared with
+# your node provisioning so there is one copy of it.
+ACCOUNT_SRC="$HERE/k7d-account.sh"
+[[ -f "$ACCOUNT_SRC" ]] || {
+  echo "missing $ACCOUNT_SRC — packaging/k7d-account.sh provisions uid k7d" >&2
+  exit 1
+}
+echo "==> provisioning the VM broker's identity (uid k7d, group kvm, 60-k7d.rules)"
+# shellcheck source=k7d-account.sh
+source "$ACCOUNT_SRC"
+# Account first so k7d-mount-disks can chown the XFS root to uid k7d
+# instead of leaving it root-owned and warning. provision is still
+# after the mount: k7d_own_state_dirs needs the XFS.
+k7d_create_account
+/usr/local/libexec/k7d-mount-disks
+k7d_provision_vm_broker_identity "$HERE/60-k7d.rules"
+
+# Jailer chroot base must live on the reflink XFS with the writable
+# disks (`link(2)` is EXDEV across mounts). ProtectSystem=strict also
+# bind-mounts /usr, so even same-disk /usr/local/share/k7d →
+# /var/lib/k7d/fc on ext4 fails hard-link with EXDEV (CHALLENGES #263).
+# Staging then copies the guest pair once into the XFS ro-cache.
+echo "==> pointing /var/lib/k7d/fc at the reflink XFS"
+mkdir -p /var/lib/k7d/disks/fc
+chown root:root /var/lib/k7d/disks/fc
+chmod 0700 /var/lib/k7d/disks/fc
+if [[ -L /var/lib/k7d/fc ]]; then
+  ln -sfn /var/lib/k7d/disks/fc /var/lib/k7d/fc
+elif [[ -d /var/lib/k7d/fc ]]; then
+  if [[ -n "$(ls -A /var/lib/k7d/fc 2>/dev/null || true)" ]]; then
+    stale="/var/lib/k7d/fc.ext4-$(date +%s)"
+    mv /var/lib/k7d/fc "$stale"
+  else
+    rmdir /var/lib/k7d/fc
+  fi
+  ln -sfn /var/lib/k7d/disks/fc /var/lib/k7d/fc
+else
+  ln -sfn /var/lib/k7d/disks/fc /var/lib/k7d/fc
+fi
+
 echo "==> writing $UNIT_PATH"
-cat >"$UNIT_PATH" <<EOF
-[Unit]
-Description=k7d microVM runtime daemon
-After=network.target
-
-[Service]
-ExecStart=${BIN_DIR}/k7d
-Restart=on-failure
-Environment=RUST_LOG=info
-Environment=K7D_KERNEL=${KERNEL}
-Environment=K7D_INITRD=${INITRD}
-# Soft default without this is 1024 — far too low for multi-cluster forks.
-LimitNOFILE=524288
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sed -e "s|@K7D_BIN@|${BIN_DIR}/k7d|g" \
+    -e "s|@KERNEL@|${KERNEL}|g" \
+    -e "s|@INITRD@|${INITRD}|g" \
+    "$UNIT_IN" >"$UNIT_PATH"
 
 systemctl daemon-reload
 systemctl enable --now k7d

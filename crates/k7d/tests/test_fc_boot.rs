@@ -592,6 +592,140 @@ fn test_fc_stop_leaks_nothing_over_twenty_cycles() {
     }
 }
 
+fn in_process_fc_config(vm_id: &str) -> FcConfig {
+    FcConfig {
+        vm_id: vm_id.to_string(),
+        memory_mb: 256,
+        vcpus: 1,
+        kernel: kernel_path(),
+        initrd: Some(initrd_path()),
+        cmdline: k7d::vm::DEFAULT_GUEST_CMDLINE.to_string(),
+        cpu_quota_us: None,
+        cpu_period_us: None,
+        drives: Vec::new(),
+        net: None,
+        track_dirty_pages: false,
+    }
+}
+
+/// A spawn that fails *after* the jailer has cloned Firecracker must
+/// kill that process before the uid, chroot and cgroup are released —
+/// otherwise the next VM is handed the uid of a live one
+/// (bug-candidates #51 / #32; #12's cgroup leak closes with it).
+///
+/// In-process, because the assertions are about this allocator's
+/// `live_uid_count` and the reaper's ordering against the lease. The
+/// uid base is moved off the default so the `/proc` scan cannot see the
+/// node daemon's own Firecracker VMs.
+#[test]
+fn test_fc_spawn_failure_after_jailer_reaps_the_orphan() {
+    common::ensure_firecracker_installed();
+    const UID_BASE: u32 = 61_500;
+    std::env::set_var("K7D_FC_UID_BASE", UID_BASE.to_string());
+    std::env::set_var(k7d::fc::spawn::TEST_HOOK_FAIL_PIDFILE, "1");
+    let vm_id = format!("vm-fcreap-{}", std::process::id());
+    let vm_dir = k7d::fc::stage::chroot_base()
+        .join("firecracker")
+        .join(&vm_id);
+    let cgroup = PathBuf::from(format!("/sys/fs/cgroup/k7d/{vm_id}"));
+    let baseline = k7d::fc::stage::live_uid_count();
+
+    let err = match FcVm::create(&in_process_fc_config(&vm_id), None) {
+        Ok(_) => panic!(
+            "{} must fail the spawn",
+            k7d::fc::spawn::TEST_HOOK_FAIL_PIDFILE
+        ),
+        Err(e) => e.to_string(),
+    };
+    std::env::remove_var(k7d::fc::spawn::TEST_HOOK_FAIL_PIDFILE);
+    assert!(
+        err.contains("read jailer pid file"),
+        "the forced failure must be the pid-file read, got: {err}"
+    );
+
+    // (a) the allocator is back at baseline — and, unlike before, that
+    // now means something: (b) no process on the node runs as the uid
+    // the failed VM was leased, and (c) its chroot and cgroup are gone.
+    assert_eq!(
+        k7d::fc::stage::live_uid_count(),
+        baseline,
+        "uid lease leaked"
+    );
+    let orphans = k7d::fc::spawn::pids_owned_by(UID_BASE);
+    assert!(
+        orphans.is_empty(),
+        "firecracker still runs as uid {UID_BASE} after the failed spawn: {orphans:?}"
+    );
+    assert!(!vm_dir.exists(), "chroot {} left behind", vm_dir.display());
+    assert!(!cgroup.exists(), "cgroup {} left behind", cgroup.display());
+
+    // The uid may now be reused safely: the next VM gets it and is the
+    // only process running as it.
+    let vm =
+        FcVm::create(&in_process_fc_config(&vm_id), None).expect("create after a reaped failure");
+    let uids = proc_status(vm.pid())["Uid"].clone();
+    assert!(
+        uids.starts_with(&UID_BASE.to_string()),
+        "the recycled uid must be {UID_BASE}, got Uid: {uids}"
+    );
+    assert_eq!(
+        k7d::fc::spawn::pids_owned_by(UID_BASE),
+        vec![vm.pid()],
+        "exactly one process may run as the reused uid"
+    );
+    drop(vm);
+    std::env::remove_var("K7D_FC_UID_BASE");
+    assert!(k7d::fc::spawn::pids_owned_by(UID_BASE).is_empty());
+}
+
+/// The jailed Firecracker holds no descriptor of the daemon's: nothing
+/// under `/run/k7d`, and no pipe whose other end k7d has open. Every
+/// pipe/eventfd k7d makes is `CLOEXEC` (`fdutil.rs`), so the only fds
+/// that cross into a helper are the ones `Command` hands it on purpose.
+#[test]
+fn test_fc_process_holds_no_daemon_fd() {
+    common::ensure_firecracker_installed();
+    let d = spawn_daemon("nofd");
+    let (vm_id, uds) = create_fc_vm(&d, fc_config());
+    connect_agent(&uds, FC_BOOT_BUDGET).ping().expect("ping");
+    let fc_pid = firecracker_pid(&chroot_of(&uds));
+    let daemon_pid = d.child.id();
+
+    let links = |pid: u32| -> Vec<String> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap_or_else(|e| panic!("read /proc/{pid}/fd: {e}"))
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .map(|t| t.to_string_lossy().into_owned())
+            .collect()
+    };
+    let daemon_pipes: Vec<String> = links(daemon_pid)
+        .into_iter()
+        .filter(|t| t.starts_with("pipe:") || t.starts_with("anon_inode:[eventfd]"))
+        .collect();
+    let fc_fds = links(fc_pid);
+
+    let under_run_k7d: Vec<&String> = fc_fds
+        .iter()
+        .filter(|t| t.starts_with("/run/k7d"))
+        .collect();
+    assert!(
+        under_run_k7d.is_empty(),
+        "jailed firecracker holds daemon paths: {under_run_k7d:?}"
+    );
+    // A pipe's inode is the same on both ends, so a `pipe:[N]` shared
+    // between the two fd tables is a daemon pipe inside the jail.
+    let shared: Vec<&String> = fc_fds
+        .iter()
+        .filter(|t| t.starts_with("pipe:") && daemon_pipes.contains(t))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "jailed firecracker shares pipes with the daemon: {shared:?} (daemon pipes: {daemon_pipes:?})"
+    );
+    stop_vm(&d, &vm_id);
+}
+
 #[test]
 fn test_fc_unsupported_operations_name_the_backend() {
     common::ensure_firecracker_installed();
@@ -690,6 +824,108 @@ fn test_fc_unsupported_operations_name_the_backend() {
     assert!(!guest.paused());
     assert!(guest.is_running());
     guest.stop().expect("stop");
+}
+
+fn pause_vm(guard: &DaemonGuard, vm_id: &str) {
+    let req = Request::PauseVm {
+        vm_id: vm_id.to_string(),
+    };
+    assert!(
+        matches!(call(guard, &req), Response::Ok),
+        "pause_vm({vm_id}) must succeed"
+    );
+}
+
+fn resume_vm(guard: &DaemonGuard, vm_id: &str) {
+    let req = Request::ResumeVm {
+        vm_id: vm_id.to_string(),
+    };
+    assert!(
+        matches!(call(guard, &req), Response::Ok),
+        "resume_vm({vm_id}) must succeed"
+    );
+}
+
+/// After resume, a guest that was dialled *while paused* must answer,
+/// and a fresh exec must answer, each within this budget. Native does
+/// it in ~0.3 s (`PERFORMANCE.md`); Firecracker may be slower but not
+/// unbounded — the k7 symptom (k7-forked CHALLENGES #17) was a hang.
+const RESUME_ANSWER_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the guest stays paused before the concurrent dial: long
+/// enough for the host `CONNECT` to land on a muxer whose guest cannot
+/// answer (the k7 symptom showed with a ~3 s pause).
+const PAUSE_HOLD: Duration = Duration::from_secs(3);
+
+/// Daemon-level repro of k7-forked CHALLENGES #17: `k7d-fc` pause →
+/// resume → exec hung. Each round pauses the VM, dials the agent from
+/// a second thread **while paused** (a readiness probe or `kubectl exec`
+/// landing in the window — it must block, not fail), resumes, and
+/// asserts that the blocked dial's ping returns and a fresh
+/// `exec echo hello` answers, both within [`RESUME_ANSWER_BUDGET`]. The
+/// client that was connected *before* the pause must survive too. Twenty
+/// rounds, because the k7 symptom was not deterministic.
+#[test]
+fn test_fc_pause_resume_exec_answers_twenty_times() {
+    common::ensure_firecracker_installed();
+    let d = spawn_daemon("pauseexec");
+    let (vm_id, uds) = create_fc_vm(&d, fc_config());
+    let mut before = connect_agent(&uds, FC_BOOT_BUDGET);
+    before.ping().expect("ping before any pause");
+
+    let mut worst = Duration::ZERO;
+    for round in 0..CYCLES {
+        pause_vm(&d, &vm_id);
+        std::thread::sleep(PAUSE_HOLD);
+
+        let dial_uds = uds.clone();
+        let dialled_while_paused = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut agent =
+                AgentClient::connect_fc_uds(&dial_uds, 1024, PAUSE_HOLD + RESUME_ANSWER_BUDGET)
+                    .map_err(|e| format!("round {round}: connect while paused: {e}"))?;
+            agent
+                .ping()
+                .map_err(|e| format!("round {round}: ping after resume: {e}"))?;
+            Ok::<Duration, String>(started.elapsed())
+        });
+        // Let the CONNECT land while the guest is still frozen.
+        std::thread::sleep(Duration::from_secs(1));
+        let dialled_for = Duration::from_secs(1);
+
+        let resumed_at = Instant::now();
+        resume_vm(&d, &vm_id);
+
+        let dial_total = dialled_while_paused
+            .join()
+            .expect("dial thread panicked")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let dial_after_resume = dial_total.saturating_sub(dialled_for);
+        assert!(
+            dial_after_resume < RESUME_ANSWER_BUDGET,
+            "round {round}: a dial made while paused took {dial_after_resume:?} after resume \
+             to answer ping (budget {RESUME_ANSWER_BUDGET:?})"
+        );
+
+        let mut fresh = connect_agent(&uds, RESUME_ANSWER_BUDGET);
+        let hello = fresh
+            .exec(&["echo", "hello"])
+            .unwrap_or_else(|e| panic!("round {round}: exec after resume: {e}"));
+        assert_eq!(hello.stdout.trim(), "hello", "round {round}: {hello:?}");
+        let exec_answered = resumed_at.elapsed();
+        assert!(
+            exec_answered < RESUME_ANSWER_BUDGET,
+            "round {round}: resume → fresh exec answered took {exec_answered:?} \
+             (budget {RESUME_ANSWER_BUDGET:?})"
+        );
+        worst = worst.max(exec_answered);
+
+        before
+            .ping()
+            .unwrap_or_else(|e| panic!("round {round}: pre-pause client ping after resume: {e}"));
+    }
+    eprintln!("fc pause→resume→exec: worst of {CYCLES} rounds {worst:?}");
+    stop_vm(&d, &vm_id);
 }
 
 #[test]

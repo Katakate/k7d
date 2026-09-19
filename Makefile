@@ -10,7 +10,8 @@
        rsync remote-check remote-build remote-test-integration remote-bench \
        remote-warp-bench remote-warp-bench-dilated \
        remote-install-rust remote-miri remote-fuzz remote-kani \
-       remote-install-verif remote-verif remote-release reference release
+       remote-install-verif remote-verif remote-release reference release \
+       node-reclaim remote-node-reclaim
 
 REFERENCE_DIR := reference
 REMOTE_DIR := /root/k7d
@@ -163,7 +164,7 @@ k7view-test:
 	python3 examples/k7view/test_store.py
 	python3 examples/k7view/test_probe.py
 
-check: lint gym-test test
+check: lint build-agent gym-test test
 
 miri:
 	# Miri runs on pure unit tests only — integration tests touch KVM, the
@@ -172,9 +173,13 @@ miri:
 	# meaningfully check.
 	cargo +nightly miri test --lib -p k7d -- tree_model
 
+# Every target, under the VM broker's uid rather than root's: after
+# privilege separation the process these parsers actually run in is uid
+# k7d with an empty capability set, and the script asserts that before
+# it fuzzes.
 fuzz:
-	cd fuzz && cargo +nightly fuzz run agent_protocol -- -max_total_time=150
-	cd fuzz && cargo +nightly fuzz run blk_request -- -max_total_time=150
+	bash utils/fuzz-as-vm-broker.sh 150 \
+	    agent_protocol blk_request broker_paths control_request
 
 kani:
 	cargo kani -p k7d
@@ -226,6 +231,10 @@ release: build build-agent build-guest-kernel build-guest-rootfs build-docker-pa
 	cp guest/rootfs/runc.amd64 "dist/$(RELEASE_NAME)/"
 	cp -a guest/docker/payload "dist/$(RELEASE_NAME)/docker"
 	install -m 755 packaging/install.sh "dist/$(RELEASE_NAME)/install.sh"
+	install -m 644 packaging/k7d.service.in "dist/$(RELEASE_NAME)/k7d.service.in"
+	install -m 755 packaging/k7d-mount-disks.sh "dist/$(RELEASE_NAME)/k7d-mount-disks"
+	install -m 644 packaging/k7d-account.sh "dist/$(RELEASE_NAME)/k7d-account.sh"
+	install -m 644 packaging/60-k7d.rules "dist/$(RELEASE_NAME)/60-k7d.rules"
 	install -m 755 scripts/quickstart.sh "dist/$(RELEASE_NAME)/quickstart.sh"
 	tar -C dist -czf "$(RELEASE_TGZ)" "$(RELEASE_NAME)"
 	@echo "==> $(RELEASE_TGZ)"
@@ -245,6 +254,14 @@ rsync:
 
 remote-check:
 	@bash utils/remote-run.sh check "make check"
+
+# Same marker rule and keep-count as the automatic sweep / image GC.
+# Reports df before and after. No extra powers.
+node-reclaim:
+	@bash utils/node-reclaim.sh
+
+remote-node-reclaim:
+	@bash utils/remote-run.sh node-reclaim "make node-reclaim"
 
 remote-build:
 	@bash utils/remote-run.sh build "make build"

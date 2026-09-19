@@ -1418,11 +1418,11 @@ fn wait_for_create_error(pod: &str, needle: &str, timeout: Duration) -> String {
 }
 
 fn wait_k7d_socket() {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while std::os::unix::net::UnixStream::connect("/run/k7d/k7d.sock").is_err() {
         assert!(
             Instant::now() < deadline,
-            "k7d socket did not accept after restart"
+            "k7d socket did not accept after restart (60s; check journalctl -u k7d)"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1442,6 +1442,9 @@ impl DenyFallbackGuard {
             "[Service]\nEnvironment=K7D_DENY_VIRTIOFS_FALLBACK=1\n",
         )
         .unwrap();
+        // Construct before restart so Drop always removes the drop-in
+        // even if the socket wait panics (CHALLENGES #244).
+        let g = Self { dropin };
         let _ = std::process::Command::new("systemctl")
             .args(["daemon-reload"])
             .status();
@@ -1449,7 +1452,7 @@ impl DenyFallbackGuard {
             .args(["restart", "k7d"])
             .status();
         wait_k7d_socket();
-        Self { dropin }
+        g
     }
 }
 
@@ -1462,7 +1465,15 @@ impl Drop for DenyFallbackGuard {
         let _ = std::process::Command::new("systemctl")
             .args(["restart", "k7d"])
             .status();
-        wait_k7d_socket();
+        // Never panic in Drop — a 15s wait here used to abort and leak
+        // the drop-in, poisoning every later hostPath test.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while std::os::unix::net::UnixStream::connect("/run/k7d/k7d.sock").is_err() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

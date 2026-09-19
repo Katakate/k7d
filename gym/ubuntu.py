@@ -116,12 +116,37 @@ def build_or_cache_image(repo: Path) -> dict[str, Any]:
         p = Path(str(manifest[key]))
         if not p.is_file():
             raise RuntimeError(f"manifest {key} is not a file: {p}")
+    _readable_by_the_vm_broker(manifest)
     log.info(
         "ubuntu image kernel=%s image=%s",
         manifest.get("kernel_version"),
         manifest["image"],
     )
     return manifest
+
+
+def _readable_by_the_vm_broker(manifest: dict[str, Any]) -> None:
+    """World-read the kernel and initrd the daemon opens by name.
+
+    Ubuntu ships /boot/vmlinuz-* as 0600 root and the builder copies it
+    out with `cp`, which keeps that. Under privilege separation these two artifacts
+    are the only ones k7d never registers with the node broker — the VM
+    broker opens them itself, as uid k7d — so a 0600 copy is
+    `failed to read kernel ...: Permission denied` at the first
+    create_vm, on a path the caller can read perfectly well
+    (CHALLENGES #250).
+
+    Here and not in build-node-image.sh because the script's own sha256
+    is part of the image content key: a one-line fix there would rebuild
+    the 16 GiB image on every node and evict the cached one.
+    """
+    for key in ("kernel", "initrd"):
+        path = manifest.get(key)
+        if not path:
+            continue
+        p = Path(str(path))
+        if p.is_file() and (p.stat().st_mode & 0o044) != 0o044:
+            p.chmod(0o644)
 
 
 def reflink_disk(base: Path, dest: Path) -> None:

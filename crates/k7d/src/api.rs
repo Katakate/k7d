@@ -345,9 +345,11 @@ impl AgentClient {
         _timeout: Duration,
     ) -> Result<Self, AgentError> {
         let read_fd = agent_serial.lock().unwrap().read_fd;
-        // SAFETY: read_fd is a valid pipe fd from PipeSerialDevice; dup returns
-        // a new fd that we take ownership of via File::from_raw_fd.
-        let dup_fd = unsafe { libc::dup(read_fd) };
+        // SAFETY: read_fd is a valid pipe fd from PipeSerialDevice;
+        // F_DUPFD_CLOEXEC returns a new fd (CLOEXEC — a plain `dup` would
+        // strip the flag the pipe was created with) that we take
+        // ownership of via File::from_raw_fd.
+        let dup_fd = unsafe { libc::fcntl(read_fd, libc::F_DUPFD_CLOEXEC, 0) };
         // SAFETY: dup_fd is a valid fd; setting O_NONBLOCK for async reads.
         unsafe {
             libc::fcntl(dup_fd, libc::F_SETFL, libc::O_NONBLOCK);
@@ -412,7 +414,7 @@ impl AgentClient {
 
     fn try_vsock_connect(guest_cid: u64) -> Result<Self, AgentError> {
         // SAFETY: creating an AF_VSOCK stream socket; no preconditions.
-        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(AgentError::Io(io::Error::last_os_error()));
         }

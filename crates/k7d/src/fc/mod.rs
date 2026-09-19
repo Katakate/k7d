@@ -363,6 +363,297 @@ pub fn drive_id(index: usize) -> String {
     format!("d{index}")
 }
 
+/// A re-adoption refusal ([`FcVm::readopt`]), always naming the VM.
+fn readopt_err(vm_id: &str, message: impl std::fmt::Display) -> FcError {
+    FcError::Config {
+        message: format!("re-adopt {vm_id}: {message}"),
+    }
+}
+
+/// Where a live jail's files and process are, and who did the
+/// privileged half of the work on them.
+///
+/// The privilege-separation cut asks for: staging, spawning, `chown`ing
+/// and killing move to the node broker; the VMM's HTTP API, the guest
+/// agent's vsock traffic and the point bookkeeping stay here, in the
+/// unprivileged half. Everything [`FcVm`] needs from the jail goes
+/// through this enum, so the difference between the two halves is one
+/// type and not a `is_split()` at forty call sites.
+#[derive(Debug)]
+enum Jail {
+    /// One process: this one staged the chroot, leased the uid and will
+    /// kill the VMM and remove its cgroup.
+    ///
+    /// Field order is teardown order: the chroot's hard links go before
+    /// the uid returns to the allocator.
+    Local {
+        chroot: Chroot,
+        cgroup_dir: PathBuf,
+        uid: UidLease,
+    },
+    /// Split: the node broker holds the `Chroot`, the `UidLease` and the
+    /// cgroup, and sent back a pidfd and an `O_PATH` descriptor of
+    /// `<vm_dir>`.
+    ///
+    /// Every path below is spelled `/proc/self/fd/<n>/…`, which resolves
+    /// from the descriptor rather than from the name — the jail's
+    /// ancestors are `0700` root and uid `k7d` could not walk to it.
+    Brokered {
+        vm_id: String,
+        uid: u32,
+        /// Polled by [`FcVm::is_running`]. Cannot kill through it: the
+        /// VMM is another uid and this process has no `CAP_KILL`.
+        pidfd: std::os::fd::OwnedFd,
+        dir: std::os::fd::OwnedFd,
+        /// `<vm_dir>` as a real path, for [`Jail::published_vm_dir`].
+        vm_dir: PathBuf,
+    },
+}
+
+impl Jail {
+    /// uid/gid the jailed Firecracker runs as.
+    fn uid(&self) -> u32 {
+        match self {
+            Self::Local { uid, .. } => uid.uid(),
+            Self::Brokered { uid, .. } => *uid,
+        }
+    }
+
+    /// `<vm_dir>`, as this process can name it.
+    fn vm_dir(&self) -> PathBuf {
+        match self {
+            Self::Local { chroot, .. } => chroot.vm_dir().to_path_buf(),
+            Self::Brokered { dir, .. } => {
+                use std::os::fd::AsRawFd;
+                PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+            }
+        }
+    }
+
+    /// What Firecracker sees as `/`.
+    fn root(&self) -> PathBuf {
+        self.vm_dir().join("root")
+    }
+
+    /// `<vm_dir>` as a name **another process** can resolve.
+    ///
+    /// Everything this process opens goes through [`Self::vm_dir`],
+    /// which under the split is a magic link into its own fd table. The
+    /// shim dials the guest agent's UDS itself, in a different process,
+    /// so what gets published to it has to be the real path — root can
+    /// walk to it even though uid `k7d` cannot (CHALLENGES #248).
+    fn published_vm_dir(&self) -> PathBuf {
+        match self {
+            Self::Local { chroot, .. } => chroot.vm_dir().to_path_buf(),
+            Self::Brokered { vm_dir, .. } => vm_dir.clone(),
+        }
+    }
+
+    fn api_socket(&self) -> PathBuf {
+        self.root().join(CHROOT_API_SOCKET.trim_start_matches('/'))
+    }
+
+    fn vsock_uds(&self) -> PathBuf {
+        self.root().join(CHROOT_VSOCK_UDS.trim_start_matches('/'))
+    }
+
+    /// `<vm_dir>/snap` — k7d's own point bookkeeping, outside the
+    /// chroot and (under the split) owned by `k7d`.
+    fn own_snap(&self) -> PathBuf {
+        self.vm_dir().join(SNAP_SUBDIR)
+    }
+
+    /// `<root>/snap` — what the jailed Firecracker writes into.
+    fn jail_snap(&self) -> PathBuf {
+        self.root().join(SNAP_SUBDIR)
+    }
+
+    fn disk_path(&self, name: &str) -> PathBuf {
+        self.root().join(stage::DISK_SUBDIR).join(name)
+    }
+
+    /// Stage a read-only image and return the path Firecracker sees it
+    /// at. Brokered jails have already had theirs staged by `fc.spawn`.
+    fn declare(&self, drive: &FcDrive) -> Result<String, FcError> {
+        let subdir = if drive.read_only {
+            stage::IMG_SUBDIR
+        } else {
+            stage::DISK_SUBDIR
+        };
+        match self {
+            Self::Local { chroot, .. } if drive.read_only => {
+                chroot.link_read_only(&drive.name, &drive.host_path)
+            }
+            Self::Local { chroot, .. } => chroot.link_read_write(&drive.name, &drive.host_path),
+            Self::Brokered { .. } => Ok(format!("/{subdir}/{}", drive.name)),
+        }
+    }
+
+    /// Link `src` into `img/<name>` for a `PATCH /drives`, and unlink
+    /// the link it replaces once the new one is in place.
+    fn refill(&self, name: &str, src: &Path, replaces: &str) -> Result<String, FcError> {
+        match self {
+            Self::Local { chroot, .. } => {
+                let staged = chroot.link_read_only(name, src)?;
+                let stale = chroot.img_path(replaces);
+                if let Err(e) = std::fs::remove_file(&stale) {
+                    log::warn!("fc: remove stale drive link {}: {e}", stale.display());
+                }
+                Ok(staged)
+            }
+            Self::Brokered { vm_id, .. } => {
+                let device_idx = broker_index(vm_id, src, false)?;
+                broker_ok(
+                    vm_id,
+                    &crate::broker::Verb::FcUpdateDrive {
+                        vm_id: vm_id.clone(),
+                        device_idx,
+                        name: name.to_string(),
+                        replaces: replaces.to_string(),
+                    },
+                )?;
+                Ok(format!("/{}/{name}", stage::IMG_SUBDIR))
+            }
+        }
+    }
+
+    /// Take point `n`'s raw output away from the jailed Firecracker and
+    /// answer with the directory k7d reads it from.
+    ///
+    /// Unsplit that is a no-op: the files are in `<root>/snap/` and
+    /// root renames them out itself a moment later. Under the split
+    /// they are the jail uid's, inside a directory this process cannot
+    /// write, and `fc.snapshot_export` is the verb that moves them —
+    /// together with a reflink of every writable disk, which is the
+    /// half the VM broker could not do at all (a staged disk's inode
+    /// belongs to the jail uid).
+    fn harvest_point(&self, n: u32) -> Result<PathBuf, FcError> {
+        match self {
+            Self::Local { .. } => Ok(self.jail_snap()),
+            Self::Brokered { vm_id, .. } => {
+                broker_ok(
+                    vm_id,
+                    &crate::broker::Verb::FcSnapshotExport {
+                        vm_id: vm_id.clone(),
+                        generation: n,
+                    },
+                )?;
+                Ok(self.own_snap())
+            }
+        }
+    }
+
+    /// Take a file the VMM wrote into k7d's own bookkeeping: move it out
+    /// of the jail when it is still in there, then fix owner and mode.
+    fn adopt(&self, src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
+        if src != dst {
+            std::fs::rename(src, dst).map_err(|e| FcError::Stage {
+                path: dst.to_path_buf(),
+                message: format!("adopt {}: {e}", src.display()),
+            })?;
+        }
+        match self {
+            // Root's, so the jail uid cannot rewrite a point it has
+            // already been snapshotted into.
+            Self::Local { .. } => stage::chown(dst, 0)?,
+            // `fc.snapshot_export` already handed it to `k7d`, and this
+            // process has no `CAP_CHOWN` to say so again.
+            Self::Brokered { .. } => {}
+        }
+        stage::chmod(dst, mode)
+    }
+
+    /// Kill the jailed Firecracker and remove its cgroup. Idempotent.
+    fn kill(&self, pid: u32) {
+        match self {
+            Self::Local { cgroup_dir, .. } => {
+                kill_and_wait(pid);
+                remove_cgroup(cgroup_dir);
+            }
+            // Neither is this process's to do: the VMM is another uid
+            // (no `CAP_KILL`) and `/sys/fs/cgroup/k7d` is root-only.
+            Self::Brokered { vm_id, .. } => {
+                if let Err(e) = broker_ok(
+                    vm_id,
+                    &crate::broker::Verb::FcKill {
+                        vm_id: vm_id.clone(),
+                    },
+                ) {
+                    log::error!("fc: fc.kill({vm_id}): {e}");
+                }
+            }
+        }
+    }
+
+    /// Whether the VMM process still exists.
+    fn alive(&self, pid: u32) -> bool {
+        match self {
+            Self::Local { .. } => process_alive(pid),
+            // `/proc/<pid>` belongs to another uid and `kill(pid, 0)` is
+            // `EPERM`, not an answer. The pidfd is: it polls readable
+            // exactly when the process has exited.
+            Self::Brokered { pidfd, .. } => {
+                use std::os::fd::AsFd;
+                !crate::seqmsg::pidfd_exited(pidfd.as_fd(), 0).unwrap_or(false)
+            }
+        }
+    }
+}
+
+/// `vm.register_disk` for a path the jail has to link by name.
+fn broker_index(vm_id: &str, path: &Path, writable: bool) -> Result<u16, FcError> {
+    crate::broker::client::fc_register_disk(vm_id, path, writable).map_err(|e| FcError::Stage {
+        path: path.to_path_buf(),
+        message: format!("node broker: {e}"),
+    })
+}
+
+/// One `fc.*` verb whose only answer is `Ok`.
+fn broker_ok(vm_id: &str, verb: &crate::broker::Verb) -> Result<(), FcError> {
+    crate::broker::client::ok(verb).map_err(|e| FcError::Stage {
+        path: PathBuf::from(vm_id),
+        message: format!("node broker: {e}"),
+    })
+}
+
+/// Guest state a jail is staged around, and where it comes from.
+///
+/// The distinction is the split's, not the VMM's: a live fork loads a
+/// point of a jail the node broker still holds and can name for itself,
+/// while a resume loads files in a tree or sandbox directory that have
+/// to cross as validated paths. Unsplit, both are the same
+/// [`FcVm::stage_from_point`] call and `source_vm_id` is ignored.
+#[derive(Debug, Clone, Copy)]
+struct Restore<'a> {
+    /// Jail holding the point, when it is live.
+    source_vm_id: Option<&'a str>,
+    point: &'a Point,
+}
+
+/// The guest pair and every read-only drive of `config`, as
+/// [`crate::broker::ImageRef`]s.
+fn read_only_images(
+    config: &FcConfig,
+    index: &dyn Fn(&Path, bool) -> Result<u16, FcError>,
+) -> Result<Vec<crate::broker::ImageRef>, FcError> {
+    use crate::broker::ImageRef;
+    let mut images = vec![ImageRef::Kernel {
+        device_idx: index(&config.kernel, false)?,
+    }];
+    if let Some(initrd) = &config.initrd {
+        images.push(ImageRef::Initrd {
+            device_idx: index(initrd, false)?,
+        });
+    }
+    for drive in config.drives.iter().filter(|d| d.read_only) {
+        images.push(ImageRef::ReadOnly {
+            device_idx: index(&drive.host_path, false)?,
+            name: drive.name.clone(),
+        });
+    }
+    Ok(images)
+}
+
 /// A live (or paused) Firecracker microVM.
 ///
 /// Dropping it kills the jailed process, removes the chroot, removes
@@ -373,8 +664,9 @@ pub struct FcVm {
     vm_id: String,
     pid: u32,
     api: FcApi,
+    /// The vsock UDS as **this** process names it — a magic link under
+    /// the split. [`Self::agent_uds`] is the one other processes get.
     agent_uds: PathBuf,
-    cgroup_dir: PathBuf,
     paused: bool,
     /// What this VM was created from. `config.drives` is **live**: index
     /// `i` is the guest's `/dev/vd{a+i}`, and a late fill
@@ -395,17 +687,16 @@ pub struct FcVm {
     loaded_from: Option<PathBuf>,
     /// Dropped after the process is dead: removing a chroot out from
     /// under a running Firecracker would leave it with open fds to
-    /// unlinked files and no way to see that had happened.
-    chroot: Chroot,
-    /// Dropped after the chroot, so the hard links into the jail are
+    /// unlinked files and no way to see that had happened. Holds the
+    /// `UidLease` too, released last of all, so a uid is never handed
+    /// to a second VM while the first one's process still exists.
+    jail: Jail,
+    /// Dropped after the jail, so the hard links into the chroot are
     /// gone before a `ScratchDisk` unlinks the image they pointed at.
     disks: Vec<FcDisk>,
     /// The VM's TAP, deleted when this drops. k7d released the
     /// descriptor to Firecracker but still owns the device.
     tap: Option<crate::network::TapDevice>,
-    /// Released last, so a uid is never handed to a second VM while the
-    /// first one's process still exists.
-    uid: UidLease,
 }
 
 impl FcVm {
@@ -422,7 +713,7 @@ impl FcVm {
         config: &FcConfig,
         tap: Option<crate::network::TapDevice>,
     ) -> Result<Self, FcError> {
-        let mut vm = Self::spawn_unconfigured(config, tap)?;
+        let mut vm = Self::spawn_unconfigured(config, tap, None)?;
         // From here on every failure must go through `vm`'s Drop, so
         // configuration errors tear the process and chroot down instead
         // of leaking a jailed Firecracker with no owner.
@@ -433,12 +724,22 @@ impl FcVm {
     /// Stage the chroot and start the jailed VMM with nothing configured
     /// — the state both a boot ([`Self::configure`]) and a
     /// `LoadSnapshot` ([`Self::spawn_child`]) start from.
+    ///
+    /// `restore` is the point the jail is staged around, when there is
+    /// one. Under the split it has to be known *here* rather than in a
+    /// later `stage_from_point`, because the staging is `fc.spawn`'s and
+    /// a second verb per child is a round trip the fork path does not
+    /// have today (`fc.*` verbs: "fork stays free of round trips").
     fn spawn_unconfigured(
         config: &FcConfig,
         tap: Option<crate::network::TapDevice>,
+        restore: Option<&Restore<'_>>,
     ) -> Result<Self, FcError> {
-        let fc_binary = binary_from_env("K7D_FC_BINARY", "/usr/local/bin/firecracker")?;
-        let jailer_binary = binary_from_env("K7D_FC_JAILER", "/usr/local/bin/jailer")?;
+        if crate::broker::client::is_split() {
+            return Self::spawn_brokered(config, tap, restore);
+        }
+        let fc_binary = firecracker_binary()?;
+        let jailer_binary = jailer_binary()?;
         let exec_name = spawn::exec_file_name(&fc_binary)?;
         let base = stage::chroot_base();
         std::fs::create_dir_all(&base).map_err(|e| FcError::Stage {
@@ -446,6 +747,15 @@ impl FcVm {
             message: format!("create jailer chroot base: {e}"),
         })?;
 
+        // Drop order on an `Err` below is the whole argument for the
+        // jail's integrity: `spawn`'s reaper is a local of `spawn`, so
+        // it runs (kills and verifies the orphan Firecracker, removes
+        // its cgroup) before `spawn` returns; only then do `chroot`
+        // (declared second, dropped first — `remove_dir_all`) and `uid`
+        // (dropped last — back to the allocator) unwind. Neither may be
+        // released while a process still runs as `uid` in `chroot`
+        // (bug-candidates #51 / #32). Declared here, before `spawn`, on
+        // purpose.
         let uid = UidLease::acquire()?;
         let chroot = stage::stage(
             &base,
@@ -470,23 +780,488 @@ impl FcVm {
             &chroot,
         )?;
 
-        Ok(Self {
-            vm_id: config.vm_id.clone(),
-            pid: spawned.pid,
-            api: FcApi::new(&chroot.api_socket()),
-            agent_uds: chroot.vsock_uds(),
+        let jail = Jail::Local {
+            chroot,
             cgroup_dir: spawned.cgroup_dir,
+            uid,
+        };
+        let mut vm = Self::from_jail(config, jail, spawned.pid, tap);
+        if let Some(restore) = restore {
+            vm.stage_from_point(restore.point)?;
+        }
+        Ok(vm)
+    }
+
+    fn from_jail(
+        config: &FcConfig,
+        jail: Jail,
+        pid: u32,
+        tap: Option<crate::network::TapDevice>,
+    ) -> Self {
+        Self {
+            vm_id: config.vm_id.clone(),
+            pid,
+            api: FcApi::new(&jail.api_socket()),
+            agent_uds: jail.vsock_uds(),
             paused: false,
             config: config.clone(),
             fills: 0,
             point: None,
             points_taken: 0,
             loaded_from: None,
-            chroot,
+            jail,
             disks: Vec::new(),
             tap,
-            uid,
+        }
+    }
+
+    /// The same jail, staged by the node broker (privilege separation).
+    ///
+    /// One verb. Everything the jail needs to contain is named in it —
+    /// the images by registered index, the point by the id of the jail
+    /// that holds it — so a fork child costs exactly the round trip a
+    /// boot costs and not one more.
+    fn spawn_brokered(
+        config: &FcConfig,
+        tap: Option<crate::network::TapDevice>,
+        restore: Option<&Restore<'_>>,
+    ) -> Result<Self, FcError> {
+        use crate::broker::{client, FcRestore, ImageRef, Verb};
+
+        let vm_id = &config.vm_id;
+        let brokered = |e: std::io::Error| FcError::Stage {
+            path: PathBuf::from(vm_id),
+            message: format!("node broker: {e}"),
+        };
+        let index = |path: &Path, writable: bool| -> Result<u16, FcError> {
+            // A path the shim already registered has an index without a
+            // round trip; the VM broker's own images take one each,
+            // which only the boot and resume paths pay.
+            if let Some((owner, idx)) = client::pinned_as(client::Pin::Block, path) {
+                if owner == *vm_id {
+                    return Ok(idx);
+                }
+            }
+            client::fc_register_disk(vm_id, path, writable).map_err(brokered)
+        };
+
+        let (images, restore_from) = match restore {
+            // A child's read-only images and guest pair are its
+            // parent's by definition, and the node broker still holds
+            // the parent's jail — so it links them from there and
+            // nothing about them crosses.
+            Some(Restore {
+                source_vm_id: Some(source),
+                point,
+            }) => (
+                Vec::new(),
+                Some(FcRestore::Point {
+                    source_vm_id: (*source).to_string(),
+                    generation: point.index,
+                }),
+            ),
+            // Resume from an exported directory: there is no live jail
+            // to inherit from, so every file is named and validated.
+            Some(Restore {
+                source_vm_id: None,
+                point,
+            }) => {
+                let mut disks = Vec::with_capacity(point.disks.len());
+                for (drive_idx, clone) in &point.disks {
+                    let drive = config
+                        .drives
+                        .get(*drive_idx)
+                        .ok_or_else(|| FcError::Config {
+                            message: format!(
+                            "point has a clone for drive {drive_idx}, which VM {vm_id} does not \
+                             have"
+                        ),
+                        })?;
+                    disks.push(crate::broker::FcRestoreDisk {
+                        device_idx: index(clone, false)?,
+                        name: drive.name.clone(),
+                    });
+                }
+                (
+                    read_only_images(config, &index)?,
+                    Some(FcRestore::Exported {
+                        vmstate_idx: index(&point.vmstate, false)?,
+                        mem_idx: index(&point.restore_mem, false)?,
+                        disks,
+                    }),
+                )
+            }
+            None => {
+                let mut images = read_only_images(config, &index)?;
+                for drive in config.drives.iter().filter(|d| !d.read_only) {
+                    images.push(ImageRef::ReadWrite {
+                        device_idx: index(&drive.host_path, true)?,
+                        name: drive.name.clone(),
+                    });
+                }
+                (images, None)
+            }
+        };
+
+        let spawned = client::fc_spawn(&Verb::FcSpawn {
+            vm_id: vm_id.clone(),
+            vcpus: config.vcpus,
+            memory_mb: config.memory_mb,
+            cpu: match (config.cpu_quota_us, config.cpu_period_us) {
+                (Some(q), Some(p)) => Some((q, p)),
+                _ => None,
+            },
+            tap: config.net.is_some(),
+            images,
+            restore_from,
         })
+        .map_err(brokered)?;
+
+        let jail = Jail::Brokered {
+            vm_id: vm_id.clone(),
+            uid: spawned.uid,
+            pidfd: spawned.pidfd,
+            dir: spawned.dir,
+            vm_dir: spawned.vm_dir,
+        };
+        let mut vm = Self::from_jail(config, jail, spawned.pid, tap);
+        if restore.is_some() {
+            // What `stage_from_point` records on the local path: the
+            // node broker reflinked `load.mem` into the VM broker's own
+            // `snap/` and repointed the writable drives at the jail's
+            // own clones.
+            vm.loaded_from = Some(vm.jail.own_snap().join("load.mem"));
+            for drive in vm.config.drives.iter_mut().filter(|d| !d.read_only) {
+                drive.host_path = vm.jail.disk_path(&drive.name);
+            }
+        }
+        Ok(vm)
+    }
+
+    /// Rebuild an [`FcVm`] around a jailed Firecracker a previous VM
+    /// broker started and the node broker kept back (`K7D_VM_BROKER_RESTART`,
+    /// §9.3). Nothing is created here; the process, the chroot, the
+    /// uid lease, the TAP and the cgroup all exist and are the node
+    /// broker's, exactly as after `fc.spawn`.
+    ///
+    /// The record says what the jail *contains*; the VMM says what it
+    /// was *configured with* (`GET /vm/config`: boot args, machine
+    /// config, drives in guest order) and what state it is in (`GET /`).
+    /// The two are joined on the drive name and every disagreement is
+    /// an error — a VM this process cannot describe exactly is one it
+    /// must not hand a shim.
+    ///
+    /// `tap` is the mirror of the VM's TAP when the record says it has
+    /// one ([`crate::network::ClusterNetwork::adopt_tap`]).
+    ///
+    /// What is recovered from the VM broker's own `snap/`: the point
+    /// counter (from the highest `vmstate-N`), the latest point when its
+    /// files are all there, the fill counter (from the drive names), and
+    /// `load.mem` for a jail that was restored. What is **not**: a
+    /// point whose files are incomplete — the next point starts clean
+    /// from `base.mem`, which is still exactly the last Diff applied.
+    pub fn readopt(
+        held: crate::broker::client::HeldJail,
+        tap: Option<crate::network::TapDevice>,
+    ) -> Result<Self, FcError> {
+        let crate::broker::client::HeldJail { record, pidfd, dir } = held;
+        let vm_id = record.vm_id.clone();
+        let config_err = |message: String| readopt_err(&vm_id, message);
+        if record.tap != tap.is_some() {
+            return Err(config_err(format!(
+                "the jail {} a TAP and the caller {} one",
+                if record.tap { "has" } else { "has not" },
+                if tap.is_some() {
+                    "brought"
+                } else {
+                    "brought none"
+                },
+            )));
+        }
+        let jail = Jail::Brokered {
+            vm_id: vm_id.clone(),
+            uid: record.uid,
+            pidfd,
+            dir,
+            vm_dir: PathBuf::from(&record.vm_dir),
+        };
+        if !jail.alive(record.pid) {
+            return Err(config_err(format!(
+                "firecracker pid {} is not running",
+                record.pid
+            )));
+        }
+        let api = FcApi::new(&jail.api_socket());
+        let info = api.instance_info()?;
+        let paused = match info.state.as_str() {
+            "Running" => false,
+            "Paused" => true,
+            other => {
+                return Err(config_err(format!(
+                    "the VMM reports state {other:?} — nothing booted is there to adopt"
+                )))
+            }
+        };
+        let seen = api.vm_config()?;
+        if seen.machine_config.vcpu_count != record.vcpus
+            || seen.machine_config.mem_size_mib != record.memory_mb
+        {
+            return Err(config_err(format!(
+                "the jail was spawned with {} vCPU / {} MiB but the VMM reports {} / {}",
+                record.vcpus,
+                record.memory_mb,
+                seen.machine_config.vcpu_count,
+                seen.machine_config.mem_size_mib
+            )));
+        }
+
+        let drives = Self::readopt_drives(&record, seen.drives.unwrap_or_default(), &jail)?;
+        let net = Self::readopt_net(
+            &vm_id,
+            tap.as_ref(),
+            seen.network_interfaces.unwrap_or_default().first(),
+        )?;
+
+        // `d<i>-fill<n>`: the highest `n` is how many fills there were.
+        let fills = drives
+            .iter()
+            .filter_map(|d| d.name.rsplit_once("-fill")?.1.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+
+        let config = FcConfig {
+            vm_id: vm_id.clone(),
+            memory_mb: record.memory_mb,
+            vcpus: record.vcpus,
+            kernel: PathBuf::from(&record.kernel),
+            initrd: record.initrd.as_ref().map(PathBuf::from),
+            cmdline: seen.boot_source.boot_args,
+            cpu_quota_us: record.cpu.map(|(q, _)| q),
+            cpu_period_us: record.cpu.map(|(_, p)| p),
+            drives,
+            net,
+            track_dirty_pages: seen.machine_config.track_dirty_pages,
+        };
+        let mut vm = Self::from_jail(&config, jail, record.pid, tap);
+        vm.paused = paused;
+        vm.fills = fills;
+        vm.recover_snap(record.restored_from.is_some())?;
+        log::info!(
+            "fc: re-adopted {vm_id} (pid {}, uid {}, {} vCPU, {} MiB, {} drive(s), {}, {}, \
+             points {}, fills {fills})",
+            record.pid,
+            record.uid,
+            config.vcpus,
+            config.memory_mb,
+            config.drives.len(),
+            if config.net.is_some() {
+                "networked"
+            } else {
+                "no network"
+            },
+            if paused { "paused" } else { "running" },
+            vm.points_taken
+        );
+        Ok(vm)
+    }
+
+    /// What the previous VM broker left in this VM's own `snap/`: the
+    /// `load.mem` a restored jail booted from, and the points taken.
+    fn recover_snap(&mut self, restored: bool) -> Result<(), FcError> {
+        let own = self.jail.own_snap();
+        if restored {
+            let load = own.join("load.mem");
+            if !load.exists() {
+                return Err(readopt_err(
+                    &self.vm_id,
+                    format!("the jail was restored but {} is gone", load.display()),
+                ));
+            }
+            self.loaded_from = Some(load);
+        }
+        self.recover_point(&own)
+    }
+
+    /// The drive list of a re-adopted VM: guest device order is the
+    /// VMM's (`GET /vm/config`), host paths are the jail's, joined on
+    /// the drive name. Every disagreement is an error.
+    fn readopt_drives(
+        record: &crate::broker::FcJailRecord,
+        seen: Vec<api::DriveView>,
+        jail: &Jail,
+    ) -> Result<Vec<FcDrive>, FcError> {
+        let config_err = |message: String| readopt_err(&record.vm_id, message);
+        let real_vm_dir = Path::new(&record.vm_dir);
+        let mut drives = Vec::new();
+        for (index, view) in seen.into_iter().enumerate() {
+            if view.drive_id != drive_id(index) {
+                return Err(config_err(format!(
+                    "drive {index} is {:?}, want {:?} — the VMM's drive order is not k7d's",
+                    view.drive_id,
+                    drive_id(index)
+                )));
+            }
+            let not_a_jail_file = || {
+                config_err(format!(
+                    "drive {index} is backed by {:?}, not a file under img/ or disk/",
+                    view.path_on_host
+                ))
+            };
+            let (subdir, name) = view
+                .path_on_host
+                .trim_start_matches('/')
+                .split_once('/')
+                .ok_or_else(not_a_jail_file)?;
+            let expect_ro = match subdir {
+                stage::IMG_SUBDIR => true,
+                stage::DISK_SUBDIR => false,
+                _ => return Err(not_a_jail_file()),
+            };
+            let jailed = record
+                .drives
+                .iter()
+                .find(|d| d.name == name && d.read_only == expect_ro)
+                .ok_or_else(|| {
+                    config_err(format!(
+                        "the VMM has drive {index} at {:?} but the jail holds no such file",
+                        view.path_on_host
+                    ))
+                })?;
+            if view.is_read_only != jailed.read_only {
+                return Err(config_err(format!(
+                    "drive {index} ({name}) is read_only={} to the VMM and {} in the jail",
+                    view.is_read_only, jailed.read_only
+                )));
+            }
+            let host = Path::new(&jailed.host_path);
+            // A clone the jail made for a restored VM is under `<vm_dir>`,
+            // which this process reaches through the descriptor only.
+            let host_path = if host.starts_with(real_vm_dir) {
+                jail.disk_path(name)
+            } else {
+                host.to_path_buf()
+            };
+            drives.push(FcDrive {
+                name: name.to_string(),
+                host_path,
+                read_only: jailed.read_only,
+            });
+        }
+        Ok(drives)
+    }
+
+    /// The network of a re-adopted VM: the TAP slot the caller rebuilt
+    /// and the interface the VMM reports must name the same device.
+    fn readopt_net(
+        vm_id: &str,
+        tap: Option<&crate::network::TapDevice>,
+        seen: Option<&api::NetworkInterfaceView>,
+    ) -> Result<Option<FcNet>, FcError> {
+        match (tap, seen) {
+            (Some(tap), Some(iface)) => {
+                if iface.host_dev_name != tap.name() {
+                    return Err(readopt_err(
+                        vm_id,
+                        format!(
+                            "the VMM opened TAP {:?} but the bridge slot names {:?}",
+                            iface.host_dev_name,
+                            tap.name()
+                        ),
+                    ));
+                }
+                Ok(Some(FcNet {
+                    host_dev_name: tap.name().to_string(),
+                    guest_mac: tap.mac(),
+                }))
+            }
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(readopt_err(
+                vm_id,
+                "the jail has a TAP but the VMM has no network interface".to_string(),
+            )),
+            (None, Some(iface)) => Err(readopt_err(
+                vm_id,
+                format!(
+                    "the VMM has network interface {:?} but the jail has no TAP",
+                    iface.host_dev_name
+                ),
+            )),
+        }
+    }
+
+    /// Seed the point counter, and the point itself when it is whole,
+    /// from what the previous VM broker left in `snap/`.
+    fn recover_point(&mut self, own: &Path) -> Result<(), FcError> {
+        let entries = match std::fs::read_dir(own) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(FcError::Stage {
+                    path: own.to_path_buf(),
+                    message: format!("list snap/: {e}"),
+                })
+            }
+        };
+        let mut latest = 0u32;
+        for entry in entries {
+            let entry = entry.map_err(|e| FcError::Stage {
+                path: own.to_path_buf(),
+                message: format!("list snap/: {e}"),
+            })?;
+            if let Some(n) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("vmstate-"))
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                latest = latest.max(n);
+            }
+        }
+        self.points_taken = latest;
+        if latest == 0 {
+            return Ok(());
+        }
+        let vmstate = own.join(format!("vmstate-{latest}"));
+        let restore_mem = own.join(format!("restore-{latest}.mem"));
+        let disks: Vec<(usize, PathBuf)> = self
+            .config
+            .drives
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| !d.read_only)
+            .map(|(i, d)| (i, own.join(format!("disk-{latest}-{}", d.name))))
+            .collect();
+        if restore_mem.exists() && disks.iter().all(|(_, p)| p.exists()) {
+            self.point = Some(Point {
+                index: latest,
+                vmstate,
+                restore_mem,
+                disks,
+                diff_bytes: 0,
+            });
+        } else {
+            log::warn!(
+                "fc: {} point {latest} is incomplete in {}; the next point starts from base.mem",
+                self.vm_id,
+                own.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Kernel command line the guest booted with.
+    #[must_use]
+    pub fn cmdline(&self) -> &str {
+        &self.config.cmdline
+    }
+
+    /// `(guest device index, drive)` of every writable block device.
+    pub fn writable_drives(&self) -> impl Iterator<Item = (usize, &FcDrive)> {
+        self.config
+            .drives
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| !d.read_only)
     }
 
     fn configure(&mut self, config: &FcConfig) -> Result<(), FcError> {
@@ -512,11 +1287,7 @@ impl FcVm {
         // drive in the order it received them, and the guest kernel
         // names them `/dev/vda`, `/dev/vdb`, … in that order.
         for (index, drive) in config.drives.iter().enumerate() {
-            let path_on_host = if drive.read_only {
-                self.chroot.link_read_only(&drive.name, &drive.host_path)?
-            } else {
-                self.chroot.link_read_write(&drive.name, &drive.host_path)?
-            };
+            let path_on_host = self.jail.declare(drive)?;
             self.api.put_drive(&api::Drive {
                 drive_id: drive_id(index),
                 path_on_host,
@@ -532,7 +1303,7 @@ impl FcVm {
             // the jailed uid: without TUNSETOWNER that `TUNSETIFF` is
             // EPERM (no CAP_NET_ADMIN in the jail), and with k7d still
             // holding the single-queue fd it would be EBUSY.
-            let uid = self.uid.uid();
+            let uid = self.jail.uid();
             if let Some(ref mut tap) = self.tap {
                 tap.detach_for_vmm(uid).map_err(|e| FcError::Config {
                     message: format!("release TAP {} to Firecracker: {e}", tap.name()),
@@ -598,26 +1369,18 @@ impl FcVm {
         // has open would swap the bytes under it.
         self.fills += 1;
         let name = format!("{}-fill{}", drive_id(index), self.fills);
-        let staged = self.chroot.link_read_only(&name, host_path)?;
+        // The link the new one replaces goes only after the `PATCH`
+        // lands: Firecracker still has the previous file open until
+        // then, and the guest would be left reading a file with no name
+        // if the staging had failed in between.
+        let previous = self.config.drives[index].name.clone();
+        let staged = self.jail.refill(&name, host_path, &previous)?;
         self.api.patch_drive(&drive_id(index), &staged)?;
-        let previous = std::mem::replace(
-            &mut self.config.drives[index],
-            FcDrive {
-                name,
-                host_path: host_path.to_path_buf(),
-                read_only: true,
-            },
-        );
-        // The guest is now reading the new file; the old link is dead
-        // weight (an empty slot backing file, or a previous fill).
-        let stale = self
-            .chroot
-            .root()
-            .join(stage::IMG_SUBDIR)
-            .join(previous.name);
-        if let Err(e) = std::fs::remove_file(&stale) {
-            log::warn!("fc: remove stale drive link {}: {e}", stale.display());
-        }
+        self.config.drives[index] = FcDrive {
+            name,
+            host_path: host_path.to_path_buf(),
+            read_only: true,
+        };
         Ok(())
     }
 
@@ -643,7 +1406,10 @@ impl FcVm {
     /// Console text Firecracker (and the jailer) wrote to
     /// [`spawn::STDERR_FILE`]. An empty file is a successful empty dump.
     pub fn serial_output(&self) -> Result<String, FcError> {
-        let path = self.chroot.root().join(spawn::STDERR_FILE);
+        // Created by whoever staged the jail, before the jailer ran, so
+        // it is root-owned `0644` and the VM broker reaches it through
+        // the `<vm_dir>` descriptor like everything else in there.
+        let path = self.jail.root().join(spawn::STDERR_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
             Err(e) => Err(FcError::Stage {
@@ -689,7 +1455,7 @@ impl FcVm {
     /// Whether the VMM process is alive and reports a running instance.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        if !process_alive(self.pid) {
+        if !self.jail.alive(self.pid) {
             return false;
         }
         self.api
@@ -697,9 +1463,15 @@ impl FcVm {
             .is_ok_and(|info| info.state == "Running")
     }
 
-    /// Kill the VMM. Idempotent; the chroot and uid survive until drop.
+    /// Kill the VMM. Idempotent.
+    ///
+    /// Unsplit the chroot and the uid survive until drop. Under the
+    /// split they do not: `fc.kill` is one verb and the node broker's
+    /// teardown order (process, cgroup, chroot, uid) is the same one
+    /// `Drop for FcVm` runs, so splitting it into two verbs would buy
+    /// nothing but a window where a uid is leased to a dead VM.
     pub fn stop(&mut self) {
-        kill_and_wait(self.pid);
+        self.jail.kill(self.pid);
     }
 
     /// Guest RAM in MiB.
@@ -726,28 +1498,51 @@ impl FcVm {
         &self.vm_id
     }
 
-    /// Host path of the vsock UDS the agent is reached through.
+    /// Host path of the vsock UDS the agent is reached through, as
+    /// **another** process must name it.
+    ///
+    /// This is what `AgentEndpoint::FcUds` publishes and the shim
+    /// dials. Not the string this process uses — see
+    /// [`Jail::published_vm_dir`].
     #[must_use]
-    pub fn agent_uds(&self) -> &Path {
+    pub fn agent_uds(&self) -> PathBuf {
+        self.jail
+            .published_vm_dir()
+            .join("root")
+            .join(CHROOT_VSOCK_UDS.trim_start_matches('/'))
+    }
+
+    /// The same socket as **this** process names it — a magic link
+    /// into its own fd table under the split, which no other process
+    /// can use and which is the only name uid `k7d` can open.
+    #[must_use]
+    pub fn own_agent_uds(&self) -> &Path {
         &self.agent_uds
     }
 
-    /// Chroot Firecracker sees as `/`.
+    /// Chroot Firecracker sees as `/`, named for another process.
     #[must_use]
-    pub fn chroot_root(&self) -> &Path {
-        self.chroot.root()
+    pub fn chroot_root(&self) -> PathBuf {
+        self.jail.published_vm_dir().join("root")
     }
 
     /// Unprivileged uid (and gid) the jailer dropped Firecracker to.
     #[must_use]
     pub fn uid(&self) -> u32 {
-        self.uid.uid()
+        self.jail.uid()
     }
 
-    /// cgroup v2 directory the jailer put the process in.
+    /// cgroup v2 directory the jailer put the process in, when this
+    /// process is the one that can see it.
+    ///
+    /// `None` under the split: `/sys/fs/cgroup/k7d` is root-only and
+    /// the node broker keeps the path, which is the point.
     #[must_use]
-    pub fn cgroup_dir(&self) -> &Path {
-        &self.cgroup_dir
+    pub fn cgroup_dir(&self) -> Option<&Path> {
+        match &self.jail {
+            Jail::Local { cgroup_dir, .. } => Some(cgroup_dir),
+            Jail::Brokered { .. } => None,
+        }
     }
 
     /// Connect to the guest agent through Firecracker's vsock UDS.
@@ -765,6 +1560,12 @@ impl FcVm {
     /// `Private_Dirty` from `smaps_rollup` — the figure we pick
     /// for FC tree-budget accounting, since k7d has no dirty bitmap of
     /// its own on this path.
+    ///
+    /// `smaps_rollup` is `0400` and owned by the jail uid, so under the
+    /// split this reads 0 and the tree accounting falls back to the
+    /// point's Diff bytes, which it already prefers. Adding a verb for
+    /// it would mean `CAP_SYS_PTRACE` on a hot accounting path for a
+    /// number nothing decides on.
     #[must_use]
     pub fn private_dirty_bytes(&self) -> u64 {
         let Ok(text) = std::fs::read_to_string(format!("/proc/{}/smaps_rollup", self.pid)) else {
@@ -1024,7 +1825,15 @@ impl FcVm {
             disks,
             diff_bytes: 0,
         };
-        Self::spawn_from_point(&point, config, tap, 0)
+        Self::spawn_from_point(
+            &Restore {
+                source_vm_id: None,
+                point: &point,
+            },
+            config,
+            tap,
+            0,
+        )
     }
 
     /// Pause, take the point, resume — resuming even when the point
@@ -1044,16 +1853,18 @@ impl FcVm {
     #[allow(clippy::too_many_lines)]
     fn take_point_paused(&mut self, mode: ForkSnapshot) -> Result<PointReport, FcError> {
         let n = self.points_taken + 1;
-        let jail = self.chroot.jail_snap_dir();
-        let own = self.chroot.snap_dir();
-        let jail_vmstate = jail.join(format!("vmstate-{n}"));
-        let jail_mem = jail.join(format!("diff-{n}.mem"));
+        let own = self.jail.own_snap();
         let t0 = Instant::now();
         self.api.create_snapshot(&SnapshotCreateParams {
             snapshot_type: mode.api_name(),
             snapshot_path: format!("/{SNAP_SUBDIR}/vmstate-{n}"),
             mem_file_path: format!("/{SNAP_SUBDIR}/diff-{n}.mem"),
         })?;
+        // Still paused, so the disk clones this takes are from the same
+        // instant as the memory.
+        let raw = self.jail.harvest_point(n)?;
+        let jail_vmstate = raw.join(format!("vmstate-{n}"));
+        let jail_mem = raw.join(format!("diff-{n}.mem"));
         let t_create = t0.elapsed();
 
         let bytes = match mode {
@@ -1081,20 +1892,20 @@ impl FcVm {
         }
 
         let vmstate = own.join(format!("vmstate-{n}"));
-        adopt(&jail_vmstate, &vmstate, 0o444)?;
+        self.jail.adopt(&jail_vmstate, &vmstate, 0o444)?;
         let base = own.join("base.mem");
         let incremental = match (mode, base.exists(), &self.loaded_from) {
             // A Full dump is the memory; it replaces whatever base
             // there was. (`rename` over the old base leaves every
             // `restore-N` reflink of it intact — they hold the inode.)
             (ForkSnapshot::Full, _, _) => {
-                adopt(&jail_mem, &base, 0o600)?;
+                self.jail.adopt(&jail_mem, &base, 0o600)?;
                 false
             }
             // First Diff of a VM booted from scratch: every page ever
             // written since boot, so it *is* the memory.
             (ForkSnapshot::Diff, false, None) => {
-                adopt(&jail_mem, &base, 0o600)?;
+                self.jail.adopt(&jail_mem, &base, 0o600)?;
                 false
             }
             // First Diff of a loaded VM: memory at load + the diff.
@@ -1123,7 +1934,23 @@ impl FcVm {
                 continue;
             }
             let clone = own.join(format!("disk-{n}-{}", drive.name));
-            snapshot::reflink(&drive.host_path, &clone, 0o400)?;
+            match &self.jail {
+                Jail::Local { .. } => snapshot::reflink(&drive.host_path, &clone, 0o400)?,
+                // `harvest_point` already reflinked it, and this process
+                // could not: a staged writable disk's inode is the jail
+                // uid's (`Chroot::link_read_write` chowns it).
+                Jail::Brokered { vm_id, .. } => {
+                    if !clone.exists() {
+                        return Err(FcError::Stage {
+                            path: clone,
+                            message: format!(
+                                "fc.snapshot_export({vm_id}) did not clone writable drive {}",
+                                drive.name
+                            ),
+                        });
+                    }
+                }
+            }
             disks.push((index, clone));
         }
 
@@ -1172,18 +1999,27 @@ impl FcVm {
         let mut config = self.config.clone();
         config.vm_id = child_vm_id();
         config.track_dirty_pages = true;
-        Self::spawn_from_point(point, config, tap, self.fills)
+        Self::spawn_from_point(
+            &Restore {
+                source_vm_id: Some(&self.vm_id),
+                point,
+            },
+            config,
+            tap,
+            self.fills,
+        )
     }
 
     /// Stage a chroot, load `point`, and resume. Shared by
     /// [`Self::spawn_child`] (live fork) and [`Self::load_exported`]
     /// (suspend/resume).
     fn spawn_from_point(
-        point: &Point,
+        restore: &Restore<'_>,
         mut config: FcConfig,
         tap: Option<crate::network::TapDevice>,
         fills: u32,
     ) -> Result<FcVm, FcError> {
+        let point = restore.point;
         config.track_dirty_pages = true;
         let network_overrides = match (&mut config.net, &tap) {
             (Some(net), Some(tap)) => {
@@ -1214,11 +2050,10 @@ impl FcVm {
         };
 
         let t0 = Instant::now();
-        let mut child = Self::spawn_unconfigured(&config, tap)?;
+        let mut child = Self::spawn_unconfigured(&config, tap, Some(restore))?;
         child.fills = fills;
-        child.stage_from_point(point)?;
         if let Some(ref mut tap) = child.tap {
-            let uid = child.uid.uid();
+            let uid = child.jail.uid();
             tap.detach_for_vmm(uid).map_err(|e| FcError::Config {
                 message: format!("release TAP {} to Firecracker: {e}", tap.name()),
             })?;
@@ -1262,12 +2097,13 @@ impl FcVm {
     /// Put `point`'s files where the jailed Firecracker will look for
     /// them and repoint this VM's writable drives at its own clones.
     fn stage_from_point(&mut self, point: &Point) -> Result<(), FcError> {
-        let Self {
-            chroot,
-            config,
-            loaded_from,
-            ..
-        } = self;
+        let Jail::Local { chroot, .. } = &self.jail else {
+            // `fc.spawn` staged it, as root, in one round trip — see
+            // `spawn_brokered`.
+            return Ok(());
+        };
+        let config = &mut self.config;
+        let loaded_from = &mut self.loaded_from;
         let jail = chroot.jail_snap_dir();
         let jail_load = jail.join("load.mem");
         let own_load = chroot.snap_dir().join("load.mem");
@@ -1320,23 +2156,6 @@ impl FcVm {
     }
 }
 
-/// Move a file Firecracker wrote as the jailed uid into k7d's
-/// root-owned bookkeeping: `rename` (same filesystem), `chown 0:0`,
-/// `chmod mode`. From here on the jail cannot touch it.
-fn adopt(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
-    std::fs::rename(src, dst).map_err(|e| FcError::Stage {
-        path: dst.to_path_buf(),
-        message: format!("adopt {}: {e}", src.display()),
-    })?;
-    stage::chown(dst, 0)?;
-    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|e| {
-        FcError::Stage {
-            path: dst.to_path_buf(),
-            message: format!("chmod {mode:o}: {e}"),
-        }
-    })
-}
-
 fn remove_loud(path: &Path) -> Result<(), FcError> {
     std::fs::remove_file(path).map_err(|e| FcError::Stage {
         path: path.to_path_buf(),
@@ -1344,12 +2163,12 @@ fn remove_loud(path: &Path) -> Result<(), FcError> {
     })
 }
 
-fn is_exdev(e: &FcError) -> bool {
+pub(crate) fn is_exdev(e: &FcError) -> bool {
     matches!(e, FcError::Stage { message, .. } if message.contains("os error 18")
         || message.contains("cross-device"))
 }
 
-fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
+pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
     let _ = std::fs::remove_file(dst);
     std::fs::copy(src, dst).map_err(|e| FcError::Stage {
         path: dst.to_path_buf(),
@@ -1363,7 +2182,7 @@ fn copy_file(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
     })
 }
 
-fn clone_or_copy(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
+pub(crate) fn clone_or_copy(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
     match snapshot::reflink(src, dst, mode) {
         Ok(()) => Ok(()),
         Err(e) if is_exdev(&e) => {
@@ -1378,7 +2197,7 @@ fn clone_or_copy(src: &Path, dst: &Path, mode: u32) -> Result<(), FcError> {
     }
 }
 
-fn hard_link_or_copy(src: &Path, dst: &Path) -> Result<(), FcError> {
+pub(crate) fn hard_link_or_copy(src: &Path, dst: &Path) -> Result<(), FcError> {
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
@@ -1398,9 +2217,11 @@ fn hard_link_or_copy(src: &Path, dst: &Path) -> Result<(), FcError> {
 
 impl Drop for FcVm {
     fn drop(&mut self) {
-        kill_and_wait(self.pid);
-        remove_cgroup(&self.cgroup_dir);
-        // `chroot` and `uid` drop after this body, in that order.
+        // Unsplit: kill, then remove the cgroup; `chroot` and `uid`
+        // drop after this body, in that order. Split: one `fc.kill`,
+        // which does all four on the node broker's side of the
+        // boundary and is idempotent if `stop` already sent it.
+        self.jail.kill(self.pid);
     }
 }
 
@@ -1417,6 +2238,16 @@ impl Drop for FcVm {
 /// Loud when the result is not an executable file: booting an FC VM
 /// without Firecracker installed must say so, not fail later inside the
 /// jailer with a path nobody chose.
+/// The pinned `firecracker` binary (`K7D_FC_BINARY`).
+pub fn firecracker_binary() -> Result<PathBuf, FcError> {
+    binary_from_env("K7D_FC_BINARY", "/usr/local/bin/firecracker")
+}
+
+/// The pinned `jailer` binary (`K7D_FC_JAILER`).
+pub fn jailer_binary() -> Result<PathBuf, FcError> {
+    binary_from_env("K7D_FC_JAILER", "/usr/local/bin/jailer")
+}
+
 fn binary_from_env(var: &str, default: &str) -> Result<PathBuf, FcError> {
     let path = std::env::var(var).map_or_else(|_| PathBuf::from(default), PathBuf::from);
     let resolved = std::fs::canonicalize(&path).map_err(|e| FcError::Config {
@@ -1499,7 +2330,7 @@ pub fn kill_and_wait(pid: u32) {
 /// this runs after [`kill_and_wait`]. Both `rmdir`s are best-effort and
 /// logged: a leftover empty cgroup is a wart, not a failure that should
 /// mask the reason a VM was being torn down.
-fn remove_cgroup(dir: &Path) {
+pub fn remove_cgroup(dir: &Path) {
     if !dir.exists() {
         return;
     }

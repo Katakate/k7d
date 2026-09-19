@@ -632,20 +632,29 @@ class Gym:
 
     def _create_source(self) -> None:
         kernel, initrd = self.cfg.kernel, self.cfg.initrd
-        if not Path(kernel).is_file():
-            raise SystemExit(f"guest kernel missing: {kernel}")
-        if not Path(initrd).is_file():
-            raise SystemExit(f"guest initrd missing: {initrd}")
+        if (kernel is None) != (initrd is None):
+            raise SystemExit(
+                "--kernel and --initrd are both-or-neither: "
+                f"kernel={kernel!r} initrd={initrd!r}"
+            )
+        config: dict[str, Any] = {
+            "memory_mb": self.cfg.memory_mb,
+            "vcpus": 1,
+            "vsock": True,
+        }
+        if kernel is not None and initrd is not None:
+            if not Path(kernel).is_file():
+                raise SystemExit(f"guest kernel missing: {kernel}")
+            if not Path(initrd).is_file():
+                raise SystemExit(f"guest initrd missing: {initrd}")
+            config["kernel"] = kernel
+            config["initrd"] = initrd
+        else:
+            log.info("gym: no guest pair given — the daemon picks one")
         before = list_bridges()
         created = self.client.tree_create_cluster(
             self.cfg.vm_count,
-            {
-                "kernel": kernel,
-                "initrd": initrd,
-                "memory_mb": self.cfg.memory_mb,
-                "vcpus": 1,
-                "vsock": True,
-            },
+            config,
             tree_id=self.cfg.source_tree_id,
             budget=self._budget(),
         )
@@ -670,7 +679,8 @@ class Gym:
         manifest = ubuntu_src.build_or_cache_image(REPO)
         kernel = Path(str(manifest["kernel"]))
         base = Path(str(manifest["image"]))
-        if kernel == Path(self.cfg.kernel) or "initramfs" in str(kernel):
+        busybox = Path(self.cfg.kernel) if self.cfg.kernel else None
+        if kernel == busybox or "initramfs" in str(kernel):
             raise RuntimeError(
                 f"ubuntu source refused busybox guest path {kernel} "
                 "(CHALLENGES #72: never K7D_KERNEL/K7D_INITRD)"
@@ -3099,16 +3109,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=float(env.get("GYM_REAPER_INTERVAL_S", "1")),
     )
     p.add_argument("--token", default=env.get("GYM_TOKEN", ""))
-    p.add_argument(
-        "--kernel",
-        default=env.get("K7D_KERNEL", str(REPO / "guest/kernel/vmlinux")),
-    )
-    p.add_argument(
-        "--initrd",
-        default=env.get(
-            "K7D_INITRD", str(REPO / "guest/rootfs/initramfs.cpio.gz")
-        ),
-    )
+    # No default pair. The daemon is the only process that picks a guest
+    # (CHALLENGES #72), and under the privilege split it reads the kernel
+    # and the initrd itself as uid `k7d` — so the repo copy this used to
+    # guess at is unopenable on a node where the workspace lives under a
+    # 0700 $HOME, which is every bare-metal node (CHALLENGES #253). Absent
+    # these, `_create_source` sends no guest paths at all, exactly as the
+    # shim does.
+    p.add_argument("--kernel", default=env.get("K7D_KERNEL"))
+    p.add_argument("--initrd", default=env.get("K7D_INITRD"))
     p.add_argument(
         "--tree-prefix", default=env.get("GYM_TREE_PREFIX", "gym-")
     )

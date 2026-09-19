@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-19
+
+Privilege separation: a node broker (root) and a VM broker (uid `k7d`).
+Intel warm-fork carries CET/XSS. Firecracker jail integrity and disk
+reclaim.
+
+### Added
+
+- Privilege separation: node broker (root) / VM broker (uid `k7d`);
+  `net.*`, `virtiofsd.spawn`, pinned-descriptor, and `fc.*` verbs;
+  `K7D_PRIVSEP` on by default.
+- Exec helpers from a pre-seccomp spawner; smaller daemon seccomp filter.
+- Measured capability bounding set and `ProtectSystem=strict`.
+- Standalone Firecracker pods survive a VM-broker restart
+  (`K7D_VM_BROKER_RESTART`).
+- README k7d vs k7d-fc comparison table.
+
+### Fixed
+
+- Intel hosts: carry IA32_XSS / CET / SSP across warm fork; auto-warp
+  on lapic-deadline guests.
+- `k7d.service` 226/NAMESPACE on join nodes before kubelet exists.
+- Firecracker jail integrity: CLOEXEC fds, `0700` staging, `O_PATH`
+  hostPath, k7d-fc resume→exec.
+- Reclaim the disk tier: sweep test trees, GC base images, fail loud
+  on ENOSPC.
+
 ## [0.6.0] — 2026-09-12
 
 A second VMM: stock Firecracker under the jailer (`k7-fc`), plus

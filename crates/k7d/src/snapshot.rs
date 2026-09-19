@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -196,6 +197,14 @@ pub struct CpuState {
     /// execute garbage.
     #[serde(default)]
     pub mp_state: Option<u32>,
+    /// The vCPU's shadow stack pointer (`KVM_GET_ONE_REG`,
+    /// `KVM_REG_GUEST_SSP`). Not an MSR: SSP is a register the CET
+    /// hardware moves on every call/ret, and KVM exposes it only through
+    /// the `ONE_REG` interface. `None` when the host does not virtualize
+    /// CET (no shadow stack in the guest, nothing to carry) or the
+    /// snapshot predates this field.
+    #[serde(default)]
+    pub ssp: Option<u64>,
 }
 
 /// The VM's kvmclock reading, paired with the host wall clock it was
@@ -482,9 +491,16 @@ impl From<&kvm_bindings::kvm_dtable> for DtableState {
     }
 }
 
-// x86_64 MSR indices essential for snapshot/restore.
-// This is the minimal set needed for a Linux guest to resume correctly.
-// Based on Firecracker's SERIALIZABLE_MSR_RANGES.
+// x86_64 MSR indices essential for snapshot/restore, in restore order.
+//
+// This is the hand-picked core; [`msr_indices`] appends every other MSR
+// the host's KVM reports as to-be-saved (`KVM_GET_MSR_INDEX_LIST`), so
+// a feature the host virtualizes and the guest CPUID advertises is
+// carried whether or not someone thought of it here. The list below
+// existed alone for the whole AMD history of this project and was
+// enough there; the first Intel host (CET virtualized, guest running
+// `XSAVES` with `IA32_XSS = CET_USER`) turned every missing MSR into a
+// panic on the first context switch after restore (CHALLENGES #260).
 const MSR_INDICES: &[u32] = &[
     0x0000_0010, // IA32_TSC
     0x0000_0174, // IA32_SYSENTER_CS
@@ -526,7 +542,137 @@ const MSR_INDICES: &[u32] = &[
     // deliberately does not advertise; the two must be changed together.
     0x4B56_4D00, // MSR_KVM_WALL_CLOCK_NEW
     0x4B56_4D01, // MSR_KVM_SYSTEM_TIME_NEW
+    // IA32_XSS: the supervisor half of the XSAVE feature mask. A guest
+    // whose CPUID offers a supervisor state (CET_USER on an Intel host
+    // that virtualizes CET) sets it once at boot and then runs
+    // `XSAVES`/`XRSTORS` with that mask on every context switch. With
+    // XSS back at 0 the first `XRSTORS` after restore is #GP, the
+    // kernel's "Bad FPU state" fixup re-executes the same instruction,
+    // and the recursion ends in "Fatal exception in interrupt".
+    0x0000_0DA0, // IA32_XSS
+    // CET: U_CET / PL3_SSP are the user shadow-stack + IBT controls
+    // (KVM keeps them in the guest FPU state, which is why they come
+    // after KVM_SET_XSAVE), S_CET / PL0..2_SSP / INT_SSP_TAB the
+    // supervisor ones (kernel IBT). All read-fail on a host without
+    // CET, which is the right answer there.
+    0x0000_06A0, // IA32_U_CET
+    0x0000_06A2, // IA32_S_CET
+    0x0000_06A4, // IA32_PL0_SSP
+    0x0000_06A5, // IA32_PL1_SSP
+    0x0000_06A6, // IA32_PL2_SSP
+    0x0000_06A7, // IA32_PL3_SSP
+    0x0000_06A8, // IA32_INT_SSP_TAB
 ];
+
+/// MSRs from `KVM_GET_MSR_INDEX_LIST` that must **not** be carried.
+///
+/// * `0x11`/`0x12` — `MSR_KVM_WALL_CLOCK` / `MSR_KVM_SYSTEM_TIME`, the
+///   pre-`_NEW` kvmclock handshake. They alias the same per-vCPU storage
+///   as `0x4B56_4D00/01`: writing `MSR_KVM_SYSTEM_TIME = 0` after
+///   `MSR_KVM_SYSTEM_TIME_NEW` deactivates the pvclock page that was
+///   just re-registered. k7d never advertises `KVM_FEATURE_CLOCKSOURCE`
+///   (only `CLOCKSOURCE2`, `vm::patch_cpuid_for_kvm_guest`).
+/// * `0x4000_0000..=0x4000_FFFF` — Hyper-V synthetic MSRs. Never
+///   advertised; a host-initiated read allocates per-vCPU Hyper-V state
+///   for nothing.
+fn msr_index_is_carried(index: u32) -> bool {
+    !matches!(index, 0x11 | 0x12 | 0x4000_0000..=0x4000_FFFF)
+}
+
+/// The MSR indices one capture reads, in restore order: [`MSR_INDICES`]
+/// first (their relative order matters — `IA32_TSC_DEADLINE` after the
+/// LAPIC, `IA32_XSS` before the CET MSRs), then every other index the
+/// host's KVM reports as to-be-saved, filtered by
+/// [`msr_index_is_carried`]. `KVM_GET_MSR_INDEX_LIST` is fixed for a
+/// host + kernel, so it is read once.
+fn msr_indices() -> Result<&'static [u32], SnapshotError> {
+    static INDICES: std::sync::OnceLock<Result<Vec<u32>, String>> = std::sync::OnceLock::new();
+    INDICES
+        .get_or_init(|| {
+            let kvm = kvm_ioctls::Kvm::new().map_err(|e| format!("open /dev/kvm: {e}"))?;
+            let list = kvm
+                .get_msr_index_list()
+                .map_err(|e| format!("KVM_GET_MSR_INDEX_LIST: {e}"))?;
+            let mut indices = MSR_INDICES.to_vec();
+            let mut extra: Vec<u32> = list
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|i| msr_index_is_carried(*i) && !MSR_INDICES.contains(i))
+                .collect();
+            extra.sort_unstable();
+            extra.dedup();
+            log::info!(
+                "snapshot: carrying {} MSRs ({} hand-picked + {} from KVM_GET_MSR_INDEX_LIST)",
+                indices.len() + extra.len(),
+                indices.len(),
+                extra.len()
+            );
+            indices.extend(extra);
+            Ok(indices)
+        })
+        .as_deref()
+        .map_err(|e| SnapshotError::Kvm(e.clone()))
+}
+
+/// `KVM_GET_ONE_REG` / `KVM_SET_ONE_REG` on `x86_64`: `_IOW(KVMIO, nr,
+/// struct kvm_one_reg)`. kvm-ioctls 0.19 wraps them for aarch64 / riscv
+/// only.
+const fn kvm_one_reg_ioctl(nr: libc::c_ulong) -> libc::c_ulong {
+    0x4000_0000
+        | ((std::mem::size_of::<kvm_bindings::kvm_one_reg>() as libc::c_ulong) << 16)
+        | (0xAE << 8)
+        | nr
+}
+const KVM_GET_ONE_REG: libc::c_ulong = kvm_one_reg_ioctl(0xAB);
+const KVM_SET_ONE_REG: libc::c_ulong = kvm_one_reg_ioctl(0xAC);
+
+/// The guest shadow stack pointer as a `ONE_REG` id:
+/// `KVM_REG_X86 | KVM_REG_SIZE_U64 | (KVM_X86_REG_TYPE_KVM << 32) |
+/// KVM_REG_GUEST_SSP` (Linux `arch/x86/include/uapi/asm/kvm.h`,
+/// documented as `0x2030 0003 0000 0000` in the KVM API).
+const KVM_REG_GUEST_SSP_ID: u64 =
+    kvm_bindings::KVM_REG_X86 | kvm_bindings::KVM_REG_SIZE_U64 | (3 << 32);
+
+/// Read the guest SSP of a paused vCPU. `Ok(None)` when KVM has no
+/// such register on this host (no CET virtualization, or a kernel that
+/// predates it), which is exactly "nothing to carry".
+pub(crate) fn get_guest_ssp(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<Option<u64>, String> {
+    let mut value: u64 = 0;
+    let reg = kvm_bindings::kvm_one_reg {
+        id: KVM_REG_GUEST_SSP_ID,
+        addr: std::ptr::from_mut(&mut value) as u64,
+    };
+    // SAFETY: `vcpu_fd` is a live vCPU fd of a paused VM; `reg.addr`
+    // points at a live `u64` KVM writes exactly 8 bytes of, and `reg`
+    // outlives the call.
+    if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), KVM_GET_ONE_REG, &reg) } < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            // EINVAL: the register id is unknown to this kernel; ENOENT:
+            // known, but this vCPU's CPUID has no shadow stack.
+            Some(libc::EINVAL | libc::ENOENT | libc::ENXIO) => Ok(None),
+            _ => Err(format!("KVM_GET_ONE_REG(GUEST_SSP): {err}")),
+        };
+    }
+    Ok(Some(value))
+}
+
+/// Write the guest SSP of a not-yet-run vCPU.
+pub(crate) fn set_guest_ssp(vcpu_fd: &kvm_ioctls::VcpuFd, value: u64) -> Result<(), String> {
+    let reg = kvm_bindings::kvm_one_reg {
+        id: KVM_REG_GUEST_SSP_ID,
+        addr: std::ptr::from_ref(&value) as u64,
+    };
+    // SAFETY: as in `get_guest_ssp`; KVM reads exactly 8 bytes at `addr`.
+    if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), KVM_SET_ONE_REG, &reg) } < 0 {
+        return Err(format!(
+            "KVM_SET_ONE_REG(GUEST_SSP = {value:#x}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
 
 /// Capture every vCPU's state, in vCPU-index order. The VM must be
 /// paused (`Vm::pause` refills `vcpu_fds` in index order).
@@ -627,9 +773,9 @@ fn capture_irqchip_state(vm: &Vm) -> Result<IrqChipState, SnapshotError> {
 }
 
 /// Read MSRs from the vCPU, skipping any that the kernel doesn't support.
-fn capture_msrs(vcpu_fd: &kvm_ioctls::VcpuFd) -> Vec<MsrEntry> {
+fn capture_msrs(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<Vec<MsrEntry>, SnapshotError> {
     let mut results = Vec::new();
-    for &index in MSR_INDICES {
+    for &index in msr_indices()? {
         let entries = [kvm_bindings::kvm_msr_entry {
             index,
             reserved: 0,
@@ -650,7 +796,7 @@ fn capture_msrs(vcpu_fd: &kvm_ioctls::VcpuFd) -> Vec<MsrEntry> {
             }
         }
     }
-    results
+    Ok(results)
 }
 
 /// Capture CPU registers from the paused `VcpuFd`.
@@ -811,17 +957,20 @@ fn capture_cpu_state(vcpu_fd: &kvm_ioctls::VcpuFd) -> Result<CpuState, SnapshotE
         .get_mp_state()
         .map_err(|e| SnapshotError::Kvm(format!("KVM_GET_MP_STATE: {e}")))?;
 
+    let ssp = get_guest_ssp(vcpu_fd).map_err(SnapshotError::Kvm)?;
+
     Ok(CpuState {
         regs: capture_regs(vcpu_fd)?,
         sregs: capture_sregs(vcpu_fd)?,
         fpu: capture_fpu(vcpu_fd)?,
-        msrs: capture_msrs(vcpu_fd),
+        msrs: capture_msrs(vcpu_fd)?,
         xsave,
         xcr,
         cpuid_entries,
         vcpu_events,
         lapic: lapic_bytes,
         mp_state: Some(mp_state.mp_state),
+        ssp,
     })
 }
 

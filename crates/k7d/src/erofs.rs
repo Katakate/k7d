@@ -16,7 +16,6 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
@@ -85,7 +84,7 @@ pub fn build_erofs_image(rootfs_dir: &Path, out_path: &Path) -> Result<(), Erofs
     ));
 
     let result = (|| {
-        let output = Command::new("mkfs.erofs")
+        let output = crate::spawner::command("mkfs.erofs")
             .arg(&tmp)
             .arg(rootfs_dir)
             .output()

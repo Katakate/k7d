@@ -7,7 +7,6 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -64,13 +63,66 @@ fn sandbox_mode() -> Result<String, String> {
     }
 }
 
+/// Exec `virtiofsd` on a listener the VM broker bound, sharing the
+/// directory the node broker pinned at `vm.register`.
+///
+/// Node-broker side of [`crate::broker::Verb::VirtiofsdSpawn`]. Both
+/// descriptors are placed by number rather than by path: `--fd 3` is the
+/// listener, and `--shared-dir /proc/self/fd/4` reaches the share
+/// through the `O_PATH` pin, so the directory virtiofsd chroots into is
+/// the inode `openat2` validated and not whatever the string resolves to
+/// now.
+///
+/// The two descriptors go through [`crate::spawner::Command::fd`], which
+/// exists for this one call site: every other helper in the daemon is
+/// handed stdio and nothing else. Routing it through the spawner rather
+/// than `std::process::Command` keeps `execve` in the one module that is
+/// allowed to have it — the node broker could exec directly, but then
+/// `only_spawner_execs` would have to grow an exception, and the next
+/// caller would inherit it.
+pub(crate) fn spawn_jailed(
+    listener: &std::os::fd::OwnedFd,
+    share: &std::os::fd::OwnedFd,
+    tag: &str,
+) -> io::Result<crate::spawner::Child> {
+    let mut cmd = crate::spawner::command(VIRTIOFSD_PATH);
+    cmd.args(["--fd", "3", "--shared-dir", "/proc/self/fd/4"])
+        .args(["--tag", tag])
+        .args(["--cache", "never"])
+        .args(["--sandbox", &sandbox_mode().map_err(io::Error::other)?])
+        .args(["--seccomp", "kill"])
+        .arg("--no-announce-submounts")
+        .fd(3, listener.try_clone()?)
+        .fd(4, share.try_clone()?);
+    cmd.spawn()
+}
+
+/// Who started the helper, which decides who may stop it.
+enum Helper {
+    /// This process did, through the pre-seccomp helper spawner.
+    Own(crate::spawner::Child),
+    /// The node broker did, on a listener this process bound
+    /// (`virtiofsd.spawn`). The pidfd is for polling only —
+    /// the child is root's and a uid-`k7d` process has no `CAP_KILL`
+    /// over it, so stopping it is [`crate::broker::Verb::HelperReap`].
+    Brokered {
+        pid: u32,
+        _pidfd: std::os::fd::OwnedFd,
+    },
+}
+
 /// Manages a virtiofsd child process.
 pub struct VirtiofsdProcess {
-    child: Child,
+    child: Helper,
     socket_path: PathBuf,
     /// Share root we bind-mounted read-only before spawn (`readonly:
     /// true`). Umounted in [`Drop`] after the child is killed.
     ro_bind: Option<PathBuf>,
+    /// The registered `(vm_id, share_idx)` whose `share.remount_ro` this
+    /// process owes a `share.umount`. `Some` only under privilege
+    /// separation, where both halves of that pair are the node
+    /// broker's.
+    ro_share: Option<(String, u16)>,
 }
 
 impl VirtiofsdProcess {
@@ -102,7 +154,10 @@ impl VirtiofsdProcess {
         tag: &str,
         readonly: bool,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(VIRTIOFSD_PATH);
+        if crate::broker::client::is_split() {
+            return Self::spawn_brokered(host_dir, socket_path, tag, readonly);
+        }
+        let mut cmd = crate::spawner::command(VIRTIOFSD_PATH);
         cmd.arg("--shared-dir")
             .arg(host_dir)
             .arg("--socket-path")
@@ -187,9 +242,100 @@ impl VirtiofsdProcess {
         }
 
         Ok(Self {
-            child,
+            child: Helper::Own(child),
             socket_path: socket_path.to_path_buf(),
             ro_bind,
+            ro_share: None,
+        })
+    }
+
+    /// [`Self::spawn_with_options`] under privilege separation.
+    ///
+    /// The listener goes the other way from every other descriptor in
+    /// the split: this process `bind`s and `listen`s in a
+    /// directory it owns and hands the *listening* socket to the node
+    /// broker, which maps it to fd 3 and passes `--fd 3`. That removes
+    /// both halves of the old arrangement's privilege — virtiofsd never
+    /// creates a socket in a directory root chose, and this process
+    /// never needs the share's path to be resolvable by anyone but the
+    /// node broker, which reaches it through the pin `vm.register`
+    /// made.
+    ///
+    /// It also removes the poll: `--socket-path` meant waiting for the
+    /// file to appear before connecting, and a socket that is already
+    /// listening accepts a `connect` into its backlog immediately.
+    fn spawn_brokered(
+        host_dir: &Path,
+        socket_path: &Path,
+        tag: &str,
+        readonly: bool,
+    ) -> Result<Self, String> {
+        use crate::broker::client::{self, Pin};
+        let Some((vm_id, share_idx)) = client::pinned_as(Pin::Share, host_dir) else {
+            return Err(format!(
+                "virtiofs share {} was never registered with the node broker — \
+                 vm.register is what validates and pins a host path, and a share that \
+                 skipped it has no pin to serve from",
+                host_dir.display()
+            ));
+        };
+        let ro_share = if readonly {
+            client::ok(&crate::broker::Verb::ShareRemountRo {
+                vm_id: vm_id.clone(),
+                share_idx,
+            })
+            .map_err(|e| {
+                format!(
+                    "host RO remount of virtiofs share {}: {e}",
+                    host_dir.display()
+                )
+            })?;
+            Some((vm_id.clone(), share_idx))
+        } else {
+            None
+        };
+        let undo_ro = |ro_share: &Option<(String, u16)>| {
+            if let Some((vm_id, share_idx)) = ro_share {
+                let _ = client::ok(&crate::broker::Verb::ShareUmount {
+                    vm_id: vm_id.clone(),
+                    share_idx: *share_idx,
+                });
+            }
+        };
+        let listener = match std::os::unix::net::UnixListener::bind(socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                undo_ro(&ro_share);
+                return Err(format!(
+                    "bind the vhost-user listener {}: {e}",
+                    socket_path.display()
+                ));
+            }
+        };
+        let spawned = client::virtiofsd_spawn(
+            &vm_id,
+            share_idx,
+            tag,
+            None,
+            std::os::unix::io::AsRawFd::as_raw_fd(&listener),
+        );
+        // The node broker holds the only copy virtiofsd needs; keeping
+        // this one open would leave a second listener on the socket that
+        // never accepts.
+        drop(listener);
+        let (pid, pidfd) = match spawned {
+            Ok(v) => v,
+            Err(e) => {
+                undo_ro(&ro_share);
+                let _ = std::fs::remove_file(socket_path);
+                return Err(format!("spawn virtiofsd (tag={tag}): {e}"));
+            }
+        };
+        Ok(Self {
+            child: Helper::Brokered { pid, _pidfd: pidfd },
+            socket_path: socket_path.to_path_buf(),
+            ro_bind: None,
+            ro_share,
         })
     }
 
@@ -197,14 +343,36 @@ impl VirtiofsdProcess {
     /// tree's cgroup jail.
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.child {
+            Helper::Own(child) => child.id(),
+            Helper::Brokered { pid, .. } => *pid,
+        }
     }
 }
 
 impl Drop for VirtiofsdProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.child {
+            Helper::Own(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Helper::Brokered { pid, .. } => {
+                if let Err(e) =
+                    crate::broker::client::ok(&crate::broker::Verb::HelperReap { pid: *pid })
+                {
+                    log::warn!("helper.reap({pid}) for virtiofsd: {e}");
+                }
+            }
+        }
+        if let Some((vm_id, share_idx)) = self.ro_share.take() {
+            if let Err(e) = crate::broker::client::ok(&crate::broker::Verb::ShareUmount {
+                vm_id: vm_id.clone(),
+                share_idx,
+            }) {
+                log::warn!("share.umount({vm_id}[{share_idx}]): {e}");
+            }
+        }
         if let Some(ref path) = self.ro_bind {
             if let Err(e) = crate::volumes::umount_path(path) {
                 log::warn!(
@@ -716,7 +884,8 @@ impl VirtioFsBackend {
             // The rings are programmed against this device's own mapping,
             // but `used.idx` is read out of the fork's `MAP_PRIVATE` view.
             let read_vq = self.validated(q, idx, guest_mem_host_addr)?;
-            let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+            let kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+                .map_err(|e| format!("eventfd: {e}"))?;
 
             client.set_vring_num(i, u32::from(vq.size()))?;
             client.set_vring_addr(
@@ -827,7 +996,8 @@ impl VirtioBackend for VirtioFsBackend {
             let i = idx as u32;
             let vq = self.validated(q, idx, self.mem_host_addr)?;
 
-            let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+            let kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+                .map_err(|e| format!("eventfd: {e}"))?;
 
             client.set_vring_num(i, u32::from(vq.size()))?;
             client.set_vring_addr(

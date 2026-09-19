@@ -262,6 +262,25 @@ impl Guest {
         }
     }
 
+    /// How **this process** reaches the guest agent.
+    ///
+    /// The same as [`Self::agent_endpoint`] for a native VM. For a
+    /// Firecracker VM under the split it is not: the published path is
+    /// under `/var/lib/k7d/fc`, which is root `0700`, and uid `k7d` can
+    /// only name the jail through the `O_PATH` descriptor it holds
+    /// (CHALLENGES #248). A daemon that dials the published path
+    /// gets `EACCES` and mistakes its own lack of privilege for a dead
+    /// guest.
+    #[must_use]
+    pub fn own_agent_endpoint(&self) -> AgentEndpoint {
+        match self {
+            Self::Native(_) => self.agent_endpoint(),
+            Self::Firecracker(vm) => AgentEndpoint::FcUds {
+                path: vm.own_agent_uds().to_string_lossy().into_owned(),
+            },
+        }
+    }
+
     /// Guest vsock CID. Native: always `Some`.
     ///
     /// Firecracker: always `None`. Its guest CID is private to the

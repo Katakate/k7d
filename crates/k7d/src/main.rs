@@ -15,6 +15,11 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
+    // systemd signals the whole cgroup, so the spawner is being asked to
+    // stop at the same moment. Tell its watchdog that, or the race
+    // between the two makes an ordinary `systemctl restart` exit 1
+    // (CHALLENGES #245).
+    k7d::spawner::mark_shutting_down();
 }
 
 fn install_signal_handlers() {
@@ -177,6 +182,14 @@ fn prepare_tree_root() {
 /// does gets the honest error from `fc::stage` naming both
 /// filesystems when it tries to link a disk in.
 fn prepare_fc_chroot_base() {
+    // Split, `/var/lib/k7d/fc` is root-owned 0700 and every jail under
+    // it is staged by the node broker (`fc.*` verbs). This process cannot
+    // probe it, and the warning it would print — "a firecracker VM with
+    // a disk will fail to stage it" — is the opposite of true.
+    if k7d::broker::client::is_split() {
+        log::info!("split: the Firecracker jailer chroot base is the node broker's");
+        return;
+    }
     if let Ok(custom) = std::env::var("K7D_FC_CHROOT_BASE") {
         log::info!("Firecracker jailer chroot base {custom} (K7D_FC_CHROOT_BASE)");
         return;
@@ -192,7 +205,52 @@ fn prepare_fc_chroot_base() {
 
 fn main() {
     handle_info_flags();
+
+    // Privilege separation: the node broker forks off here, before anything else,
+    // and this call returns only in the child. Two reasons it is first:
+    // the same one the spawner has below (a `fork` after a thread or a
+    // logger exists hands the child their locks), and the credential
+    // change itself — the uid drop and the bounding-set drop are what the
+    // rest of this function then runs under. `K7D_PRIVSEP` off (the
+    // default for this increment) returns `Unsplit` and changes nothing.
+    let role = match k7d::broker::start() {
+        Ok(role) => role,
+        Err(e) => {
+            eprintln!("k7d: privilege separation: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // The spawner is forked here and nowhere else: it must exist while
+    // this process is still single-threaded (a `fork` after
+    // `env_logger::init()` hands the child the logger's and malloc's
+    // locks, and the spawner allocates — CHALLENGES #245), before the
+    // signal handlers (the child must keep the default dispositions),
+    // and before `seccomp::install()` removes `execve` from this
+    // process for good. There is no second chance: a spawner forked
+    // after the filter is installed inherits it and dies on its first
+    // helper.
+    let spawner_pid = match k7d::spawner::start() {
+        Ok(pid) => pid,
+        Err(e) => {
+            eprintln!("k7d: spawner: {e}");
+            std::process::exit(1);
+        }
+    };
+
     env_logger::init();
+    log::info!("helper spawner forked (pid {spawner_pid}) before the daemon's seccomp filter");
+    match role {
+        k7d::broker::Role::VmBroker => log::info!(
+            "running as the VM broker (pid {}, generation {}, empty capability set); privileged \
+             work is a node-broker verb",
+            std::process::id(),
+            k7d::broker::client::restart_epoch()
+        ),
+        k7d::broker::Role::Unsplit => {
+            log::info!("K7D_PRIVSEP is off: one process, root, as before privilege separation")
+        }
+    }
     let socket = socket_path();
     log::info!("k7d starting (socket={socket})");
 
@@ -209,10 +267,16 @@ fn main() {
 
     // Installed before the first VM (and before the
     // pool's threads) exists: a filter on this thread is inherited by
-    // every thread and child process created afterwards, which is what
+    // every thread created afterwards, which is what
     // makes a daemon-wide filter possible at all in a process that owns
-    // every tree's VMs as threads. Defaults to `enforce`.
-    match k7d::seccomp::install() {
+    // every tree's VMs as threads. Defaults to `enforce`. This is the
+    // *daemon's* allowlist only — the helpers' lives on the spawner
+    // forked above.
+    let installed = match role {
+        k7d::broker::Role::VmBroker => k7d::seccomp::install_for_vm_broker(),
+        k7d::broker::Role::Unsplit => k7d::seccomp::install(),
+    };
+    match installed {
         Ok(mode) => log::info!("seccomp mode: {mode:?}"),
         Err(e) => {
             log::error!("seccomp: {e}");
@@ -241,6 +305,11 @@ fn main() {
     };
 
     let daemon = Arc::new(Daemon::with_pool(pool));
+    // VM-broker restart: a successor VM broker takes over the Firecracker
+    // sandboxes the node broker kept back from its predecessor. Before
+    // the stale-record GC below, which would otherwise delete the very
+    // reattach records those sandboxes are found by.
+    daemon.readopt_fc_sandboxes();
     // GC sandbox reattach records orphaned by a
     // previous daemon (its VMs died with it — they must not be
     // resurrected from JSON alone).
@@ -258,13 +327,21 @@ fn main() {
     // with the process. Not in Daemon::new: in-process
     // tests must not sweep /var/lib/k7d/trees.
     daemon.rehydrate_trees_from_disk();
-    let reaped_jails = k7d::netjail::clean_stale_jails();
-    if !reaped_jails.is_empty() {
-        log::warn!("reaped stale net jails: {reaped_jails:?}");
-    }
-    let reaped_tap_jails = k7d::netjail::clean_stale_tap_jails();
-    if !reaped_tap_jails.is_empty() {
-        log::warn!("reaped stale tap anti-spoof jails: {reaped_tap_jails:?}");
+    // nft needs root. Split, the node broker has already done both of
+    // these in `sweep_orphans()` before this process existed; running
+    // them again here only logs `you must be root` twice a restart and
+    // teaches the reader to ignore an error that is usually real.
+    if k7d::broker::client::is_split() {
+        log::info!("split: stale net jails are the node broker's sweep");
+    } else {
+        let reaped_jails = k7d::netjail::clean_stale_jails();
+        if !reaped_jails.is_empty() {
+            log::warn!("reaped stale net jails: {reaped_jails:?}");
+        }
+        let reaped_tap_jails = k7d::netjail::clean_stale_tap_jails();
+        if !reaped_tap_jails.is_empty() {
+            log::warn!("reaped stale tap anti-spoof jails: {reaped_tap_jails:?}");
+        }
     }
     prepare_tree_root();
     prepare_fc_chroot_base();
@@ -302,6 +379,15 @@ fn main() {
 
     log::info!("k7d draining {} VM(s)", daemon.vm_count());
     daemon.shutdown_all();
+    // The node broker keeps serving verbs throughout `shutdown_all` —
+    // every `StopVm` on the way out issues `vm.release` — and only this
+    // tells it there will be no more, so that `systemctl stop` exits 0
+    // instead of looking like the VM broker crashed.
+    if role == k7d::broker::Role::VmBroker {
+        if let Err(e) = k7d::broker::client::shutdown() {
+            log::error!("telling the node broker that shutdown_all finished: {e}");
+        }
+    }
     log::info!("k7d stopped");
 
     if serve_result.is_err() {

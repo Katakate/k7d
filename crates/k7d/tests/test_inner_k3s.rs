@@ -2677,6 +2677,7 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     // A `TreeDrop`-based teardown for every failure exit below.
@@ -2956,6 +2957,7 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
     // Create performs adopt + fork. Running == both succeeded.
     kubectl_apply(&fork_trigger_pod_yaml(&tree_id));
     wait_for_pod_running(inner3_trigger_pod(), Duration::from_secs(420));
+    common::mark_test_tree(&tree_id);
 
     // The held session must still be alive after adopt + fork.
     let watch_alive = watch.try_wait().expect("watch try_wait").is_none();
@@ -3643,6 +3645,7 @@ fn test_inner_k3s_coredns_dns_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -4876,6 +4879,7 @@ fn test_inner_k3s_ingress_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -5634,6 +5638,7 @@ fn test_inner_k3s_local_path_pvc_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -5908,6 +5913,7 @@ fn test_inner_k3s_metrics_server_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -6502,6 +6508,7 @@ fn test_inner_k3s_network_policy_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -6990,6 +6997,7 @@ fn test_inner_k3s_hpa_scale_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -7392,6 +7400,7 @@ fn test_inner_k3s_etcd_datastore_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -8610,6 +8619,7 @@ fn test_inner_k3s_argocd_gitops_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {
@@ -10087,6 +10097,7 @@ fn test_inner_k3s_cilium_datapath_fork() {
             panic!("TreeAdoptCluster transport error: {e}");
         }
     };
+    common::mark_test_tree(&tree_id);
     eprintln!("  adopted tree={tree_id} root_cids={root_cids:?}");
 
     let teardown = |client: &mut Client| {

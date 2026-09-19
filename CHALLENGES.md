@@ -8326,11 +8326,15 @@ for this; do not `ip link del` a bridge another run still owns (#64).
 
 ## 239. A 96G disk tier filled up with trees no VM owned and base images nothing booted (spec 41a)
 
-**Symptom:** `test_fork_under_load` failed in the `kafka` phase with
-`No space left on device`. `df` on the disk tier showed 80G of 96G used
-(83%), and the phase needs multi-GB of headroom for its sibling
-divergence probe. Every other binary in the suite had passed, so this
-read like a kafka-specific bug rather than the node running out of room.
+**Symptom:** a full `make remote-check` died after 27 green test
+binaries on `tree_suspend: IO error: No space left on device` inside
+`gym/fork_under_load.py`'s kafka arm. `/var/lib/k7d/disks` (96 G
+loop-mounted XFS) was 80 G used / 17 G free: **48 G in 525 retained
+tree dirs** and **31 G in 9 never-evicted Ubuntu base images**. Dropping
+all 478 registered trees reclaimed **zero bytes** — `tree_drop` keeps
+the on-disk tree so `tree_open` can re-adopt it. The kafka arm needs
+more headroom than 17 G to keyframe a ~2.9 GB parent and sibling.
+Nothing was wrong with the code under test.
 
 **Root cause:** two independent accumulations on a node that had been up
 for weeks. 478 trees were still registered with the daemon but had no
@@ -8341,25 +8345,1528 @@ So dropping every registered tree still left most of the bytes on disk.
 Separately, 8 superseded Ubuntu base image sets were never collected;
 only the current one is ever booted.
 
-**Fix:** drop the 478 registered trees through the daemon
-(`tree_list` + `tree_drop`), then remove the 525 orphaned directories
-(48G) and the 8 superseded base image sets (28G), and restart `k7d` so
-it rescans a clean disk tier. 68G reclaimed; the suite then went green
-end to end, and the tier stayed at 6% for the whole run.
+**Fix:** `tree_drop` does not delete the on-disk tree — that is the
+feature (`tree_open` / `rehydrate_trees_from_disk`). The missing piece
+was a reaper, not a contract change. Spec 41a adds:
 
-Both halves are one-off operator work, which is the actual problem —
-spec 41a makes them the daemon's job: sweep orphaned tree dirs in
-`sweep_stranded_resources` (age plus a test marker plus zero live VMs),
-GC the base-image cache on a build miss down to `K7D_KEEP_BASE_IMAGES`,
-and fail the test binaries loudly at preflight when free space is under
-`K7D_MIN_FREE_DISK` instead of surfacing as `ENOSPC` in whichever phase
-happens to need the most room.
+1. `sweep_trees` in `sweep_stranded_resources`: reap a dir under
+   `DISKS_DIR/trees` only if it carries `.k7d-test-tree`, the marker is
+   older than `STALE_AGE` (30 min), and the daemon reports zero live
+   VMs (or does not know the tree). `tree_drop` first, then
+   `remove_dir_all`. Unmarked dirs are never touched — those 525 dirs
+   had eight prefixes, and an operator's suspended tree looks identical
+   to an old test tree.
+2. Base-image GC in `build-node-image.sh` on a cache **miss** only:
+   keep `K7D_KEEP_BASE_IMAGES` (default 2) most recent sets, delete all
+   four files of each older set, skip loudly if an `.img` is open.
+   Sort by `find -printf '%T@'` (seconds with fraction). GNU `stat %N`
+   is the quoted filename, not nanoseconds — a same-second tie then
+   sorted by path and deleted the set just built.
+3. `make node-reclaim` / `make remote-node-reclaim` — same marker rule
+   and keep-count, `df` before and after. No extra powers.
+4. Loud preflight after the sweep: if free space on `DISKS_DIR` is
+   under `K7D_MIN_FREE_DISK` (default 24 GiB), the test binary fails
+   immediately with free vs needed and `Run \`make remote-node-reclaim\``.
+
+The one-off operator recovery (drop 478 registered trees, `rm` 525
+dirs, delete 8 superseded image sets, restart `k7d`) reclaimed 68 G
+and got the suite green; the code above is what stops it happening
+again.
 
 **Reference:** CHALLENGES #235 (the XFS-full disk-clone sibling), #238
-(the network sibling on the same node).
+(the network sibling on the same node); spec 41a.
 
-**Time lost:** ~1 h, most of it attributing `ENOSPC` to the kafka phase
-before looking at `df`.
+**Time lost:** ~1 h attributing `ENOSPC` to the kafka phase before
+looking at `df`, plus three hours of suite time to learn the disk was
+full.
+
+---
+
+## 240. `k7d-fc` pause → resume → exec hung: Firecracker v1.16.0/1 gated vsock RX after a bare resume (spec 42a)
+
+**Symptom:** k7-forked CHALLENGES #17 — `k7 pause` then `k7 resume`
+on a `k7d-fc` sandbox returned Ok (`resumed vm-… (guest_cid=0)`), and
+every exec after that hung: the kubelet exec probe timed out, `k7 exec`
+never returned. Native `k7d` was fine. Reproduced at the daemon layer
+in `test_fc_pause_resume_exec_answers_twenty_times`: round 0, the
+dial made *while paused* failed with `EAGAIN` from the
+`connect_fc_uds` read timeout after resume, and a *fresh* dial failed
+the same way. The client connected *before* the pause also never got
+its ping back.
+
+**Root cause:** not the muxer (hypothesis a as written), not the shim
+(b, see #241), not `reattach_cpu_cgroup` (c — FC entries register
+`cpu_cgroup: None`), not the clock (d). It is the vsock *device* in
+Firecracker v1.16.0/v1.16.1. `PATCH /vm Resumed` → `resume_vm` →
+`device_manager.kick_virtio_devices()` → vsock `kick()` sets
+`pending_event_ack = true` unconditionally and signals the event
+queue. That flag exists for snapshot restore: `create_snapshot` first
+queues a `TRANSPORT_RESET_EVENT`, the guest processes it, refills the
+evq and kicks it, and `handle_evq_event` clears the flag. On a bare
+pause/resume no event was queued, the guest's event work pops nothing,
+and under `EVENT_IDX` (new in 1.16.0) `virtqueue_kick` with no new
+buffers is suppressed — so the guest never kicks, the flag is never
+cleared, and `process_rx` returns early forever: every host→guest
+packet, including the `CONNECT` reply, is held. Guest→host TX still
+flows, which is why the VM looks alive. A cgroup-freezer pause/thaw
+of the same VM (bypassing the FC API) answered immediately, which is
+what pointed at the API path rather than the muxer.
+
+Upstream found the same thing and shipped it as
+[firecracker #6100](https://github.com/firecracker-microvm/firecracker/pull/6100)
+in v1.16.2 / v1.17.0 (2026-09-10, four days before this diagnosis):
+"the resume kick armed the `TRANSPORT_RESET` RX gate even though no
+reset event had been sent … every new host-initiated connection made
+after the resume hung forever."
+
+**Fix:** the fix is at the layer the hypothesis names — the VMM — so
+`guest/fc/pins.env` moves to v1.16.2 (patch release; three sha256
+pins from upstream's own `.sha256.txt`), with a "do not go below"
+note. `control::resume_vm` also dials the resumed FC guest once
+(`FC_RESUME_DIAL`, 5 s) and returns an error naming this bug if it
+does not answer, so a pin regression is a loud `resume` error instead
+of a `kubectl exec` that never returns. The daemon test runs twenty
+pause → dial-while-paused → resume → exec rounds (worst resume→exec
+30 ms); `test_k7_fc_pause_resume_exec_answers` does the same through
+kubelet's probe on `k7-fc`, with `test_k7_native_pause_resume_exec_answers`
+as the control (409 ms / 359 ms resume→exec).
+
+The spec listed "changing the Firecracker/jailer pins" as out of
+scope — written before the root cause was known to be in the pinned
+binary. A freezer-based pause was the alternative and was rejected: it
+loses FC's `KVM_KVMCLOCK_CTRL` on pause, makes the FC API unreachable
+while frozen (snapshot-while-paused would have to thaw first), and
+works around a bug upstream has already fixed.
+
+**Reference:** Firecracker v1.16.1
+`src/vmm/src/devices/virtio/vsock/{device.rs,event_handler.rs}`
+(`kick`, `process_rx`, `handle_evq_event`), Linux
+`net/vmw_vsock/virtio_transport.c` `virtio_transport_event_work`,
+upstream #5882 (the gate, 1.16.0) and #6100 (the fix, 1.16.2);
+k7-forked CHALLENGES #17.
+
+**Time lost:** ~3 h — strace on the FC UDS, a diagnostic test with
+both pause mechanisms, and reading the vsock device before the
+upstream changelog was checked. Check the changelog first.
+
+---
+
+## 241. The exec bridge never touched containerd's FIFOs on failure, so a paused pod stayed Ready for two minutes (spec 42a)
+
+**Symptom:** `test_k7_fc_pause_resume_exec_answers` paused the VM,
+then waited for the exec readiness probe (period 2 s, timeout 5 s,
+threshold 1) to flip the pod NotReady — and it never did within 60 s,
+on `k7-fc` *and* on native `k7`. The shim log showed the probe's
+`Exec` → `Start` → `Wait`, containerd's `Kill … signal=9` at exactly
++5 s, then `exec bridge: agent connect failed … (os error 11)` at
++10 s — and **no further `Exec` for a minute**. Kubelet had stopped
+probing.
+
+**Root cause:** containerd's `ExecSync` returns only after the exec's
+exit code *and* EOF on its stdout/stderr FIFOs (`process.IO().Wait()`).
+Its read side is `containerd/fifo` opened `O_RDONLY|O_NONBLOCK`, which
+that package implements as a blocking `open(2)` in a goroutine —
+nothing but a writer opening the FIFO completes it. `run_exec_bridge`
+opened the FIFOs only on the success path, after `container_exec`
+returned. On the failure path (guest paused → connect timeout) it set
+the exit code and returned without ever opening them, so `Wait`
+resolved but the attach never did, and kubelet's prober sat in
+`ExecSync` until its gRPC deadline (2 min + probe timeout). One probe
+worker per container, so no probe ran in that window and the stale
+`Ready` stood. Native had the same bug; #240 masked it on `k7-fc`
+because there the *post-resume* exec hung too.
+
+**Fix:** the bridge opens both FIFOs before anything can fail and
+closes them on every exit — a real exec process's stdio — and writes
+the bridge error to stderr so it lands in the probe event. After the
+fix the probe flips NotReady 11–12 s after pause (the bridge's 10 s
+connect timeout, not the 5 s probe timeout: containerd's attach still
+waits for the bridge to give up) and Ready again ~0.5 s after resume.
+
+**Reference:** containerd `pkg/cri/server/container_execsync.go`
+(`execInternal`: `exitCh`, then `<-attachDone`), `containerd/fifo`
+`openFifo` (`block := flag&O_NONBLOCK == 0 …` then a goroutine
+`open(2)`), kubelet `remote_runtime.go` `ExecSync` context deadline.
+
+**Time lost:** ~40 min, from "why does kubelet stop probing" to the
+FIFO open semantics.
+
+---
+
+## 242. Spec 42a A–D: the reaper is a local of `spawn`, and `O_NOFOLLOW` would have broken symlink hostPaths (spec 42a)
+
+**Symptom (A):** the obvious shape for "kill the orphan before the uid
+and chroot are released" is to carry the `UidLease` and `Chroot` into
+the error, or `ManuallyDrop` them in `spawn_unconfigured` until a
+reaper has run. Both put lease semantics into `FcError` or
+choreography into the caller.
+
+**Fix (A):** `SpawnReaper` is a local of `spawn`, armed the instant the
+jailer returns 0 and disarmed only when the pid is handed to `FcVm`.
+Locals drop before the function returns, so its `Drop` — kill by pid
+file / `cgroup.procs` / `/proc` `Uid:` scan restricted to the VM's
+cgroup, verify from `/proc` that nothing runs as the uid, remove the
+cgroup, or `quarantine_uid` if something survived — has finished
+before `spawn_unconfigured`'s lease and chroot can unwind. The
+fault-injection hook (`K7D_FC_TEST_FAIL_PIDFILE`) is honoured in debug
+builds only; a release daemon that finds it set refuses every FC
+create rather than silently running a test hook.
+
+**Symptom (D):** the spec (and #23's fix direction) said open the
+hostPath source `O_PATH|O_NOFOLLOW`. `/etc/localtime` is a symlink on
+every Ubuntu node, and `mount --bind` follows it. `O_PATH|O_NOFOLLOW`
+on a symlink does not fail — it is *the* way to get an fd to the link
+itself — so `fstat` would have said `S_IFLNK`, neither file nor
+directory, and a hostPath that works today would have been refused.
+
+**Fix (D):** plain `O_PATH|O_CLOEXEC` after `wait_for_source`, kind
+from `fstat` on the fd, bind from `/proc/self/fd/<src>` into the
+fd-pinned destination. The race #23 describes is a swap *between*
+inspection and mount; pinning the inode closes it whether or not the
+path was a symlink at open time. `hostpath_bind_pins_the_inspected_source`
+swaps a file for a directory behind the fd and asserts the mount shows
+the inspected inode.
+
+**Symptom (B):** with every pipe and eventfd `CLOEXEC`, the new
+child-fd assertion in `test_boot_multi_vcpu` still failed — the
+helper child held `5 -> /memfd:k7d-guest-mem`. Not a pipe, not an
+eventfd: the guest's RAM. `Vm::new` created the memfd `MFD_CLOEXEC`
+and then, three lines later, `fcntl(F_SETFD, 0)` "so virtiofsd can
+inherit the fd if needed". virtiofsd never inherited it — the memfd
+travels over the vhost-user socket as `SCM_RIGHTS` in
+`set_mem_table` — so the only effect was every `nft`, `ip`, `mkfs`
+and jailer k7d execs holding a read-write fd to the guest's memory.
+The grep test could not catch this (a `memfd_create` *with*
+`MFD_CLOEXEC`); only the behavioural one did.
+
+**Fix (B):** drop the `F_SETFD` clear. Nothing else changed — the
+vhost-user path was already fd-passing.
+
+**Reference:** `open(2)` `O_PATH`, `fstat` on `O_PATH` fds,
+`mount(2)` with `/proc/self/fd/N` sources; `memfd_create(2)`
+`MFD_CLOEXEC`, vhost-user `VHOST_USER_SET_MEM_TABLE` fd passing.
+
+**Time lost:** ~30 min across A and D, mostly deciding D against the
+letter of the spec; B's memfd was one failed run.
+
+---
+
+## 243. `lru_live_victim` ties on whole-second stamps and breaks them by HashMap order (spec 42a)
+
+**Symptom:** `test_cluster_tree_fork_of_fork_with_rw_disks` failed
+twice in a row at `suspend for eviction: NodeNotFound("great-0002")`,
+then passed unchanged on the third run. Nothing in the diff touched
+the tree.
+
+**Root cause:** the test fills the live budget (4 nodes × 2 members)
+and forks `after-resume` from `grand`, so `evict_for_incoming` must
+suspend one of root, child, `great`. `NodeInfo::last_active_at_unix`
+is whole seconds and `ClusterSnapshotTree::nodes` is a `HashMap`;
+on a warm node the three forks land in the same second, every
+candidate carries the same `last_active`, and
+`tree_model::lru_live_victim`'s strict `<` keeps the first candidate
+in `nodes.values()` order — hash order, different per process. Some
+runs suspend `root`, some suspend `great`, and the later
+`tree.suspend(&great)` then finds it not live.
+
+**Fix:** the test sleeps 1.1 s before forking `great`, so it is
+strictly newer than its ancestors and the victim is root or child.
+`tree_model.rs` is left as is — the verified model's tie rule is
+deliberate, and a finer clock is a spec, not a test fix.
+
+**Reference:** `tree_model::lru_live_victim`, CHALLENGES #239.
+
+**Time lost:** two ~50 min `make remote-check` runs.
+
+---
+
+## 244. Measured `cap_capable` union for the k7d.service bounding set (spec 43a-inc1)
+
+**Symptom:** the Inc 1 unit cannot be a guess — `CapabilityBoundingSet`
+is inherited by every helper the daemon execs, and dropping a cap the
+jailer or `iptables` actually checks is a silent `EPERM` in a child.
+
+**Root cause / measurement:** `kprobe:cap_capable` over a full unhardened
+`make remote-check` on k7-node-01 (`K7_NODE_IP=<node-ip>`) plus the
+binaries that run after `test_ubuntu_incident` (that test failed on
+main with an inspect-battery leak, unrelated to this increment; the
+rest of the k7d test binaries were run under the same tracer).
+
+The spec's one-liner used `comm=="jailer"` / `comm=="firecracker"`.
+Pinned binaries are `jailer-v1.16.2` and `firecracker-v1.16.2`, so
+`comm` is `jailer-v1.16.2` and `firecracker-v1.` (`TASK_COMM_LEN`). A
+second tracer with those exact names caught the jailer row. `losetup`
+and `mkfs.*` never appeared: the reflink XFS was already mounted and
+volume images were already formatted.
+
+| comm | caps checked (`capability.h`) |
+|---|---|
+| `k7d` | `CHOWN`(0), `DAC_OVERRIDE`(1), `DAC_READ_SEARCH`(2), `FOWNER`(3), `KILL`(5), `NET_ADMIN`(12), `SYS_PTRACE`(19), `SYS_ADMIN`(21) |
+| `jailer-v1.16.2` | `CHOWN`(0), `DAC_OVERRIDE`(1), `DAC_READ_SEARCH`(2), `FOWNER`(3), `FSETID`(4), `SETGID`(6), `SETUID`(7), `SYS_ADMIN`(21), `MKNOD`(27) |
+| `firecracker-v1.` | `DAC_OVERRIDE`(1), `SYS_ADMIN`(21) — after the jailer drop these checks fail; not a reason to widen the set |
+| `virtiofsd` | `CHOWN`(0), `DAC_OVERRIDE`(1), `DAC_READ_SEARCH`(2), `FSETID`(4), `SETGID`(6), `SETPCAP`(8), `SYS_CHROOT`(18), `SYS_ADMIN`(21), `SYS_RESOURCE`(24) |
+| `ip` | `NET_ADMIN`(12), `SYS_MODULE`(16), `SYS_ADMIN`(21) |
+| `iptables` | `NET_ADMIN`(12), `NET_RAW`(13) |
+| `nft` | `NET_ADMIN`(12) |
+| `mount` | `SYS_ADMIN`(21) |
+| `nsenter` | `SYS_CHROOT`(18), `SYS_ADMIN`(21) |
+
+**Kept in `CapabilityBoundingSet`:** the union of successful product
+paths: `SYS_ADMIN`, `NET_ADMIN`, `NET_RAW` (xtables; nft does not need
+it — the spec's "drop NET_RAW" guess was wrong), `SETUID`/`SETGID`/
+`MKNOD` (jailer; it never checked `SYS_CHROOT`, it uses `SYS_ADMIN`
+for the jail), `SETPCAP` + `SYS_RESOURCE` (virtiofsd `cap_set_proc`;
+dropping either fails RW hostPath / virtiofs volumes with `can't apply
+the child capabilities`), `SYS_CHROOT` (virtiofsd + `nsenter`), `CHOWN`,
+`KILL`, `SYS_PTRACE` (`fc/spawn.rs` `pids_owned_by` reads
+`/proc/<other-uid>/status` — the spec guessed this was test-only),
+`FSETID` (jailer + virtiofsd chmod), `FOWNER`, `DAC_OVERRIDE`,
+`DAC_READ_SEARCH`.
+
+**Dropped (check fired, tolerated):** `CAP_SYS_MODULE` (`ip` probing
+netdev modules). `losetup`/`mkfs.*` were not observed; loop
+`DeviceAllow` stays because `ensure_loopback_xfs` is still the
+in-process/test fallback.
+
+**Fix:** one unit body in `packaging/k7d.service.in`, consumed by
+`install.sh`, `tests/common/mod.rs`, and named by
+`setup-node-after-reset.sh`. The reflink XFS is mounted from
+`ExecStartPre=+/usr/local/libexec/k7d-mount-disks` so it lives in the
+host mount namespace (`ProtectSystem=strict` would otherwise hide a
+daemon-side `mount`). `k7d doctor` reports `CapBnd` against
+`EXPECTED_CAPBND`.
+
+**Option dropped:** `PrivateTmp=yes`. `test_cni_pod_traffic_flows`
+failed with `open block backing file /tmp/k7d-shim-<id>/image-slots/slot-0.img:
+No such file or directory`. The shim still stages overlay slots under
+host `/tmp` (`crates/shim/src/task.rs` `std::env::temp_dir()`);
+`PrivateTmp` gave the daemon a different `/tmp`. Punching `/tmp` as
+`ReadWritePaths` would defeat the option. 42a's "do not stage in `/tmp`"
+rule covers the daemon's own RO-volume staging (`/var/lib/k7d`), not
+the shim's image slots. Do not re-add until the shim's state dir
+moves out of `/tmp`.
+
+**Option dropped:** `ProtectHome=yes`. `test_gym_*` failed with
+`failed to open kernel file: No such file or directory`. The gym
+defaults `--kernel` to `/root/k7d/guest/kernel/vmlinux` and sends
+that path on `tree_create_cluster`; ProtectHome makes `/root` look
+empty from the service. Binding `/root/k7d` into the unit would leak
+the checkout layout into packaging. Do not re-add until every
+client that talks to the systemd daemon uses `K7D_KERNEL` /
+`/usr/local/share/k7d`.
+
+**Nested mount:** `ReadWritePaths=/var/lib/k7d` is not enough under
+`ProtectSystem=strict`. The reflink XFS is a *nested* loop mount at
+`/var/lib/k7d/disks`; systemd leaves nested mounts RO.
+
+**`/tmp` is still product-writable:** `Vm::prepare_fork_source`
+dumps to `std::env::temp_dir()` (`/tmp/k7d-fork-src-*`). After
+dropping `PrivateTmp`, `ProtectSystem=strict` still made `/tmp`
+EROFS; `test_shim` fork tests failed with `prepare_fork_source:
+Read-only file system`. The unit lists `/tmp` in `ReadWritePaths`.
+Moving those dumps under `/var/lib/k7d` is a follow-up, not Inc 1.
+
+**Reference:** spec 43a-k7d-daemon-jail Inc 1; Linux
+`include/uapi/linux/capability.h`; systemd `ProtectSystem=strict`
+private mount ns.
+
+**Option dropped then restored:** `CAP_SETPCAP`, `CAP_SYS_RESOURCE`,
+and **`CAP_SETFCAP`**. virtiofsd 1.10's `drop_capabilities` required
+list is `CHOWN DAC_OVERRIDE FOWNER FSETID SETGID SETUID MKNOD SETFCAP`
+(`src/main.rs` `default_caps`). `SETFCAP` never appeared in the
+`kprobe:cap_capable` table — `capng::apply` failed with `can't apply
+the child capabilities` instead. With `SETFCAP` in the bounding set,
+chroot sandbox works under ProtectSystem-implied NNP (probed with
+`setpriv --no-new-privs --bounding-set=...`).
+
+**ProtectSystem=strict vs leaked hostPath binds:** `cleanup_k7_runtime_leaks`
+used to `systemctl try-restart k7d` *before* umounting leftovers. With
+`ProtectSystem=strict` systemd clones the host mount table into the
+service ns. This node had ~10k nested `/var/lib/k7d/pods/.../_hostpath-*`
+binds (hostPath tests leaking into each other); `systemd-executor` spun
+at 100% CPU as MainPID `(k7d)` and never exec'd, `CapBnd` stayed full,
+and `k7d.sock` never appeared. Umount those paths (and `/tmp/k7d-*`)
+*before* the restart.
+
+**Socket wait:** after the unit rewrite, `ensure_k7d_daemon_running`
+restarts k7d. Rehydrating leftover empty trees on the node took ~46 s
+before `k7d.sock` accepted; the old 10 s connect deadline made every
+kubectl volume test fail with a false "socket did not accept". The
+wait is 60 s. `test_deny_virtiofs_fallback_knob`'s `DenyFallbackGuard`
+had the same bug at 15 s: `apply()` wrote the drop-in, restarted,
+panicked on the wait *before* constructing `Self`, so `Drop` never
+ran and `k7d.service.d/deny-virtiofs.conf` leaked — every later hostPath
+test then failed with `K7D_DENY_VIRTIOFS_FALLBACK`. Guard is now
+constructed first; Drop does not panic.
+
+**Leftover k8s pods steal the gym subnet.** A first full
+`make remote-check` died in `k7d-mcp-test` (`ubuntu nodes never
+present after 600s`, `dial tcp 10.200.0.2:6443: no route to host`)
+with Ubuntu VMs actually booting on a *different* `k7-br-*`. Three
+`test-vol-*-401e68` pods from an earlier SETFCAP-era volume-test
+failure were still CrashLoop/StartError/Running after 5 h, and a
+DOWN `k7-br-20f-2a64c` still held `10.200.0.1/24`. `gym-test` runs
+*before* cargo's stranded-resource sweep. Force-delete those pods,
+`ip link delete` the DOWN bridge, then the MCP smoke is green in
+~115 s. Same class as #11 — check `kubectl get pods` and
+`ip -br link | grep k7-br` before debugging the unit.
+
+**Time lost:** ~2 h waiting on the unhardened suite; ~20 min on the
+versioned jailer comm filter; one hardened run to `test_cni`; ~15 min
+on the SETPCAP virtiofsd failure; ~10 min on the 10 s socket wait;
+~15 min on the leaked deny-virtiofs drop-in; ~20 min on the
+systemd-executor mount-ns spin; ~30 min on leftover volume-test
+pods stealing `10.200.0.2` from the MCP gym.
+
+---
+
+## 245. Moving `execve` out of the filtered daemon: the crash coupling fired on every `systemctl restart` (spec 43a-inc2)
+
+**Symptom:** `test_docker_warm_fork_nginx_survives` timed out after
+300 s on a pod that never became ready — in a suite that had been fully
+green on the same code an hour earlier. The cause was four hops away
+(trap 4 below): the increment's own "if the spawner dies the daemon
+exits within 5 s" watchdog was firing on ordinary restarts. The other
+traps here produce no stack trace either, and none of them is visible
+in the final diff: forking a helper spawner in `main()` and installing
+a filter on the daemon with no `execve` means a mistake yields a hang,
+a latency regression with no failing test, or — worst — a daemon that
+is quietly *less* filtered than the code claims while every test stays
+green.
+
+**Root causes, in the order they bite:**
+
+1. **The fork has to precede the first lock and the first thread.**
+   `fork(2)` gives the child whatever locks the other threads held at
+   that instant, and this child is not a `_exit`-only child: it parses
+   requests, so it allocates, and it writes diagnostics. `main()` ran
+   `env_logger::init()` — which takes a lock and installs a global — as
+   its second statement, so a spawner forked after it can deadlock in
+   its first `malloc` or its first log call, on a schedule nothing
+   reproduces. `spawner::start()` therefore goes between
+   `handle_info_flags()` and `env_logger::init()`, which also puts it
+   before `install_signal_handlers` (the child must keep the default
+   dispositions, not a `SIGTERM` handler that sets a flag none of its
+   own loops read) and before the warm pool. There is no second chance: a
+   spawner forked *after* `seccomp::install()` inherits the daemon's
+   filter and dies on its first `execve`, which is the same property
+   that makes shrinking the daemon's filter worth anything.
+2. **`dup2` does not carry `FD_CLOEXEC` over.** The spawner seats its
+   socket on fd 3 so it can `close_range(4, ~0)` the rest of what it
+   inherited — and `dup2`ing it there drops the flag
+   `socketpair(SOCK_CLOEXEC)` had set, so every helper would have
+   inherited the daemon's control channel. One
+   `fcntl(F_SETFD, FD_CLOEXEC)` after the `dup2`, plus
+   `MSG_CMSG_CLOEXEC` on every `recvmsg`, is what keeps 42a-B's "a
+   helper sees only its own stdio" assertion true now that the helper
+   is two hops out.
+3. **Asking the spawner to `wait` would have serialized the helpers,
+   not just the spawns.** One `SOCK_SEQPACKET` connection under a
+   `Mutex` is the honest design, and it is what lets the hardening test
+   assert the spawner holds exactly *one* socket — but a `Wait` request
+   that blocks in `waitpid` holds that lock for the helper's whole
+   runtime, so a `mkfs.xfs` would stall every concurrent `nft` and `ip`
+   behind it. The spawn reply carries a `pidfd` back over `SCM_RIGHTS`
+   instead: the caller `poll()`s it outside the lock and only asks for
+   the status once the helper is already a zombie. The connection is
+   held for the issuance and the reap, never the run.
+4. **The crash coupling fired on every ordinary restart, and this one
+   was not designed around — it took a full suite to find.** `systemd`
+   stops a unit by signalling its whole cgroup (`KillMode=control-group`
+   is the default), so `systemctl restart k7d` delivers `SIGTERM` to the
+   spawner as well as to the daemon. The spawner had the default
+   disposition and died instantly; the daemon's handler had only just
+   stored its shutdown flag; the watchdog saw a dead spawner and did
+   what it is for — `exit(1)` naming it. So a restart that was asked for
+   became a failure exit, and `Restart=on-failure` then restarted the
+   unit *again* on top of it. The symptom was nowhere near the cause:
+   `test_docker_warm_fork_nginx_survives` timed out after 300 s on a pod
+   that never went ready, because `ensure_k7d_daemon_running` had
+   restarted the daemon under it and the daemon bounced twice more. The
+   journal is where it is legible — `spawner (pid N) is gone (killed by
+   signal 15)` three times in four seconds.
+
+   Two changes: the spawner now **catches** `SIGTERM`/`SIGINT` with an
+   empty handler, so the cgroup-wide signal does not kill it and its
+   `recvmsg` retries on the `EINTR`; and the watchdog consults a flag
+   the daemon's own handler sets, so a spawner that dies during shutdown
+   is logged, not escalated. `SIG_IGN` would have been the obvious way
+   to do the first part and is wrong: `execve` resets *caught* signals
+   to their default but leaves *ignored* ones ignored, so `SIG_IGN` on
+   the spawner would have handed every helper — `virtiofsd`, the jailer,
+   Firecracker — a process that cannot be asked to terminate. The
+   spawner's lifetime is its socket: `serve` leaves on EOF, which
+   arrives however the daemon goes away, `SIGKILL` included.
+5. **A helper is a grandchild now, so the code that waited on it cannot.**
+   `netns::run_capture` waited on a `pidfd` because the shim's Tokio
+   `SIGCHLD` reaper stole its statuses (`ECHILD`, surfacing as
+   `"netns IO: No child processes"` and silently breaking every
+   `attach_to_pod_netns` call). In the daemon the same `waitpid` would
+   now fail for an unrelated reason: the process is not the daemon's
+   child at all. The wait moved into `spawner.rs`, which keeps both
+   paths — the spawner owns the `wait4` in the daemon, and the
+   in-process path that the shim and the test binaries take (neither
+   forks a spawner) keeps the race-free `waitid(P_PIDFD)`.
+
+**Fix:** `crates/k7d/src/spawner.rs` is the only module in the crate
+that may say `Command::new`, enforced by an `only_spawner_execs` source
+lint the way `fdutil`'s enforces `pipe_cloexec`; `seccomp::install` for
+the daemon versus `seccomp::install_for_spawner` for the union; and a
+watchdog thread that `poll()`s the spawner's pidfd and exits the daemon
+non-zero naming it, so `Restart=on-failure` brings the pair back
+together.
+
+**Measurement:** the daemon's own allowlist needed exactly two
+additions from the helper set, both with a named caller in the source:
+`chmod`/`fchmod`/`fchmodat` (`std::fs::set_permissions` in
+`fc/stage.rs`, `fc/snapshot.rs`, `volumes_blk.rs`, `control.rs`) and
+`chown`/`fchownat` (`fc::stage::chown`). `setns` did *not* have to
+move, despite the parent spec expecting it to — `netns.rs` shells out
+to `nsenter` precisely so that no k7d thread ever switches namespace.
+`chroot`, `pivot_root`, `unshare`, `capset`,
+`setuid`/`setgid`/`setres*`, `mknod`, `personality`, `*xattr` and
+`execve` itself are now absent from the daemon. The shipping default is
+`enforce`, whose mismatch action is `KillProcess`, so a green full
+suite is stronger evidence than the `K7D_SECCOMP=log` audit sweep the
+spec asked for: a syscall missing from either filter kills the daemon
+or the helper outright rather than logging a line. Both actions emit a
+`seccomp` audit record first, and `dmesg` after the full suite has
+none at all — no mismatch on either filter, in either process.
+
+**Reference:** `reference/firecracker` `src/jailer/src/env.rs` (the
+jailer's `getsid`/`setsid` and its own `close_range`, which is why a
+spawn request carries a `setsid` flag); CHALLENGES #214 (the jailer
+inherits the filter, and its stderr pipe hang); `docs/bug-candidates.md`
+#28 (a write end left open anywhere means the read end never sees EOF —
+here it has to be dropped both in the daemon and in the spawner).
+
+**Time lost:** ~1 h on the restart storm in trap 4, most of it spent
+believing a docker-service pod timeout was a docker-service problem —
+the tell was in `journalctl -u k7d`, not in the test output. Plus
+~30 min on the clippy pass that the new module's casts and by-value
+`OwnedFd` arguments failed, and two full enforce-mode suites of node
+time. Traps 1-3 and 5 were designed around rather than debugged, which
+is the reason to write them down: each is a silent failure whose cost
+would otherwise land on whoever touches this next.
+
+---
+
+## 246. Splitting k7d in two: the cgroup delegation and the uid drop each fail in a way that is not about the thing you changed (spec 43a-inc3)
+
+**Symptom:** the split pair would not start, twice, with errors that
+named the wrong subject each time.
+
+First: `write "+cpu +cpuset +memory +pids" to
+/sys/fs/cgroup/.../cgroup.subtree_control: Device or resource busy (os
+error 16)`, from the step that hands `<service>/vm` to uid `k7d`. `EBUSY`
+on a cgroupfs write reads as "something is using it", and the obvious
+next move — a retry, or a sleep, or blaming a leftover directory from the
+previous run — is wrong in all three cases.
+
+Then, past that: `PR_CAP_AMBIENT_CLEAR_ALL: Invalid argument (os error
+22)`, and after fixing *that* one `PR_SET_NO_NEW_PRIVS: Invalid argument
+(os error 22)`. Two `prctl` operations with nothing in common except that
+they were the two written with the wrong number of arguments. `EINVAL`
+from `PR_SET_NO_NEW_PRIVS` invites the conclusion that the kernel or the
+container runtime does not support it.
+
+**Root causes:**
+
+1. **cgroup v2's no-internal-process rule, applied to the writer's own
+   parent.** A domain controller cannot be enabled in a cgroup that has
+   member processes, and `<service>/` had two: both brokers. The
+   delegation was written as "create `vm/`, enable the controllers,
+   chown, move the child in", and no order of those four steps works
+   while the *node* broker is still sitting in the service cgroup. The
+   fix is a second subdirectory nobody asked for: the node broker creates
+   `<service>/node`, moves itself into it, and only then enables the
+   controllers in `<service>/cgroup.subtree_control` — which is what
+   systemd's own delegation guidance asks a delegatee to do, and which
+   the error message cannot suggest because from the kernel's side the
+   busy resource *is* the writer. `cpu`, `cpuset` and `pids` are threaded
+   controllers and are exempt, so a version that delegated only those
+   would have started cleanly and left `memory.max` silently
+   unavailable — the more expensive outcome.
+
+2. **`prctl(2)` is variadic, and two of its operations check the
+   arguments they do not read.** `PR_CAP_AMBIENT` and
+   `PR_SET_NO_NEW_PRIVS` both require `arg3`, `arg4` and `arg5` to be
+   zero. Calling glibc's wrapper with only the arguments an operation
+   *uses* leaves the rest as whatever the argument registers held, so
+   both return `EINVAL` on most hosts and neither error mentions arity.
+   `PR_SET_PDEATHSIG`, `PR_CAPBSET_DROP` and `PR_SET_DUMPABLE` do not
+   check, which is why the same mistake was invisible in three of the
+   five calls and fatal in two. Every call now goes through one helper
+   that passes five arguments.
+
+**Fix:** `broker::prepare_delegated_cgroups` runs before the `fork`, in
+the order above, and returns the subtree the child joins while it is
+still root (moving a pid between siblings needs write access on the
+common ancestor's `cgroup.procs`, and that ancestor stays root-owned).
+`broker::prctl` is the only `prctl` call site.
+
+**What made both cheap to find and expensive to have missed:** the
+increment asserts its own result out of `/proc/self/status` immediately
+after the drop, rather than trusting the return codes. That is what
+turned trap 2 from "a uid-k7d process that still has an ambient
+capability set and no `NoNewPrivs`, logging nothing" into a start-up
+failure with the operation named. `CHALLENGES` #244's measured table has
+the same shape of argument: the difference between jailed and
+root-with-a-different-name is invisible in every log line the daemon
+prints about itself.
+
+**Reference:** `Documentation/admin-guide/cgroup-v2.rst`
+("no internal process constraint", and the threaded-controller exemption
+that makes a partial delegation look like a working one); `prctl(2)`
+under `PR_SET_NO_NEW_PRIVS` and `PR_CAP_AMBIENT`; systemd's
+`Delegate=` documentation on a delegatee moving out of its own cgroup.
+
+**Time lost:** ~40 min, almost all of it on trap 1 — the `EBUSY` was
+read as state left over from an earlier manual run, so the first two
+attempts were at cleaning up rather than at the rule. Trap 2 cost two
+build-and-probe cycles because the second `EINVAL` looked like a
+different bug from the first.
+
+---
+
+## 247. A helper root spawns cannot be moved out of again: cgroup v2 migration needs the *common ancestor*, not the destination (spec 43a-inc3b)
+
+**Symptom:** none, which is the point of writing it down. The design
+(§4.3) says `TreeCgroup::add_process` "needs `CAP_SYS_ADMIN` because a
+process the node broker spawned starts in the *service* cgroup" and
+offers `clone3(CLONE_INTO_CGROUP)` or a `pre_exec` write as the fix. Both
+of those are answers to "the destination is not writable", and the
+destination *is* writable: `k7d/k7-jail/tree-<id>/helpers` is `k7d`-owned
+`0644` and the writer is uid `k7d`. Taking the design at its word and
+checking the destination's mode would have concluded there was nothing to
+fix, and the failure would have arrived later as an `EACCES` on a path
+`ls -l` says is writable.
+
+**Root cause:** cgroup v2 authorises a migration against three things,
+not one. The writer needs write permission on the destination's
+`cgroup.procs`, *and* — when it is not the target process's own uid —
+write permission on `cgroup.procs` of the **nearest common ancestor** of
+the source and destination cgroups. The helper had been `fork`ed by the
+node broker, so its source cgroup was the node broker's own
+`<service>/node`. The nearest common ancestor of `<service>/node` and
+`/sys/fs/cgroup/k7d/k7-jail/tree-<id>/helpers` is the **root cgroup**,
+which is root-owned by definition and which 43a-inc3 deliberately did not
+delegate: `/sys/fs/cgroup/k7d` staying root-only is an asserted property
+(`test_privsep.rs`, and the §10.4 fuzz precondition), not an oversight.
+
+So the placement was unfixable from the VM broker's side no matter what
+was chowned. It is decided entirely by *where the node broker drops the
+child*, which is a decision made one process and one `execve` earlier.
+
+The obvious repair — have the node broker put the helper straight into
+`k7d/k7-jail` — does not work either, for the reason #246 is about:
+`k7-jail` has controllers in its `cgroup.subtree_control`, and cgroup
+v2's no-internal-process rule forbids member processes in a cgroup whose
+children have controllers enabled. `EBUSY`, from the other direction.
+
+**Fix:** `prepare_delegated_cgroups` creates one more leaf,
+`k7d/k7-jail/spawned`, owned by `k7d` and with an empty
+`subtree_control`, and the node broker's `place_helper` writes the
+freshly spawned helper's pid into it before replying. The common ancestor
+of `spawned` and `tree-<id>/helpers` is then `k7-jail`, which uid `k7d`
+owns, and `TreeCgroup::add_process` goes back to being a plain write with
+no verb and no capability — which is what keeps it off the fork path's
+bill (`LATENCY_BUDGETS.md` is not widened by this increment).
+
+The placement happens in the parent after `spawn` rather than in a
+`pre_exec` closure. `clone3(CLONE_INTO_CGROUP)` would be race-free and is
+what the design preferred, but `std::process::Command` cannot express it,
+and the `pre_exec` fallback would have to write a pid into a path from a
+context where allocating is forbidden. virtiofsd does not fork before it
+execs, so the window the parent's write races is the same one
+`add_vm` has always had.
+
+**What this generalises to:** in a split daemon, "which cgroup a child is
+born in" is part of the privileged half's *interface*, not an
+implementation detail of it. Any helper the node broker will later be
+asked to let go of has to be born somewhere the unprivileged half shares
+an owned ancestor with.
+
+**Reference:** `Documentation/admin-guide/cgroup-v2.rst`, "Delegation
+Containment" — the common-ancestor rule is stated there and nowhere in
+the `cgroups(7)` man page's v2 section, which is where we looked first.
+
+**Time lost:** ~50 min of design, none of debugging — the ancestor rule
+was found while working out why the design's own `CAP_SYS_ADMIN` claim
+was true, since the destination's ownership did not explain it.
+
+---
+
+## 248. A Firecracker jail the VM broker can only name as `/proc/self/fd/<n>` (spec 43a-inc3c)
+
+**Symptom:** under `K7D_PRIVSEP=on` a Firecracker VM booted, forked, and
+answered `exec` — and then the shim timed out dialing the guest agent,
+with `No such file or directory` on a socket path the daemon had just
+logged as present.
+
+**Root cause:** the design (§4.4, §6) has the node broker stage the jail
+and pass the VM broker an `O_PATH` directory descriptor for `<vm_dir>`,
+which the VM broker reaches as `/proc/self/fd/<n>/root/run/…`. That is
+exactly right for every open the VM broker *itself* does: the chroot base
+is `0700 root`, uid `k7d` cannot walk to it by name, and the descriptor
+is both the only way in and immune to the name being swapped underneath.
+
+What it is not is a *path*. `/proc/self/fd/<n>` names a slot in one
+process's descriptor table. The VM broker publishes the guest agent's UDS
+to the shim as `AgentEndpoint::FcUds` and the **shim** connects, in
+another process, where fd `n` is something else or nothing at all. The
+socket the shim could not find was one it was looking for in its own fd
+table.
+
+The reason this survived the integration tests for a while is that
+`test_privsep.rs` drives the daemon's control socket directly and dials
+nothing itself, so every consumer of the published path was inside the
+process that owned the descriptor.
+
+**Fix:** the node broker answers `fc.spawn` with the real host path as
+well — `Reply::FcSpawned { vm_dir, pid, uid }` plus the pidfd and the
+`O_PATH` fd over `SCM_RIGHTS` — and `Jail::Brokered` keeps both.
+`Jail::vm_dir()` stays the magic link and is what every VM-broker open
+goes through; the new `Jail::published_vm_dir()` is the string, and only
+`agent_uds()` and `chroot_root()` use it. The shim is root, so it can
+walk a `0700` ancestor the VM broker cannot.
+
+**What this generalises to:** in a privilege-split daemon, "the fd" and
+"the name" stop being two spellings of one thing, and which of the two a
+value is has to be part of its type or at least its name. A descriptor
+that crosses one process boundary does not cross the second one.
+
+**Reference:** `proc(5)`, `/proc/[pid]/fd` — "the symbolic links ... can
+be dereferenced" is true of the owning process only. Kata's
+`agent-config` publishes an absolute host path for the same reason.
+
+**Time lost:** ~40 min, most of it re-reading the node broker's staging
+for a permission bug that was not there.
+
+---
+
+## 249. `RestrictSUIDSGID=yes` makes `openat2` return ENOSYS, so every hostPath the shim named was refused (spec 43a-inc3c)
+
+**Symptom:** with the split turned on in the shipped unit, `CreateVm`
+through the gym's MCP smoke failed with
+
+```
+block backing file /var/lib/k7d/disks/ubuntu-mcp-…img refused: did not
+resolve beneath /var/lib/k7d/disks with symlinks refused: Function not
+implemented (os error 38)
+```
+
+for a file that existed, was `k7d`-owned, and had no symlink anywhere in
+its path. `cargo test` on the same node passed the same validation, and
+`test_privsep.rs` — which boots a VM with a disk and a share under the
+split — was green.
+
+**Root cause:** ENOSYS out of a syscall that plainly exists means a
+filter, and the first suspect was ours. It was not: the node broker's
+seccomp allowlist has `SYS_openat2` explicitly (`NODE_BROKER_EXTRA`), and
+the filter's mismatch action is `KillProcess`, not an errno — a denial
+there is a dead process and an audit record, not an `Err`.
+
+The filter was **systemd's**. `RestrictSUIDSGID=yes` is implemented by
+refusing the mode bits `S_ISUID`/`S_ISGID` in the `chmod` and `open`
+families, and `openat2` takes its mode inside a `struct open_how` that
+seccomp cannot dereference. systemd's answer is to block `openat2`
+outright, and to do it with **ENOSYS** so that callers fall back to
+`openat` — glibc does exactly that, which is why nothing else on the node
+had ever noticed. `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS)` is the entirety of the node broker's path
+validator (`broker/paths.rs`), and it has no fallback by design.
+
+Two things hid it. The unit had shipped `K7D_PRIVSEP=off` until this
+increment, and with the split off `broker::client::register_vm` returns
+`Ok(())` before any path is validated — so the option and the validator
+had never been in the same process. And the tests run the daemon from a
+shell, not from the unit, so the only thing that ever exercised the
+combination was the packaged service the gym uses.
+
+The same option also refuses the setgid `chmod 02710` the node broker
+puts on a jail's `run/`, which is what makes Firecracker's `v.sock`
+inherit group `k7d`. That would have been the next failure.
+
+**Fix:** drop `RestrictSUIDSGID=yes` from `packaging/k7d.service.in`,
+with the reason in the unit, and a unit test
+(`the_shipped_unit_does_not_restrict_suid_sgid`) so a later hardening
+pass does not add it back. Falling back to `openat` when `openat2`
+reports ENOSYS was rejected: it would trade the one race-free resolver in
+the daemon for a TOCTOU, silently, on exactly the boundary the resolver
+exists to defend.
+
+**What this generalises to:** a sandbox option that is documented as
+"refuse X" can be implemented as "refuse the whole syscall, with an errno
+chosen to make libc retry a weaker one". Ours was the caller that had no
+weaker one. When a hardening flag and a hardening mechanism disagree,
+the flag is the one to measure — `systemd-run -p <option> …` around a
+20-line probe settled this in one command after an hour of reading our
+own seccomp code.
+
+**Reference:** systemd `src/shared/seccomp-util.c`,
+`seccomp_restrict_suid_sgid()`: "the `openat2()` system call takes the
+mode as part of a struct, hence we cannot filter it" — blocked with
+ENOSYS. systemd 255 on Ubuntu 24.04.
+
+**Time lost:** ~1 h 40 min, nearly all of it spent proving our own
+seccomp filter innocent.
+
+---
+
+## 250. Turning the split on moved two file owners, and each one surfaced one VM later (spec 43a-inc3c)
+
+**Symptom:** with `K7D_PRIVSEP=on` shipped, the Ubuntu MCP smoke failed
+twice in a row at a different place each time, both with an errno and no
+subject:
+
+```
+create_vm: build VM: failed to open kernel file: Permission denied
+tree_fork_batch: ... fork error: IO error: Permission denied
+```
+
+The second one arrived *after* the log said all six fork members had
+materialised, three Ubuntu nodes had joined k3s, and Cilium and Tetragon
+were installed — so the thing that failed was the last few lines of a
+two-minute success.
+
+**Root cause:** both are the same shape. Un-split, k7d did everything as
+root, so "which uid owns this file" never had to be answered. The split
+makes the VM broker uid `k7d`, and §5 is explicit that its own state
+never crosses as a path — which is also a promise that the state is
+*reachable*. Two places were not:
+
+1. **The guest kernel.** Ubuntu ships `/boot/vmlinuz-*` as `0600 root`,
+   and `guest/ubuntu/build-node-image.sh` copies it out with `cp`, which
+   keeps the mode. The kernel and the initrd are the two artifacts no
+   verb pins — the VM broker opens them by name, itself — so a 0600 copy
+   is unopenable by exactly the process that needs it, on a path the
+   caller can read fine. The image is content-keyed, so a cache hit never
+   rebuilt it either.
+
+2. **The reflink XFS mount root.** `/var/lib/k7d/disks` is `mkfs`'d by
+   `k7d-mount-disks.sh` and comes up `root:root 0755`. Provisioning
+   chowned the directories *under* it (`trees`, `data`, `sandboxes`,
+   `stage`) and stopped there, which looked complete. It is not: a fork's
+   reflink copy has to be on the same filesystem as the image it clones,
+   so `fork.rs` puts `.k7d-blk-fork-<pid>-<n>` *beside* that image, which
+   for every gym disk is the mount root itself. `disks.rs` writes its
+   reflink probe there too — that one had been warning at every startup
+   and was read as leftover state.
+
+**Fix:** `chmod 0644` the kernel and initrd in `gym/ubuntu.py`'s
+`build_or_cache_image`, which runs on the cache-hit path too — the cached
+set is what a provisioned node actually has. Deliberately *not* in
+`build-node-image.sh`: that script's own sha256 is an input to the image
+content key, so a one-line fix there rebuilds the 16 GiB image on every
+node and evicts the cached one, which is how this fix first announced
+itself (a 10-minute rebuild followed by an Ubuntu cluster that never
+formed). Chown `/var/lib/k7d/disks` itself to
+`k7d:k7d`, non-recursively, in both `k7d-mount-disks.sh` (which runs
+after every mount, including the one after a `mkfs`) and
+`k7d_own_state_dirs`. Mode stays 0755 rather than the 0750 the other
+state dirs get: a jailed Firecracker runs as a per-VM lease uid that is
+in no group of ours and has to traverse this to reach its chroot under
+`disks/fc`, which stays `root 0700`.
+
+`VmError::KernelFile` now carries the path and the effective uid, because
+"Permission denied" on a file the operator can `cat` is a question about
+*who asked*, and the answer was three processes away.
+
+**What this generalises to:** a privilege split is a change of file
+ownership as much as a change of code, and the ownership half has no
+compiler. The directories we remembered to hand over were the ones named
+in the design; the two we missed were an artifact produced by a build
+script and a mount point produced by a shell script, neither of which the
+design mentions. Anywhere the product writes *next to* something rather
+than *under* something is a place the handover list will not cover.
+
+**Reference:** none — both are ours.
+
+**Time lost:** ~35 min, one four-minute smoke run per discovery.
+
+---
+
+## 251. The one `net.*` call that only reads is still `CAP_SYS_ADMIN`, and it is the first one a CNI pod makes (spec 43a-inc3c)
+
+**Symptom:** under the split, a `runtimeClassName: k7` pod with CNI came
+up, got a pod IP, reported `Running` — and was unreachable from the host.
+`crictl pods` showed `ATTEMPT 5`: kubelet had been recreating the sandbox
+in a loop, each attempt getting a fresh netns, and the test's "pod is
+Running with an IP" gate kept passing on whichever attempt was current.
+The same test un-split finished in 17 seconds.
+
+**Root cause:** `control.rs`'s CNI attach reads the pod's address out of
+the CNI namespace before it does anything with it —
+`nsenter --net=<netns> ip -4 -o addr show dev eth0`. `setns` is
+`CAP_SYS_ADMIN` whether you enter a namespace to change it or only to
+look at it, and the VM broker has no capabilities at all, so the read
+failed and `create_vm` returned `CNI attach failed`. Everything *after*
+that point had already been converted: `net.pod_attach` and
+`net.pod_nat` are verbs, and they were fine. The one call that was
+missed is the one that does not modify anything, which is exactly the
+one an audit of "what writes to the host?" does not turn up.
+
+It also does not fit the shape §5 prefers. Every other netns operation
+names `(tree_id, vm_index)` and the node broker looks the handle up in
+what registration pinned. This one runs before the VM has a tree, a TAP
+or an index — learning the pod IP is what the rest is built on — so the
+handle has to arrive as a path.
+
+**Fix:** `Verb::NetPodIp { netns }` → `Reply::PodIp { addrs }`, with the
+path validated exactly as `net.pod_attach` already validates its own:
+`Class::Netns`, allowlisted roots, `RESOLVE_NO_SYMLINKS`, and an
+`fstatfs` that must report nsfs. `broker::client::pod_ip` is the call
+site's only change and is a plain in-process `nsenter` when un-split.
+
+Two startup calls in `main()` had the same shape and were made
+conditional at the same time: `netjail::clean_stale_jails` (the node
+broker already sweeps those in `sweep_orphans`, and the VM broker's
+attempt logged `nft: you must be root` twice per restart) and
+`prepare_fc_chroot_base` (the chroot base is root-owned `0700` and the
+node broker's, so the VM broker's probe warned that Firecracker VMs
+would fail to stage a disk, which was the opposite of true).
+
+**What this generalises to:** when splitting a daemon, the checklist
+"which calls modify privileged state?" misses reads through privileged
+*interfaces*. Namespaces, cgroup files under a root-only subtree, and
+`/proc/<pid>` of another uid all read with the same permission they
+write with. And a loud startup error that is merely *redundant* under
+the new arrangement is worse than noise: it trained us to skim past the
+`Operation not permitted` lines that turned out to be the real fault.
+
+**Reference:** `setns(2)` — "the calling process must have the
+`CAP_SYS_ADMIN` capability in the target namespace's user namespace";
+there is no read-only form.
+
+**Time lost:** ~50 min, most of it deciding whether the failure was ours
+at all (stale host `CILIUM_FORWARD` chains and a `FORWARD DROP` policy
+were a convincing red herring until the un-split control run passed).
+
+---
+
+## 252. A jail's hard link outlives the jail, so the second boot of a data disk is refused (spec 43a-inc3c)
+
+**Symptom:** a `runtimeClassName: k7-fc` pod with a named data disk came
+up once and then never again. The first `create_vm` was fine; every
+restart of the same pod failed with
+
+```
+vm.register_disk(vm-…-2): block backing file
+/var/lib/k7d/disks/data/fcdata-….img refused: opened read-write but
+owned by uid 60000 — a read-write backing file must be root's or k7d's
+```
+
+and kubelet backed off, so the test spent two minutes watching a pod
+that could not be recreated. `60000` is `K7D_FC_UID_BASE`.
+
+**Root cause:** `broker::paths::validate` insists a writable block
+backing file be owned by root or by the VM broker, which is the right
+question for a path arriving from an unprivileged caller and was true of
+every disk while k7d ran as one root process. It is not true after a
+Firecracker VM has touched the disk: `Chroot::link_read_write` hard-links
+the host file into the jail and `chown`s it to the lease uid so the jailed
+VMM can write it, and a hard link is the *same inode*. The chown is
+therefore visible on the host path, and it is permanent — the uid is
+released when the VM dies, but nothing walks back over the files that
+jail wrote. So the disk is owned by a uid that no longer leases anything,
+and the validator has no vocabulary for it.
+
+Scratch disks hid this: they are created per-VM and deleted on teardown,
+so they are always freshly `k7d`-owned. A *named* data disk is the one
+kind that is supposed to survive its VM, which makes it the only one that
+can come back wearing the old owner.
+
+**Fix:** teach the validator the third owner that is ours —
+`fc::stage::is_jail_uid`, a range check against
+`K7D_FC_UID_BASE .. +MAX_LIVE_UIDS`. Range membership rather than
+liveness is deliberate: the question is about a file, not a process, and
+the file legitimately keeps a dead lease's uid. Nothing else can hold a
+uid in that window (no account exists there and only `fc::stage`'s
+allocator hands them out), and a malformed `K7D_FC_UID_BASE` answers
+`false`, which refuses rather than widens.
+
+Chowning the drives back to `k7d` when a jail is killed was the other
+option and is not enough on its own: a k7d crash would leave the files
+jail-owned and the next boot refusing forever, so the validator has to
+know the range regardless.
+
+**What this generalises to:** an ownership check is a statement about who
+may have written a file, and hard links make that set larger than the
+list of processes you handed the path to. Any `chown` inside a jail is a
+`chown` outside it too.
+
+**Reference:** none — ours.
+
+**Time lost:** ~25 min, one `test_fc_pod` run.
+
+---
+
+## 253. A client that guesses the guest points the daemon at a path inside `$HOME` (spec 43a-inc3c)
+
+**Symptom:** all four `test_gym` cases failed to start, each with the
+same line from the daemon:
+
+```
+tree_create_cluster: member 0: build VM:
+failed to read kernel /root/k7d/guest/kernel/vmlinux as uid 999:
+Permission denied
+```
+
+The file is `0644 root` and `root` can `cat` it. Every other suite that
+boots the same kernel was green.
+
+**Root cause:** not the file — `/root` is `0700`, so uid `k7d` cannot
+traverse to it at all, and no mode on the kernel itself can help.
+`gym/server.py` defaulted `--kernel`/`--initrd` to `REPO/guest/...`, a
+Python re-implementation of `vm.rs`'s `default_guest_paths()`
+workspace-first preference. That default was harmless while the daemon
+was root and the repo was root's; under the split the daemon reads the
+kernel as uid `k7d`, and on a bare-metal node the workspace is `/root/k7d`.
+
+The suites that stayed green did so because they build VMs in-process as
+root, or because they use the Ubuntu images under
+`/var/lib/k7d/disks/base-images`. The gym is the only client that talks
+to the *system* daemon and names a guest.
+
+**Fix:** the gym names no guest unless told to. `--kernel`/`--initrd`
+default to nothing, `_create_source` omits both keys from the config
+when they are absent, and `config::resolve_vm_guest` falls back to the
+daemon's own `K7D_KERNEL`/`K7D_INITRD` — which the unit sets to
+`/usr/local/share/k7d`, a path the VM broker can reach. This is what the
+shim has always done and what CHALLENGES #72 asks for: the daemon is the
+only process that picks a guest. Both-or-neither is checked explicitly
+so a half-set pair fails at startup rather than at the first VM.
+
+**What this generalises to:** every re-implementation of a default in a
+second language is a place the first language can be fixed without the
+second noticing. And after a privilege split, "which paths can the
+daemon read?" is no longer answerable from a file's own mode — the
+question is whether the *whole ancestry* is traversable by the new uid,
+and `$HOME` almost never is.
+
+**Reference:** none — ours.
+
+**Time lost:** ~20 min, one suite run.
+
+---
+
+## 254. Giving the VM broker the disks mount root turned a dormant probe race into "not reflink-capable" (spec 43a-inc3c)
+
+**Symptom:** `test_hardening` failed at `ensure_k7d_daemon_running` with
+
+```
+cp: cannot stat '/var/lib/k7d/disks/.reflink-probe-src': No such file
+k7d-mount-disks: /var/lib/k7d/disks is not reflink-capable
+```
+
+on a node whose XFS had been reflinking all day, in a suite that had
+just finished forking a hundred VMs on that filesystem.
+
+**Root cause:** `packaging/k7d-mount-disks.sh` probes reflink support by
+writing `.reflink-probe-src`, `cp --reflink=always`-ing it and deleting
+both — under one fixed name. The script is the unit's `ExecStartPre`
+*and* what the suite calls directly, so a test that restarts the daemon
+runs two copies at once: the first copy's `rm -f` lands between the
+second's `echo` and its `cp`. The message accuses the filesystem, which
+is the one thing that was not wrong.
+
+The race is older than this increment but could not fire before it: the
+probe only ran to completion for root, and the daemon's own probe
+(`disks.rs`, which does use pid-unique names) had been failing on
+permissions since the split went on and was fixed one trap ago by
+chowning the mount root to `k7d` (CHALLENGES #250).
+
+**Fix:** `$$` in both probe names, here and in
+`your node provisioning`, matching what `disks.rs` already
+does.
+
+**What this generalises to:** a fixed filename in a script that is both a
+unit hook and a test helper is a lock without a locking primitive. Also:
+widening a permission can *activate* a latent race by letting a second
+participant finish.
+
+**Reference:** none — ours.
+
+**Time lost:** ~10 min.
+
+---
+
+## 255. A hardening check that reads `/proc/self` measures whichever half of the daemon answered (spec 43a-inc3c)
+
+**Symptom:** with `K7D_PRIVSEP=on` shipped,
+`test_systemd_daemon_capbnd_matches_measured_mask` failed on
+
+```
+hardening item not ok on the suite node:
+weak  capbnd  0000000000000000 want 00000000892c31ff
+```
+
+while the same test's earlier assertion — `capbnd_of(MainPID)` — passed
+with exactly the mask the doctor said was missing. Two readings of "the
+daemon's bounding set", 15 lines apart, disagreeing.
+
+**Root cause:** both were right about different processes.
+`doctor::hardening_checks` reads `/proc/self/status`, and the test asks
+for the report over the control socket, so `self` is whoever serves that
+socket: `MainPID` un-split, the **VM broker** with the split on. An empty
+bounding set there is 43a-inc3 working — the check was reporting its own
+success as a regression. The three neighbouring items survived because
+`NoNewPrivs` and `Seccomp` are inherited and `/usr` is read-only in the
+shared mount namespace, so only the one field that the split deliberately
+changes was wrong.
+
+The same shape hit `test_hardening`'s process-tree assertions, which
+required the spawner's `PPid` to be `MainPID`. It is now one further
+down: `MainPID` (node broker, root) → VM broker (uid `k7d`) → spawner.
+
+**Fix:** when the reporting process is not root, `check_capbnd` asserts
+*both* halves — ∅ for itself and `EXPECTED_CAPBND` for its `PPid`, which
+can only be the node broker that forked it. The test derives the
+socket-serving pid from the spawner's `PPid` and asserts the whole chain
+up to `MainPID`, including that the middle process is not root, so it
+still fails if the spawner ends up parented to something else.
+
+**What this generalises to:** after a privilege split, `/proc/self` is an
+ambiguous subject in any code that can run in either half, and an
+introspection check phrased as "am I hardened?" has to say *which* `I`.
+The tell is a check that fails precisely because the thing it checks for
+started working.
+
+**Reference:** none — ours.
+
+**Time lost:** ~20 min.
+
+---
+
+## 256. `MainPID`'s cgroup stopped being the service cgroup, so every per-VM cgroup looked missing (spec 43a-inc3c)
+
+**Symptom:** four `test_resources` cases failed with
+
+```
+expected exactly one new per-VM CPU cgroup, found: []
+```
+
+while the daemon's own journal, for the very pod the test had just
+created, said
+
+```
+applied host CPU cap 50000/100000us to vCPU thread(s) [1591286]
+  of vm-1591144-0
+  (cgroup /sys/fs/cgroup/system.slice/k7d.service/vm/vm-vm-1591144-0)
+```
+
+**Root cause:** two moves, and fixing only the obvious one still finds
+nothing. The tests resolve "where the daemon makes per-VM cgroups" by
+reading `/proc/<MainPID>/cgroup` and listing `vm-*` in it.
+
+1. With the split on, VM cgroups are made by the VM broker, which can
+   only write in the subtree systemd delegated to uid `k7d` — so they
+   are a level down, in `<service>/vm/`.
+2. Less obviously, `MainPID` is no longer *in* the service cgroup.
+   cgroup v2's no-internal-process rule refuses to enable a domain
+   controller in a cgroup that holds processes, and the service cgroup
+   held both brokers, so the node broker vacates into `<service>/node/`
+   before enabling the controllers (CHALLENGES #246).
+
+Appending `vm/` to `MainPID`'s cgroup therefore looks for
+`<service>/node/vm`, which does not exist, and the fallback quietly
+lists `<service>/node` — a directory with no VMs in it and no error to
+show for it.
+
+**Fix:** one resolver in `tests/common/mod.rs` that strips a trailing
+`node/` and then prefers `<service>/vm` when it exists, used by both
+`test_resources` and `test_shim` instead of their two private copies.
+Resolved by looking at the filesystem rather than by reading
+`K7D_PRIVSEP`, because the question a test is asking is where the
+*running* daemon puts them.
+
+**What this generalises to:** "the daemon's cgroup" was one place and is
+now three — the service cgroup, the node broker's, and the delegated
+subtree — and code that conflated them kept working by finding an empty
+directory rather than by failing. A resolver that falls back instead of
+erroring turns a moved directory into a wrong answer.
+
+**Reference:** none — ours.
+
+**Time lost:** ~30 min, two suite runs.
+
+---
+
+## 257. `reattach_sandbox` tore down every healthy Firecracker pod under the split, because the daemon dialled the path it publishes for the shim (spec 43a-inc3d)
+
+**Symptom:** the first run of the VM-broker-restart test never reached
+its `kill -9`. Its *pre*-kill `reattach_sandbox` — taken as the
+"before" reading — answered
+
+```
+sandbox privsep-fc: VM vm-3809855-0 was unresponsive and has been torn down
+```
+
+while the test itself, one line earlier and as root, had just executed
+`cat /proc/sys/kernel/random/boot_id` in that guest over the very same
+socket. The journal had the daemon's side:
+
+```
+reattach_sandbox(privsep-fc): VM vm-3809855-0
+  (FcUds { path: "/var/lib/k7d/fc/firecracker-v1.16.2/vm-3809855-0/root/run/v.sock" })
+  is unresponsive: IO error: Permission denied (os error 13); tearing it down
+```
+
+**Root cause:** `reattach_sandbox` proves liveness by pinging the agent
+"the same way any client does: over the endpoint the VM's backend
+published". For a Firecracker VM the published endpoint is deliberately
+the **real** path (CHALLENGES #248) because the shim, which is root,
+dials it from another process. The VM broker is uid `k7d`, and
+`/var/lib/k7d/fc` is root `0700`, so the only name *it* has for the
+socket is `/proc/self/fd/<n>/root/run/v.sock` through the `O_PATH`
+descriptor `fc.spawn` gave it — which is what `FcVm` uses for every
+other agent call. `connect(2)` on the real path is `EACCES`, and the
+code read its own lack of privilege as a dead guest and ran `stop_vm`.
+
+Nothing had caught it since 43a-inc3c turned the split on because no
+test reattached a Firecracker sandbox under it: the shim-restart
+suite is native, and the FC suite never asked. In production it would
+have been every `k7-fc` pod whose shim restarted, torn down by the
+daemon with a log line blaming the guest.
+
+**Fix:** `Guest::own_agent_endpoint()` — the endpoint *this process*
+can dial (native: the vsock CID, unchanged; Firecracker: the magic-link
+path) — read under the registry lock and pinged outside it, in place
+of the published one. The published endpoint is still what the reply
+carries, because the shim still has to dial it.
+
+**What this generalises to:** after #248 a Firecracker VM has *two*
+names for everything under its jail, and "how a client reaches the
+guest" is not a property of the VM but of who is asking. Any daemon
+code path that reuses the value it hands to clients — rather than the
+one it holds — is this bug waiting for a caller with fewer privileges.
+
+**Reference:** none — ours.
+
+**Time lost:** ~20 min; visible on the first run, once the test's own
+"before" reading was moved *after* the guest had booted (the same
+`reattach` also tears down a guest that is merely still booting, which
+looked identical until the journal's `os error 13` was read).
+
+---
+
+## 258. The spec's survival predicate `tree_id.is_none()` would have kept zero real pods (spec 43a-inc3d)
+
+**Symptom:** none at runtime — a design reading, caught before the
+code was written. Spec 43a-inc3d keeps an FC VM across a VM-broker
+crash iff `backend == Firecracker && tree_id.is_none() &&
+sandbox_id.is_some()`, and its first success criterion is that a
+networked `runtimeClassName: k7-fc` pod survives with `kubectl exec`
+working afterwards.
+
+**Root cause:** those two cannot both hold. Every networked pod the
+shim creates passes `NetConfig { cluster_id: <sandbox_id>, .. }` —
+"single-VM pods pass their sandbox ID here (bridge lives and dies with
+the pod)" — and `vm.register` records that `cluster_id` as the
+`tree_id` the node broker's `VmEntry` holds. So a real pod always has
+`tree_id == Some(sandbox_id)`, and the predicate as written would have
+released every one of them with the log line "a cluster member — trees
+are not survived". Only the un-networked FC VMs the tests create would
+have qualified, and the criterion would have failed on the first real
+pod.
+
+**Fix:** `broker::node::survives` admits `tree_id.is_none() || tree_id
+== sandbox_id`: a bridge named after the pod is the pod's own, not a
+cluster's. A `tree_id` that names anything else is still a tree member
+and is still released. The survivor's `TreeRecord` is kept minus any
+TAP that was not handed to a survivor's jail uid, which needed the
+node broker to remember which uid each `net.tap_detach` went to
+(`TreeRecord::detached_to`) — the VM table knows `tree_id`, not
+`vm_index`, and had no other way back from a TAP to its VM.
+
+**What this generalises to:** "belongs to a tree" and "has a bridge"
+are the same field in this codebase and different concepts in the
+spec. A predicate written against the concept has to be checked
+against what the shim actually puts in the field.
+
+**Reference:** none — ours.
+
+**Time lost:** ~1 h of reading `shim/src/sandbox.rs`, `control.rs`'s
+`NetConfig` and `node.rs`'s `vm.register` before writing a line.
+
+---
+
+## 259. `x509: certificate signed by unknown authority` from `kubectl` mid-test means another cluster answered at `10.200.0.2`
+
+**Symptom:** `test_time_warp_idle_and_deadline_survey` brought its
+3-node Ubuntu k3s cluster up, ran a pod, sampled the steady phase —
+and then every `kubectl get nodes` against `10.200.0.2:6443` failed
+with
+
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+until the crash-loop wait timed out. Nothing in the test or the guest
+had changed a certificate. Earlier in the same suite the MCP ubuntu
+smoke had failed differently — `dial tcp 10.200.0.2:6443: no route to
+host` — with a DOWN `k7-br-gym-*` holding `10.200.0.1/24` (#192).
+
+**Root cause:** every k7 bridge is the same `10.200.0.0/24` with the
+host as `10.200.0.1`, and every Ubuntu k3s server is `10.200.0.2`. Two
+bridges give the kernel two identical connected routes, and a lookup
+takes the *older* one (a `linkdown` route is not skipped unless
+`net.ipv4.conf.all.ignore_routes_with_linkdown=1`, which the nodes do
+not set). While the survey ran, a live k7rl gym (`gym/server.py`,
+started on the node by another session) forked eight clusters from
+`gym-src-k7rl-fork`; its first bridge was older than the test's, so the
+host's packets to `10.200.0.2` went to *that* cluster's k3s, whose CA
+the test's kubeconfig had never seen. The guests were fine; only the
+host-side path had been hijacked. The same mechanism produces the
+`no route to host` of #192 when the older bridge has no carrier.
+
+**Fix:** none in code — this is what a shared subnet plus host-side
+`kubectl` means on a shared node. Recognise the two signatures
+(`no route to host` = an older bridge with no carrier; `unknown
+authority` = an older bridge with a *live* k3s at `10.200.0.2`), check
+`ip route | grep 10.200` and `ps -ef | grep server.py` before blaming
+the change, and move the host-side Ubuntu suites to a node nobody
+else is forking on. The rest of the suite finished green on the idle
+node without a code change.
+
+**Reference:** none — Linux FIB semantics for duplicate connected
+routes; `ip route` on the node.
+
+**Time lost:** one 460 s survey run plus ~15 min reading the journal
+for the eight `bridge … created with gateway 10.200.0.1/24` lines.
+
+---
+
+## 260. The first Intel host: every forked child "triple-faulted at RIP=0x11c1", and that RIP was the reboot, not the fault
+
+**Symptom:** v0.6.0 Ubuntu k3s+Cilium warm fork on an Intel VT-x node
+(Sapphire Rapids), then on the new Arrow Lake dev node: every child vCPU
+ends in `KVM_EXIT_SHUTDOWN`
+
+```
+vCPU 1 shutdown (triple fault) after 52140 exits: RIP=0x1191 RSP=0x45e08
+```
+
+and the k7-agent reconnect times out. The busybox guest reproduces it
+in 30 s (`test_fork_warm_multi_vcpu`), which the AMD nodes had passed
+for the project's whole history. Low RIP, nonsense RSP, BSP and AP alike
+— it looked like restored register state that was wrong for Intel.
+
+**Root cause:** three layers, and the RIP in the log is the last one.
+
+1. *What the log shows* — the reboot path. With CS/CR0/CR3/EFER added to
+   the shutdown log and `kvm:kvm_exit` tracing on the host, the AP's
+   last exits are `outb 0xfe → 0x64` (keyboard-controller reset pulses,
+   which k7d ignores), CMOS `0x8f`, `CR4 &= ~PCIDE`, a jump to
+   `0x9a270` (`machine_real_restart_asm` in the low-memory trampoline),
+   `EFER = 0`, then `mov cr0, 0x60000011` — which KVM answers with `#GP`
+   because kernel 7.0's CET-aware `kvm_set_cr0` refuses `CR0.WP = 0`
+   while `CR4.CET` is set. The real-mode restart IDT is empty, so that
+   `#GP` is a triple fault. `0x11c1`/`0x1191` is `machine_real_restart_asm16`
+   inside the realmode blob at `0x99000`; it is where `panic=1 reboot=k`
+   *ends*, on any Intel host, for any panic.
+2. *Why the guest panicked* — decoded from the traced port `0x3f8` writes:
+   `Bad FPU state detected at restore_fpregs_from_fpstate+0x3a`,
+   `RAX=0x807`, opcode `48 0f c7 1f` = `XRSTORS`. Mask `0x807` is
+   x87|SSE|AVX|**CET_USER**. The fixup path re-executes the same
+   `XRSTORS`, `#GP`s again, and the recursion ends in
+   `Fatal exception in interrupt`.
+3. *Why `XRSTORS` faulted* — `IA32_XSS` was 0 in the child. This host's
+   KVM virtualizes CET: `KVM_GET_SUPPORTED_CPUID` advertises
+   `SHSTK`/`IBT` and XSS bit 11, so the 6.12 guest sets
+   `IA32_XSS = CET_USER` at boot and uses it on every context switch.
+   `snapshot::MSR_INDICES` — a fixed list written on AMD hosts, where no
+   supervisor XSAVE state was ever offered — never included `0xDA0`, nor
+   the CET MSRs `0x6A0..0x6A8`, nor the guest SSP (which is not an MSR
+   at all: `KVM_GET_ONE_REG(KVM_REG_GUEST_SSP)`).
+
+A fourth thing was hiding it: `KVM_SET_MSRS` reports a refused write as
+a *count* (`Ok(0)`), not `-1`, so the `if let Err(e) = set_msrs(...)`
+warning in `restore_cpu_state` never fired. MSR restore had been
+failing silently by construction.
+
+**Fix:** (a) the hand-picked list gains `IA32_XSS` and the seven CET
+MSRs, and is extended at runtime with every other MSR the host's
+`KVM_GET_MSR_INDEX_LIST` reports as to-be-saved — minus the legacy
+kvmclock pair `0x11/0x12`, which aliases the `_NEW` pair's storage
+(writing `MSR_KVM_SYSTEM_TIME = 0` after `MSR_KVM_SYSTEM_TIME_NEW`
+deactivates the pvclock page just re-registered), and the Hyper-V
+range k7d never advertises; (b) guest SSP captured/restored through
+`KVM_{GET,SET}_ONE_REG` id `0x2030_0003_0000_0000`, `None` where KVM
+has no CET; (c) a `KVM_SET_MSRS` count other than 1 is a
+`RestoreError`. `test_fork_warm_multi_vcpu` on the Intel node: 30 s
+agent timeout → 0.54 s pass.
+
+**What this generalises to:** a fixed MSR allowlist encodes the hosts it
+was written on. `KVM_GET_MSR_INDEX_LIST` exists precisely so userspace
+does not have to know which supervisor state *this* host hands the
+guest; Firecracker has serialized from it since day one. And when a
+guest dies at a low RIP with `CS.base = 0x99000`, read it as "the guest
+rebooted" and go find the panic on the serial line — the fault site is
+somewhere else entirely.
+
+**Reference:** Firecracker `src/vmm/src/arch/x86_64/msr.rs`
+(`msr_should_serialize` over `KVM_GET_MSR_INDEX_LIST`); Linux
+`arch/x86/realmode/rm/reboot.S` (`machine_real_restart_asm16`),
+`arch/x86/kernel/fpu/core.c` (`restore_fpregs_from_fpstate`), KVM API
+§4.69 (x86 `KVM_REG_GUEST_SSP`).
+
+**Time lost:** ~2 h including provisioning the first Intel node.
+
+---
+
+## 261. Auto-warp on the Intel node: the guest arms `lapic-deadline`, and the jump policy had two different meanings depending on which timer it jumped to
+
+**Symptom:** `test_auto_warp_jump_compresses_a_crash_loop_backoff` on
+the new Intel node, in three acts.
+
+1. `check_clockevent` fails: the guest's per-CPU clock event device is
+   `lapic-deadline`, not the `lapic` the AMD nodes had always reported.
+2. With that assertion widened, the policy never warps: every idle cycle
+   declines `uncalibrated` — `calibrate_apic_bus_cycle_fs` needs a
+   running one-shot count to time, and no vCPU has one.
+3. With calibration skipped, the run passes the safety checks but not
+   the headline: **314 s of guest backoff in 191.8 s of wall (1.64×)**
+   against the 150 s ceiling measured on AMD (132.3 s, 2.34×). 42% of
+   cycles decline `vcpu_awake` against 18% on AMD.
+
+**Root cause:** the host decides which timer the guest arms, and the
+policy had been written and measured on hosts that decide one way.
+Kernel 6.8 on the AMD nodes does not report `CPUID.1:ECX[24]` through
+`KVM_GET_SUPPORTED_CPUID`; kernel 7.0 on the Intel node does. Linux
+registers the TSC-deadline clockevent when the bit is there, and then
+`TMCCT` never counts, `IA32_TSC_DEADLINE` holds the expiry in guest-TSC
+units, and there is nothing to calibrate.
+
+The 1.64× is the interesting part. `Vm::warp_vcpus` step 3 rewrites the
+deadline MSR after the offset moves, KVM recomputes its timer against
+the advanced TSC, and the timer fires on the next entry — exactly the
+`earliest − ε` semantics `autowarp::EPSILON` is documented for. The
+guest wakes, does its work, and the next cycle finds a vCPU awake. One
+idle gap deleted per successful cycle, nothing invented.
+
+On AMD the LAPIC one-shot's KVM hrtimer is anchored in *host* time
+(`apic_get_tmcct` subtracts `ktime_get()` from `target_expiration`) and
+the warp does not touch it. A jump to `earliest − ε` does not make it
+fire: it fires when it always would have, the guest wakes to a clock
+past the expiry, and every idle cycle in between saw the same remaining
+count and jumped it again. That is suspend semantics — timers late,
+clock fast — and a share of the 2.34× is the guest believing more time
+passed than the timers it slept on. Bounded in practice because the
+one-shot count is 32 bits over the bus clock, so far-out wakeups go to
+the PIT broadcast and the predicate declines them.
+
+**What was tried and rejected:** shifting `IA32_TSC_DEADLINE` by the
+same ticks as the offset, so the Intel deadline keeps its host expiry
+and behaves like the AMD one-shot. It does — and without the one-shot's
+range limit or a broadcast device to decline on, every idle cycle
+re-jumps a still-armed deadline: fabricated guest time up to R²/cycle
+per host wait (an 87 ms deadline, 500 µs cycles: ~15 s invented per 87 ms
+slept). One run passed; the next stamped a nominal 160 s kubelet
+backoff as **245 s guest in 49 s wall = 5.00×**, over the 3.76×
+all-idle ceiling the test treats as an accounting bug — which it is.
+
+**Fix:** (a) `check_clockevent` admits `lapic` or `lapic-deadline` and
+returns both devices; (b) `Driver::decide_jump` calibrates the APIC bus
+cycle only when some vCPU has a one-shot count to convert
+(`Vm::has_armed_lapic_one_shot`), and `Vm::sample_timers` takes
+`Option<u64>` for it, reporting any count met uncalibrated as
+unmodelled instead of converting it by a guess; (c) step 3 stays
+exact, with the measured reason written next to it; (d) the wall
+ceiling is per timer: 150 s where the guest arms one-shots, 240 s where
+it arms deadlines (25% over the one 191.8 s measurement; a 1.3× floor
+on the ~5 min window). The compression claim is now two claims, each
+naming the semantics it was measured under.
+
+**What this generalises to:** "jump to the next timer" means different
+things under KVM depending on whether the timer is guest-TSC-anchored
+or host-anchored, and a policy measured under one will read as broken
+or as impossibly good under the other. The exact semantics are the ones
+the design describes; the AMD number is the one the spec headlines.
+Closing that gap — either re-arming the one-shot so AMD is exact too,
+or making the deadline host cheaper per idle gap — is policy work with
+its own measurements, not a fix.
+
+**Reference:** Linux `arch/x86/kvm/lapic.c` (`apic_get_tmcct`,
+`start_sw_tscdeadline`, `kvm_lapic_switch_to_hv_timer`),
+`arch/x86/kernel/apic/apic.c` (`lapic_next_deadline` vs
+`lapic_next_event`), spec 34a-inc3-auto-warp §measurements.
+
+**Time lost:** ~2.5 h, three 10-minute runs of the compression test
+among them.
+
+---
+
+## 262. k7d.service status=226/NAMESPACE on a join node: ReadWritePaths bind-mounts `/var/lib/kubelet/pods` before kubelet exists
+
+**Symptom:** `k7 install -i inventory.ini --ha --k7d-artifact …` with
+all backends on three fresh nodes. Node-01 (first master) starts
+`k7d.service`. Node-02 and node-03 fail at the k7d install.sh step:
+
+```
+Failed to set up mount namespacing: /var/lib/kubelet/pods: No such file or directory
+k7d.service: Failed with result 'exit-code'.
+Main process exited, code=exited, status=226/NAMESPACE
+k7d socket /run/k7d/k7d.sock did not appear
+```
+
+**Root cause:** `packaging/k7d.service.in` sets `ProtectSystem=strict`
+and `ReadWritePaths=… /var/lib/kubelet/pods /var/lib/rancher/k3s …`.
+systemd bind-mounts every listed path into the service mount namespace
+at start; a missing path is 226/NAMESPACE, not a later EROFS. k7's HA
+playbook runs the release `install.sh` on every node, including joiners
+that do not yet have kubelet or k3s. Node-01 already has those dirs
+because k3s came up first on the init server.
+
+**Fix:** `packaging/install.sh` `install -d` both paths before
+`systemctl enable --now k7d`. Empty dirs are enough; kubelet reuses
+them. Also create uid `k7d` before `k7d-mount-disks` so the XFS root
+is owned by the VM broker on first mount instead of staying root-owned
+until `k7d_own_state_dirs`.
+
+**Reference:** systemd `systemd.exec(5)` `ReadWritePaths=` — a missing
+path under `ProtectSystem=strict` fails unit start rather than being
+created. k7 `src/k7/deploy/k7-install-node.yaml` "K7d — run the release
+install.sh".
+
+**Time lost:** ~1.5 h (one three-node HA install + diagnosis).
+
+---
+
+## 263. k7d-fc create: `hard-link vmlinux: Invalid cross-device link` after a k7 install
+
+**Symptom:** `k7 install --backend k7d,k7d-fc` (or HA with all backends)
+starts `k7d.service`. Native `runtimeClassName: k7` pods become Ready.
+`runtimeClassName: k7-fc` pods stay `RunContainerError`:
+
+```
+firecracker staging /var/lib/k7d/fc/firecracker-v1.16.1/<id>/root/vmlinux:
+hard-link /usr/local/share/k7d/vmlinux: Invalid cross-device link (os error 18)
+```
+
+**Root cause:** `packaging/install.sh` left `/var/lib/k7d/fc` as a real
+directory on the OS ext4. `your node provisioning` already
+symlinks that path onto the reflink XFS (`/var/lib/k7d/disks/fc`) so a
+jail can hard-link writable disks. The release install did not.
+
+`crates/k7d/src/fc/stage.rs` `stage_read_only` copies the guest pair
+into an XFS cache when `stat.st_dev` differs, then hard-links from the
+cache. When `/var/lib/k7d/fc` is on the *same* ext4 superblock as
+`/usr/local/share/k7d`, that check says "same FS" and calls `link(2)`
+directly. systemd `ProtectSystem=strict` bind-mounts `/usr` into the
+service mount namespace, so `link(2)` still returns `EXDEV` (different
+`vfsmount`, same `st_dev`). The cache path is skipped; create fails.
+
+**Fix:** `packaging/install.sh` points `/var/lib/k7d/fc` at
+`/var/lib/k7d/disks/fc` on the loop XFS, matching the reset script.
+Kernel and chroot then have different `st_dev`, the ro-cache copies
+once, and jail hard-links stay on the XFS.
+
+**Reference:** `your node provisioning` `FC_LINK` /
+`FC_TARGET`; `crates/k7d/src/fc/stage.rs` `stage_read_only`.
+
+**Time lost:** ~1 h (integration suite + a diagnostic `k7-fc` pod).
 
 ---
 

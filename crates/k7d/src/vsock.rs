@@ -332,7 +332,8 @@ impl VirtioBackend for VhostVsockBackend {
             let i = idx as u32;
             let vq = self.validated(q, idx, self.mem_addr)?;
 
-            let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+            let kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+                .map_err(|e| format!("eventfd: {e}"))?;
 
             ioctl_ref(
                 fd,
@@ -441,7 +442,8 @@ impl VhostVsockBackend {
             let vq = self.validated(q, idx, self.mem_addr)?;
             let read_vq = self.validated(q, idx, mem_host_addr)?;
 
-            let kick = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+            let kick = crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK)
+                .map_err(|e| format!("eventfd: {e}"))?;
 
             ioctl_ref(
                 fd,

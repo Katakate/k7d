@@ -1737,7 +1737,7 @@ mod tests {
     }
 
     fn mmio_with(backend: StubBackend) -> Arc<Mutex<MmioDevice>> {
-        let irq = EventFd::new(0).expect("eventfd");
+        let irq = crate::fdutil::eventfd_cloexec(0).expect("eventfd");
         Arc::new(Mutex::new(MmioDevice::new(
             0,
             5,

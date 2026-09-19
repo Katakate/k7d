@@ -21,7 +21,7 @@ pub mod ubuntu_helm;
 pub mod ubuntu_k3s;
 pub mod warp;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -71,6 +71,7 @@ impl ReflinkTreeRoot {
         std::fs::create_dir_all(&path).expect("create reflink tree root");
         k7d::disks::assert_reflink_capable(&path)
             .expect("the tree root we just made on the XFS must be reflink-capable");
+        mark_test_tree_dir(&path);
         Self { path }
     }
 
@@ -104,6 +105,18 @@ pub fn fs_used_bytes(path: &Path) -> u64 {
     frsize * (buf.f_blocks - buf.f_bfree)
 }
 
+/// Bytes free (available to an unprivileged caller) on the filesystem
+/// holding `path`. Same `statvfs` as [`fs_used_bytes`].
+#[must_use]
+pub fn fs_free_bytes(path: &Path) -> u64 {
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path has no NUL");
+    // SAFETY: `c` outlives the call and `buf` is a valid, owned statvfs.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut buf) };
+    assert!(rc == 0, "statvfs({}) failed", path.display());
+    buf.f_frsize * buf.f_bavail
+}
+
 /// Idempotent, best-effort cleanup of host-side k7 runtime leaks left
 /// by a prior integration test: orphan `virtiofsd` / shim processes,
 /// stale `/tmp/k7d-shim-*` tmpfs/bind mounts, and the scratch socket
@@ -115,14 +128,6 @@ pub fn fs_used_bytes(path: &Path) -> u64 {
 /// there is no concurrent shim/sandbox to disturb. Every failure is
 /// ignored on purpose (see module docs).
 pub fn cleanup_k7_runtime_leaks() {
-    // The k7d daemon owns the VMs now. Restart it (if the
-    // unit exists) so leaked VMs from a crashed/panicked test are
-    // dropped cleanly — the daemon's shutdown path tears down vCPUs,
-    // virtiofsd children, TAPs, and cluster bridges in order.
-    let _ = Command::new("systemctl")
-        .args(["try-restart", "k7d"])
-        .status();
-
     // Orphan virtiofsd children: a multi-share pod spawns up to three
     // (`k7fs`, `k7fs1`, `k7fs2`) per sandbox and they are not always
     // reparented/reaped cleanly when a sandbox crashes mid-start.
@@ -132,21 +137,35 @@ pub fn cleanup_k7_runtime_leaks() {
         .args(["-9", "-f", "containerd-shim-k7-v1"])
         .status();
 
-    // Lazy-unmount leftover per-shim tmpfs/bind mounts (reverse-sorted
-    // so nested mounts detach before their parents), then drop the
-    // scratch socket dirs. `umount -l` so a still-busy mount detaches.
+    // Lazy-unmount leftover hostPath / shim binds BEFORE restarting
+    // k7d. ProtectSystem=strict clones the host mount table into the
+    // service ns; ~10k leaked nested `/var/lib/k7d/pods/...` binds
+    // make systemd-executor spin and never exec (CHALLENGES #244).
+    // Reverse-length order so nested mounts detach first. `umount -l`
+    // so a still-busy mount detaches.
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "findmnt -rn -o TARGET 2>/dev/null | grep -E '^(/tmp/k7d|/var/lib/k7d/pods/)' \
+             | awk '{print length, $0}' | sort -nr | while read -r _ t; do \
+                 umount -l \"$t\" 2>/dev/null; done; \
+             rm -rf /tmp/k7d-shim-* /tmp/k7d-virtiofs-* /tmp/k7d-fork-* \
+                    /tmp/k7d-vol-* /tmp/k7d-voltest-* /tmp/k7d-test-* 2>/dev/null",
+        )
+        .status();
+
+    let _ = Command::new("/usr/local/libexec/k7d-mount-disks").status();
+
+    // Restart after the mount table is sane so leaked VMs drop cleanly.
+    let _ = Command::new("systemctl")
+        .args(["try-restart", "k7d"])
+        .status();
+
     // `/tmp/k7d-fork-*` (fork/snapshot memory files, ~1.8 GB per
     // SIGKILLed daemon) is safe to sweep here: the daemon was just
     // restarted above, so no live VM maps them — leaving them behind
     // fills the 32 GB tmpfs after a few dozen aborted runs and every
     // later snapshot fails with ENOSPC (collateral).
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(
-            "mount | awk '/k7d-shim/ {print $3}' | sort -ru | xargs -r umount -l 2>/dev/null; \
-             rm -rf /tmp/k7d-shim-* /tmp/k7d-virtiofs-* /tmp/k7d-fork-* 2>/dev/null",
-        )
-        .status();
 
     // Give kubelet/containerd a beat to observe the teardown before
     // the next pod is created.
@@ -260,6 +279,49 @@ pub fn ensure_shim_installed() -> LeakGuard {
     LeakGuard
 }
 
+/// The directory per-VM cgroups are created in.
+///
+/// Un-split that is the service cgroup itself, since the daemon makes
+/// them beside its own process. With privilege separation on it is the delegated
+/// `vm/` subtree: the VM broker has no capabilities and can only write
+/// in a directory systemd handed to uid `k7d`, so `vm-<id>` moved one
+/// level down. Resolved by looking rather than by reading
+/// `K7D_PRIVSEP`, because what a test wants to know is where the
+/// *running* daemon puts them.
+pub fn vm_cgroup_root() -> PathBuf {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "MainPID", "--value", "k7d"])
+        .output()
+        .expect("systemctl show k7d");
+    let pid: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("k7d MainPID");
+    assert!(pid > 0, "k7d.service has no main PID — is it running?");
+    let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read k7d cgroup");
+    let rel = cg
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .expect("cgroup v2 entry")
+        .trim();
+    let main = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    // MainPID is the node broker, which vacates the service cgroup into
+    // `node/` so the controllers can be enabled for the delegated
+    // sibling (cgroup v2's no-internal-process rule). So the service
+    // cgroup is its parent, not its own directory.
+    let service = if main.file_name().and_then(|n| n.to_str()) == Some(k7d::broker::NODE_SUBDIR) {
+        main.parent().expect("node/ has a parent").to_path_buf()
+    } else {
+        main
+    };
+    let delegated = service.join(k7d::broker::DELEGATED_SUBDIR);
+    if delegated.is_dir() {
+        delegated
+    } else {
+        service
+    }
+}
+
 /// Install `/usr/local/bin/k7d`, register it as the
 /// `k7d.service` systemd unit, and make sure it is running with its
 /// control socket up. Idempotent — kubectl-driven integration tests
@@ -307,27 +369,24 @@ pub fn ensure_k7d_daemon_running() {
     }
 
     let guest_refreshed = install_workspace_guest();
+    install_k7d_mount_disks();
+    provision_vm_broker_identity();
+    // RequiresMountsFor=/var/lib/k7d/disks waits on a host mount unit.
+    // Mount in the host ns *before* systemd evaluates that, so the
+    // first restart on a node without fstab does not hang.
+    let mount_status = Command::new("/usr/local/libexec/k7d-mount-disks")
+        .status()
+        .expect("run k7d-mount-disks");
+    assert!(
+        mount_status.success(),
+        "k7d-mount-disks failed: {mount_status}"
+    );
 
     let unit = Path::new("/etc/systemd/system/k7d.service");
-    let unit_body = format!(
-        "[Unit]\n\
-Description=k7d microVM runtime daemon\n\
-After=network.target\n\n\
-[Service]\n\
-ExecStart=/usr/local/bin/k7d\n\
-Restart=on-failure\n\
-Environment=RUST_LOG=info\n\
-# The daemon is the only process that decides which guest a VM boots\n\
-# (CHALLENGES #72), so these two are what the suite is testing.\n\
-Environment=K7D_KERNEL={}\n\
-Environment=K7D_INITRD={}\n\
-# Soft default without this is 1024 — far too low for multi-cluster\n\
-# fork batches (EMFILE on /dev/vhost-vsock; CHALLENGES #49).\n\
-LimitNOFILE=524288\n\n\
-[Install]\n\
-WantedBy=multi-user.target\n",
-        share_guest_paths().0.display(),
-        share_guest_paths().1.display(),
+    let unit_body = k7d_service_unit_body(
+        Path::new("/usr/local/bin/k7d"),
+        &share_guest_paths().0,
+        &share_guest_paths().1,
     );
     let need_unit = match std::fs::read_to_string(unit) {
         Ok(existing) => existing != unit_body,
@@ -388,11 +447,14 @@ WantedBy=multi-user.target\n",
     // real connect (not just file existence) so a stale socket file
     // from a daemon mid-restart doesn't fool us.
     let socket = "/run/k7d/k7d.sock";
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 60s: a unit rewrite (`need_unit`) restarts k7d, and rehydrating
+    // leftover trees on a dirty node exceeded the old 10s window
+    // (CHALLENGES #244 — test_volumes after SETPCAP).
+    let deadline = Instant::now() + Duration::from_secs(60);
     while std::os::unix::net::UnixStream::connect(socket).is_err() {
         assert!(
             Instant::now() < deadline,
-            "k7d control socket {socket} did not accept within 10s \
+            "k7d control socket {socket} did not accept within 60s \
              (check `journalctl -u k7d`)"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -450,6 +512,74 @@ pub fn firecracker_pin(key: &str) -> String {
 fn share_guest_paths() -> (PathBuf, PathBuf) {
     let share = PathBuf::from("/usr/local/share/k7d");
     (share.join("vmlinux"), share.join("initramfs.cpio.gz"))
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+/// Render `packaging/k7d.service.in` — the same body `install.sh` and
+/// `setup-node-after-reset.sh` consume. One template so the three
+/// cannot drift.
+pub fn k7d_service_unit_body(bin: &Path, kernel: &Path, initrd: &Path) -> String {
+    let template = include_str!("../../../../packaging/k7d.service.in");
+    template
+        .replace("@K7D_BIN@", &bin.display().to_string())
+        .replace("@KERNEL@", &kernel.display().to_string())
+        .replace("@INITRD@", &initrd.display().to_string())
+}
+
+/// Install the `ExecStartPre=+` mount helper the unit names.
+fn install_k7d_mount_disks() {
+    let src = workspace_root().join("packaging/k7d-mount-disks.sh");
+    assert!(src.is_file(), "missing {}", src.display());
+    let dest = Path::new("/usr/local/libexec/k7d-mount-disks");
+    std::fs::create_dir_all("/usr/local/libexec").expect("create /usr/local/libexec");
+    let tmp = dest.with_extension("new");
+    std::fs::copy(&src, &tmp).expect("copy k7d-mount-disks");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::rename(&tmp, dest).expect("install k7d-mount-disks");
+}
+
+/// Create the `k7d` account, install `60-k7d.rules` and hand the state
+/// directories over — the packaging half of privilege separation, run by the suite
+/// so a node the tests provisioned matches one `install.sh` provisioned.
+///
+/// Self-sufficient on purpose (the `ensure_shim_installed` rule): the
+/// `privsep:` doctor section asserts the account and the device group,
+/// and a test that skipped when they were missing would assert nothing on
+/// exactly the node that regressed. The script is idempotent, so this
+/// runs on every invocation rather than guessing at freshness.
+fn provision_vm_broker_identity() {
+    let root = workspace_root();
+    let script = root.join("packaging/k7d-account.sh");
+    let rules = root.join("packaging/60-k7d.rules");
+    assert!(script.is_file(), "missing {}", script.display());
+    assert!(rules.is_file(), "missing {}", rules.display());
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -euo pipefail; source {}; k7d_provision_vm_broker_identity {}",
+            script.display(),
+            rules.display()
+        ))
+        .output()
+        .expect("run k7d-account.sh");
+    assert!(
+        out.status.success(),
+        "provisioning the k7d account failed: {}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The guest kernel `k7d.service` tells the daemon to boot — the only
@@ -876,6 +1006,18 @@ pub const TEST_RUN_LABEL: &str = "k7-test-run";
 /// stranded (crashed prior run) rather than a live concurrent suite.
 pub const STALE_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// Empty file written into every test-created tree directory. The
+/// stranded-tree sweep reaps **only** dirs that carry this marker —
+/// never by id prefix. An operator's suspended tree looks identical
+/// to an old test tree without it.
+pub const TEST_TREE_MARKER: &str = ".k7d-test-tree";
+
+/// Default free-space floor on [`k7d::disks::DISKS_DIR`] after the
+/// sweep (24 GiB). The kafka fork-under-load arm needs ~that much to
+/// keyframe a ~2.9 GB parent and sibling. Override with
+/// `K7D_MIN_FREE_DISK` (integer bytes).
+pub const DEFAULT_MIN_FREE_DISK: u64 = 24 * 1024 * 1024 * 1024;
+
 /// Per-process test-run id: 6 hex chars from pid XOR boot-time nanos.
 ///
 /// Stable for the life of this test binary so every resource this
@@ -1074,7 +1216,89 @@ fn maybe_hygiene_once() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         let _ = sweep_stranded_resources();
+        assert_disks_have_headroom();
     });
+}
+
+/// Sweep stranded leftovers, then fail loud if [`k7d::disks::DISKS_DIR`]
+/// is under [`DEFAULT_MIN_FREE_DISK`]. Every test binary that goes
+/// through [`ensure_k7d_daemon_running`] / [`cleanup_k7_runtime_leaks`]
+/// hits this once.
+pub fn hygiene_once() {
+    maybe_hygiene_once();
+}
+
+/// Fail the test binary if free space on [`k7d::disks::DISKS_DIR`] is
+/// below `K7D_MIN_FREE_DISK` (default [`DEFAULT_MIN_FREE_DISK`]). Hard
+/// failure — not a warning, not a skip.
+pub fn assert_disks_have_headroom() {
+    let need = min_free_disk_bytes();
+    let dir = Path::new(k7d::disks::DISKS_DIR);
+    let free = fs_free_bytes(dir);
+    if free < need {
+        let free_gib = free / (1024 * 1024 * 1024);
+        let need_gib = need / (1024 * 1024 * 1024);
+        panic!(
+            "DISKS_DIR {}: {free_gib} GiB free, need {need_gib} GiB.\n\
+             Run `make remote-node-reclaim`.",
+            dir.display()
+        );
+    }
+}
+
+fn min_free_disk_bytes() -> u64 {
+    match std::env::var("K7D_MIN_FREE_DISK") {
+        Ok(s) => s
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("K7D_MIN_FREE_DISK={s} is not an integer byte count")),
+        Err(_) => DEFAULT_MIN_FREE_DISK,
+    }
+}
+
+/// Stamp [`TEST_TREE_MARKER`] into the on-disk tree dir.
+///
+/// Tries [`k7d::control::tree_root_dir`] (symlink `/var/lib/k7d/trees`
+/// or `K7D_TREE_ROOT`) and [`k7d::disks::DISKS_DIR`]/[`k7d::disks::TREES_SUBDIR`].
+/// Panics if neither directory exists — a successful `tree_create*`
+/// always leaves one.
+pub fn mark_test_tree(tree_id: &str) {
+    assert!(!tree_id.is_empty(), "mark_test_tree: empty tree_id");
+    let via_root = k7d::control::tree_root_dir().join(tree_id);
+    let via_disks = Path::new(k7d::disks::DISKS_DIR)
+        .join(k7d::disks::TREES_SUBDIR)
+        .join(tree_id);
+    let mut marked = false;
+    for dir in [&via_root, &via_disks] {
+        if dir.is_dir() {
+            mark_test_tree_dir(dir);
+            marked = true;
+        }
+    }
+    assert!(
+        marked,
+        "mark_test_tree: no directory for {tree_id} at {} or {}",
+        via_root.display(),
+        via_disks.display()
+    );
+}
+
+/// Stamp [`TEST_TREE_MARKER`] into an already-created tree directory.
+pub fn mark_test_tree_dir(dir: &Path) {
+    assert!(
+        dir.is_dir(),
+        "mark_test_tree_dir: {} is not a directory",
+        dir.display()
+    );
+    std::fs::write(dir.join(TEST_TREE_MARKER), b"").unwrap_or_else(|e| {
+        panic!("write {}/{}: {e}", dir.display(), TEST_TREE_MARKER);
+    });
+}
+
+/// Mark the tree if `resp` is a successful `tree_create*` / adopt.
+pub fn mark_if_tree_created(resp: &k7d::control::Response) {
+    if let k7d::control::Response::TreeCreated { tree_id, .. } = resp {
+        mark_test_tree(tree_id);
+    }
 }
 
 /// Loud stranded-resource sweep. Cleans and prints one line per
@@ -1083,13 +1307,15 @@ fn maybe_hygiene_once() {
 /// Reaps: `k7*` bridges with no live owning VM (delegates `k7-br-*`
 /// to [`k7d::network::cleanup_stale_k7_bridges`]), TAP devices
 /// matching our naming with no attached fd, disk images under
-/// `/var/lib/k7d/disks` not referenced by any live VM, and `test-*`
-/// / `k7-test-run` cluster resources older than [`STALE_AGE`].
+/// `/var/lib/k7d/disks` not referenced by any live VM, marked
+/// on-disk trees older than [`STALE_AGE`] with zero live VMs, and
+/// `test-*` / `k7-test-run` cluster resources older than [`STALE_AGE`].
 pub fn sweep_stranded_resources() -> Vec<String> {
     let mut report = Vec::new();
     sweep_bridges(&mut report);
     sweep_taps(&mut report);
     sweep_disks(&mut report);
+    sweep_trees(&mut report);
     report.extend(cleanup_stale_labeled_resources());
     report
 }
@@ -1309,6 +1535,88 @@ fn sweep_data_disks(live: &HashSet<PathBuf>, report: &mut Vec<String>) {
         }
         match std::fs::remove_file(&path) {
             Ok(()) => reap(report, "data-disk", &path.display().to_string()),
+            Err(e) => eprintln!("sweep: failed to remove {}: {e}", path.display()),
+        }
+    }
+}
+
+fn tree_live_vm_counts() -> HashMap<String, usize> {
+    let mut client = match k7d::control::Client::connect_env() {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    match client.call(&k7d::control::Request::TreeList) {
+        Ok(k7d::control::Response::TreeList { trees }) => trees
+            .into_iter()
+            .map(|t| (t.tree_id, t.usage.live_vm_count))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// Reap on-disk trees under [`k7d::disks::TREES_SUBDIR`] that a test
+/// created and a crashed run left behind.
+///
+/// Same argument as [`sweep_data_disks`]: a tree's contract is to
+/// outlive its VMs (`tree_drop` keeps the dir so `tree_open` can
+/// re-adopt it), so "no live VM" is the state a correctly retained
+/// tree is in. The gates are therefore **marker + age + zero live
+/// VMs**. Unmarked dirs are never touched — an operator's suspended
+/// tree is indistinguishable from an old test tree by id.
+fn sweep_trees(report: &mut Vec<String>) {
+    let dir = Path::new(k7d::disks::DISKS_DIR).join(k7d::disks::TREES_SUBDIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let live = tree_live_vm_counts();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let marker = path.join(TEST_TREE_MARKER);
+        if !marker.is_file() {
+            continue;
+        }
+        let age = marker
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok());
+        match age {
+            Some(age) if age >= STALE_AGE => {}
+            Some(_) => continue,
+            None => {
+                eprintln!("sweep: cannot age {} — leaving it alone", marker.display());
+                continue;
+            }
+        }
+        let Some(tree_id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if live.get(tree_id).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        // Drop from the registry first so a later rehydrate cannot
+        // resurrect a dir we are about to delete. "no such tree" is
+        // the unknown-to-the-daemon case and still proceeds.
+        if let Ok(mut client) = k7d::control::Client::connect_env() {
+            match client.call(&k7d::control::Request::TreeDrop {
+                tree_id: tree_id.to_string(),
+            }) {
+                Ok(k7d::control::Response::Ok) | Ok(k7d::control::Response::Error { .. }) => {}
+                Ok(other) => {
+                    eprintln!("sweep: tree_drop({tree_id}) unexpected {other:?} — leaving the dir");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("sweep: tree_drop({tree_id}): {e} — leaving the dir");
+                    continue;
+                }
+            }
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => reap(report, "tree", tree_id),
             Err(e) => eprintln!("sweep: failed to remove {}: {e}", path.display()),
         }
     }

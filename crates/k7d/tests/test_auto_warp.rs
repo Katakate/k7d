@@ -66,7 +66,27 @@ const CAP_MIN: i64 = 240;
 /// The spec's headline: ~300 s of guest backoff for under 150 s of wall
 /// time. Half the guest time is a 2× floor on the compression, which is
 /// well inside the survey's 3.59× ceiling for the backoff-wait phase.
-const BACKOFF_WALL_CEILING: Duration = Duration::from_secs(150);
+///
+/// Measured (132.3 s, 2.34×) on guests whose timers are the LAPIC
+/// one-shot — the AMD nodes. There KVM's hrtimer is host-anchored, so a
+/// jump to `earliest − ε` does not make that timer fire: it fires when
+/// it was always going to, the guest wakes to find its clock past the
+/// expiry, and every idle cycle in between has jumped the same target
+/// again. That is suspend semantics, and part of the 2.34× is the guest
+/// believing more time passed than the timers it slept on.
+const BACKOFF_WALL_CEILING_ONE_SHOT: Duration = Duration::from_secs(150);
+
+/// The same claim on guests whose timers are TSC deadlines — the Intel
+/// node, where the host advertises `CPUID.1:ECX[24]` and Linux
+/// registers `lapic-deadline`. `Vm::warp_vcpus` rewrites the deadline
+/// after the offset moves, KVM fires it on the next entry, and the jump
+/// deletes exactly one idle gap: the guest wakes, does its work, and
+/// the next cycle finds a vCPU awake. Exact, bounded, and slower —
+/// measured once at 191.8 s for a 314 s window (1.64×, 42% of cycles
+/// declined `vcpu_awake` against 18% on AMD). 25% over that; a 1.3×
+/// floor. Mirroring the one-shot's host-anchored expiry by shifting the
+/// deadline with the offset was tried and rejected (CHALLENGES #261).
+const BACKOFF_WALL_CEILING_DEADLINE: Duration = Duration::from_secs(240);
 
 /// Wall time the whole walk to a capped backoff may take. The guest has
 /// to live through the entire doubling schedule
@@ -180,7 +200,7 @@ fn report(tag: &str, stats: &AutoWarpStats, pumped: &Pumped, wall: Duration) {
          mean cycle {:.0}µs = pause {:.0} + decide {:.0} + warp {:.0} + resume {:.0}µs, \
          pause = freeze {:.0} + stop-vcpus {:.0} ({:.1} signals/cycle) \
          + quiesce {:.0}µs, \
-         APIC bus cycle {}fs; declines: {declines}",
+         APIC bus cycle {}; declines: {declines}",
         stats.cycles,
         stats.warps,
         pumped.added.as_secs_f64(),
@@ -201,9 +221,10 @@ fn report(tag: &str, stats: &AutoWarpStats, pumped: &Pumped, wall: Duration) {
             stats.stop_signal_rounds as f64 / stats.cycles as f64
         },
         per_cycle_us(stats.quiesce_ns),
-        stats
-            .apic_bus_cycle_fs
-            .map_or_else(|| "unmeasured".to_string(), |fs| fs.to_string()),
+        stats.apic_bus_cycle_fs.map_or_else(
+            || "unmeasured (no one-shot count to convert)".to_string(),
+            |fs| format!("{fs}fs")
+        ),
     );
     assert_eq!(
         stats.resume_failures, 0,
@@ -390,26 +411,42 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
     let whose = ["server", "agent-1", "agent-2"];
 
     // The preconditions the whole increment rests on, asserted before
-    // any clock moves: the guest reads the clock k7d owns, arms the
-    // LAPIC one-shot (not the deadline MSR the survey found always zero), and
-    // runs no NTP client to fight a 20 Hz policy loop.
-    {
+    // any clock moves: the guest reads the clock k7d owns, arms either
+    // the LAPIC one-shot or the TSC deadline (which one is the host's
+    // choice, and decides the wall ceiling below), and runs no NTP
+    // client to fight a 20 Hz policy loop.
+    let tsc_deadline = {
         let mut agents = [
             connect_or_dump(&mut cluster.server, whose[0]),
             connect_or_dump(&mut cluster.agent1, whose[1]),
             connect_or_dump(&mut cluster.agent2, whose[2]),
         ];
+        let mut per_cpu = Vec::new();
         for (i, agent) in agents.iter_mut().enumerate() {
             check_clocksource(agent, whose[i]);
-            let broadcast = check_clockevent(agent, whose[i]);
+            let clockevents = check_clockevent(agent, whose[i]);
             check_no_ntp_client(agent, whose[i]);
             eprintln!(
-                "MEASUREMENT {} tick_broadcast device: {broadcast} \
+                "MEASUREMENT {} tick_broadcast device: {} \
                  (the timer the predicate declines on when KVM will not export its expiry)",
-                whose[i]
+                whose[i], clockevents.broadcast
             );
+            per_cpu.push(clockevents.per_cpu);
         }
-    }
+        per_cpu.dedup();
+        assert_eq!(
+            per_cpu.len(),
+            1,
+            "the members of one cluster on one host arm different timers ({per_cpu:?}) — the \
+             compression claim below is per timer, so it does not know which one to make"
+        );
+        per_cpu[0] == "lapic-deadline"
+    };
+    let backoff_wall_ceiling = if tsc_deadline {
+        BACKOFF_WALL_CEILING_DEADLINE
+    } else {
+        BACKOFF_WALL_CEILING_ONE_SHOT
+    };
 
     settle_cluster(&kubeconfig, "auto-warp");
     start_crashloop(&kubeconfig);
@@ -473,14 +510,20 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
     let ceiling = 1.0 / (1.0 - ALL_IDLE_WAITING);
     eprintln!(
         "MEASUREMENT jump-mode compression: {}s of guest backoff in {:?} of wall \
-         time = {:.2}× (idleness ceiling {ceiling:.2}×, measured bound 3.59×)",
+         time = {:.2}× (idleness ceiling {ceiling:.2}×, measured bound 3.59×; timers are \
+         {}, wall ceiling {backoff_wall_ceiling:?})",
         capped.guest,
         capped.wall,
-        capped.ratio()
+        capped.ratio(),
+        if tsc_deadline {
+            "TSC deadlines"
+        } else {
+            "LAPIC one-shots"
+        }
     );
     assert!(
-        capped.wall < BACKOFF_WALL_CEILING,
-        "a {}s guest backoff cost {:?} of wall time, over the {BACKOFF_WALL_CEILING:?} \
+        capped.wall < backoff_wall_ceiling,
+        "a {}s guest backoff cost {:?} of wall time, over the {backoff_wall_ceiling:?} \
          bound. Counters: {:?}",
         capped.guest,
         capped.wall,

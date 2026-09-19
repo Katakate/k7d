@@ -139,7 +139,7 @@ pub const ETC_FILE_WHITELIST: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/et
 ///
 /// And anything under the containerd / k3s sandbox directories is
 /// `etc/resolv.conf`, `etc/hostname`, or `/dev/shm` (all either
-/// handled by 2b.1 or intentionally dropped).
+/// handled by the CRI rewrite pass or intentionally dropped).
 ///
 /// Filtering by exclusion via this list is the same heuristic
 /// kata-containers uses to distinguish user hostPaths from CRI
@@ -733,15 +733,22 @@ impl PodVolumes {
             } else {
                 (&self.host_volumes_rw, &self.share_fd_rw)
             };
-            // Source kind follows symlinks, matching `mount --bind`.
-            let src_is_file = src.is_file();
+            // Pin the source to one inode before deciding anything
+            // about it: the kind check and the mount below both go
+            // through this fd, so a symlink swapped in under the path
+            // between them cannot turn a file bind into a directory
+            // bind or point it somewhere else (bug-candidates #23).
+            // The open follows symlinks — once, atomically — which is
+            // what `mount --bind` does with a symlink source.
+            let src_fd = open_source_pinned(&src)?;
+            let src_is_file = fd_is_regular_file(&src_fd)?;
             let kind = if src_is_file {
                 PlaceholderKind::File
             } else {
                 PlaceholderKind::Dir
             };
             let dest_fd = create_placeholder(root_fd, &dest_name, kind)?;
-            if let Err(e) = bind_mount_into_fd(&src, &dest_fd) {
+            if let Err(e) = bind_mount_fd_into_fd(&src, &src_fd, &dest_fd) {
                 let _ = unlinkat_name(root_fd, &dest_name, !src_is_file);
                 return Err(e);
             }
@@ -1248,8 +1255,46 @@ fn unlinkat_name(root_fd: &OwnedFd, name: &str, is_dir: bool) -> Result<(), Volu
 /// guest that swaps the dentry for a symlink after we opened the fd
 /// cannot redirect the mount.
 fn bind_mount_into_fd(src: &Path, dest_fd: &OwnedFd) -> Result<(), VolumeError> {
-    let dest = format!("/proc/self/fd/{}", dest_fd.as_raw_fd());
     let src_c = cstr_path(src)?;
+    bind_mount_c(src, &src_c, dest_fd)
+}
+
+/// [`bind_mount_into_fd`] with the source pinned too: the mount reads
+/// `src_fd` through `/proc/self/fd/N`, so it binds the inode the caller
+/// already inspected, not whatever `src` names by now. `src` is for the
+/// error message.
+fn bind_mount_fd_into_fd(
+    src: &Path,
+    src_fd: &OwnedFd,
+    dest_fd: &OwnedFd,
+) -> Result<(), VolumeError> {
+    let src_c = cstr(&format!("/proc/self/fd/{}", src_fd.as_raw_fd()))?;
+    bind_mount_c(src, &src_c, dest_fd)
+}
+
+/// `O_PATH` handle on a hostPath bind source, following a symlink source
+/// exactly once (the `mount --bind` semantics the enumerator promises).
+fn open_source_pinned(src: &Path) -> Result<OwnedFd, VolumeError> {
+    let c = cstr_path(src)?;
+    // SAFETY: `c` is a valid CString; O_PATH opens no file description
+    // for I/O, just a handle on the inode.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` is a freshly opened descriptor we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether the inode behind an `O_PATH` fd is a regular file (anything
+/// else — directory, device, socket — takes the directory placeholder,
+/// as `mount --bind` of a non-file onto a file would fail).
+fn fd_is_regular_file(fd: &OwnedFd) -> Result<bool, VolumeError> {
+    Ok(fd_stat(fd)?.st_mode & libc::S_IFMT == libc::S_IFREG)
+}
+
+fn bind_mount_c(src: &Path, src_c: &CString, dest_fd: &OwnedFd) -> Result<(), VolumeError> {
+    let dest = format!("/proc/self/fd/{}", dest_fd.as_raw_fd());
     let dest_c = cstr(&dest)?;
     // SAFETY: both CStrings outlive the call; dest is our O_PATH fd.
     let rc = unsafe {
@@ -1888,6 +1933,79 @@ mod tests {
         assert!(!name.contains('/'));
         assert_ne!(name, ".");
         assert_ne!(name, "..");
+    }
+
+    /// bug-candidates #23: the source kind used to be decided by
+    /// `is_file()` on the path and the bind re-resolved the path, so a
+    /// symlink swapped in between produced a dir-on-file mismatch or a
+    /// bind to whatever the path named by then. With the source pinned
+    /// to one `O_PATH` fd, every bind lands on exactly the inode that
+    /// was inspected — under a hostile thread flipping the symlink as
+    /// fast as it can.
+    #[test]
+    fn hostpath_bind_pins_the_inspected_source() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let dir = unique_test_dir();
+        let real_dir = dir.join("real_dir");
+        let real_file = dir.join("real_file");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(&real_file, b"x").unwrap();
+        let src = dir.join("src");
+        std::os::unix::fs::symlink(&real_dir, &src).unwrap();
+        let share = dir.join("share");
+        std::fs::create_dir(&share).unwrap();
+        let root_fd = open_share_root(&share).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (stop, src, dir) = (stop.clone(), src.clone(), dir.clone());
+            std::thread::spawn(move || {
+                let tmp = dir.join("src.tmp");
+                let mut to_file = true;
+                while !stop.load(Ordering::Relaxed) {
+                    let target = if to_file { "real_file" } else { "real_dir" };
+                    std::os::unix::fs::symlink(dir.join(target), &tmp).unwrap();
+                    std::fs::rename(&tmp, &src).unwrap();
+                    to_file = !to_file;
+                }
+            })
+        };
+
+        let (mut files, mut dirs) = (0, 0);
+        for i in 0..400 {
+            let src_fd = open_source_pinned(&src).unwrap();
+            let pinned = fd_stat(&src_fd).unwrap();
+            let is_file = fd_is_regular_file(&src_fd).unwrap();
+            let kind = if is_file {
+                files += 1;
+                PlaceholderKind::File
+            } else {
+                dirs += 1;
+                PlaceholderKind::Dir
+            };
+            let name = format!("_hostpath-{i:016x}");
+            let dest_fd = create_placeholder(&root_fd, &name, kind).unwrap();
+            bind_mount_fd_into_fd(&src, &src_fd, &dest_fd).unwrap();
+            let mounted = std::fs::metadata(share.join(&name)).unwrap();
+            assert_eq!(
+                (mounted.dev(), mounted.ino()),
+                (pinned.st_dev, pinned.st_ino),
+                "iteration {i}: bound a different inode than the one inspected"
+            );
+            assert_eq!(mounted.is_file(), is_file, "iteration {i}: kind mismatch");
+            umount_path(&share.join(&name)).unwrap();
+            unlinkat_name(&root_fd, &name, !is_file).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        assert!(
+            files > 0 && dirs > 0,
+            "flipper never raced us (files={files}, dirs={dirs}); test is not exercising the swap"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -124,6 +124,67 @@ pub struct NetworkInterface {
     pub guest_mac: String,
 }
 
+/// The parts of `GET /vm/config` a re-adopting VM broker reads
+/// after a VM-broker restart. Everything else Firecracker reports is ignored on
+/// decode, so a newer VMM adding fields does not break the rebuild.
+#[derive(Debug, Deserialize)]
+pub struct VmConfigView {
+    /// Boot source as configured.
+    #[serde(rename = "boot-source")]
+    pub boot_source: BootSourceView,
+    /// Machine configuration as configured.
+    #[serde(rename = "machine-config")]
+    pub machine_config: MachineConfigView,
+    /// Drives in the order they were declared — the guest's device
+    /// order. `None` when there are none.
+    #[serde(default)]
+    pub drives: Option<Vec<DriveView>>,
+    /// Network interfaces. `None` when there are none.
+    #[serde(rename = "network-interfaces", default)]
+    pub network_interfaces: Option<Vec<NetworkInterfaceView>>,
+}
+
+/// `boot-source` of [`VmConfigView`].
+#[derive(Debug, Deserialize)]
+pub struct BootSourceView {
+    /// Kernel command line as configured (without the `virtio_mmio`
+    /// tokens Firecracker appends at boot).
+    pub boot_args: String,
+}
+
+/// `machine-config` of [`VmConfigView`].
+#[derive(Debug, Deserialize)]
+pub struct MachineConfigView {
+    /// vCPU count.
+    pub vcpu_count: u32,
+    /// Guest RAM in MiB.
+    pub mem_size_mib: u64,
+    /// Whether dirty-page tracking is on.
+    #[serde(default)]
+    pub track_dirty_pages: bool,
+}
+
+/// One entry of [`VmConfigView::drives`].
+#[derive(Debug, Deserialize)]
+pub struct DriveView {
+    /// `d<i>` — see [`super::drive_id`].
+    pub drive_id: String,
+    /// Chroot-relative backing path, current after any `PATCH`.
+    pub path_on_host: String,
+    /// Read-only device.
+    #[serde(default)]
+    pub is_read_only: bool,
+}
+
+/// One entry of [`VmConfigView::network_interfaces`].
+#[derive(Debug, Deserialize)]
+pub struct NetworkInterfaceView {
+    /// Host TAP name.
+    pub host_dev_name: String,
+    /// Guest MAC, `aa:bb:…`.
+    pub guest_mac: Option<String>,
+}
+
 /// Instance state as reported by `GET /`.
 #[derive(Debug, Deserialize)]
 pub struct InstanceInfo {
@@ -254,6 +315,17 @@ impl FcApi {
             method: "GET",
             uri: "/".to_string(),
             message: format!("decode InstanceInfo from {body:?}: {e}"),
+        })
+    }
+
+    /// `GET /vm/config` — what the running VMM was configured with, for
+    /// a process that did not configure it (VM-broker restart re-adoption).
+    pub fn vm_config(&self) -> Result<VmConfigView, FcError> {
+        let body = self.send_raw("GET", "/vm/config", None)?;
+        serde_json::from_str(&body).map_err(|e| FcError::Api {
+            method: "GET",
+            uri: "/vm/config".to_string(),
+            message: format!("decode the VM configuration from {body:?}: {e}"),
         })
     }
 

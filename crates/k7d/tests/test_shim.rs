@@ -2509,25 +2509,10 @@ spec:
 
 // ──: multi-vCPU kubectl / annotation path ───────────────────
 
-/// The k7d daemon's cgroup v2 directory (per-VM CPU cgroups live here).
+/// The directory per-VM CPU cgroups live in — the service cgroup, or
+/// the delegated `vm/` subtree under it once the split is on.
 fn k7d_service_cgroup() -> std::path::PathBuf {
-    use std::process::Command;
-    let out = Command::new("systemctl")
-        .args(["show", "-p", "MainPID", "--value", "k7d"])
-        .output()
-        .expect("systemctl show k7d");
-    let pid: u32 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .expect("k7d MainPID");
-    assert!(pid > 0, "k7d.service has no main PID — is it running?");
-    let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read k7d cgroup");
-    let rel = cg
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("cgroup v2 entry")
-        .trim();
-    std::path::PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
+    common::vm_cgroup_root()
 }
 
 /// vCPU thread comm names (`vcpu0`, `vcpu1`, …) currently in `cg`'s
@@ -2777,6 +2762,7 @@ spec:
     .expect("apply trigger");
     wait_for_pod_ready(&trigger, Duration::from_secs(300))
         .expect("trigger Running (= adopt+fork succeeded)");
+    common::mark_test_tree(&tree_id);
 
     let mut daemon = k7d::control::Client::connect_env().expect("connect k7d daemon");
     match daemon.call(&k7d::control::Request::TreeNodes {

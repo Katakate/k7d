@@ -143,7 +143,12 @@ echo "==> Checking the config kconfig answered against the one we asked for"
 assert_config_survived "${BUILD_DIR}/.config"
 
 echo "==> Building vmlinux"
-make -j"$(nproc)" vmlinux
+# HOSTCFLAGS reaches tools/bpf/resolve_btfids' bundled libbpf, which is
+# built -Werror. glibc >= 2.42 in C23 mode makes strchr/strstr return
+# `const char *` for a const argument, and 6.12's libbpf assigns that
+# to `char *` — a hard error on gcc 15 / Ubuntu 26.04 hosts, a no-op on
+# gcc 13 / 24.04. Only the host-side BTF tool is affected, not vmlinux.
+make -j"$(nproc)" HOSTCFLAGS="-Wno-error=discarded-qualifiers" vmlinux
 
 cp vmlinux "$SCRIPT_DIR/vmlinux"
 strip --strip-all "$SCRIPT_DIR/vmlinux" 2>/dev/null || true

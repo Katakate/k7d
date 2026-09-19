@@ -131,7 +131,18 @@ pub fn build_fake_gpu_plugin() -> Vec<u8> {
     let out = PathBuf::from(format!("/tmp/k7d-fake-gpu-plugin-{}", std::process::id()));
     let go = go_bin();
     let status = Command::new(&go)
-        .args(["build", "-mod=mod", "-trimpath", "-ldflags=-s -w", "-o"])
+        // `-buildvcs=false`: the fixture is content-addressed by the
+        // test, and default VCS stamping runs `git status` in the
+        // workspace — which fails on a node where the rsynced tree and
+        // its `.git` have different owners ("dubious ownership").
+        .args([
+            "build",
+            "-mod=mod",
+            "-trimpath",
+            "-buildvcs=false",
+            "-ldflags=-s -w",
+            "-o",
+        ])
         .arg(&out)
         .arg(".")
         .current_dir(&src)

@@ -26,19 +26,39 @@
 //!
 //! With `--new-pid-ns` the jailer `clone(CLONE_NEWPID)`s, writes the
 //! child's (host-namespace) pid to `<chroot>/<exec-name>.pid`, and
-//! `exit(0)`s immediately. So the [`std::process::Child`] k7d spawned
-//! is the *jailer*, which is reaped here, and the Firecracker process
+//! `exit(0)`s immediately. So the [`crate::spawner::Child`] k7d asked
+//! for is the *jailer*, which is reaped here, and the Firecracker process
 //! is an orphan k7d tracks by pid — it cannot be `wait`ed on, only
 //! signalled and polled. That is what [`super::FcVm`]'s `Drop` does.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use super::{FcError, CHROOT_API_SOCKET};
+use crate::spawner::Stdio;
 
 /// How long to wait for the API socket after the jailer returns.
 const SOCKET_WAIT: Duration = Duration::from_secs(5);
+
+/// `umask` the jailer — and therefore Firecracker — runs under.
+///
+/// Firecracker binds `firecracker.socket` and `v.sock` with a plain
+/// `UnixListener::bind`, which creates them `0777 & ~umask`, and it
+/// never `chmod`s them afterwards. Connecting to a Unix socket needs
+/// **write** permission on the socket file, so the default `0022` makes
+/// them `srwxr-xr-x` — reachable by root and by the jail uid and by
+/// nobody else. Under `K7D_PRIVSEP` the process driving that API is uid
+/// `k7d`, which is neither.
+///
+/// `0007` gives `srwxrwx---`: the jail uid, the socket's *group*, and
+/// nobody else. The group is `k7d` because the node broker sets the
+/// setgid bit on `<root>/run` (`broker::jail`), which is what makes
+/// this work for `v.sock` too — that one is bound minutes later, at the
+/// VM broker's `PUT /vsock`, when no verb is in flight to re-mode it.
+///
+/// Unsplit, this is strictly tighter than the default and changes
+/// nothing: root reaches the sockets either way.
+pub const JAIL_UMASK: u32 = 0o007;
 
 /// Chroot-relative name of the file the jailer's (and then
 /// Firecracker's) stderr is written to. [`crate::guest::Guest::serial_output`]
@@ -129,7 +149,7 @@ pub fn spawn(args: &JailerArgs<'_>, chroot: &super::stage::Chroot) -> Result<Spa
         message: format!("create {}: {e}", stderr_path.display()),
     })?;
 
-    let mut cmd = Command::new(args.jailer);
+    let mut cmd = crate::spawner::command(args.jailer);
     cmd.arg("--id")
         .arg(args.vm_id)
         .arg("--exec-file")
@@ -152,9 +172,21 @@ pub fn spawn(args: &JailerArgs<'_>, chroot: &super::stage::Chroot) -> Result<Spa
         .arg("--")
         .arg("--api-sock")
         .arg(CHROOT_API_SOCKET)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file));
+        .stdin(Stdio::Null)
+        .stdout(Stdio::Null)
+        // The log file crosses to the jailer as an `SCM_RIGHTS`
+        // descriptor and is closed here, so the only process holding it
+        // is the one whose stderr it is. Same file, same fd number, one
+        // hop further away.
+        .stderr(Stdio::Fd(stderr_file.into()))
+        // Without `--daemonize` the jailer asks `getsid(0)` whether it
+        // already leads a session and `setsid()`s if not; the spawner
+        // does it between fork and exec so the jailer's own call is the
+        // no-op it expects (CHALLENGES #214).
+        .setsid(true)
+        .umask(JAIL_UMASK);
+
+    let fail_pidfile = test_hook_fail_pidfile()?;
 
     let mut child = cmd.spawn().map_err(|e| FcError::Spawn {
         message: format!("spawn {}: {e}", args.jailer.display()),
@@ -173,8 +205,68 @@ pub fn spawn(args: &JailerArgs<'_>, chroot: &super::stage::Chroot) -> Result<Spa
         });
     }
 
+    // From here on a Firecracker process runs as `uid` inside the
+    // chroot, and every `?` below is a path that must kill it first.
     let pid_file = chroot.pid_file(&exec_name);
-    let pid = std::fs::read_to_string(&pid_file)
+    let cgroup_dir = PathBuf::from("/sys/fs/cgroup").join(cgroup_rel_path(args.vm_id));
+    let mut reaper = SpawnReaper {
+        vm_id: args.vm_id,
+        uid: args.uid,
+        pid_file: pid_file.clone(),
+        cgroup_dir: cgroup_dir.clone(),
+        pid: None,
+        armed: true,
+    };
+
+    if fail_pidfile {
+        log::error!(
+            "fc: {TEST_HOOK_FAIL_PIDFILE} is set — hiding {} to force a post-jailer spawn failure",
+            pid_file.display()
+        );
+        let hidden = pid_file.with_extension("pid.test-hidden");
+        std::fs::rename(&pid_file, &hidden).map_err(|e| FcError::Spawn {
+            message: format!(
+                "{TEST_HOOK_FAIL_PIDFILE}: rename {}: {e}",
+                pid_file.display()
+            ),
+        })?;
+    }
+
+    let pid = read_pid_file(&pid_file)?;
+    reaper.pid = Some(pid);
+
+    let socket = chroot.api_socket();
+    super::api::wait_for_socket(&socket, SOCKET_WAIT)?;
+
+    reaper.armed = false;
+    Ok(Spawned { pid, cgroup_dir })
+}
+
+/// Test-only hook: when set, `spawn` renames the jailer's pid file
+/// away before reading it, so the read fails **after** the jailer has
+/// cloned Firecracker — the exact path bug-candidates #51 / #32
+/// describe, which no real input reaches on purpose. Honoured only in
+/// debug builds (what `cargo test` runs); a release daemon that finds
+/// it set refuses every Firecracker create rather than silently
+/// running a fault-injection hook in production.
+pub const TEST_HOOK_FAIL_PIDFILE: &str = "K7D_FC_TEST_FAIL_PIDFILE";
+
+fn test_hook_fail_pidfile() -> Result<bool, FcError> {
+    match std::env::var_os(TEST_HOOK_FAIL_PIDFILE) {
+        None => Ok(false),
+        Some(v) if v.is_empty() || v == "0" => Ok(false),
+        Some(_) if cfg!(debug_assertions) => Ok(true),
+        Some(_) => Err(FcError::Config {
+            message: format!(
+                "{TEST_HOOK_FAIL_PIDFILE} is set in a release build — it is a test-only \
+                 fault-injection hook; unset it"
+            ),
+        }),
+    }
+}
+
+fn read_pid_file(pid_file: &Path) -> Result<u32, FcError> {
+    std::fs::read_to_string(pid_file)
         .map_err(|e| FcError::Spawn {
             message: format!("read jailer pid file {}: {e}", pid_file.display()),
         })?
@@ -182,21 +274,120 @@ pub fn spawn(args: &JailerArgs<'_>, chroot: &super::stage::Chroot) -> Result<Spa
         .parse::<u32>()
         .map_err(|e| FcError::Spawn {
             message: format!("malformed pid in {}: {e}", pid_file.display()),
-        })?;
+        })
+}
 
-    let socket = chroot.api_socket();
-    if let Err(e) = super::api::wait_for_socket(&socket, SOCKET_WAIT) {
-        // The process is already running under an unprivileged uid in
-        // its own pid ns; leaving it behind because its socket was slow
-        // would leak a VM with no handle on it.
-        super::kill_and_wait(pid);
-        return Err(e);
+/// Every pid whose **real** uid is `uid`, from `/proc`.
+///
+/// The jailer's per-VM uid is exclusive to one Firecracker process by
+/// construction, so this is how the reaper finds an orphan whose pid
+/// file it could not read — and how it proves, afterwards, that nothing
+/// runs as that uid any more.
+#[must_use]
+pub fn pids_owned_by(uid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let want = uid.to_string();
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|s| {
+                s.lines().any(|l| {
+                    l.strip_prefix("Uid:")
+                        .is_some_and(|rest| rest.split_whitespace().next() == Some(want.as_str()))
+                })
+            })
+        })
+        .collect()
+}
+
+/// Armed the instant the jailer returns 0; disarmed only when the
+/// caller takes the pid to hand to an `FcVm`. On any other exit from
+/// [`spawn`] it kills the Firecracker process — by the pid it read, or
+/// by scanning `/proc` for the VM's uid when the pid file was the thing
+/// that failed — waits for it to disappear, and removes the jailer's
+/// cgroup.
+///
+/// **Why a guard inside `spawn` and not a lease carried in the error:**
+/// the reaper is a local of `spawn`, so it drops before `spawn`
+/// returns, i.e. before the `UidLease` and `Chroot` that
+/// `spawn_unconfigured` holds can unwind. Its `Drop` does not return
+/// until either no process runs as the uid (verified from `/proc`, not
+/// inferred from `kill` succeeding) or the uid has been retired via
+/// [`super::stage::quarantine_uid`]. Either way the lease that drops
+/// next is safe to release: it is recycling a uid nothing runs as, or
+/// it is releasing a uid the allocator will refuse to hand out. That
+/// keeps the lease type out of `FcError` and needs no `ManuallyDrop`
+/// choreography in the caller.
+struct SpawnReaper<'a> {
+    vm_id: &'a str,
+    uid: u32,
+    pid_file: PathBuf,
+    cgroup_dir: PathBuf,
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl Drop for SpawnReaper<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pid = self.pid.or_else(|| read_pid_file(&self.pid_file).ok());
+        log::error!(
+            "fc: spawn of {} failed after the jailer cloned firecracker (uid {}, pid {}) — \
+             killing the orphan before its uid, chroot and cgroup are released",
+            self.vm_id,
+            self.uid,
+            pid.map_or_else(|| "unknown".to_string(), |p| p.to_string())
+        );
+        // Three views of the same process, cheapest first: the pid file,
+        // the jailer's cgroup (`cgroup.procs` lists exactly what it
+        // cloned), and a `/proc` scan for the uid restricted to this
+        // VM's cgroup — a process on this uid *outside* it belongs to
+        // someone else and is not ours to kill.
+        let mut targets: Vec<u32> = pid.into_iter().collect();
+        targets.extend(cgroup_procs(&self.cgroup_dir));
+        targets.extend(
+            pids_owned_by(self.uid)
+                .into_iter()
+                .filter(|p| in_vm_cgroup(*p, self.vm_id)),
+        );
+        targets.sort_unstable();
+        targets.dedup();
+        for p in &targets {
+            super::kill_and_wait(*p);
+        }
+        // Verified from /proc, not inferred from kill(2) returning 0.
+        let survivors = pids_owned_by(self.uid);
+        if survivors.is_empty() {
+            super::remove_cgroup(&self.cgroup_dir);
+        } else {
+            log::error!(
+                "fc: {} process(es) still run as uid {} after reaping {}: {survivors:?}",
+                survivors.len(),
+                self.uid,
+                self.vm_id
+            );
+            super::stage::quarantine_uid(self.uid);
+        }
     }
+}
 
-    Ok(Spawned {
-        pid,
-        cgroup_dir: PathBuf::from("/sys/fs/cgroup").join(cgroup_rel_path(args.vm_id)),
-    })
+/// pids listed in `<cgroup_dir>/cgroup.procs`, or none if the cgroup is
+/// gone.
+fn cgroup_procs(cgroup_dir: &Path) -> Vec<u32> {
+    std::fs::read_to_string(cgroup_dir.join("cgroup.procs"))
+        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether `pid`'s cgroup is under this VM's `k7d/<vm_id>/` scope.
+fn in_vm_cgroup(pid: u32, vm_id: &str) -> bool {
+    let want = format!("k7d/{vm_id}/");
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|s| s.contains(&want))
 }
 
 /// The `memory.max` written for a guest of `memory_mb`: its RAM plus

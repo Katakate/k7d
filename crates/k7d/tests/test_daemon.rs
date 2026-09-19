@@ -1884,7 +1884,7 @@ fn test_daemon_reattach_verifies_live_vm() {
     drop(guard);
 }
 
-/// Inc 2 observer protocol: `tree_watch` streams a snapshot then
+/// Observer protocol: `tree_watch` streams a snapshot then
 /// mutation events; `latency_ns` is on the fork event.
 #[test]
 fn test_daemon_tree_watch() {
@@ -2016,6 +2016,10 @@ fn test_doctor_cli_does_not_start_a_daemon() {
         "doctor summary missing: {stdout}"
     );
     assert!(
+        stdout.contains("hardening:"),
+        "doctor must print a hardening: section: {stdout}"
+    );
+    assert!(
         !stdout.contains("listening on"),
         "doctor must not start serving, got: {stdout}"
     );
@@ -2046,7 +2050,14 @@ fn test_doctor_verb_reports_host() {
             let expected_mode =
                 std::env::var("K7D_FC_FORK_SNAPSHOT").unwrap_or_else(|_| "diff".to_string());
             assert_eq!(fc_fork_mode, expected_mode, "FC fork mode");
-            let host: Vec<&String> = details.iter().filter(|d| !d.contains("  fc_")).collect();
+            let n = details
+                .iter()
+                .position(|d| d.as_str() == "hardening:")
+                .unwrap_or(details.len());
+            let host: Vec<&String> = details[..n]
+                .iter()
+                .filter(|d| !d.contains("  fc_"))
+                .collect();
             assert_eq!(host.len(), 4, "{details:?}");
             // A node with no Firecracker installed is still a healthy
             // node, so the backend's lines are reported but never
@@ -2054,6 +2065,10 @@ fn test_doctor_verb_reports_host() {
             assert!(
                 details.iter().any(|d| d.contains("  fc_firecracker  ")),
                 "doctor must report the Firecracker backend: {details:?}"
+            );
+            assert!(
+                details.iter().any(|d| d.as_str() == "hardening:"),
+                "doctor must report hardening: {details:?}"
             );
         }
         other => panic!("unexpected doctor response: {other:?}"),

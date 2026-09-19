@@ -158,14 +158,12 @@ impl PipeSerialDevice {
 
     /// Create with a specific trigger (for IRQ delivery).
     pub fn with_trigger(trigger: SerialTrigger) -> io::Result<(Self, std::os::unix::io::RawFd)> {
-        // Pipe for guest output → host (agent responses)
-        let mut output_pipe = [0i32; 2];
-        // SAFETY: output_pipe is a valid 2-element array for pipe(2) to fill.
-        if unsafe { libc::pipe(output_pipe.as_mut_ptr()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let output_read_fd = output_pipe[0];
-        let output_write_fd = output_pipe[1];
+        // Pipe for guest output → host (agent responses). CLOEXEC, so a
+        // helper the daemon execs later cannot hold the write end open
+        // and keep EOF from ever reaching the reader (bug-candidates #28).
+        let (read_end, write_end) = crate::fdutil::pipe_cloexec()?;
+        let output_read_fd = std::os::fd::IntoRawFd::into_raw_fd(read_end);
+        let output_write_fd = std::os::fd::IntoRawFd::into_raw_fd(write_end);
 
         let writer = PipeWriter {
             fd: output_write_fd,

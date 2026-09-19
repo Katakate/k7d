@@ -107,14 +107,7 @@ impl BlockVolumes {
         // Stage every RO volume tree into one directory, then pack it
         // once. Staged names reuse the virtiofs-era `<class>-<name>`
         // convention so in-VM paths line up with the old share layout.
-        let staging = std::env::temp_dir().join(format!(
-            "k7d-volblk-stage-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&staging)?;
+        let staging = staging_root()?;
         let result = out.stage_and_pack(kubelet_volumes_dir, cache_dir, &staging);
         // The staging tree is scratch either way — the packed image is
         // the durable artifact.
@@ -202,11 +195,40 @@ impl BlockVolumes {
     }
 }
 
-/// Recursively copy `src` into `dst` (created), preserving file modes
-/// and symlinks (kubelet's `..data` atomic-swap layout is symlink-
-/// based; erofs packs symlinks natively so the tree stays coherent
-/// read-only).
+/// A fresh, root-only staging directory under
+/// [`crate::disks::STAGE_DIR`]: `<pid>-<nanos>`, mode `0700`, with the
+/// parent re-`chmod`ed to `0700` in case it pre-existed under a wider
+/// umask. What is staged here is kubelet's Secret / projected-token
+/// material, so the directory must never be traversable by anyone but
+/// root for even the length of the pack (bug-candidates #57).
+fn staging_root() -> Result<PathBuf, VolumeError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = PathBuf::from(crate::disks::STAGE_DIR);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&parent)?;
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
+    let staging = parent.join(format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    Ok(staging)
+}
+
+/// Recursively copy `src` into `dst` (created), preserving file and
+/// directory modes and symlinks (kubelet's `..data` atomic-swap layout
+/// is symlink-based; erofs packs symlinks natively so the tree stays
+/// coherent read-only). Modes matter: a `0400` token stays `0400` in
+/// staging and, since `mkfs.erofs` reads them from the tree, in the
+/// image.
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), VolumeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let src_meta = std::fs::metadata(src)?;
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -219,9 +241,16 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), VolumeError> {
         } else if meta.file_type().is_dir() {
             copy_tree(&from, &to)?;
         } else {
+            // `fs::copy` carries the source's permission bits.
             std::fs::copy(&from, &to)?;
         }
     }
+    // After the children: a read-only source directory must not stop
+    // its own copy from being populated.
+    std::fs::set_permissions(
+        dst,
+        std::fs::Permissions::from_mode(src_meta.permissions().mode() & 0o7777),
+    )?;
     Ok(())
 }
 
@@ -335,6 +364,116 @@ mod tests {
             bv1.ro_image, bv3.ro_image,
             "changed volume content must produce a new image"
         );
+    }
+
+    #[test]
+    fn staging_root_is_root_only_and_not_in_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = staging_root().expect("staging root");
+        let parent = Path::new(crate::disks::STAGE_DIR);
+        assert!(staging.starts_with(parent), "{}", staging.display());
+        assert!(
+            !staging.starts_with(std::env::temp_dir()),
+            "staging must not be under {}",
+            std::env::temp_dir().display()
+        );
+        for dir in [parent, staging.as_path()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}, not 0700", dir.display());
+        }
+        // A pre-existing parent that umask left wider is tightened.
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let again = staging_root().expect("second staging root");
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::remove_dir_all(&staging).unwrap();
+        std::fs::remove_dir_all(&again).unwrap();
+    }
+
+    /// kubelet keeps tokens at 0400; the copy into staging and the
+    /// packed image must not widen that, and nothing may appear under
+    /// /tmp while the pack runs (bug-candidates #57).
+    #[test]
+    fn prepare_keeps_0400_token_and_stages_nothing_in_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let pod = tempfile::tempdir().unwrap();
+        let volumes = fake_kubelet_dir(pod.path());
+        let tok_dir = volumes.join("kubernetes.io~projected/kube-api-access-x");
+        std::fs::create_dir_all(&tok_dir).unwrap();
+        let tok = tok_dir.join("token");
+        std::fs::write(&tok, "eyJhbGciOi").unwrap();
+        std::fs::set_permissions(&tok, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut tmp_hits = Vec::new();
+                let mut stage_modes = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    for e in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.starts_with("k7d-volblk-stage-") {
+                            tmp_hits.push(name);
+                        }
+                    }
+                    if let Ok(entries) = std::fs::read_dir(crate::disks::STAGE_DIR) {
+                        for e in entries.flatten() {
+                            if let Ok(m) = e.metadata() {
+                                stage_modes.push((e.path(), m.permissions().mode() & 0o7777));
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                (tmp_hits, stage_modes)
+            })
+        };
+
+        let bv = BlockVolumes::prepare_from_kubelet_dir(&volumes, cache.path()).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tmp_hits, stage_modes) = watcher.join().unwrap();
+        assert!(
+            tmp_hits.is_empty(),
+            "staging appeared under /tmp: {tmp_hits:?}"
+        );
+        for (path, mode) in &stage_modes {
+            assert_eq!(*mode, 0o700, "{} was {mode:o} while staged", path.display());
+        }
+        let mine = format!("{}-", std::process::id());
+        assert!(
+            std::fs::read_dir(crate::disks::STAGE_DIR)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with(&mine)),
+            "staging directory not removed after the pack"
+        );
+
+        // Mode inside the image: extract it with the modes erofs stored.
+        let img = bv.ro_image.expect("RO volumes must pack");
+        let out = tempfile::tempdir().unwrap();
+        let extract = out.path().join("x");
+        let fsck = crate::spawner::command("fsck.erofs")
+            .arg(format!("--extract={}", extract.display()))
+            .arg("--preserve-perms")
+            .arg(&img)
+            .output()
+            .expect("fsck.erofs");
+        assert!(
+            fsck.status.success(),
+            "fsck.erofs --extract: {}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        let packed = extract.join("projected-kube-api-access-x/token");
+        let mode = std::fs::metadata(&packed)
+            .unwrap_or_else(|e| panic!("{}: {e}", packed.display()))
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o400, "token is {mode:o} inside the image");
     }
 
     #[test]

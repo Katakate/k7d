@@ -12,6 +12,7 @@ use std::process::Command;
 
 #[test]
 fn test_run_id_is_stable_hex() {
+    common::hygiene_once();
     let a = common::run_id();
     let b = common::run_id();
     assert_eq!(a, b, "run_id must be stable for the process");
@@ -137,4 +138,236 @@ fn test_sweep_reaps_orphan_data_disks_and_spares_fresh_ones() {
         fresh.display()
     );
     std::fs::remove_file(&fresh).expect("clean up the fresh data disk");
+}
+
+fn trees_dir() -> std::path::PathBuf {
+    std::path::Path::new(k7d::disks::DISKS_DIR).join(k7d::disks::TREES_SUBDIR)
+}
+
+fn age_an_hour(path: &Path) {
+    let st = Command::new("touch")
+        .args(["-d", "-1 hour"])
+        .arg(path)
+        .status()
+        .expect("touch runs");
+    assert!(st.success(), "failed to age {}", path.display());
+}
+
+fn plant_tree_dir(name: &str) -> std::path::PathBuf {
+    let dir = trees_dir().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("plant tree dir");
+    dir
+}
+
+/// Marked tree older than `STALE_AGE`, unknown to the daemon → swept.
+#[test]
+fn test_sweep_reaps_marked_stale_tree() {
+    let dir = plant_tree_dir(&format!("marked-stale-{}", common::run_id()));
+    common::mark_test_tree_dir(&dir);
+    age_an_hour(&dir.join(common::TEST_TREE_MARKER));
+
+    let report = common::sweep_stranded_resources();
+    let joined = report.join("\n");
+    let name = dir.file_name().unwrap().to_string_lossy();
+    assert!(
+        report.iter().any(|l| l.contains(name.as_ref())),
+        "sweep must report the marked stale tree: {joined}"
+    );
+    assert!(
+        !dir.exists(),
+        "marked stale tree {} must be gone after sweep",
+        dir.display()
+    );
+}
+
+/// Marked tree younger than `STALE_AGE` → untouched.
+#[test]
+fn test_sweep_spares_marked_fresh_tree() {
+    let dir = plant_tree_dir(&format!("marked-fresh-{}", common::run_id()));
+    common::mark_test_tree_dir(&dir);
+
+    let report = common::sweep_stranded_resources();
+    let name = dir.file_name().unwrap().to_string_lossy();
+    assert!(
+        !report.iter().any(|l| l.contains(name.as_ref())),
+        "sweep must not reap a fresh marked tree: {}",
+        report.join("\n")
+    );
+    assert!(
+        dir.exists(),
+        "fresh marked tree {} must survive the sweep",
+        dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Unmarked dir with a valid `tree.json`, arbitrarily old → untouched.
+/// Operator-safety: never infer "test tree" from age or id.
+#[test]
+fn test_sweep_spares_unmarked_old_tree() {
+    let dir = plant_tree_dir(&format!("unmarked-op-{}", common::run_id()));
+    let json = dir.join("tree.json");
+    std::fs::write(&json, b"{\"tree_id\":\"operator\"}\n").expect("plant tree.json");
+    age_an_hour(&json);
+
+    let report = common::sweep_stranded_resources();
+    let name = dir.file_name().unwrap().to_string_lossy();
+    assert!(
+        !report.iter().any(|l| l.contains(name.as_ref())),
+        "sweep must not reap an unmarked tree: {}",
+        report.join("\n")
+    );
+    assert!(
+        dir.exists() && json.exists(),
+        "unmarked tree {} and its tree.json must survive the sweep",
+        dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `tree_drop` then sweep leaves neither a registry entry nor a dir.
+#[test]
+fn test_tree_drop_then_sweep_agrees_with_registry() {
+    common::ensure_k7d_daemon_running();
+    let tree_id = format!("swdrop-{}", common::run_id());
+    let dir = plant_tree_dir(&tree_id);
+    std::fs::write(dir.join("tree.json"), b"{}\n").expect("plant tree.json");
+    common::mark_test_tree_dir(&dir);
+    age_an_hour(&dir.join(common::TEST_TREE_MARKER));
+
+    let mut c = k7d::control::Client::connect_env().expect("connect k7d");
+    // Unknown to the daemon: drop is a no-op error; sweep still reaps.
+    let _ = c.call(&k7d::control::Request::TreeDrop {
+        tree_id: tree_id.clone(),
+    });
+    let report = common::sweep_stranded_resources();
+    assert!(
+        report.iter().any(|l| l.contains(&tree_id)),
+        "sweep must report dropped tree {tree_id}: {}",
+        report.join("\n")
+    );
+    assert!(!dir.exists(), "dir {} must be gone", dir.display());
+    match c.call(&k7d::control::Request::TreeList) {
+        Ok(k7d::control::Response::TreeList { trees }) => {
+            assert!(
+                trees.iter().all(|t| t.tree_id != tree_id),
+                "tree_list still has {tree_id}: {trees:?}"
+            );
+        }
+        other => panic!("tree_list: {other:?}"),
+    }
+}
+
+/// Marked tree with a live VM stays until the VM is gone and the marker ages out.
+#[test]
+fn test_sweep_spares_marked_tree_with_live_vm() {
+    common::ensure_k7d_daemon_running();
+    let tree_id = format!("swlive-{}", common::run_id());
+    let mut c = k7d::control::Client::connect_env().expect("connect k7d");
+    let created = c
+        .call(&k7d::control::Request::TreeCreate {
+            config: k7d::control::VmConfig::default(),
+            budget: None,
+            tree_id: Some(tree_id.clone()),
+        })
+        .expect("tree_create");
+    let tree_id = match created {
+        k7d::control::Response::TreeCreated { tree_id, .. } => {
+            common::mark_test_tree(&tree_id);
+            tree_id
+        }
+        other => panic!("tree_create: {other:?}"),
+    };
+    struct ReapTree(String);
+    impl Drop for ReapTree {
+        fn drop(&mut self) {
+            if let Ok(mut c) = k7d::control::Client::connect_env() {
+                let _ = c.call(&k7d::control::Request::TreeDrop {
+                    tree_id: self.0.clone(),
+                });
+            }
+            let _ = std::fs::remove_dir_all(k7d::control::tree_root_dir().join(&self.0));
+        }
+    }
+    let _reap = ReapTree(tree_id.clone());
+    let dir = k7d::control::tree_root_dir().join(&tree_id);
+    assert!(dir.is_dir(), "tree dir missing: {}", dir.display());
+    age_an_hour(&dir.join(common::TEST_TREE_MARKER));
+
+    let report = common::sweep_stranded_resources();
+    assert!(
+        !report.iter().any(|l| l.contains(&tree_id)),
+        "sweep must not reap a marked tree with a live VM: {}",
+        report.join("\n")
+    );
+    assert!(
+        dir.exists(),
+        "live marked tree {} must survive the sweep",
+        dir.display()
+    );
+
+    match c.call(&k7d::control::Request::TreeDrop {
+        tree_id: tree_id.clone(),
+    }) {
+        Ok(k7d::control::Response::Ok) => {}
+        other => panic!("tree_drop: {other:?}"),
+    }
+    assert!(
+        dir.exists(),
+        "tree_drop must keep the on-disk tree (retention contract): {}",
+        dir.display()
+    );
+
+    let report = common::sweep_stranded_resources();
+    assert!(
+        report.iter().any(|l| l.contains(&tree_id)),
+        "sweep must reap the marked tree once the VM is gone: {}",
+        report.join("\n")
+    );
+    assert!(
+        !dir.exists(),
+        "dir {} must be gone after drop+sweep",
+        dir.display()
+    );
+    match c.call(&k7d::control::Request::TreeList) {
+        Ok(k7d::control::Response::TreeList { trees }) => {
+            assert!(
+                trees.iter().all(|t| t.tree_id != tree_id),
+                "tree_list still has {tree_id} after drop+sweep: {trees:?}"
+            );
+        }
+        other => panic!("tree_list: {other:?}"),
+    }
+}
+
+/// Preflight fails immediately with free/needed numbers and the reclaim hint.
+#[test]
+fn test_z_preflight_fails_loud_with_numbers() {
+    common::hygiene_once();
+    // SAFETY: test binaries run `--test-threads=1`; this env is restored
+    // before the next test (and before any later hygiene_once).
+    std::env::set_var("K7D_MIN_FREE_DISK", u64::MAX.to_string());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        common::assert_disks_have_headroom,
+    ));
+    std::env::remove_var("K7D_MIN_FREE_DISK");
+    let err = result.expect_err("preflight must hard-fail, not skip or warn");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("GiB free") && msg.contains("need") && msg.contains("GiB"),
+        "preflight must print free vs needed GiB, got: {msg}"
+    );
+    assert!(
+        msg.contains("make remote-node-reclaim"),
+        "preflight must hint `make remote-node-reclaim`, got: {msg}"
+    );
+    assert!(
+        msg.contains(k7d::disks::DISKS_DIR),
+        "preflight must name DISKS_DIR, got: {msg}"
+    );
 }

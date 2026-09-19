@@ -527,6 +527,7 @@ spec:
     )))
     .expect("apply trigger");
     wait_for_pod_ready(&trigger, Duration::from_secs(300)).expect("trigger");
+    common::mark_test_tree(&tree_id);
 
     let mut daemon = k7d::control::Client::connect_env().expect("daemon");
     let child_cids = match daemon.call(&k7d::control::Request::TreeNodes {

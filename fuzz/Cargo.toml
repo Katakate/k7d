@@ -17,6 +17,16 @@ name = "blk_request"
 path = "fuzz_targets/blk_request.rs"
 doc = false
 
+[[bin]]
+name = "broker_paths"
+path = "fuzz_targets/broker_paths.rs"
+doc = false
+
+[[bin]]
+name = "control_request"
+path = "fuzz_targets/control_request.rs"
+doc = false
+
 [dependencies]
 libfuzzer-sys = "=0.4.7"
 serde_json = "=1.0.149"

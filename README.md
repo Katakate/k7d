@@ -476,50 +476,143 @@ feature.
 ### Host RuntimeClass (pods *as* k7d VMs)
 
 This is the outer layer: kubectl on the host schedules pods into k7d
-microVMs via `runtimeClassName: k7`. Relevant if you also want
-single-VM sandboxes, not only whole-cluster forks.
+microVMs via `runtimeClassName: k7` (native) or `k7-fc` (Firecracker).
+Relevant if you also want single-VM sandboxes, not only whole-cluster
+forks.
 
 | Feature | Status | Notes |
 |---|---|---|
-| `runtimeClassName: k7` (CRI / containerd shim) | ✅ Today | |
+| `runtimeClassName: k7` (CRI / containerd shim) | ✅ Today | Native in-process VMM |
+| `runtimeClassName: k7-fc` | ✅ Today | Same pods, stock Firecracker + jailer. [k7d vs k7d-fc](#two-backends-k7d-vs-k7d-fc) |
 | `kubectl logs` / `exec` / `exec -it` (PTY) | ✅ Today | Incl. resize, Ctrl-C, detach |
 | Pod IP, Services, DNS, egress | ✅ Today | Host CNI dataplane |
 | ConfigMap / Secret / projected / downwardAPI / emptyDir | ✅ Today | |
-| hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | |
+| hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | hostPath is native-only (`k7-fc` has no virtiofs) |
 | Memory / CPU limits; multi-container / sidecars | ✅ Today | |
-| Warm VM + whole-cluster fork / snapshot tree | ✅ Today | The point of the project |
+| Warm fork of the pod VM | ✅ Today | Snapshot-tree fork of that sandbox. Whole-cluster fork is the daemon tree API (bare VMs), not a kubectl feature — [k7d vs k7d-fc](#two-backends-k7d-vs-k7d-fc) |
 | Init containers; natural exit / `restartPolicy` | ✅ Today | Multi-container pods |
 | Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | From pod CPU limits; fork/snapshot parity |
 | `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
 | Cross-node fork | 🔮 Later | Host-local trees today |
 
+## Two backends: k7d vs k7d-fc
+
+One daemon, two VMMs. `backend` on `create_vm` picks which process
+owns the KVM fd. A tree is one backend, never mixed.
+
+That is **not** “bare VM vs RuntimeClass.” Both surfaces run on either
+VMM:
+
+- **Bare VM / tree / gym** — `create_vm` / `tree_create` /
+  `tree_fork_batch` on `/run/k7d/k7d.sock`. Cluster fork, the two
+  clocks in the hero (~105&nbsp;ms CI guest / ~1.1&nbsp;s Ubuntu
+  k3s), time warp, and the gym all live here.
+- **Kubernetes RuntimeClass pods** — kubectl on the *host* cluster
+  schedules a pod into a microVM. `runtimeClassName` is only the
+  kubectl way to set `backend`.
+
+| | **native** (`k7d`) | **firecracker** (`k7d-fc`) |
+|---|---|---|
+| Pick on the socket | `backend: native` (default) | `backend: firecracker` |
+| Kubernetes RuntimeClass | `runtimeClassName: k7` | `runtimeClassName: k7-fc` |
+| VMM | k7d's in-process rust-vmm | stock Firecracker + jailer |
+| Per-VM jail (own uid, chroot, seccomp) | ❌ | ✅ |
+| Independently audited VMM | ❌ | ✅ |
+| Privilege split (root node broker / uid-`k7d` VM broker) | ✅ same daemon | ✅ same daemon |
+| virtiofs | ✅ | ❌ |
+| Built for | RL, gym, fleets you control | multi-tenant / hostile guests |
+
+**Bare VM / tree / gym** (daemon API — not a Kubernetes RuntimeClass):
+
+| | native | firecracker |
+|---|---|---|
+| Warm VM fork | ✅ **~5–50 ms** | ✅ **~76–140 ms** / child |
+| Whole-cluster fork | ✅ | ✅ |
+| Snapshot tree / warm pool | ✅ | ✅ |
+| Guest time warp / ×N dilation | ✅ | ❌ |
+| Lockstep cluster pause | ✅ | ⚠️ parallel pause (µs skew) |
+
+**Kubernetes RuntimeClass pods** (host `runtimeClassName` — not the gym):
+
+| | `k7` (native) | `k7-fc` (firecracker) |
+|---|---|---|
+| `kubectl logs` / `exec` | ✅ | ✅ |
+| hostPath (virtiofs) | ✅ | ❌ |
+| docker-in-guest | ✅ | ✅ |
+
+Privilege separation is the daemon, not a third backend: one node
+broker (root, no listening socket) plus one VM broker (uid `k7d`,
+empty caps) for the whole node. The shipped unit sets
+`K7D_PRIVSEP=on`; `off` is the escape hatch (one root process).
+Native vCPU threads and virtio emulation run *in* the VM broker;
+Firecracker vCPUs run in the jailer jail and the VM broker only
+speaks the API. A VM-broker crash kills native VMs (they are
+threads); standalone Firecracker pods can survive it
+(`K7D_VM_BROKER_RESTART`, ships off). `k7d doctor` reports
+`privsep:`.
+
+Native is the default and the 250&nbsp;ms latency suite. Use
+Firecracker when the guest might try to escape — especially
+multi-tenant `--docker`. Asking for virtiofs or time warp on the
+Firecracker backend fails Create loudly; nothing is silently dropped.
+Details: [Backends](https://docs.katakate.org/k7d/concepts/backends),
+[`SECURITY.md` privilege split](SECURITY.md#privilege-separation),
+[Firecracker profile](SECURITY.md#firecracker-profile-runtimeclassname-k7-fc).
+
 ## Why not Firecracker / Kata / E2B-style sandboxes?
 
 | | Firecracker | Kata | CubeSandbox / E2B-style | forkd | **k7d** |
 |---|---|---|---|---|---|
-| Warm fork of a **running** VM | snapshot → restore | no | snapshot + N restores (~220 ms) | Firecracker + MAP_PRIVATE (~56–150 ms BRANCH) | live copy-on-write fork (**~5 ms**) |
+| Warm fork of a **running** VM | snapshot → restore | no | snapshot + N restores (~220 ms) | Firecracker + MAP_PRIVATE (~56–150 ms BRANCH) | live copy-on-write fork (**~5 ms** native VMM; ~76–140 ms Firecracker backend) |
 | Snapshot tree (fork / rollback / protect / budget) | no | no | SDK around sandboxes | snapshot tag + branch | yes - daemon API |
 | Forks a **whole k8s cluster** | no | no | no | no (one sandbox VM) | **yes** (~105 ms CI guest / ~1.1 s Ubuntu) |
-| Per-VM jailer | yes | yes | process-per-sandbox | yes (one Firecracker process per child) | **no** — one daemon, one address space |
-| Runs as a Kubernetes RuntimeClass | via FC-containerd | yes | no | no | yes (`runtimeClassName: k7`) |
-| Guest time warp (lockstep jump / ×N dilation) | no | no | no | no | **yes** (1.83× jump at zero fidelity delta; 8× dilation) |
+| Per-VM jailer | yes | yes | process-per-sandbox | process-per-child, **no jailer** | native VMM ❌ / Firecracker backend ✅ |
+| Runs as a Kubernetes RuntimeClass | via FC-containerd | yes | no | no | yes (`k7` / `k7-fc`) |
+| Guest time warp (lockstep jump / ×N dilation) | no | no | no | no | native VMM **yes**; Firecracker backend ❌ |
 | Formal methods | audit/fuzz culture | - | - | - | Kani + Aeneas on selected paths (memory math, tree budgets) |
 
-They fork a sandbox. k7d forks a **VM or an entire cluster**.
-Deliberately not E2B-API compatible - different job. forkd is the
-honest nearest neighbor on the *sandbox* side: same CoW idea, one
-Firecracker process per child, no cluster unit. CubeSandbox is the
-honest nearest neighbor on density and packaging. Neither is a
-cluster time machine.
+They fork a sandbox. k7d forks a **VM or an entire cluster** (daemon
+tree API, either VMM). Deliberately not E2B-API compatible - different
+job. CubeSandbox is the honest nearest neighbor on density and
+packaging. forkd is the honest nearest neighbor on the *sandbox*
+side — see below.
+
+### k7d-fc vs forkd
+
+Both wrap Firecracker and CoW-fork guest RAM. forkd is a sandbox
+fan-out. `k7d-fc` is k7d's tree / cluster / RuntimeClass product with
+Firecracker swapped in as the VMM ([forkd](https://github.com/deeplethe/forkd)).
+
+| | **k7d-fc** | **forkd** |
+|---|---|---|
+| Stock Firecracker (no patch) | ✅ | ❌ vendored FC for live BRANCH (`MAP_SHARED` + UFFD) |
+| Stock jailer (uid, chroot, seccomp) | ✅ always | ❌ drives the API socket; no jailer |
+| Whole-cluster fork | ✅ | ❌ one sandbox VM |
+| Snapshot tree / RAM+disk budget | ✅ daemon API | ⚠️ snapshot tag + branch |
+| Kubernetes RuntimeClass | ✅ `k7-fc` | ❌ |
+| Privilege-separated daemon | ✅ | ❌ |
+| Warm fork of a running VM | ✅ **~76–140 ms** / child | ✅ **~56–150 ms** BRANCH |
+| 100 children from one snapshot | ❌ jailer spawn per child | ✅ **~100 ms** (`mmap MAP_PRIVATE`) |
+| Live BRANCH (source barely pauses) | ❌ Diff snapshot + `LoadSnapshot` | ✅ v0.4 UFFD-WP (needs the FC patch) |
+| Guest time warp / ×N dilation | ❌ | ❌ |
+| Built for | k7d tree + hostile guests | agent sandbox fan-out |
+
+Native k7d (~5&nbsp;ms in-process fork) is a different mechanism —
+do not compare that number to forkd. `k7d-fc` pays the jailer on
+every child so a guest→VMM bug dies in the jail, not in a patched
+VMM.
 
 ## Security model & limitations
 
-- **One daemon, many VMs, one address space.** Live copy-on-write fork
-  requires parent and child memory to be mappings in the same process.
-  Guest→host isolation is still KVM; isolation *between sibling forks
-  of the same tenant* is weaker than Firecracker's
-  one-jailed-process-per-VM. k7d is built for fleets of *your own*
-  environments, not hostile multi-tenant isolation between forks.
+- **Two backends, two isolation stories.** Native (`backend: native`)
+  is one daemon address space: live copy-on-write fork requires parent
+  and child memory to be mappings in the same process. Guest→host is
+  still KVM; isolation *between sibling forks of the same tenant* is
+  weaker than a jailed VMM. Firecracker (`backend: firecracker`,
+  RuntimeClass `k7-fc` for pods) puts each VM in stock Firecracker
+  under the stock jailer (own uid, chroot, seccomp). Native is for
+  fleets you control (RL, gym); Firecracker is the multi-tenant /
+  hostile-guest profile. See [k7d vs k7d-fc](#two-backends-k7d-vs-k7d-fc).
 - **What survives a fork:** everything inside the forked set - 
   in-cluster TLS, established TCP between member VMs, disk state.
   Guest clocks are reset so time does not jump backwards.
@@ -548,7 +641,7 @@ make verif-gen verif-build     # regenerate Lean model + prove it
 ## Roadmap
 
 - ✅ Warm single-VM fork, snapshot trees, budget eviction
-- ✅ containerd shim + `runtimeClassName: k7`
+- ✅ containerd shim + `runtimeClassName: k7` / `k7-fc`
 - ✅ Live 3-node cluster fork — two clocks: ~105 ms CI guest / ~1.1 s Ubuntu k3s+Cilium+Tetragon
 - ✅ Kani + Aeneas proofs on selected critical paths
 - ✅ Guest time warp: lockstep jumps (1.83×, zero fidelity delta) and ×8 KVM dilation, fork-aware

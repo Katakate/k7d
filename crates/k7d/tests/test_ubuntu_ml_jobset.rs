@@ -6,7 +6,7 @@
 //! (Flannel) and `FORK_UBUNTU_K3S_CLUSTER_3VM`. Does not touch
 //! `crates/k7d/src`.
 //!
-//! TrainJob / Kubeflow Trainer is parked for inc2b: the documented
+//! TrainJob / Kubeflow Trainer is parked as a follow-up: the documented
 //! install is a second controller + webhook, not a thin CRD on JobSet.
 
 mod common;

@@ -16,12 +16,14 @@
 //!    parked in a CrashLoopBackOff wait longer than 60 s restarts within
 //!    seconds of the warp instead of a minute later.
 //!
-//! The clock survey measured that `IA32_TSC_DEADLINE` is never armed on
-//! this guest — it uses the LAPIC one-shot timer, because
-//! `KVM_GET_SUPPORTED_CPUID` on host kernels before 6.14 does not report
-//! `CPUID.1:ECX[24]`. So the deadline-MSR write-back in
-//! `Vm::warp_clock` is not what re-arms anything here; the pod above is
-//! the only honest evidence, and this test is where it is produced.
+//! Which timer the warp has to re-arm is the host's choice: on the AMD
+//! nodes (host kernel 6.8, no `CPUID.1:ECX[24]`) the guest uses the LAPIC
+//! one-shot timer and `IA32_TSC_DEADLINE` is never armed, so the
+//! deadline-MSR write-back in `Vm::warp_clock` re-arms nothing there; on
+//! the Intel node (host kernel 7.0) the guest runs `lapic-deadline` and
+//! that write-back is the whole re-arm story. Either way the pod above is
+//! the only honest evidence, and this test is where it is produced
+//! (`common::warp::check_clockevent` names which of the two it proved).
 
 mod common;
 

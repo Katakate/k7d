@@ -180,31 +180,10 @@ fn guest_mem_total_kb(pod: &str) -> u64 {
         .unwrap_or_else(|| panic!("no MemTotal in guest meminfo: {meminfo:?}"))
 }
 
-/// The k7d daemon's cgroup v2 directory (where per-VM CPU cgroups
-/// live), resolved from the service's main PID.
-fn k7d_service_cgroup() -> PathBuf {
-    let out = Command::new("systemctl")
-        .args(["show", "-p", "MainPID", "--value", "k7d"])
-        .output()
-        .expect("systemctl show k7d");
-    let pid: u32 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .expect("k7d MainPID");
-    assert!(pid > 0, "k7d.service has no main PID — is it running?");
-    let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("read k7d cgroup");
-    let rel = cg
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .expect("cgroup v2 entry")
-        .trim();
-    PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
-}
-
 /// All `vm-*` CPU cgroups currently present under the daemon.
 fn vm_cpu_cgroups() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(k7d_service_cgroup())
-        .expect("read k7d service cgroup")
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(common::vm_cgroup_root())
+        .expect("read the daemon's VM cgroup root")
         .flatten()
         .map(|e| e.path())
         .filter(|p| {

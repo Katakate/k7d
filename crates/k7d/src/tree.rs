@@ -342,7 +342,10 @@ impl SnapshotTree {
                 "tree: node '{node_id}' runs on Firecracker (pid {}) — capped by the \
                  jailer's cgroup {}, not the tree jail",
                 fc.pid(),
-                fc.cgroup_dir().display()
+                fc.cgroup_dir().map_or_else(
+                    || "(the node broker's)".to_string(),
+                    |d| d.display().to_string()
+                )
             );
             return Ok(());
         }

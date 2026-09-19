@@ -18,6 +18,30 @@ from typing import Any
 
 
 DEFAULT_SOCKET = os.environ.get("K7D_SOCKET", "/run/k7d/k7d.sock")
+TEST_TREE_MARKER = ".k7d-test-tree"
+_TREE_CREATE_OPS = frozenset(
+    {"tree_create", "tree_create_cluster", "tree_adopt_cluster"}
+)
+
+
+def mark_test_tree(tree_id: str) -> None:
+    """Write `.k7d-test-tree` into the on-disk tree dir.
+
+    The stranded-tree sweep reaps only marked dirs. Unmarked operator
+    trees are never touched. A stub client that never creates a dir is
+    a no-op here — the real daemon always leaves `{tree_root}/{id}`.
+    """
+    if not tree_id:
+        raise RuntimeError("mark_test_tree: empty tree_id")
+    roots = [Path("/var/lib/k7d/trees"), Path("/var/lib/k7d/disks/trees")]
+    env = os.environ.get("K7D_TREE_ROOT")
+    if env:
+        roots.insert(0, Path(env))
+    for root in roots:
+        d = root / tree_id
+        if d.is_dir():
+            (d / TEST_TREE_MARKER).touch()
+            return
 
 
 class K7dClient:
@@ -49,6 +73,13 @@ class K7dClient:
         status = resp.get("status")
         if status == "error":
             raise RuntimeError(f"{req.get('op')}: {resp.get('message')}")
+        if req.get("op") in _TREE_CREATE_OPS:
+            tid = resp.get("tree_id") or req.get("tree_id")
+            if not tid:
+                raise RuntimeError(
+                    f"{req.get('op')} succeeded with no tree_id in request or reply"
+                )
+            mark_test_tree(str(tid))
         return resp
 
     def ping(self) -> dict[str, Any]:

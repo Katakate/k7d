@@ -176,7 +176,10 @@ class TestGrpoInject(unittest.TestCase):
                 },
                 "test",
             )
-        self.assertEqual(calls, list(range(8)))
+        # `_inject` fans out over a ThreadPoolExecutor, so completion
+        # order is whatever the scheduler picked (visibly so on a 20-core
+        # node); the contract is "every env exactly once".
+        self.assertEqual(sorted(calls), list(range(8)))
         self.assertEqual(len(rec["envs"]), 8)
         self.assertFalse(fault.keep_apiserver)
         self.assertIn("inject_ms", rec)
