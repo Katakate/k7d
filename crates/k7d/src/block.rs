@@ -434,7 +434,7 @@ impl VirtioBackend for BlockBackend {
             if i >= acc.len() {
                 break;
             }
-            acc[i] |= w.load(Ordering::SeqCst);
+            acc[i] |= w.swap(0, Ordering::AcqRel);
         }
     }
 

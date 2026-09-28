@@ -18,7 +18,7 @@ use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::bzimage::BzImage as BzImageLoader;
 use linux_loader::loader::elf::Elf as ElfLoader;
 use linux_loader::loader::{load_cmdline, Cmdline, KernelLoader};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use serde::{Deserialize, Serialize};
@@ -306,8 +306,8 @@ pub enum LapicTimerMode {
     /// Reloads `TMICT` and fires forever — a tick rate, not a deadline.
     Periodic,
     /// Fires when `IA32_TSC` passes `IA32_TSC_DEADLINE`. Needs
-    /// `CPUID.1:ECX[24]`: not reported by the AMD nodes' host kernel
-    /// (6.8), reported by the Intel node's (7.0), so Ubuntu guests there
+    /// `CPUID.1:ECX[24]`: not reported by host kernel 6.8, reported by
+    /// 7.0, so Ubuntu guests on 7.0
     /// register `lapic-deadline` and this is the mode they run in.
     TscDeadline,
     /// Bits 18:17 = 3, reserved by the SDM.
@@ -1039,6 +1039,9 @@ pub struct VmBuilder {
     /// above 1 requires the carried KVM patch in `utils/kvm-dilation`
     /// and fails the build loudly on a stock host.
     dilation: u32,
+    /// Advertise `CPUID.1:ECX[24]` so the guest arms the TSC-deadline
+    /// timer. See [`Self::tsc_deadline_timer`].
+    tsc_deadline: bool,
 }
 
 impl Default for VmBuilder {
@@ -1240,6 +1243,7 @@ impl VmBuilder {
             docker_disk: None,
             docker: false,
             dilation: 1,
+            tsc_deadline: false,
         }
     }
 
@@ -1313,6 +1317,18 @@ impl VmBuilder {
     #[must_use]
     pub fn dilation(mut self, n: u32) -> Self {
         self.dilation = n;
+        self
+    }
+
+    /// Advertise the TSC-deadline LAPIC timer (`CPUID.1:ECX[24]`), which
+    /// KVM always emulates but host kernel 6.8 leaves out of
+    /// `KVM_GET_SUPPORTED_CPUID`. The guest then registers
+    /// `lapic-deadline` instead of the one-shot `lapic`, as it does
+    /// unasked on 7.0. Off by default: it is how the dilation suite
+    /// exercises both timer modes on one host kernel.
+    #[must_use]
+    pub fn tsc_deadline_timer(mut self, on: bool) -> Self {
+        self.tsc_deadline = on;
         self
     }
 
@@ -1987,6 +2003,18 @@ impl VmBuilder {
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .map_err(VmError::GetCpuid)?;
         patch_cpuid_for_kvm_guest(&mut kvm_cpuid);
+        if self.tsc_deadline {
+            if !kvm.check_extension(kvm_ioctls::Cap::TscDeadlineTimer) {
+                return Err(VmError::Pipe(std::io::Error::other(
+                    "tsc_deadline_timer: KVM_CAP_TSC_DEADLINE_TIMER is not available",
+                )));
+            }
+            for entry in kvm_cpuid.as_mut_slice().iter_mut() {
+                if entry.function == 0x1 {
+                    entry.ecx |= 1 << 24;
+                }
+            }
+        }
         let mut vcpu_fds = Vec::with_capacity(self.vcpus as usize);
         for cpu_index in 0..self.vcpus {
             let vcpu_fd = vm_fd
@@ -3087,8 +3115,9 @@ impl Vm {
             }
 
             // Zero is unarmed, never "a deadline at TSC zero". Never
-            // armed on the AMD nodes (CPUID.1:ECX[24] not advertised);
-            // the live timer of every Ubuntu vCPU on the Intel node.
+            // armed where the host kernel does not advertise
+            // CPUID.1:ECX[24] (6.8); the live timer of every Ubuntu
+            // vCPU where it does (7.0).
             let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)?;
             if deadline != 0 {
                 let tsc = read_msr(vcpu_fd, cpu, MSR_IA32_TSC)?;
@@ -3454,11 +3483,15 @@ impl Vm {
             //    jump lands ε before it, and it goes off. That is the
             //    semantics `autowarp::EPSILON` is written for.
             //
-            //    Never armed on the AMD nodes (host kernel 6.8 does not
-            //    advertise CPUID.1:ECX[24], the guest runs the LAPIC
-            //    one-shot, whose KVM hrtimer is host-anchored and is not
-            //    touched here). The live timer of every Ubuntu vCPU on
-            //    the Intel node (kernel 7.0, `lapic-deadline`). It is
+            //    Never armed under host kernel 6.8, which does not
+            //    advertise CPUID.1:ECX[24]: the guest runs the LAPIC
+            //    one-shot, not touched here. Its KVM hrtimer is
+            //    host-anchored, but on VMX the preemption timer re-reads
+            //    a guest-TSC copy of the expiry whenever a pause wakes
+            //    the vCPU, so there a jumped one-shot fires at the next
+            //    pause and on SVM it never does (CHALLENGES #264). The
+            //    live timer of every Ubuntu vCPU under kernel 7.0
+            //    (`lapic-deadline`). It is
             //    not shifted along with the offset to mirror the
             //    one-shot's host expiry: measured, that makes every idle
             //    cycle re-jump the same still-armed deadline, fabricating
@@ -3699,6 +3732,17 @@ impl Vm {
             .unwrap_or_else(|| self.guest_memory.get_host_address(GuestAddress(0)).unwrap() as u64)
     }
 
+    /// Mark this VM's guest RAM `MADV_MERGEABLE`.
+    ///
+    /// Call it from the process that owns the mapping, after the guest
+    /// is running: the VM broker under privilege separation, otherwise
+    /// the daemon. `madvise` only sets a VMA flag, so it does not extend
+    /// a fork pause when it runs after resume. Does not call
+    /// `PR_SET_MEMORY_MERGE` and does not write `/sys/kernel/mm/ksm`.
+    pub fn advise_memory_mergeable(&self) -> std::io::Result<()> {
+        crate::ksm::advise_mergeable(self.mem_host_addr(), self.mem_span())
+    }
+
     /// Whether this VM was restored from a snapshot (`CoW` memory).
     #[must_use]
     pub fn is_restored(&self) -> bool {
@@ -3771,15 +3815,7 @@ impl Vm {
         &mut self,
         base_dir: &Path,
     ) -> Result<PathBuf, crate::fork::ForkError> {
-        // Forkability validation: virtiofs shares force
-        // every fork onto the slow full-memfd path (vhost-user needs
-        // fd-backed shared memory). That
-        // trade must be taken knowingly, never inherited silently.
-        if !self.virtiofs_shares.is_empty() && !self.slow_fork_allowed {
-            return Err(crate::fork::ForkError::VirtiofsSlowForkNotAllowed {
-                shares: self.virtiofs_shares.len(),
-            });
-        }
+        self.check_fork_source_allowed()?;
         std::fs::create_dir_all(base_dir)?;
 
         self.snapshot(base_dir)
@@ -3788,6 +3824,19 @@ impl Vm {
         // question has data; do not refuse — a full dump is what ran.
         let _ = self.take_full_dump_if_not_quiescent();
         self.restore_swap_onto_base(base_dir)
+    }
+
+    /// Forkability validation: virtiofs shares force every fork onto the
+    /// slow full-memfd path (vhost-user needs fd-backed shared memory).
+    /// That trade must be taken knowingly ([`Self::allow_slow_fork`]),
+    /// never inherited silently.
+    pub(crate) fn check_fork_source_allowed(&self) -> Result<(), crate::fork::ForkError> {
+        if !self.virtiofs_shares.is_empty() && !self.slow_fork_allowed {
+            return Err(crate::fork::ForkError::VirtiofsSlowForkNotAllowed {
+                shares: self.virtiofs_shares.len(),
+            });
+        }
+        Ok(())
     }
 
     /// Like [`Self::prepare_fork_source_in`], but write the keyframe
@@ -3813,52 +3862,80 @@ impl Vm {
         base_dir: &Path,
         ancestor_mem: &Path,
     ) -> Result<PreparedBase, crate::fork::ForkError> {
-        if !self.virtiofs_shares.is_empty() {
-            // Keep-live sources never take the CoW fork path at all
-            // (CHALLENGES #39) and virtiofsd's FUSE DMA is invisible to
-            // the bitmap, so an incremental keyframe would be incomplete.
-            log::warn!(
-                "prepare_fork_source_incremental_in: VM (cid {}) has {} virtiofs share(s) — \
-                 writing a full keyframe instead",
-                self.guest_cid,
-                self.virtiofs_shares.len()
-            );
-            return Ok(PreparedBase::full(
-                self.prepare_fork_source_in(base_dir)?,
-                self.mem_span(),
-            ));
-        }
-        if !self.dirty_tracking_enabled {
-            log::warn!(
-                "prepare_fork_source_incremental_in: VM (cid {}) has no dirty tracking — \
-                 the divergence from {} is unknown, writing a full keyframe instead",
-                self.guest_cid,
-                ancestor_mem.display()
-            );
-            return Ok(PreparedBase::full(
-                self.prepare_fork_source_in(base_dir)?,
-                self.mem_span(),
-            ));
-        }
-
         std::fs::create_dir_all(base_dir)?;
         let was_running = self.is_running();
         if was_running {
             self.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
         }
-        if self.take_full_dump_if_not_quiescent() {
-            if was_running {
-                self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
-            }
+        let (incremental, disk_bytes) =
+            match self.write_keyframe_paused(base_dir, Some(ancestor_mem)) {
+                Ok(written) => written,
+                Err(e) => {
+                    if was_running {
+                        self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
+                    }
+                    return Err(e);
+                }
+            };
+        let t_swap = std::time::Instant::now();
+        let base_mem = self.restore_swap_onto_base(base_dir)?;
+        if was_running && self.paused() {
+            self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
+        }
+        log::info!(
+            "prepare_fork_source_incremental_in: restore-swap took {:?}",
+            t_swap.elapsed()
+        );
+        Ok(PreparedBase {
+            base_mem,
+            incremental,
+            disk_bytes,
+        })
+    }
+
+    /// Write this **paused** VM's keyframe into `base_dir` without
+    /// swapping onto it: incrementally against `ancestor_mem` when given
+    /// (see [`Self::prepare_fork_source_incremental_in`] for the
+    /// contract), else as a full dump. Returns `(incremental,
+    /// disk_bytes)`. Every fallback to a full dump is logged and runs
+    /// under the same pause.
+    pub(crate) fn write_keyframe_paused(
+        &mut self,
+        base_dir: &Path,
+        ancestor_mem: Option<&Path>,
+    ) -> Result<(bool, u64), crate::fork::ForkError> {
+        let missed_park = self.take_full_dump_if_not_quiescent();
+        let Some(ancestor_mem) = ancestor_mem else {
+            return self.write_full_keyframe_paused(base_dir);
+        };
+        if !self.virtiofs_shares.is_empty() {
+            // Keep-live sources never take the CoW fork path at all
+            // (CHALLENGES #39) and virtiofsd's FUSE DMA is invisible to
+            // the bitmap, so an incremental keyframe would be incomplete.
             log::warn!(
-                "prepare_fork_source_incremental_in: VM (cid {}) missed the 200ms park \
+                "write_keyframe_paused: VM (cid {}) has {} virtiofs share(s) — \
+                 writing a full keyframe instead",
+                self.guest_cid,
+                self.virtiofs_shares.len()
+            );
+            return self.write_full_keyframe_paused(base_dir);
+        }
+        if !self.dirty_tracking_enabled {
+            log::warn!(
+                "write_keyframe_paused: VM (cid {}) has no dirty tracking — \
+                 the divergence from {} is unknown, writing a full keyframe instead",
+                self.guest_cid,
+                ancestor_mem.display()
+            );
+            return self.write_full_keyframe_paused(base_dir);
+        }
+        if missed_park {
+            log::warn!(
+                "write_keyframe_paused: VM (cid {}) missed the 200ms park \
                  — writing a full keyframe instead of an incremental dirty-delta",
                 self.guest_cid
             );
-            return Ok(PreparedBase::full(
-                self.prepare_fork_source_in(base_dir)?,
-                self.mem_span(),
-            ));
+            return self.write_full_keyframe_paused(base_dir);
         }
         // The complete dirty set vs the ancestor keyframe: KVM's log ∪
         // the device-DMA bitmaps ∪ the vhost-vsock rings (#101). The
@@ -3868,21 +3945,8 @@ impl Vm {
             .get_and_accumulate_dirty()
             .map_err(crate::snapshot::SnapshotError::Vm)?
             .to_vec();
-
         match crate::snapshot::snapshot_vm_incremental(self, base_dir, ancestor_mem, &mut dirty) {
-            Ok(dirty_bytes) => {
-                let t_swap = std::time::Instant::now();
-                let base_mem = self.restore_swap_onto_base(base_dir)?;
-                log::info!(
-                    "prepare_fork_source_incremental_in: restore-swap took {:?}",
-                    t_swap.elapsed()
-                );
-                Ok(PreparedBase {
-                    base_mem,
-                    incremental: true,
-                    disk_bytes: dirty_bytes,
-                })
-            }
+            Ok(dirty_bytes) => Ok((true, dirty_bytes)),
             Err(crate::snapshot::SnapshotError::ReflinkUnsupported {
                 ancestor,
                 dest,
@@ -3893,22 +3957,25 @@ impl Vm {
                 // means the node is misconfigured and every keyframe is
                 // about to cost a full dump.
                 log::warn!(
-                    "prepare_fork_source_incremental_in: FICLONE {} -> {} failed ({detail}); \
+                    "write_keyframe_paused: FICLONE {} -> {} failed ({detail}); \
                      falling back to a FULL keyframe dump — put the tree root on a \
                      reflink-capable filesystem to get O(divergence) fork points",
                     ancestor.display(),
                     dest.display(),
                 );
-                if was_running {
-                    self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
-                }
-                Ok(PreparedBase::full(
-                    self.prepare_fork_source_in(base_dir)?,
-                    self.mem_span(),
-                ))
+                self.write_full_keyframe_paused(base_dir)
             }
             Err(e) => Err(crate::fork::ForkError::Snapshot(e)),
         }
+    }
+
+    pub(crate) fn write_full_keyframe_paused(
+        &mut self,
+        base_dir: &Path,
+    ) -> Result<(bool, u64), crate::fork::ForkError> {
+        self.check_fork_source_allowed()?;
+        crate::snapshot::snapshot_vm(self, base_dir).map_err(crate::fork::ForkError::Snapshot)?;
+        Ok((false, self.mem_span()))
     }
 
     /// The half of `prepare_fork_source_in` that runs **after** the
@@ -3916,10 +3983,26 @@ impl Vm {
     /// shut the source down and restore it onto its own new
     /// `memory.bin` (preserving the vsock CID) so later warm forks share
     /// that file's page cache.
-    fn restore_swap_onto_base(
+    ///
+    /// A virtiofs source is left in whatever run state it arrived in; a
+    /// swapped source comes back running.
+    pub(crate) fn restore_swap_onto_base(
         &mut self,
         base_dir: &Path,
     ) -> Result<PathBuf, crate::fork::ForkError> {
+        let (base_mem, husk) = self.restore_swap_onto_base_keep_husk(base_dir)?;
+        drop(husk);
+        Ok(base_mem)
+    }
+
+    /// [`Self::restore_swap_onto_base`], but hand back the swapped-out
+    /// husk instead of dropping it. The restored copy already runs;
+    /// unmapping the husk's RAM takes seconds for a guest of tens of
+    /// GiB, so a caller timing the pause stops its clock first.
+    pub(crate) fn restore_swap_onto_base_keep_husk(
+        &mut self,
+        base_dir: &Path,
+    ) -> Result<(PathBuf, Option<Self>), crate::fork::ForkError> {
         let base_mem = base_dir.join("memory.bin");
 
         // VMs with virtiofs shares keep running as-is: vhost-user needs
@@ -3939,7 +4022,7 @@ impl Vm {
                 self.virtiofs_shares.len(),
                 self.guest_cid
             );
-            return Ok(base_mem);
+            return Ok((base_mem, None));
         }
 
         // Move the source's TAP into the restored VM so the host bridge link
@@ -3998,10 +4081,9 @@ impl Vm {
         // The old source was already shut down above (CID release);
         // dropping the swapped-out husk just unmaps its memory.
         std::mem::swap(self, &mut restored);
-        drop(restored);
 
         self.fork_source_base_path = Some(base_mem.clone());
-        Ok(base_mem)
+        Ok((base_mem, Some(restored)))
     }
 
     /// Number of pages marked dirty in the accumulated bitmap since dirty
@@ -4107,46 +4189,58 @@ impl Vm {
         Ok(())
     }
 
-    /// Read the KVM dirty bitmap, OR it into the accumulated bitmap, and clear KVM's copy.
-    ///
-    /// Returns a reference to the accumulated bitmap (union of all pages dirtied
-    /// since dirty tracking was enabled).
+    /// Harvest the dirty log, OR it into the accumulated bitmap, and
+    /// return the accumulated bitmap (union of all pages dirtied since
+    /// dirty tracking was enabled).
     pub fn get_and_accumulate_dirty(&mut self) -> Result<&[u64], VmError> {
+        self.harvest_dirty()?;
+        Ok(self
+            .accumulated_dirty
+            .as_deref()
+            .expect("harvest checked tracking"))
+    }
+
+    /// Pages dirtied since the previous harvest — KVM's log ∪ the
+    /// device-DMA bitmaps ∪ the vhost-vsock rings — as a span-indexed
+    /// bitmap, also OR'd into the accumulated bitmap. Safe on a
+    /// **running** VM: a page written at any point after its bit is
+    /// cleared here is reported by a later harvest, which is what the
+    /// live keyframe (`snapshot::LiveKeyframe`) relies on.
+    pub fn harvest_dirty(&mut self) -> Result<Vec<u64>, VmError> {
         if !self.dirty_tracking_enabled {
             return Err(VmError::Pipe(std::io::Error::other(
                 "dirty tracking not enabled",
             )));
         }
+        let mem_host_addr = self.mem_host_addr();
+        let mem_span = self.mem_span();
+        let mut round = vec![0u64; self.accumulated_dirty.as_ref().map_or(0, Vec::len)];
+        let round_words = round.len();
 
-        // One KVM bitmap per RAM slot, OR'd into the span-indexed
-        // accumulated bitmap. Both region boundaries are whole bitmap words
-        // (see `mem_layout::tests::region_boundaries_are_bitmap_word_aligned`),
+        // One KVM bitmap per RAM slot. Both region boundaries are whole
+        // bitmap words (see
+        // `mem_layout::tests::region_boundaries_are_bitmap_word_aligned`),
         // so a slot's bits land at a word offset with no shifting.
-        let slots = self.mem_layout().slots();
-        let mut per_slot = Vec::with_capacity(slots.len());
-        for &(slot, gpa, size) in &slots {
+        for (slot, gpa, size) in self.mem_layout().slots() {
             let bitmap = self.vm_fd.get_dirty_log(slot, size as usize).map_err(|e| {
                 VmError::Pipe(std::io::Error::other(format!(
                     "KVM_GET_DIRTY_LOG slot {slot}: {e}"
                 )))
             })?;
-            per_slot.push((gpa, bitmap));
-        }
-
-        let mem_host_addr = self.mem_host_addr();
-        let mem_span = self.mem_span();
-        let acc = self.accumulated_dirty.as_mut().expect("bitmap allocated");
-        let acc_words = acc.len();
-        for (gpa, bitmap) in per_slot {
+            // Re-arm write protection for exactly the pages GET reported.
+            // With MANUAL_DIRTY_LOG_PROTECT2 GET no longer clears; an
+            // all-ones clear on a running guest would also drop a write
+            // that landed after GET on a page GET saw clean.
+            clear_dirty_log(&self.vm_fd, slot, size, &bitmap)?;
             let word_offset = (gpa / 4096 / 64) as usize;
             // Dropping words here would silently lose dirty pages and hand
             // forks a stale copy of them, so a short bitmap is an error.
-            let dst = acc
+            let dst = round
                 .get_mut(word_offset..word_offset + bitmap.len())
                 .ok_or_else(|| {
                     VmError::Pipe(std::io::Error::other(format!(
                         "dirty bitmap of the slot at {gpa:#x} ({} words at word {word_offset}) \
-                         does not fit the {acc_words}-word span bitmap",
+                         does not fit the {round_words}-word span bitmap",
                         bitmap.len(),
                     )))
                 })?;
@@ -4155,26 +4249,67 @@ impl Vm {
             }
         }
 
-        // Merge device-DMA dirty pages: KVM's log only sees vCPU writes, so
-        // in-process device workers (virtio-blk) that write guest memory
-        // through k7d's own mapping report their pages here. Without this,
+        // Device-DMA dirty pages: KVM's log only sees vCPU writes, so
+        // in-process device workers that write guest memory through k7d's
+        // own mapping report (and here drain) their pages. Without this,
         // warm forks on the base.mem + dirty-delta path would silently miss
         // read completions and used-ring updates (host-side #27 class).
         // vhost-vsock has no userspace worker to report anything, so its
         // virtqueue rings and buffers are marked from the queue state.
-        self.mmio_registry
-            .lock()
-            .unwrap()
-            .merge_dirty_pages_all(acc, mem_host_addr, mem_span);
+        self.mmio_registry.lock().unwrap().merge_dirty_pages_all(
+            &mut round,
+            mem_host_addr,
+            mem_span,
+        );
 
-        // Re-arm write protection. With MANUAL_DIRTY_LOG_PROTECT2, KVM_GET_DIRTY_LOG
-        // no longer clears the bitmap — we must do it explicitly via KVM_CLEAR_DIRTY_LOG
-        // so that subsequent guest writes are tracked again.
-        for &(slot, _, size) in &slots {
-            clear_dirty_log(&self.vm_fd, slot, size)?;
+        let acc = self.accumulated_dirty.as_mut().expect("bitmap allocated");
+        for (a, r) in acc.iter_mut().zip(&round) {
+            *a |= r;
         }
+        Ok(round)
+    }
 
-        Ok(acc.as_slice())
+    /// Guest-physical `[start, end)` extents of RAM that may hold data:
+    /// for a memfd-backed guest, the memfd's `SEEK_DATA` extents clipped
+    /// to the RAM slots (never-touched pages are holes and read as zero);
+    /// for a restored guest, its whole RAM slots. Never the MMIO hole.
+    pub fn ram_data_extents(&self) -> Result<Vec<(u64, u64)>, VmError> {
+        use vm_memory::GuestMemoryRegion;
+        let slots = self.mem_layout().slots();
+        // The memfd only describes guest RAM when the guest runs on it.
+        let memfd = if self.restored || self.cow_mmap_addr.is_some() {
+            None
+        } else {
+            self.guest_memory
+                .iter()
+                .next()
+                .and_then(|r| r.file_offset().map(|f| f.file().as_raw_fd()))
+        };
+        let Some(fd) = memfd else {
+            return Ok(slots
+                .iter()
+                .map(|&(_, gpa, size)| (gpa, gpa + size))
+                .collect());
+        };
+        let mut out = Vec::new();
+        for (_, gpa, size) in slots {
+            let end = gpa + size;
+            let mut pos = gpa;
+            while pos < end {
+                let Some(data) = seek_memfd(fd, pos, libc::SEEK_DATA)? else {
+                    break;
+                };
+                if data >= end {
+                    break;
+                }
+                let hole = seek_memfd(fd, data, libc::SEEK_HOLE)?.unwrap_or(end);
+                if let Some(ext) = clip_extent(data, hole, gpa, end) {
+                    out.push(ext);
+                }
+                pos = hole;
+            }
+        }
+        Ok(out)
     }
 
     /// Path to the `base.mem` file this VM is fork-ready against, if any.
@@ -4751,12 +4886,40 @@ fn vcpu_run_loop(
     let _ = return_tx.send(vcpu_fd);
 }
 
-/// Clear the KVM dirty log for a memory slot via the raw `KVM_CLEAR_DIRTY_LOG` ioctl.
+/// `lseek(fd, pos, whence)` for `SEEK_DATA` / `SEEK_HOLE`; `None` on
+/// `ENXIO` (no data at or after `pos`).
+fn seek_memfd(fd: RawFd, pos: u64, whence: libc::c_int) -> Result<Option<u64>, VmError> {
+    // SAFETY: lseek on a valid fd owned by the guest memory region.
+    #[allow(clippy::cast_possible_wrap)]
+    let r = unsafe { libc::lseek(fd, pos as libc::off_t, whence) };
+    if r < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENXIO) {
+            return Ok(None);
+        }
+        return Err(VmError::Pipe(err));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Ok(Some(r as u64))
+}
+
+/// `[start, end)` intersected with `[lo, hi)`, page-aligned outward;
+/// `None` if empty. Outward rounding keeps a partial page whole — the
+/// writer copies pages, and the caller's slots are page-aligned.
+fn clip_extent(start: u64, end: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let s = (start.max(lo) / 4096) * 4096;
+    let e = end.min(hi).div_ceil(4096) * 4096;
+    let (s, e) = (s.max(lo), e.min(hi));
+    (s < e).then_some((s, e))
+}
+
+/// Clear the KVM dirty log for the pages set in `mask` (one bit per page
+/// of the slot) via the raw `KVM_CLEAR_DIRTY_LOG` ioctl.
 ///
 /// `kvm-ioctls` 0.19.1 does not expose a safe wrapper for this ioctl. We call it
 /// directly to re-arm write protection on tracked pages after reading the dirty
 /// bitmap. Requires `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` (Linux 5.0+) to be enabled.
-fn clear_dirty_log(vm_fd: &VmFd, slot: u32, memory_size: u64) -> Result<(), VmError> {
+fn clear_dirty_log(vm_fd: &VmFd, slot: u32, memory_size: u64, mask: &[u64]) -> Result<(), VmError> {
     #[repr(C)]
     struct KvmClearDirtyLog {
         slot: u32,
@@ -4773,17 +4936,24 @@ fn clear_dirty_log(vm_fd: &VmFd, slot: u32, memory_size: u64) -> Result<(), VmEr
 
     let num_pages = memory_size.div_ceil(4096) as u32;
     let words = (num_pages as usize).div_ceil(64);
-    // Pass an all-ones bitmap: clear every tracked page.
-    let bitmap: Vec<u64> = vec![u64::MAX; words];
+    if mask.len() < words {
+        return Err(VmError::Pipe(std::io::Error::other(format!(
+            "KVM_CLEAR_DIRTY_LOG slot {slot}: {}-word mask for {num_pages} pages",
+            mask.len()
+        ))));
+    }
+    if mask[..words].iter().all(|&w| w == 0) {
+        return Ok(());
+    }
     let req = KvmClearDirtyLog {
         slot,
         num_pages,
         first_page: 0,
-        dirty_bitmap: bitmap.as_ptr() as u64,
+        dirty_bitmap: mask.as_ptr() as u64,
     };
 
     // SAFETY: vm_fd is valid; KvmClearDirtyLog matches the kernel's struct layout
-    // and the bitmap points to `words * 8` bytes of valid memory.
+    // and the mask points to at least `words * 8` bytes of valid memory.
     let rc = unsafe {
         libc::ioctl(
             vm_fd.as_raw_fd(),
@@ -5454,6 +5624,31 @@ fn sync_dir_to_guest(
 #[cfg(kani)]
 mod verification {
     use super::*;
+
+    /// A clipped `SEEK_DATA` extent stays inside its page-aligned RAM
+    /// slot, is page-aligned, and covers every byte of the extent that
+    /// lies in the slot — the live keyframe's pass-0 `pwrite` reads
+    /// exactly that range out of the guest mapping, and a byte it missed
+    /// would read back as a hole (zero) in the keyframe.
+    #[kani::proof]
+    fn verify_clip_extent_in_slot() {
+        let (lo_pg, hi_pg, start, end): (u64, u64, u64, u64) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        kani::assume(lo_pg < hi_pg && hi_pg <= 1 << 40);
+        kani::assume(start < end && end <= 1 << 52);
+        let (lo, hi) = (lo_pg * 4096, hi_pg * 4096);
+        match clip_extent(start, end, lo, hi) {
+            None => assert!(
+                end <= lo || start >= hi,
+                "only a disjoint extent clips to nothing"
+            ),
+            Some((s, e)) => {
+                assert!(lo <= s && s < e && e <= hi);
+                assert!(s % 4096 == 0 && e % 4096 == 0);
+                assert!(s <= start.max(lo) && end.min(hi) <= e);
+            }
+        }
+    }
 
     /// The initrd goes at the top of the LOW RAM region, so its
     /// address must stay page-aligned, clear of the kernel, inside low RAM

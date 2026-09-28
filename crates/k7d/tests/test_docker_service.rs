@@ -638,6 +638,8 @@ spec:
         source_id: "root".into(),
         label: "cow".into(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(k7d::control::Response::TreeForked {
             fork_memory_full_copy,

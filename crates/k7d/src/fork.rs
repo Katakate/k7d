@@ -1838,6 +1838,383 @@ pub fn fork_cluster_warm_batch(
     Ok(out)
 }
 
+/// One member's timeline in a [`ClusterCut`], in ns since the cut's
+/// live phase began.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberCut {
+    /// The live pre-copy phase started (the guest still runs).
+    pub live_begin_ns: u64,
+    /// Host ns the arm stop paused the guest (`enable_dirty_tracking`,
+    /// before and independent of the cut; 0 if tracking was already on).
+    pub arm_pause_ns: u64,
+    /// Bytes written while the guest ran (pass 0 + dirty rounds).
+    pub precopied_bytes: u64,
+    /// Bytes written while the guest was paused: the pre-copy residual,
+    /// or the whole span for a full dump.
+    pub final_bytes: u64,
+    /// `pause` was called.
+    pub pause_begin_ns: u64,
+    /// `pause` returned: vCPUs parked, workers quiesced.
+    pub paused_ns: u64,
+    /// The paused keyframe write started.
+    pub dump_begin_ns: u64,
+    /// The paused keyframe write finished (`memory.bin` + state files).
+    pub dump_end_ns: u64,
+    /// The guest runs again: the restored copy started (or, for a
+    /// virtiofs source kept live, `resume` returned).
+    pub running_ns: u64,
+    /// The keyframe was a `FICLONE` of the ancestor plus dirty pages.
+    pub incremental: bool,
+    /// Physical bytes the keyframe added to the filesystem.
+    pub disk_bytes: u64,
+}
+
+impl MemberCut {
+    /// Host ns this guest did not run during the cut (the arm stop is
+    /// reported separately in [`Self::arm_pause_ns`]).
+    #[must_use]
+    pub fn pause_ns(&self) -> u64 {
+        self.running_ns.saturating_sub(self.pause_begin_ns)
+    }
+
+    /// Host ns the paused keyframe write took.
+    #[must_use]
+    pub fn dump_ns(&self) -> u64 {
+        self.dump_end_ns.saturating_sub(self.dump_begin_ns)
+    }
+
+    /// Whether this member's keyframe was pre-copied while it ran.
+    #[must_use]
+    pub fn precopied(&self) -> bool {
+        self.precopied_bytes > 0
+    }
+}
+
+/// Timeline of one coordinated cluster keyframe
+/// ([`prepare_cluster_fork_source`]), members in `vm_index` order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterCut {
+    /// Per-member timelines.
+    pub members: Vec<MemberCut>,
+}
+
+impl ClusterCut {
+    /// Per-member [`MemberCut::pause_ns`].
+    #[must_use]
+    pub fn pause_ns(&self) -> Vec<u64> {
+        self.members.iter().map(MemberCut::pause_ns).collect()
+    }
+
+    /// Longest per-member pause.
+    #[must_use]
+    pub fn max_pause_ns(&self) -> u64 {
+        self.members
+            .iter()
+            .map(MemberCut::pause_ns)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether every member's paused write ran while **every** member was
+    /// paused — the keyframes are one instant of the whole cluster.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        let last_paused = self.members.iter().map(|m| m.paused_ns).max();
+        let first_dump = self.members.iter().map(|m| m.dump_begin_ns).min();
+        let last_dump = self.members.iter().map(|m| m.dump_end_ns).max();
+        let first_running = self.members.iter().map(|m| m.running_ns).min();
+        match (last_paused, first_dump, last_dump, first_running) {
+            (Some(p), Some(d0), Some(d1), Some(r)) => p <= d0 && d1 <= r,
+            _ => false,
+        }
+    }
+}
+
+/// Keyframe a native cluster as **one** coordinated cut whose pause does
+/// not grow with guest RAM.
+///
+/// 1. Live, in parallel: each share-less member pre-copies its RAM into
+///    `dirs[i]/memory.bin.tmp` while it runs
+///    ([`crate::snapshot::LiveKeyframe`]) — incrementally over
+///    `ancestors[i]` when that is `Some`, as a full keyframe when
+///    `None` — then every member runs one catch-up round, since early
+///    finishers kept running while the late ones wrote.
+/// 2. Pause every member.
+/// 3. In parallel, write each member's residual and state files. A
+///    member with virtiofs shares (FUSE DMA is invisible to every dirty
+///    bitmap) or whose workers missed the 200 ms park gets a paused
+///    [`Vm::write_keyframe_paused`] / full dump instead, loudly.
+/// 4. In parallel, restore-swap every member onto its own `memory.bin`.
+///
+/// Members are swapped from the paused state, never resumed first:
+/// the swap restores the guest from its keyframe, so anything a member
+/// did after a resume would be rewound — and its already-swapped peers
+/// would have seen it (CHALLENGES #271). A swap drops and re-claims only
+/// its own member's vsock CID and moves only its own TAP, so swaps of
+/// different members do not order against each other (the same
+/// concurrent restore `fork_cluster_warm_batch` runs for its children).
+///
+/// A live-phase failure returns before anything is paused (tmp files
+/// are removed). On a pause or paused-write failure every paused member
+/// is resumed and nothing is swapped. A swap failure leaves that member
+/// dead (as [`Vm::prepare_fork_source_in`] does); the others still swap.
+#[allow(clippy::too_many_lines)]
+pub fn prepare_cluster_fork_source(
+    members: &mut [&mut Vm],
+    dirs: &[PathBuf],
+    ancestors: &[Option<PathBuf>],
+) -> Result<ClusterCut, ForkError> {
+    use crate::snapshot::LiveKeyframe;
+
+    if members.len() != dirs.len() || members.len() != ancestors.len() {
+        return Err(ForkError::Reflink(format!(
+            "prepare_cluster_fork_source: {} members but {} dirs, {} ancestors",
+            members.len(),
+            dirs.len(),
+            ancestors.len()
+        )));
+    }
+    for (vm, dir) in members.iter().zip(dirs) {
+        vm.check_fork_source_allowed()?;
+        fs::create_dir_all(dir)?;
+    }
+    let t0 = std::time::Instant::now();
+    let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let mut cut = ClusterCut {
+        members: vec![MemberCut::default(); members.len()],
+    };
+
+    // 1. Live pre-copy, in parallel.
+    let live_in: Vec<(&PathBuf, Option<&Path>)> = dirs
+        .iter()
+        .zip(ancestors)
+        .map(|(d, a)| (d, a.as_deref()))
+        .collect();
+    let mut live: Vec<Option<LiveKeyframe>> = par_members(
+        members,
+        &live_in,
+        |vm, &(dir, ancestor)| {
+            let begin = now();
+            if !vm.virtiofs_shares().is_empty() {
+                log::warn!(
+                    "prepare_cluster_fork_source: member cid {} has virtiofs shares — \
+                     FUSE DMA is invisible to the dirty log, so its keyframe is a FULL \
+                     paused dump",
+                    vm.guest_cid()
+                );
+                return Ok((begin, None));
+            }
+            let mut kf = LiveKeyframe::begin(vm, dir, ancestor).map_err(ForkError::Snapshot)?;
+            kf.converge(vm).map_err(ForkError::Snapshot)?;
+            Ok((begin, Some(kf)))
+        },
+        || ForkError::Reflink("live keyframe thread panicked".into()),
+    )?
+    .into_iter()
+    .zip(cut.members.iter_mut())
+    .map(|((begin, kf), m)| {
+        m.live_begin_ns = begin;
+        kf
+    })
+    .collect();
+    par_members_mut(members, &mut live, |vm, kf| match kf {
+        Some(kf) => kf.round(vm).map(|_| ()).map_err(ForkError::Snapshot),
+        None => Ok(()),
+    })?;
+    for (m, kf) in cut.members.iter_mut().zip(&live) {
+        if let Some(kf) = kf {
+            m.arm_pause_ns = kf.arm_pause_ns;
+            m.precopied_bytes = kf.precopied_bytes;
+        }
+    }
+
+    // 2. Pause all.
+    let mut was_running: Vec<bool> = Vec::with_capacity(members.len());
+    let mut pause_err = None;
+    for (vm, m) in members.iter_mut().zip(cut.members.iter_mut()) {
+        m.pause_begin_ns = now();
+        let running = vm.is_running();
+        if running {
+            if let Err(e) = vm.pause() {
+                pause_err = Some(ForkError::Snapshot(SnapshotError::Vm(e)));
+                break;
+            }
+        }
+        was_running.push(running);
+        m.paused_ns = now();
+    }
+
+    // 3. Paused writes, in parallel.
+    let mut jobs: Vec<(&PathBuf, Option<&Path>, Option<LiveKeyframe>)> = dirs
+        .iter()
+        .zip(ancestors)
+        .zip(live)
+        .map(|((d, a), kf)| (d, a.as_deref(), kf))
+        .collect();
+    let dumped = match pause_err {
+        Some(e) => Err(e),
+        None => par_members_mut(members, &mut jobs, |vm, job| {
+            let (dir, ancestor, kf) = job;
+            let begin = now();
+            let Some(kf) = kf.take() else {
+                // Virtiofs: `write_keyframe_paused` writes it in full.
+                let written = vm.write_keyframe_paused(dir.as_path(), *ancestor)?;
+                return Ok((begin, now(), vm.mem_span(), written));
+            };
+            // A missed park means a worker may still be writing guest
+            // memory, which no bitmap will report: only a full dump is
+            // honest then.
+            if vm.take_full_dump_if_not_quiescent() {
+                drop(kf);
+                log::warn!(
+                    "prepare_cluster_fork_source: member cid {} missed the 200ms park \
+                     — writing a FULL keyframe instead of the pre-copied one",
+                    vm.guest_cid()
+                );
+                let written = vm.write_full_keyframe_paused(dir.as_path())?;
+                return Ok((begin, now(), vm.mem_span(), written));
+            }
+            let incremental = kf.incremental();
+            let (bytes, disk_bytes) = kf.finish(vm).map_err(ForkError::Snapshot)?;
+            Ok((begin, now(), bytes, (incremental, disk_bytes)))
+        }),
+    };
+    drop(jobs);
+    let windows = match dumped {
+        Ok(w) => w,
+        Err(e) => {
+            for (vm, running) in members.iter_mut().zip(&was_running) {
+                if *running {
+                    if let Err(re) = vm.resume() {
+                        log::error!(
+                            "prepare_cluster_fork_source: resume (cid {}): {re}",
+                            vm.guest_cid()
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
+    for (m, (begin, end, bytes, (incremental, disk_bytes))) in cut.members.iter_mut().zip(windows) {
+        m.dump_begin_ns = begin;
+        m.dump_end_ns = end;
+        m.final_bytes = bytes;
+        m.incremental = incremental;
+        m.disk_bytes = disk_bytes;
+    }
+
+    // 4. Swap all onto their keyframes, straight from the pause.
+    let swap_in: Vec<(&PathBuf, bool)> = dirs.iter().zip(was_running).collect();
+    let running = par_members(
+        members,
+        &swap_in,
+        |vm, &(dir, was_running)| {
+            let (_, husk) = vm.restore_swap_onto_base_keep_husk(dir)?;
+            if was_running && vm.paused() {
+                vm.resume()
+                    .map_err(|e| ForkError::Snapshot(SnapshotError::Vm(e)))?;
+            }
+            let at = now();
+            drop(husk);
+            Ok(at)
+        },
+        || ForkError::Reflink("restore-swap thread panicked".into()),
+    )?;
+    for (m, at) in cut.members.iter_mut().zip(running) {
+        m.running_ns = at;
+    }
+    log::info!(
+        "prepare_cluster_fork_source: {} members, pause_ns {:?}, paused write ns {:?}, \
+         live MiB {:?}, paused MiB {:?}, arm stop ns {:?}",
+        members.len(),
+        cut.pause_ns(),
+        cut.members
+            .iter()
+            .map(MemberCut::dump_ns)
+            .collect::<Vec<_>>(),
+        cut.members
+            .iter()
+            .map(|m| m.precopied_bytes >> 20)
+            .collect::<Vec<_>>(),
+        cut.members
+            .iter()
+            .map(|m| m.final_bytes >> 20)
+            .collect::<Vec<_>>(),
+        cut.members
+            .iter()
+            .map(|m| m.arm_pause_ns)
+            .collect::<Vec<_>>(),
+    );
+    Ok(cut)
+}
+
+/// [`par_members`] with a mutable per-member input: `f(members[i],
+/// &mut inputs[i])` on its own scoped thread.
+fn par_members_mut<I, T, F>(
+    members: &mut [&mut Vm],
+    inputs: &mut [I],
+    f: F,
+) -> Result<Vec<T>, ForkError>
+where
+    I: Send,
+    T: Send,
+    F: Fn(&mut Vm, &mut I) -> Result<T, ForkError> + Sync,
+{
+    std::thread::scope(|s| {
+        let f = &f;
+        let handles: Vec<_> = members
+            .iter_mut()
+            .zip(inputs.iter_mut())
+            .map(|(vm, input)| {
+                let vm: &mut Vm = vm;
+                s.spawn(move || f(vm, input))
+            })
+            .collect();
+        let results: Vec<Result<T, ForkError>> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(ForkError::Reflink("keyframe thread panicked".into())))
+            })
+            .collect();
+        results.into_iter().collect()
+    })
+}
+
+/// Run `f(members[i], &inputs[i])` for every member on its own scoped
+/// thread. Returns every result in order, or the first error once all
+/// threads have finished. Each thread owns one member exclusively
+/// (`&mut`: `Vm` is `Send`, not `Sync`).
+fn par_members<I, T, F>(
+    members: &mut [&mut Vm],
+    inputs: &[I],
+    f: F,
+    panicked: impl Fn() -> ForkError,
+) -> Result<Vec<T>, ForkError>
+where
+    I: Sync,
+    T: Send,
+    F: Fn(&mut Vm, &I) -> Result<T, ForkError> + Sync,
+{
+    std::thread::scope(|s| {
+        let f = &f;
+        let handles: Vec<_> = members
+            .iter_mut()
+            .zip(inputs)
+            .map(|(vm, input)| {
+                let vm: &mut Vm = vm;
+                s.spawn(move || f(vm, input))
+            })
+            .collect();
+        let results: Vec<Result<T, ForkError>> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+            .collect();
+        results.into_iter().collect()
+    })
+}
+
 /// Materialize a new VM from a pre-populated `MAP_PRIVATE` memory region +
 /// captured state. Used by `restore_vm_from_state` (after memcpy) and by
 /// the tree `resume` path (after `apply_delta`).
@@ -2438,5 +2815,57 @@ mod verification {
             "CID allocation must be monotonically increasing"
         );
         assert!(cid1 >= 100, "CID must start at 100 or above");
+    }
+}
+
+#[cfg(test)]
+mod cluster_cut_tests {
+    use super::{ClusterCut, MemberCut};
+
+    fn m(pause: u64, paused: u64, d0: u64, d1: u64, run: u64) -> MemberCut {
+        MemberCut {
+            pause_begin_ns: pause,
+            paused_ns: paused,
+            dump_begin_ns: d0,
+            dump_end_ns: d1,
+            running_ns: run,
+            ..MemberCut::default()
+        }
+    }
+
+    #[test]
+    fn overlapping_dumps_inside_common_pause_are_consistent() {
+        let cut = ClusterCut {
+            members: vec![m(0, 5, 10, 100, 150), m(5, 10, 10, 90, 300)],
+        };
+        assert!(cut.is_consistent());
+        assert_eq!(cut.pause_ns(), vec![150, 295]);
+        assert_eq!(cut.max_pause_ns(), 295);
+    }
+
+    #[test]
+    fn sequential_prepare_is_not_a_cut() {
+        // Member 1 is paused only after member 0 already runs again.
+        let cut = ClusterCut {
+            members: vec![m(0, 5, 5, 100, 110), m(110, 115, 115, 210, 220)],
+        };
+        assert!(!cut.is_consistent());
+        assert!(!ClusterCut::default().is_consistent());
+    }
+
+    /// The arm stop and the live phase are not part of the cut's pause.
+    #[test]
+    fn live_phase_is_not_pause() {
+        let c = MemberCut {
+            live_begin_ns: 0,
+            arm_pause_ns: 40,
+            precopied_bytes: 1 << 30,
+            final_bytes: 1 << 20,
+            ..m(1_000, 1_010, 1_010, 1_100, 1_300)
+        };
+        assert!(c.precopied());
+        assert_eq!(c.pause_ns(), 300);
+        assert_eq!(c.dump_ns(), 90);
+        assert!(!m(0, 1, 1, 2, 3).precopied());
     }
 }

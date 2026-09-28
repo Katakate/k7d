@@ -118,13 +118,21 @@ pub struct NodeInfo {
     /// Empty for live, Evicted, and legacy files.
     #[serde(default)]
     pub parked_disk_dirs: Vec<PathBuf>,
-    /// Generation of this node's `memory.bin`, minted afresh every time
-    /// a keyframe is written here. A `delta.pack` records the identity
-    /// of the base it was diffed against, and `resume` refuses to apply
-    /// one whose identity is not this (CHALLENGES #144). 0 means
-    /// "unknown": legacy `tree.json` files and v1 packs.
+    /// Generation of this node's current `memory.bin`, minted afresh
+    /// every time a keyframe is written here. A `delta.pack` records the
+    /// generation it was diffed against. `resume` opens that generation's
+    /// file, which may be an older one still on disk after a refresh
+    /// (CHALLENGES #144). 0 means "unknown": legacy `tree.json` files
+    /// and v1 packs.
     #[serde(default)]
     pub base_identity: u64,
+    /// Older keyframe generations still on disk. The current generation
+    /// is [`Self::base_identity`] / [`Self::base_disk_bytes`]. A refresh
+    /// writes a new file and parks the previous generation here until
+    /// nothing — a live `cow_base`, a live mapping path, or a suspended
+    /// `delta.pack` — still names it.
+    #[serde(default)]
+    pub retained_keyframes: Vec<RetainedKeyframe>,
     /// Physical bytes this node's `memory.bin` cost the filesystem.
     ///
     /// An incremental keyframe is a reflink clone of its
@@ -141,6 +149,19 @@ pub struct NodeInfo {
 
 fn default_vm_count() -> u32 {
     1
+}
+
+/// One retired keyframe generation and the bytes it added on disk.
+///
+/// `st_blocks` cannot answer this: a reflinked `memory.bin` shares
+/// extents with its ancestor, and XFS counts those extents in every
+/// file (CHALLENGES #152). The writer records the cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedKeyframe {
+    /// Generation number, the same value a `delta.pack` header stores.
+    pub identity: u64,
+    /// Physical bytes this generation added. Not its logical length.
+    pub disk_bytes: u64,
 }
 
 /// What a `prepare_fork_source` call actually did.
@@ -440,6 +461,7 @@ impl SnapshotTree {
             // this tree mints (0 is reserved for "unknown").
             base_identity: 1,
             base_disk_bytes: Some(root_span),
+            retained_keyframes: Vec::new(),
         };
 
         let mut nodes = HashMap::new();
@@ -589,39 +611,200 @@ impl SnapshotTree {
             .map(|(id, vm)| (id.as_str(), vm))
     }
 
-    /// The keyframe this node's live VM is a `MAP_PRIVATE` mapping of,
-    /// if it is still the file the tree recorded at fork/resume time.
+    /// The keyframe this node's live VM is a `MAP_PRIVATE` mapping of.
     ///
-    /// An incremental keyframe is only correct when the VM's memory
-    /// really is that file plus the VM's accumulated dirty set, so the
-    /// answer comes from what the tree *did* (`cow_base`), not from the
-    /// topology: an ancestor that has re-prepared since holds a new
-    /// generation at the same path, and cloning it would produce a
-    /// keyframe that is neither the ancestor nor this node. Such a node
-    /// falls back to the full dump.
+    /// The recorded generation stays valid after the ancestor refreshes:
+    /// the refresh writes a new file and leaves this one in place.
     fn cow_base_keyframe(&self, node_id: &NodeId) -> Option<PathBuf> {
         if !self.reflink_root {
             return None;
         }
         let (ancestor, identity) = self.cow_base.get(node_id)?;
-        if self.nodes.get(ancestor)?.base_identity != *identity {
-            log::warn!(
-                "tree: node '{node_id}' was forked off '{ancestor}' generation \
-                 {identity}, which has since re-prepared — writing a full keyframe"
-            );
-            return None;
-        }
-        let mem = self.node_dir(ancestor).join("memory.bin");
-        mem.is_file().then_some(mem)
+        let mem = match self.keyframe_path(ancestor, *identity) {
+            Ok(mem) => mem,
+            Err(e) => {
+                log::warn!(
+                    "tree: node '{node_id}' maps '{ancestor}' generation {identity}, \
+                     but that keyframe is not on disk ({e}) — writing a full keyframe"
+                );
+                return None;
+            }
+        };
+        Some(mem)
     }
 
-    /// Record that `node_id`'s VM maps `ancestor`'s current keyframe.
-    fn record_cow_base(&mut self, node_id: &NodeId, ancestor: &NodeId) {
-        let Some(identity) = self.nodes.get(ancestor).map(|n| n.base_identity) else {
+    /// `gen-<identity>/memory.bin` when that generation was a refresh,
+    /// otherwise `memory.bin` in the node directory (the first keyframe).
+    ///
+    /// An identity this node never wrote is an error. Falling back to the
+    /// current file would apply a pack onto a generation it does not name.
+    fn keyframe_path(&self, node_id: &NodeId, identity: u64) -> Result<PathBuf, TreeError> {
+        let versioned = self
+            .node_dir(node_id)
+            .join(format!("gen-{identity}"))
+            .join("memory.bin");
+        if versioned.is_file() {
+            return Ok(versioned);
+        }
+        if self.legacy_generation(node_id) == Some(identity) {
+            let legacy = self.node_dir(node_id).join("memory.bin");
+            if legacy.is_file() {
+                return Ok(legacy);
+            }
+        }
+        Err(TreeError::InvalidDelta(format!(
+            "keyframe '{node_id}' generation {identity} has no memory.bin — \
+             a pack names a base generation that is not on disk"
+        )))
+    }
+
+    /// The generation stored at `memory.bin` rather than `gen-<id>/`.
+    ///
+    /// That is the original keyframe. A refresh leaves it there and writes
+    /// the new one under `gen-<id>/`. Two known identities without a gen
+    /// directory is ambiguous, so this returns nothing.
+    fn legacy_generation(&self, node_id: &NodeId) -> Option<u64> {
+        let info = self.nodes.get(node_id)?;
+        let mut found = None;
+        for id in std::iter::once(info.base_identity)
+            .chain(info.retained_keyframes.iter().map(|g| g.identity))
+        {
+            let versioned = self
+                .node_dir(node_id)
+                .join(format!("gen-{id}"))
+                .join("memory.bin");
+            if versioned.is_file() {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
+        }
+        found
+    }
+
+    /// See [`crate::cluster_tree::ClusterSnapshotTree`]'s method of the
+    /// same name.
+    fn fork_cow_generation(&self, source_id: &NodeId) -> Result<(NodeId, u64), TreeError> {
+        if self
+            .nodes
+            .get(source_id)
+            .is_some_and(|n| n.has_base_snapshot)
+        {
+            let id = self.nodes.get(source_id).map_or(0, |n| n.base_identity);
+            return Ok((source_id.clone(), id));
+        }
+        if let Some(entry) = self.cow_base.get(source_id) {
+            return Ok(entry.clone());
+        }
+        let ckpt = self.nearest_checkpoint(source_id)?;
+        let id = self.nodes.get(&ckpt).map_or(0, |n| n.base_identity);
+        Ok((ckpt, id))
+    }
+
+    fn reap_unreferenced_keyframes(&mut self) {
+        let owners: Vec<NodeId> = self.nodes.keys().cloned().collect();
+        for owner in owners {
+            let retained = match self.nodes.get(&owner) {
+                Some(info) => info.retained_keyframes.clone(),
+                None => continue,
+            };
+            let mut keep = Vec::with_capacity(retained.len());
+            for gen in retained {
+                if self.generation_referenced(&owner, gen.identity) {
+                    keep.push(gen);
+                } else {
+                    self.delete_generation_files(&owner, gen.identity);
+                    log::info!(
+                        "tree: reaped keyframe {} generation {}",
+                        owner,
+                        gen.identity
+                    );
+                }
+            }
+            if let Some(info) = self.nodes.get_mut(&owner) {
+                info.retained_keyframes = keep;
+            }
+        }
+    }
+
+    fn generation_referenced(&self, owner: &NodeId, identity: u64) -> bool {
+        if self
+            .cow_base
+            .values()
+            .any(|(node, id)| node == owner && *id == identity)
+        {
+            return true;
+        }
+        for vm in self.live_vms.values() {
+            let Ok(native) = vm.as_native() else {
+                continue;
+            };
+            let Some(path) = native.fork_source_base_path() else {
+                continue;
+            };
+            if self.path_names_generation(path, owner, identity) {
+                return true;
+            }
+        }
+        for (id, info) in &self.nodes {
+            if info.state != NodeState::Suspended {
+                continue;
+            }
+            if self.nearest_checkpoint(id).ok().as_ref() != Some(owner) {
+                continue;
+            }
+            let pack = self.node_dir(id).join("delta.pack");
+            if read_pack_identity(&pack).ok() == Some(identity) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn path_names_generation(&self, path: &Path, owner: &NodeId, identity: u64) -> bool {
+        let versioned = self.node_dir(owner).join(format!("gen-{identity}"));
+        if path.starts_with(&versioned) {
+            return true;
+        }
+        if versioned.join("memory.bin").is_file() {
+            return false;
+        }
+        path == self.node_dir(owner).join("memory.bin")
+    }
+
+    fn delete_generation_files(&self, owner: &NodeId, identity: u64) {
+        let versioned = self.node_dir(owner).join(format!("gen-{identity}"));
+        if versioned.is_dir() {
+            let _ = fs::remove_dir_all(&versioned);
             return;
-        };
-        self.cow_base
-            .insert(node_id.clone(), (ancestor.clone(), identity));
+        }
+        for name in [
+            "memory.bin",
+            "cpu.json",
+            "devices.json",
+            "irqchip.json",
+            "metadata.json",
+        ] {
+            let _ = fs::remove_file(self.node_dir(owner).join(name));
+        }
+    }
+
+    fn suspend_base_identity(&self, node_id: &NodeId) -> u64 {
+        // A prepared node was swapped onto its own keyframe. The pack is
+        // that generation, even if `cow_base` still names the parent it
+        // was forked from. An unprepared child keeps the inherited one.
+        if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
+            return self.nodes.get(node_id).map_or(0, |n| n.base_identity);
+        }
+        if let Some((_, id)) = self.cow_base.get(node_id) {
+            return *id;
+        }
+        self.nearest_checkpoint(node_id)
+            .ok()
+            .and_then(|base| self.nodes.get(&base).map(|n| n.base_identity))
+            .unwrap_or(0)
     }
 
     /// The next unused base-generation number for this tree.
@@ -665,10 +848,8 @@ impl SnapshotTree {
         if !virtiofs {
             if let Ok(ckpt) = self.nearest_checkpoint(source_id) {
                 if ckpt != *source_id {
-                    if let Some(mem) = {
-                        let p = self.node_dir(&ckpt).join("memory.bin");
-                        p.is_file().then_some(p)
-                    } {
+                    let identity = self.nodes.get(&ckpt).map_or(0, |n| n.base_identity);
+                    if let Ok(mem) = self.keyframe_path(&ckpt, identity) {
                         let vm = self
                             .live_vms
                             .get_mut(source_id)
@@ -704,15 +885,60 @@ impl SnapshotTree {
     /// VMs, and any node whose ancestor keyframe is on a different (or
     /// non-reflink) filesystem fall back to the full dump — loudly.
     pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
+        self.prepare_fork_source_with(node_id, false)
+    }
+
+    /// [`Self::prepare_fork_source`], and when `refresh` is set, re-keyframe
+    /// a node that already owns one.
+    ///
+    /// A refresh writes `nodes/<id>/gen-<identity>/memory.bin` and swaps
+    /// the VM onto it. The previous file stays: live children re-open it
+    /// by path. The ancestor is this VM's own keyframe (a root has no
+    /// `cow_base`). Without `refresh`, a node that already has a keyframe
+    /// is an idempotent no-op.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_fork_source_with(
+        &mut self,
+        node_id: &NodeId,
+        refresh: bool,
+    ) -> Result<PrepareOutcome, TreeError> {
         self.ensure_live(node_id)?;
         if self.is_fc(node_id) {
             return self.prepare_fork_source_fc(node_id);
         }
-        if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
+        let has_base = self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot);
+        if has_base && !refresh {
             return Ok(PrepareOutcome::already_prepared());
         }
-        let dir = self.node_dir(node_id);
-        let ancestor_mem = self.cow_base_keyframe(node_id);
+        let refresh_self = has_base && refresh;
+        let minted = if refresh_self {
+            Some(self.mint_base_identity())
+        } else {
+            None
+        };
+        let dir = match minted {
+            Some(id) => self.node_dir(node_id).join(format!("gen-{id}")),
+            None => self.node_dir(node_id),
+        };
+        let ancestor_mem = if refresh_self {
+            let vm = self
+                .live_vms
+                .get(node_id)
+                .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+            Some(
+                vm.as_native()?
+                    .fork_source_base_path()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| {
+                        TreeError::InvalidDelta(format!(
+                            "prepare_fork_source({node_id}): refresh but the VM has no keyframe \
+                             path (its own memory.bin is the ancestor; cow_base is empty on a root)"
+                        ))
+                    })?,
+            )
+        } else {
+            self.cow_base_keyframe(node_id)
+        };
         // Make disk headroom BEFORE writing — `usage()`
         // only sees the keyframe after the fact, so without this the
         // write silently blows `max_disk_bytes` until the next
@@ -738,7 +964,7 @@ impl SnapshotTree {
         if !vm.virtiofs_shares().is_empty() {
             vm.as_native_mut()?.allow_slow_fork();
         }
-        log::info!("tree: prepare_fork_source({node_id})");
+        log::info!("tree: prepare_fork_source({node_id}, refresh={refresh})");
         let prepared = if let Some(ancestor) = &ancestor_mem {
             vm.as_native_mut()?
                 .prepare_fork_source_incremental_in(&dir, ancestor)?
@@ -747,8 +973,17 @@ impl SnapshotTree {
             let span = native.mem_span();
             crate::vm::PreparedBase::full(native.prepare_fork_source_in(&dir)?, span)
         };
-        let identity = self.mint_base_identity();
+        let identity = minted.unwrap_or_else(|| self.mint_base_identity());
         if let Some(info) = self.nodes.get_mut(node_id) {
+            if refresh_self {
+                if let Some(bytes) = info.base_disk_bytes {
+                    let old = info.base_identity;
+                    info.retained_keyframes.push(RetainedKeyframe {
+                        identity: old,
+                        disk_bytes: bytes,
+                    });
+                }
+            }
             info.has_base_snapshot = true;
             info.base_identity = identity;
             info.base_disk_bytes = Some(prepared.disk_bytes);
@@ -865,6 +1100,7 @@ impl SnapshotTree {
                 parked_disk_dirs: Vec::new(),
                 base_identity: 0,
                 base_disk_bytes: None,
+                retained_keyframes: Vec::new(),
             };
             self.nodes.insert(new_id.clone(), info);
             self.live_vms.insert(new_id.clone(), Guest::from(child));
@@ -929,7 +1165,7 @@ impl SnapshotTree {
                 .map(std::path::Path::to_path_buf);
             (forks, bitmap, base)
         };
-        let cow_ancestor = self.nearest_checkpoint(source_id)?;
+        let (cow_ancestor, cow_identity) = self.fork_cow_generation(source_id)?;
 
         let mut new_ids = Vec::with_capacity(forks.len());
         let now = now_unix();
@@ -954,6 +1190,7 @@ impl SnapshotTree {
                 parked_disk_dirs: Vec::new(),
                 base_identity: 0,
                 base_disk_bytes: None,
+                retained_keyframes: Vec::new(),
             };
 
             // Start the fork's vCPU; the tree owns it from here.
@@ -974,7 +1211,8 @@ impl SnapshotTree {
             self.nodes.insert(new_id.clone(), info);
             self.live_vms.insert(new_id.clone(), fork_vm);
             // Child maps the checkpoint's memory.bin, not a new keyframe.
-            self.record_cow_base(&new_id, &cow_ancestor);
+            self.cow_base
+                .insert(new_id.clone(), (cow_ancestor.clone(), cow_identity));
             self.jail_vm(&new_id)?;
             if let Some(src) = self.nodes.get_mut(source_id) {
                 src.children.push(new_id.clone());
@@ -1112,11 +1350,7 @@ impl SnapshotTree {
         // scattering the pack's pages over a stranger's memory
         // (CHALLENGES #144). A checkpoint's own pack sits on its own
         // `memory.bin`.
-        let base_identity = self
-            .nearest_checkpoint(node_id)
-            .ok()
-            .and_then(|base| self.nodes.get(&base).map(|n| n.base_identity))
-            .unwrap_or(0);
+        let base_identity = self.suspend_base_identity(node_id);
 
         // Write delta + vm_state.json. Then drop the VM (munmap memory, close fds).
         let dirty_pages = write_delta(
@@ -1213,33 +1447,40 @@ impl SnapshotTree {
         // Reserve headroom for the VM we're about to bring back to Live.
         self.evict_for_incoming_no_exempt(1)?;
 
-        // Find the nearest ancestor with a memory.bin (checkpoint).
+        // The pack names the generation it was diffed against. A refresh
+        // of that checkpoint writes a new file and leaves this one.
         let base_node = self.nearest_checkpoint(node_id)?;
-        let base_path = self.node_dir(&base_node).join("memory.bin");
-        let base_identity = self
-            .nodes
-            .get(&base_node)
-            .map_or(0, |info| info.base_identity);
+        let node_dir = self.node_dir(node_id);
+        let mapped_identity = if base_node == *node_id {
+            self.nodes
+                .get(&base_node)
+                .map_or(0, |info| info.base_identity)
+        } else {
+            read_pack_identity(&node_dir.join("delta.pack"))?
+        };
+        let base_path = self.keyframe_path(&base_node, mapped_identity)?;
 
         // Load state + delta, materialize the VM.
-        let node_dir = self.node_dir(node_id);
         let state_json = fs::read_to_string(node_dir.join("vm_state.json"))?;
         let state: VmState = serde_json::from_str(&state_json)?;
 
         let mem_span = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
         let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_path, mem_span)?;
 
-        // Apply this node's delta on top of base.mem. (If the node is the same
-        // as base_node — i.e. a checkpoint that also has a delta — we skip.)
-        let applied = if base_node == *node_id {
+        // The pack is this node's divergence from `base_node`'s keyframe,
+        // including when this node *is* that checkpoint. Suspend writes
+        // that dirt and does not refresh `memory.bin`. A checkpoint with
+        // no pack was never suspended: `open` marks a killed live root
+        // Suspended, and the unsnapshotted dirt died with the process.
+        let pack = node_dir.join("delta.pack");
+        let applied = if base_node == *node_id && !pack.is_file() {
+            log::info!(
+                "tree: resume '{node_id}' has no delta.pack; restoring the \
+                 checkpoint keyframe only"
+            );
             AppliedDelta::empty(mem_span)
         } else {
-            apply_delta(
-                &node_dir.join("delta.pack"),
-                fork_mem_addr,
-                mem_span,
-                base_identity,
-            )?
+            apply_delta(&pack, fork_mem_addr, mem_span, mapped_identity)?
         };
 
         let mut vm = crate::fork::build_vm_from_state_and_mem(
@@ -1265,7 +1506,12 @@ impl SnapshotTree {
         vm.set_fork_source_base_path(base_path.clone());
 
         self.live_vms.insert(node_id.clone(), Guest::from(vm));
-        self.record_cow_base(node_id, &base_node);
+        if base_node == *node_id {
+            self.cow_base.remove(node_id);
+        } else {
+            self.cow_base
+                .insert(node_id.clone(), (base_node, mapped_identity));
+        }
         self.jail_vm(node_id)?;
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.state = NodeState::Live;
@@ -1340,6 +1586,7 @@ impl SnapshotTree {
                 }
             }
         }
+        self.reap_unreferenced_keyframes();
         self.save_metadata()?;
         log::info!("tree: pruned '{node_id}' and its subtree");
         Ok(())
@@ -1379,6 +1626,9 @@ impl SnapshotTree {
                 _ => keyframe_disk_bytes(&dir.join("memory.bin"), info.base_disk_bytes),
             };
             disk_bytes = disk_bytes.saturating_add(keyframe);
+            for gen in &info.retained_keyframes {
+                disk_bytes = disk_bytes.saturating_add(gen.disk_bytes);
+            }
             if let Ok(md) = fs::metadata(dir.join("delta.pack")) {
                 disk_bytes = disk_bytes.saturating_add(md.len());
             }
@@ -1592,6 +1842,7 @@ impl SnapshotTree {
                 // generation any pack may still claim.
                 info.base_disk_bytes = None;
                 info.base_identity = 0;
+                info.retained_keyframes.clear();
                 // Suspend parks RW disk-clone dirs on the record (see
                 // `suspend`); eviction must reap them the way prune does
                 // or usage() reports the space free while XFS still holds
@@ -1603,6 +1854,7 @@ impl SnapshotTree {
             }
             evicted.push(id);
         }
+        self.reap_unreferenced_keyframes();
         self.save_metadata()?;
         log::info!(
             "tree: evicted subtree rooted at '{node_id}' ({} nodes)",
@@ -1937,8 +2189,7 @@ pub struct AppliedDelta {
 }
 
 impl AppliedDelta {
-    /// The no-pack case: a checkpoint resumes straight off its own
-    /// `memory.bin` and diverges from it by nothing.
+    /// An applied delta that restored no pages, sized for `mem_size`.
     #[must_use]
     pub fn empty(mem_size: u64) -> Self {
         Self {
@@ -1952,6 +2203,18 @@ impl AppliedDelta {
 /// guest-physical address space. Matches `Vm::enable_dirty_tracking`.
 fn bitmap_words(mem_size: u64) -> usize {
     (mem_size.div_ceil(4096) as usize).div_ceil(64)
+}
+
+/// The generation a `delta.pack` was written against.
+///
+/// `resume` uses this to open that generation's `memory.bin` rather than
+/// the checkpoint's current one, which a refresh may have replaced.
+pub(crate) fn read_pack_identity(path: &Path) -> Result<u64, TreeError> {
+    let mut f = fs::File::open(path)?;
+    let mut header = [0u8; K7DL_HEADER_SIZE];
+    f.read_exact(&mut header)?;
+    k7dl_parse_header(&header)?;
+    Ok(k7dl_base_identity(&header))
 }
 
 /// Apply a packed K7DL delta into a `MAP_PRIVATE` memory region.

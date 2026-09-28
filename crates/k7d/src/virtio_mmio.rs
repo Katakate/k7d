@@ -638,8 +638,11 @@ pub trait VirtioBackend: Send {
     fn is_quiescent(&self) -> bool {
         true
     }
-    /// OR the backend's device-DMA dirty page bitmap into `acc` (one bit
-    /// per 4 KiB guest page, `u64` words).
+    /// Drain the backend's device-DMA dirty page bitmap into `acc` (one
+    /// bit per 4 KiB guest page, `u64` words): OR it in and clear it, so
+    /// the next call reports only pages written since this one. A worker
+    /// marks a page only after writing it, so a drained bit means the
+    /// bytes are visible to the caller's copy.
     ///
     /// KVM dirty logging only sees vCPU writes; an in-process worker that
     /// writes guest memory through k7d's own mapping (virtio-blk reads,

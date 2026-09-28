@@ -2790,6 +2790,8 @@ spec:
         source_id: "root".to_string(),
         label: "probe".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(k7d::control::Response::TreeForked { guest_cids, .. }) => guest_cids,
         other => {
@@ -3111,10 +3113,11 @@ spec:
     let _ = kubectl_delete("pod", &pod);
 }
 
-/// / CHALLENGES #60: after an annotation-driven fork, deleting
-/// both pods must clear the *source* out of `Terminating` within
-/// seconds. Lifecycle suites used to pass while source pods wedged
-/// forever (Kill blocked on the dead pre-swap agent connection).
+/// / CHALLENGES #60 and #279: after an annotation-driven fork, deleting
+/// both pods must clear the *source* within seconds. #60 was `Kill`
+/// blocking on the dead pre-swap agent connection. #279 is the log
+/// bridge holding that same connection's stdio FIFOs, so containerd
+/// never gets from the container exit to sandbox `Delete` / `stop_vm`.
 #[test]
 fn test_kubectl_fork_source_teardown() {
     let _leak_guard = ensure_shim_installed();
@@ -3214,7 +3217,8 @@ spec:
             Instant::now() < deadline,
             "fork-source teardown: pods still present after {:?}\n\
              source={:?} fork={:?}\n\
-             (CHALLENGES #60: source stuck in Terminating = Kill on dead agent)",
+             (CHALLENGES #60/#279: source still up = teardown stuck on the \
+              pre-swap agent connection)",
             start.elapsed(),
             pod_jsonpath(&src, ".status.phase"),
             pod_jsonpath(&fork, ".status.phase"),

@@ -103,12 +103,13 @@ pub fn check_clocksource(agent: &mut AgentClient, whose: &str) {
 ///
 /// * `lapic` — the one-shot count-down timer. What Linux registers when
 ///   `KVM_GET_SUPPORTED_CPUID` does not report `CPUID.1:ECX[24]`
-///   (the AMD nodes, host kernel 6.8). `IA32_TSC_DEADLINE` reads zero
+///   (host kernel 6.8, AMD or Intel). `IA32_TSC_DEADLINE` reads zero
 ///   on every vCPU, the deadline write-back in `Vm::warp_clock` re-arms
 ///   nothing, and the policy's jump target comes from `KVM_GET_LAPIC`
-///   (`TMCCT`).
+///   (`TMCCT`). Whether a jump then fires it is a second host fact —
+///   see [`host_runs_lapic_timer_on_preemption_timer`].
 /// * `lapic-deadline` — the TSC-deadline timer. What Linux registers
-///   when the bit is advertised (the Intel node, host kernel 7.0). The
+///   when the bit is advertised (the Intel node on host kernel 7.0). The
 ///   LVT mode is 2, `TMCCT` is meaningless, `IA32_TSC_DEADLINE` holds
 ///   the armed expiry in guest-TSC units, `Vm::sample_timers` surveys
 ///   it as `TimerSource::TscDeadline`, and step 3 of `Vm::warp_vcpus`
@@ -161,6 +162,34 @@ pub fn check_clockevent(agent: &mut AgentClient, whose: &str) -> Clockevents {
         per_cpu: per_cpu.trim().to_string(),
         broadcast: broadcast.trim().to_string(),
     }
+}
+
+/// Whether this host's KVM runs a guest's LAPIC timer on the VMX
+/// preemption timer, which decides what a jump does to an armed
+/// one-shot.
+///
+/// KVM keeps a one-shot's expiry twice: `target_expiration` in host
+/// time, which the hrtimer and `TMCCT` use, and `tscdeadline` in
+/// guest-TSC units, which `vmx_set_hv_timer` compares against the
+/// guest's TSC. `vcpu_block` swaps the preemption timer for the hrtimer
+/// while a vCPU halts and swaps it back when anything wakes it — the
+/// policy's own pause signal included. That swap-back reads the
+/// guest-TSC copy against the TSC the warp just advanced, so a jumped
+/// one-shot fires at the next pause, as a rewritten deadline does. SVM
+/// has no `set_hv_timer`: only the host-time copy exists and a jump
+/// never fires the timer (CHALLENGES #264).
+///
+/// k7d never disables MWAIT or HLT exits, the only per-VM way
+/// (`kvm_can_use_hv_timer`) to lose the preemption timer on a host that
+/// has it, so the module parameter is the whole answer.
+pub fn host_runs_lapic_timer_on_preemption_timer() -> bool {
+    if Path::new("/sys/module/kvm_amd").exists() {
+        return false;
+    }
+    let param = "/sys/module/kvm_intel/parameters/preemption_timer";
+    let value = std::fs::read_to_string(param)
+        .unwrap_or_else(|e| panic!("neither kvm_amd nor kvm_intel is loaded ({param}: {e})"));
+    value.trim() == "Y"
 }
 
 /// No in-guest NTP client, because there is no sharing the clock with

@@ -484,7 +484,11 @@ def remove_disks(paths: list[Path]) -> None:
 
 
 def remove_tree_disks(tree_id: str) -> int:
-    """Unlink `ubuntu-gym-{tree_id}-*.img`. tree_drop does not."""
+    """Unlink `ubuntu-gym-{tree_id}-*.img`.
+
+    `tree_drop` stops the guests and releases broker pins; the caller
+    unlinks images.
+    """
     if not tree_id:
         raise RuntimeError("remove_tree_disks: empty tree_id")
     n = 0
@@ -540,7 +544,8 @@ def sweep_orphaned_gym_disks() -> int:
 
     Reset n=8 dirties each reflink clone (k3s + Tetragon layers).
     The 96 GiB loop fills if a 502 abandon leaves the clones behind
-    (`tree_drop` stops VMs, does not unlink gym-owned images).
+    (`tree_drop` stops guests and releases broker pins; the caller
+    unlinks gym-owned images).
     """
     if not DISKS_DIR.is_dir():
         return 0

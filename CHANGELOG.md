@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-28
+
+Cluster keyframes pause for the residual, not the guest's RAM. A tree
+can opt into a dilation policy and into KSM. The fake-GPU fixture
+grows a count, per-GPU DCGM series, device IDs, and Kueue flavors.
+
+### Added
+
+- Coordinated cluster keyframe: `tree_adopt_cluster`,
+  `tree_create_cluster`, and in-tree children cut every native member
+  at one instant. Live pre-copy writes RAM while the guest runs, so
+  the pause is the residual rather than guest RAM. An adopted root
+  keyframe can be refreshed into a new generation. `TreeCreated`
+  reports `pause_ns` and `max_pause_ns`.
+- Opt-in per-tree dilation policy (`fixed` / `down` / `track`) with
+  caller knobs for window, saturated, quiet, cadence, and ladder.
+  The default stays `fixed` and starts no loop. Intel live
+  `SetDilation` re-arms in-flight LAPIC timers (VMX preemption timer).
+- Opt-in per-tree KSM (`ksm: true` on `tree_create_cluster` /
+  `tree_adopt_cluster`, off by default, inherited by forks). Guest
+  RAM is marked mergeable after the guest is running. Same-tenant
+  hosts only; k7d does not start `ksmd`.
+- Resume applies the checkpoint's own dirty delta.
+- Fake GPU fixture: `FAKE_GPU_COUNT` (default 2), `Allocate` sets
+  `NVIDIA_VISIBLE_DEVICES` to the kubelet-assigned `fake-gpu-N` IDs,
+  one DCGM series per device, product and topology labels with Kueue
+  flavors `fake-h100` / `fake-l40s`, and a RayJob on digest-pinned
+  `rayproject/ray:2.47.1-py311`. Mock only.
+- `tree_drop` tears a tree down. `list_vms` / `vm_status` stay the
+  sandbox registry; adopted members are reached through
+  `tree_nodes.live_guest_cids`.
+
+### Fixed
+
+- Close log-bridge FIFOs so a fork source can tear down.
+- `stop_vm` on an id adopted into a tree errors and does not free
+  tree disks. `tree_prune` of the root and `tree_drop` release the
+  broker pins for those ids.
+
 ## [0.7.0] — 2026-09-19
 
 Privilege separation: a node broker (root) and a VM broker (uid `k7d`).

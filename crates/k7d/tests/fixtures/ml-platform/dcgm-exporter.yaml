@@ -1,14 +1,56 @@
 # dcgm-exporter-shaped Prometheus fixture. Not NVML.
-# Serves DCGM_FI_DEV_GPU_UTIL and DCGM_FI_DEV_FB_USED on :9400.
+#
+# DaemonSet: one series per fake-gpu-N (FAKE_GPU_COUNT, default 2,
+# matching the device plugin). Labels pod / namespace / container come
+# from the kubelet pod-resources API and disappear when the pod is
+# deleted. modelName=Fake-A100.
+#
+# Defaults (mock only):
+#   DCGM_FI_DEV_GPU_UTIL = 42   (env FAKE_DCGM_GPU_UTIL)
+#   DCGM_FI_DEV_FB_USED  = 1024 (env FAKE_DCGM_FB_USED)
+# A pod annotation overrides that device only:
+#   k7d.katakate.org/fake-dcgm-gpu-util
+#   k7d.katakate.org/fake-dcgm-fb-used
+# Unset uses the default. A set-but-invalid number fails the render.
+#
+# Listens on 9400. NodePort 30400 with externalTrafficPolicy Local so
+# a scrape of a node IP is that node's series.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dcgm-exporter
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dcgm-exporter
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dcgm-exporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dcgm-exporter
+subjects:
+- kind: ServiceAccount
+  name: dcgm-exporter
+  namespace: default
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: dcgm-exporter
   namespace: default
   labels:
     app: dcgm-exporter
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: dcgm-exporter
@@ -17,6 +59,10 @@ spec:
       labels:
         app: dcgm-exporter
     spec:
+      serviceAccountName: dcgm-exporter
+      automountServiceAccountToken: true
+      tolerations:
+      - operator: Exists
       containers:
       - name: dcgm-exporter
         image: docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
@@ -24,22 +70,64 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
+          set -eu
           mkdir -p /www
-          cat > /www/metrics <<EOF
-          # TYPE DCGM_FI_DEV_GPU_UTIL gauge
-          DCGM_FI_DEV_GPU_UTIL{gpu="0",UUID="GPU-fake-0",device="nvidia0",modelName="Fake-A100",Hostname="${NODE_NAME}"} 42
-          # TYPE DCGM_FI_DEV_FB_USED gauge
-          DCGM_FI_DEV_FB_USED{gpu="0",UUID="GPU-fake-0",device="nvidia0",modelName="Fake-A100",Hostname="${NODE_NAME}"} 1024
-          EOF
-          exec httpd -f -p 9400 -h /www
+          render() {
+            /opt/k7d-ml/fake-gpu-plugin -render-dcgm > /www/metrics.tmp \
+              && mv /www/metrics.tmp /www/metrics
+          }
+          render
+          httpd -f -p 9400 -h /www &
+          hpid=$!
+          set +e
+          while true; do
+            kill -0 "$hpid" 2>/dev/null || { echo "httpd exited" >&2; exit 1; }
+            render || echo "fake dcgm render failed; keeping last metrics" >&2
+            sleep 2
+          done
         env:
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: FAKE_GPU_COUNT
+          value: "2"
+        - name: FAKE_DCGM_GPU_UTIL
+          value: "42"
+        - name: FAKE_DCGM_FB_USED
+          value: "1024"
+        securityContext:
+          privileged: true
         ports:
         - name: metrics
           containerPort: 9400
+        volumeMounts:
+        - name: plugin-bin
+          mountPath: /opt/k7d-ml
+          readOnly: true
+        - name: kubelet-pod-resources
+          mountPath: /var/lib/kubelet/pod-resources
+        - name: k3s-pod-resources
+          mountPath: /var/lib/rancher/k3s/agent/kubelet/pod-resources
+        - name: k3s-agent-pod-resources
+          mountPath: /var/lib/rancher/k3s/agent/pod-resources
+      volumes:
+      - name: plugin-bin
+        hostPath:
+          path: /opt/k7d-ml
+          type: Directory
+      - name: kubelet-pod-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
+          type: DirectoryOrCreate
+      - name: k3s-pod-resources
+        hostPath:
+          path: /var/lib/rancher/k3s/agent/kubelet/pod-resources
+          type: DirectoryOrCreate
+      - name: k3s-agent-pod-resources
+        hostPath:
+          path: /var/lib/rancher/k3s/agent/pod-resources
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -50,6 +138,7 @@ metadata:
     app: dcgm-exporter
 spec:
   type: NodePort
+  externalTrafficPolicy: Local
   selector:
     app: dcgm-exporter
   ports:

@@ -2152,7 +2152,7 @@ pub(crate) fn mark_dirty(dirty: &[std::sync::atomic::AtomicU64], gpa: u64, len: 
     for page in first..=last {
         let word = (page / 64) as usize;
         if let Some(w) = dirty.get(word) {
-            w.fetch_or(1u64 << (page % 64), Ordering::Relaxed);
+            w.fetch_or(1u64 << (page % 64), Ordering::Release);
         }
     }
 }
@@ -2355,7 +2355,7 @@ impl VirtioBackend for TapNetBackend {
             if i >= acc.len() {
                 break;
             }
-            acc[i] |= w.load(Ordering::SeqCst);
+            acc[i] |= w.swap(0, Ordering::AcqRel);
         }
     }
 

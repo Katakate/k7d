@@ -2654,10 +2654,13 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
     // false-fail). Required order: prepare → probe → fork.
     let tree_id = format!("inner3-adopt-{}", std::process::id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -2720,6 +2723,8 @@ fn test_inner_k3s_cluster_warm_fork_no_restart() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -3617,10 +3622,13 @@ fn test_inner_k3s_coredns_dns_fork() {
 
     let tree_id = format!("i3cd-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -3675,6 +3683,8 @@ fn test_inner_k3s_coredns_dns_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -4851,10 +4861,13 @@ fn test_inner_k3s_ingress_fork() {
 
     let tree_id = format!("i3ing-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -4909,6 +4922,8 @@ fn test_inner_k3s_ingress_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -5610,10 +5625,13 @@ fn test_inner_k3s_local_path_pvc_fork() {
 
     let tree_id = format!("i3lpp-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -5668,6 +5686,8 @@ fn test_inner_k3s_local_path_pvc_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -5885,10 +5905,13 @@ fn test_inner_k3s_metrics_server_fork() {
 
     let tree_id = format!("i3ms-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -5943,6 +5966,8 @@ fn test_inner_k3s_metrics_server_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -6480,10 +6505,13 @@ fn test_inner_k3s_network_policy_fork() {
 
     let tree_id = format!("i3np-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -6538,6 +6566,8 @@ fn test_inner_k3s_network_policy_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -6969,10 +6999,13 @@ fn test_inner_k3s_hpa_scale_fork() {
 
     let tree_id = format!("i3hpa-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -7027,6 +7060,8 @@ fn test_inner_k3s_hpa_scale_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -7372,10 +7407,13 @@ fn test_inner_k3s_etcd_datastore_fork() {
 
     let tree_id = format!("i3etcd-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -7430,6 +7468,8 @@ fn test_inner_k3s_etcd_datastore_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -8591,10 +8631,13 @@ fn test_inner_k3s_argocd_gitops_fork() {
 
     let tree_id = format!("i3argo-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -8649,6 +8692,8 @@ fn test_inner_k3s_argocd_gitops_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,
@@ -10069,10 +10114,13 @@ fn test_inner_k3s_cilium_datapath_fork() {
 
     let tree_id = format!("i3cil-{}", common::run_id());
     let (tree_id, root_id, root_cids) = match client.call(&Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget: Some(inner3_tree_budget()),
         tree_id: Some(tree_id),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeCreated {
             tree_id,
@@ -10127,6 +10175,8 @@ fn test_inner_k3s_cilium_datapath_fork() {
         source_id: root_id.clone(),
         label: "warm".to_string(),
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Ok(Response::TreeForked {
             node_id,

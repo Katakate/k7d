@@ -633,6 +633,29 @@ pub enum Verb {
         /// Pid from a [`Reply::Spawned`].
         pid: u32,
     },
+
+    /// Read KSM counters for guest mappings in the VM broker.
+    ///
+    /// Read-only. The node broker opens `/proc/<vm-broker-pid>/smaps`
+    /// and `ksm_stat` because `PR_SET_DUMPABLE=0` makes those files
+    /// root-owned, so the VM broker cannot read its own. The pid is
+    /// the node broker's child — the verb does not take a pid, so it
+    /// cannot be pointed at another process. k7d never writes
+    /// `/sys/kernel/mm/ksm`.
+    KsmQuery {
+        /// Host address and length of each guest RAM mapping, in the
+        /// VM broker's address space.
+        ranges: Vec<KsmRange>,
+    },
+}
+
+/// One guest-RAM range for [`Verb::KsmQuery`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KsmRange {
+    /// Host userspace address of the mapping.
+    pub start: u64,
+    /// Length in bytes. Page-aligned guest span.
+    pub len: u64,
 }
 
 /// What the node broker answers. The verb table says which replies
@@ -710,6 +733,14 @@ pub enum Reply {
         records: Vec<FcJailRecord>,
         /// Whether a page after this one exists.
         more: bool,
+    },
+    /// Answer to [`Verb::KsmQuery`]. `merging_pages[i]` is the smaps
+    /// KSM page count of `ranges[i]`. `stat` is the process-wide file.
+    KsmQuery {
+        /// Per-range merged pages, same order as the request.
+        merging_pages: Vec<u64>,
+        /// `/proc/<vm-broker-pid>/ksm_stat`.
+        stat: crate::ksm::KsmProcStat,
     },
     /// The verb was refused or the syscall failed. `errno` is preserved
     /// so `io::ErrorKind` survives the hop; `message` is for the log.

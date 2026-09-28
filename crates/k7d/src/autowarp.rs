@@ -10,12 +10,12 @@
 //! Two measured facts shape it, and neither is negotiable:
 //!
 //! 1. **Which timer the guest arms is the host's choice, not ours.** On
-//!    the AMD nodes (host kernel 6.8) `KVM_GET_SUPPORTED_CPUID` does not
+//!    host kernel 6.8 (AMD or Intel) `KVM_GET_SUPPORTED_CPUID` does not
 //!    report `CPUID.1:ECX[24]`, `IA32_TSC_DEADLINE` reads zero on every
 //!    vCPU in every sample, `/proc/timer_list` says `lapic`, and the
 //!    timer the guest arms is the LAPIC one-shot, read here through
 //!    `KVM_GET_LAPIC`'s live `TMCCT` — which needs the APIC bus cycle
-//!    calibrated first. On the Intel node (host kernel 7.0) the bit is
+//!    calibrated first. Under host kernel 7.0 (the Intel node) the bit is
 //!    advertised, the guest says `lapic-deadline`, `TMCCT` never counts,
 //!    and the deadline is read from `IA32_TSC_DEADLINE` in TSC units
 //!    with nothing to calibrate. `Vm::sample_timers` reports both; the
@@ -33,9 +33,11 @@
 //!
 //! Hard safety comes from the pause: the clock only moves while every
 //! member is stopped and every device is quiescent, exactly as on the
-//! fork path. A forward jump never *loses* a timer — the host hrtimers
-//! backing the guest's timers are untouched, so they fire at the same
-//! host instant either way. What the target buys is **fidelity**: land
+//! fork path. A forward jump never *loses* a timer — at worst the host
+//! hrtimer backing it fires at the same host instant it always would
+//! have (a one-shot on SVM); a rewritten deadline, or a one-shot under
+//! VMX's preemption timer, fires at the next entry or pause instead
+//! (CHALLENGES #261, #264). What the target buys is **fidelity**: land
 //! just before the earliest armed deadline and no timer's
 //! guest-observed firing time moves by more than ε, so the cluster
 //! cannot tell the deleted wall time from a scheduling hiccup. Jump

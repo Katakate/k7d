@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use k7d::control::{Client, Request, Response, ShareConfig, VmConfig};
+use k7d::control::{
+    BlockDeviceConfig, Client, NetConfig, Request, Response, ShareConfig, VmConfig,
+};
 use k7d::doctor::{capbnd_of, EXPECTED_CAPBND};
 
 /// Transient unit name. One at a time: the suite runs with
@@ -1587,6 +1589,394 @@ fn owner_uid(path: &Path) -> u32 {
     std::fs::metadata(path)
         .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
         .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+}
+
+/// One open fd in `pids` whose `/proc` link is `path` or `path (deleted)`.
+#[derive(Debug)]
+#[allow(dead_code)] // fields are the Debug dump when a pin is still open
+struct HeldImage {
+    /// Broker pid that still has the inode open. Shown in the failure.
+    pid: u32,
+    /// `st_nlink` of that fd. `0` means unlinked but still open.
+    nlink: u64,
+    /// `st_size` of that fd.
+    size: u64,
+    /// `/proc/<pid>/fd` link text, so a ghost path is visible.
+    target: String,
+}
+
+fn fd_links(pid: u32) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return vec![format!("unreadable /proc/{pid}/fd")];
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            std::fs::read_link(entry.path())
+                .ok()
+                .map(|path| path.display().to_string())
+        })
+        .collect()
+}
+
+fn file_ident(path: &Path) -> (u64, u64) {
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    (
+        std::os::unix::fs::MetadataExt::dev(&meta),
+        std::os::unix::fs::MetadataExt::ino(&meta),
+    )
+}
+
+/// Broker fds still naming `path` (or its inode), with the `st_nlink` /
+/// size a stat of the open inode returns. Empty once the last pin and
+/// the last virtio-blk handle are closed — that is when unlink actually
+/// frees the blocks. `ident` is captured before unlink so a deleted
+/// inode still matches.
+fn held_images(pids: &[u32], path: &Path, ident: (u64, u64)) -> Vec<HeldImage> {
+    let prefix = path.display().to_string();
+    let mut out = Vec::new();
+    for &pid in pids {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target_s = target.to_string_lossy().into_owned();
+            let live = target_s == prefix;
+            let deleted = target_s
+                .strip_suffix(" (deleted)")
+                .is_some_and(|s| s == prefix);
+            let meta = std::fs::metadata(entry.path()).ok();
+            let ino_match = meta.as_ref().is_some_and(|m| {
+                (
+                    std::os::unix::fs::MetadataExt::dev(m),
+                    std::os::unix::fs::MetadataExt::ino(m),
+                ) == ident
+            });
+            if !live && !deleted && !ino_match {
+                continue;
+            }
+            let (nlink, size) = meta
+                .map(|m| (std::os::unix::fs::MetadataExt::nlink(&m), m.len()))
+                .unwrap_or((u64::MAX, u64::MAX));
+            out.push(HeldImage {
+                pid,
+                nlink,
+                size,
+                target: target_s,
+            });
+        }
+    }
+    out
+}
+
+fn root_owned_disk(name: &str) -> PathBuf {
+    std::fs::create_dir_all("/var/lib/k7d/images").expect("mkdir images");
+    let disk = PathBuf::from(format!("/var/lib/k7d/images/{name}.img"));
+    let _ = std::fs::remove_file(&disk);
+    // 1 MiB, a multiple of the 512-byte sector size. Root-owned 0600:
+    // uid `k7d` cannot open it, so a later `disk.open` has to come
+    // through the `O_PATH` pin.
+    std::fs::write(&disk, vec![0u8; 1024 * 1024]).expect("write disk image");
+    std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("chmod 0600");
+    let denied = as_vm_broker(&["dd", "if=/dev/null", &format!("of={}", disk.display())]);
+    assert!(
+        !denied.status.success(),
+        "uid k7d could open {} — this test would pass without a broker pin",
+        disk.display()
+    );
+    disk
+}
+
+fn assert_guest_vda(cid: u64) {
+    let mut agent = k7d::api::AgentClient::connect_vsock(cid, Duration::from_secs(90))
+        .unwrap_or_else(|e| panic!("connect to guest {cid}: {e}\n{}", journal()));
+    let parts = agent
+        .exec(&["cat", "/proc/partitions"])
+        .unwrap_or_else(|e| panic!("partitions on {cid}: {e}"));
+    assert!(
+        parts.stdout.contains("vda"),
+        "guest {cid} has no virtio-blk — disk.open did not deliver:\n{}",
+        parts.stdout
+    );
+}
+
+fn create_bridged_disk(pair: &SplitPair, cluster: &str, idx: u32, disk: &Path) -> (String, u64) {
+    let response = call(
+        pair,
+        &Request::CreateVm {
+            config: VmConfig {
+                block_devices: vec![BlockDeviceConfig {
+                    host_path: disk.display().to_string(),
+                    readonly: true,
+                    guest_mount: None,
+                    fstype: None,
+                }],
+                network: Some(NetConfig {
+                    cluster_id: cluster.to_string(),
+                    vm_index: Some(idx),
+                    pod_netns: None,
+                }),
+                ..VmConfig::default()
+            },
+        },
+    );
+    match response {
+        Response::VmCreated {
+            vm_id, guest_cid, ..
+        } => (vm_id, guest_cid),
+        other => panic!(
+            "create bridged VM {idx} on {cluster}: {other:?}\n{}",
+            journal()
+        ),
+    }
+}
+
+struct DiskCleanup(Vec<PathBuf>);
+
+impl Drop for DiskCleanup {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Adopted caller images stay pinned across restore-swap and a child
+/// prune, and the pin is gone after `tree_drop`.
+///
+/// Readonly root-owned images: a fork shares the file and reopens it
+/// with `disk.open`. Releasing the pin at adopt would make that open
+/// `EACCES`. A child prune must not release either — the root is still
+/// live on the same pins. After drop + unlink, no broker fd still
+/// stats the inode (`st_nlink` / size would still return if it did).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_adopted_disk_pins_survive_fork_and_release_on_tree_drop() {
+    let pair = start_pair();
+    let disk0 = root_owned_disk("t2-drop-0");
+    let disk1 = root_owned_disk("t2-drop-1");
+    let _cleanup = DiskCleanup(vec![disk0.clone(), disk1.clone()]);
+    let ident0 = file_ident(&disk0);
+    let ident1 = file_ident(&disk1);
+
+    let (id0, cid0) = create_bridged_disk(&pair, "t2drop", 0, &disk0);
+    let (id1, cid1) = create_bridged_disk(&pair, "t2drop", 1, &disk1);
+    assert_guest_vda(cid0);
+    assert_guest_vda(cid1);
+    let brokers = [pair.node_pid, pair.vm_pid];
+    assert!(
+        !held_images(&[pair.node_pid], &disk0, ident0).is_empty()
+            && !held_images(&[pair.node_pid], &disk1, ident1).is_empty(),
+        "node broker did not pin the caller images at CreateVm; fds: {:?}",
+        fd_links(pair.node_pid)
+    );
+
+    let (tree_id, root_cids) = match call(
+        &pair,
+        &Request::TreeAdoptCluster {
+            ksm: false,
+            vm_ids: vec![id1.clone(), id0.clone()],
+            budget: None,
+            tree_id: Some("t2-drop".to_string()),
+            egress: None,
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            guest_cids,
+            ..
+        } => (tree_id, guest_cids),
+        other => panic!("tree_adopt_cluster: {other:?}\n{}", journal()),
+    };
+    assert_eq!(root_cids.len(), 2, "adopted root keeps both members");
+    // Restore-swap reopened the same files. Pins were not released.
+    assert_guest_vda(root_cids[0]);
+    assert_guest_vda(root_cids[1]);
+    assert!(
+        !held_images(&[pair.node_pid], &disk0, ident0).is_empty(),
+        "adopt released the root pin for {}",
+        disk0.display()
+    );
+
+    let (child, fork_cids) = match call(
+        &pair,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: "root".to_string(),
+            label: "child".to_string(),
+            dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeForked {
+            node_id,
+            guest_cids,
+            ..
+        } => (node_id, guest_cids),
+        other => panic!("fork after adopt: {other:?}\n{}", journal()),
+    };
+    assert_eq!(fork_cids.len(), 2);
+    assert_guest_vda(fork_cids[0]);
+
+    assert!(matches!(
+        call(
+            &pair,
+            &Request::TreePrune {
+                tree_id: tree_id.clone(),
+                node_id: child,
+            },
+        ),
+        Response::Ok
+    ));
+    // Child prune drops the child's fds only. The root pin stays, and
+    // a later fork still disk.opens the caller image.
+    let still = held_images(&[pair.node_pid], &disk0, ident0);
+    assert!(
+        !still.is_empty(),
+        "pruning a child released the root pin for {}",
+        disk0.display()
+    );
+    assert!(
+        still.iter().all(|h| h.nlink >= 1 && h.size == 1024 * 1024),
+        "root pin stat changed after child prune: {still:?}"
+    );
+    assert_guest_vda(root_cids[0]);
+    let (_child2, fork2) = match call(
+        &pair,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: "root".to_string(),
+            label: "again".to_string(),
+            dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeForked {
+            node_id,
+            guest_cids,
+            ..
+        } => (node_id, guest_cids),
+        other => panic!(
+            "fork after child prune (pin was released too early): {other:?}\n{}",
+            journal()
+        ),
+    };
+    assert_guest_vda(fork2[0]);
+    match call(&pair, &Request::StopVm { vm_id: id0.clone() }) {
+        Response::Error { message } => assert!(
+            message.contains(&tree_id) && message.contains("tree_drop"),
+            "stop after child prune: {message}"
+        ),
+        other => panic!("expected adopted StopVm error, got {other:?}"),
+    }
+
+    assert!(matches!(
+        call(
+            &pair,
+            &Request::TreeDrop {
+                tree_id: tree_id.clone(),
+            },
+        ),
+        Response::Ok
+    ));
+    match call(&pair, &Request::StopVm { vm_id: id0 }) {
+        Response::Error { message } => assert!(
+            message.contains("no such VM") && !message.contains("adopted"),
+            "stop after tree_drop: {message}"
+        ),
+        other => panic!("expected no-such-VM after drop, got {other:?}"),
+    }
+    std::fs::remove_file(&disk0).expect("unlink disk0");
+    std::fs::remove_file(&disk1).expect("unlink disk1");
+    let ghosts = held_images(&brokers, &disk0, ident0);
+    let ghosts1 = held_images(&brokers, &disk1, ident1);
+    assert!(
+        ghosts.is_empty() && ghosts1.is_empty(),
+        "caller images still open after tree_drop (st_nlink/size would still return): \
+         {ghosts:?} {ghosts1:?}"
+    );
+}
+
+/// `tree_prune` of the root releases the same pins. A child is not
+/// required: the subtree includes the root, so every live payload is
+/// already gone.
+#[test]
+fn test_adopted_disk_pins_release_on_root_prune() {
+    let pair = start_pair();
+    let disk0 = root_owned_disk("t2-prune-0");
+    let disk1 = root_owned_disk("t2-prune-1");
+    let _cleanup = DiskCleanup(vec![disk0.clone(), disk1.clone()]);
+    let ident0 = file_ident(&disk0);
+    let ident1 = file_ident(&disk1);
+
+    let (id0, cid0) = create_bridged_disk(&pair, "t2prune", 0, &disk0);
+    let (id1, cid1) = create_bridged_disk(&pair, "t2prune", 1, &disk1);
+    // Adopt only after the agents answer. A restore-swap of a guest
+    // whose vhost-vsock is not up yet fails `SET_RUNNING` with EFAULT.
+    assert_guest_vda(cid0);
+    assert_guest_vda(cid1);
+    let (tree_id, root_cids) = match call(
+        &pair,
+        &Request::TreeAdoptCluster {
+            ksm: false,
+            vm_ids: vec![id0.clone(), id1.clone()],
+            budget: None,
+            tree_id: Some("t2-prune".to_string()),
+            egress: None,
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            guest_cids,
+            ..
+        } => (tree_id, guest_cids),
+        other => panic!("tree_adopt_cluster: {other:?}\n{}", journal()),
+    };
+    assert_guest_vda(root_cids[0]);
+    assert!(
+        !held_images(&[pair.node_pid], &disk0, ident0).is_empty(),
+        "adopt released the pin before root prune"
+    );
+
+    assert!(matches!(
+        call(
+            &pair,
+            &Request::TreePrune {
+                tree_id: tree_id.clone(),
+                node_id: "root".to_string(),
+            },
+        ),
+        Response::Ok
+    ));
+    std::fs::remove_file(&disk0).expect("unlink disk0");
+    std::fs::remove_file(&disk1).expect("unlink disk1");
+    let brokers = [pair.node_pid, pair.vm_pid];
+    let ghosts = held_images(&brokers, &disk0, ident0);
+    let ghosts1 = held_images(&brokers, &disk1, ident1);
+    assert!(
+        ghosts.is_empty() && ghosts1.is_empty(),
+        "caller images still open after root prune (st_nlink/size would still return): \
+         {ghosts:?} {ghosts1:?}"
+    );
+    for id in [id0, id1] {
+        match call(&pair, &Request::StopVm { vm_id: id }) {
+            Response::Error { message } => assert!(
+                message.contains("no such VM") && !message.contains("adopted"),
+                "stop after root prune: {message}"
+            ),
+            other => panic!("expected no-such-VM after root prune, got {other:?}"),
+        }
+    }
 }
 
 fn cgroup_of(pid: u32) -> String {

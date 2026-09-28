@@ -1,0 +1,82 @@
+# Two mock GPU flavors. Does not replace kueue/queues.yaml
+# (the default-flavor queue, GPU quota 1). Not a production batch scheduler.
+# Topology levels: block, rack, then kubernetes.io/hostname (kubelet).
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Topology
+metadata:
+  name: fake-gpu
+spec:
+  levels:
+  - nodeLabel: k7d.katakate.org/topology-block
+  - nodeLabel: k7d.katakate.org/topology-rack
+  - nodeLabel: kubernetes.io/hostname
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fake-h100
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+  topologyName: fake-gpu
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fake-l40s
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: NVIDIA-L40S
+  topologyName: fake-gpu
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: fake-h100-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+    flavors:
+    - name: fake-h100
+      resources:
+      - name: cpu
+        nominalQuota: 4
+      - name: memory
+        nominalQuota: 8Gi
+      - name: nvidia.com/gpu
+        nominalQuota: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: fake-l40s-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+    flavors:
+    - name: fake-l40s
+      resources:
+      - name: cpu
+        nominalQuota: 2
+      - name: memory
+        nominalQuota: 4Gi
+      - name: nvidia.com/gpu
+        nominalQuota: 2
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: h100-queue
+  namespace: default
+spec:
+  clusterQueue: fake-h100-cq
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: l40s-queue
+  namespace: default
+spec:
+  clusterQueue: fake-l40s-cq

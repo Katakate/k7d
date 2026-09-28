@@ -1,0 +1,84 @@
+# RayJob on the fake nvidia.com/gpu fixture with a digest-pinned
+# CPU rayproject/ray image (not busybox, not CUDA, not Ray Train).
+#
+# Do NOT set ray.io/overwrite-container-cmd — that annotation is the
+# busybox opt-out that stops KubeRay injecting `ray start`
+# (CHALLENGES #157). This operand is real Ray; the inject is required.
+#
+# Worker requests nvidia.com/gpu: 1. There is no NVML on the mock.
+# KubeRay still injects ray start --num-gpus from that request, so
+# `ray status` reports 0.0/1.0 GPU even if rayStartParams omits
+# num-gpus (CHALLENGES #269). Head dashboard-host is 0.0.0.0 so the
+# operator can submit the job.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: gpu-rayjob
+  namespace: default
+spec:
+  shutdownAfterJobFinishes: false
+  submissionMode: HTTPMode
+  entrypoint: python -c "import ray; ray.init(); print('K7D_RAYJOB_OK', sorted(ray.cluster_resources().items()))"
+  rayClusterSpec:
+    rayVersion: "2.47.1"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: docker.io/rayproject/ray:2.47.1-py311@sha256:a2d5da8d5becaf5369309d0cc30a848094ce2c596b2536201f6dfb66679d42d3
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+                limits:
+                  cpu: "2"
+                  memory: 3Gi
+              volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 1Gi
+    workerGroupSpecs:
+      - groupName: gpu-group
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-gpus: "1"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: docker.io/rayproject/ray:2.47.1-py311@sha256:a2d5da8d5becaf5369309d0cc30a848094ce2c596b2536201f6dfb66679d42d3
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: 2Gi
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "2"
+                    memory: 3Gi
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 1Gi

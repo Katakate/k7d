@@ -133,6 +133,9 @@ if ! flock -w $LOCK_WAIT 9; then
     exit 75
 fi
 echo "$RUN_NAME pid \$\$ since \$(date -Is)" > '$LOCK_FILE.holder'
+# A status left by the last run of this name would end the wait below
+# at once and hand the lock to the next agent while this run builds.
+rm -f '$RUN_DIR/status'
 echo \$\$ > '$RUN_DIR/lock.pid'
 started=\$(date +%s)
 while [ ! -f '$RUN_DIR/status' ]; do

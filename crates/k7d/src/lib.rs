@@ -51,6 +51,8 @@ pub mod fork;
 #[cfg(not(feature = "verif"))]
 pub mod guest;
 #[cfg(not(feature = "verif"))]
+pub mod ksm;
+#[cfg(not(feature = "verif"))]
 pub mod latency;
 #[cfg(not(feature = "verif"))]
 pub mod mem_layout;

@@ -213,7 +213,8 @@ pub const WARP_CLUSTER_3VM: Duration = Duration::from_millis(250);
 /// Incremental keyframe for a 3-VM Ubuntu cluster child.
 ///
 /// `prepare_fork_source` on a tree child whose ancestor already has a
-/// keyframe on the same reflink filesystem: per member a pause, the
+/// keyframe on the same reflink filesystem: one pause of every member,
+/// then in parallel per member the
 /// dirty merge, an `FICLONE` of the ancestor's `memory.bin`, a `pwrite`
 /// per run of dirty pages, `rename`, and the restore-swap. The clone is
 /// metadata-only, so the cost is the divergence, not the 6 GiB of guest

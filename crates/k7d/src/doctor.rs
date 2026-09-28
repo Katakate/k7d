@@ -79,6 +79,9 @@ pub struct Report {
     /// root process is a supported configuration and must not read as a
     /// failure — it reads as `weak`, which is exactly what it is.
     pub privsep: Vec<Check>,
+    /// `/sys/kernel/mm/ksm/run`, read only. `None` when the kernel has
+    /// no KSM. Does not decide [`Report::ok`].
+    pub ksm_run: Option<u32>,
 }
 
 impl Report {
@@ -110,6 +113,14 @@ impl Report {
     #[must_use]
     pub fn cgroup_v2(&self) -> bool {
         self.named("cgroup_v2")
+    }
+
+    /// Host `ksmd` state from `/sys/kernel/mm/ksm/run`.
+    ///
+    /// `Some(1)` means ksmd is scanning. k7d never writes that file.
+    #[must_use]
+    pub fn ksm_run(&self) -> Option<u32> {
+        self.ksm_run
     }
 
     fn named(&self, name: &str) -> bool {
@@ -148,8 +159,34 @@ impl Report {
                 format!("{mark:4}  {}  {}", c.name, c.detail)
             }));
         }
+        out.push(ksmd_line(self.ksm_run));
         out
     }
+}
+
+/// One advisory line: whether host `ksmd` is scanning. Not a `checks`
+/// entry, so a stopped ksmd does not fail `doctor`.
+fn ksmd_line(run: Option<u32>) -> String {
+    let (mark, detail) = match run {
+        Some(1) => (
+            "ok",
+            "running (run=1); same-tenant only — k7d does not start ksmd",
+        ),
+        Some(0) => (
+            "warn",
+            "stopped (run=0); opt-in guest KSM stays idle until an operator starts ksmd",
+        ),
+        Some(2) => (
+            "warn",
+            "unmerging (run=2); k7d does not write /sys/kernel/mm/ksm",
+        ),
+        Some(v) => return format!("warn  ksmd  /sys/kernel/mm/ksm/run={v}"),
+        None => (
+            "warn",
+            "no /sys/kernel/mm/ksm/run (kernel built without KSM)",
+        ),
+    };
+    format!("{mark:4}  ksmd  {detail}")
 }
 
 /// Run the four host checks.
@@ -165,6 +202,7 @@ pub fn run() -> Report {
         fc: fc_checks(),
         hardening: hardening_checks(),
         privsep: privsep_checks(),
+        ksm_run: crate::ksm::host_ksmd_run(),
     }
 }
 
@@ -933,7 +971,13 @@ mod tests {
         // hardening items, 5 privsep items. Counted rather than
         // approximated so a section that stops being printed at all fails
         // here as well as in its own assertion above.
-        assert_eq!(report.lines().len(), 4 + 5 + 2 + 6 + 5);
+        // +1 is the trailing ksmd line (advisory, not a section).
+        assert_eq!(report.lines().len(), 4 + 5 + 2 + 6 + 5 + 1);
+        assert!(
+            report.lines().last().is_some_and(|l| l.contains("ksmd")),
+            "doctor must say whether ksmd is running: {:?}",
+            report.lines()
+        );
     }
 
     #[test]
@@ -960,6 +1004,7 @@ mod tests {
             }],
             hardening: vec![],
             privsep: vec![],
+            ksm_run: None,
         };
         assert!(report.ok());
         assert!(

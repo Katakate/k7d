@@ -1175,6 +1175,48 @@ fn dump_host_addr(vm: &Vm) -> Result<*const u8, SnapshotError> {
 /// filesystem the caller falls back to a full dump, and a second
 /// injection would push a second event into the guest's vsock event
 /// queue.
+/// `FICLONE` `ancestor_mem` into a fresh `tmp_path`, removing it again
+/// on failure. [`SnapshotError::ReflinkUnsupported`] when the two paths
+/// are not on one reflink-capable filesystem.
+fn clone_ancestor_into(
+    tmp_path: &Path,
+    ancestor_mem: &Path,
+    mem_span: u64,
+) -> Result<fs::File, SnapshotError> {
+    use std::os::fd::AsRawFd;
+
+    // A tmp file left behind by a crashed prepare would make
+    // `create_new` fail EEXIST forever.
+    let _ = fs::remove_file(tmp_path);
+    let ancestor = fs::File::open(ancestor_mem)?;
+    let ancestor_len = ancestor.metadata()?.len();
+    if ancestor_len != mem_span {
+        return Err(SnapshotError::Kvm(format!(
+            "ancestor keyframe {} is {ancestor_len} bytes but this VM's guest-physical \
+             span is {mem_span} — refusing to clone a base of a different shape",
+            ancestor_mem.display(),
+        )));
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp_path)?;
+    // SAFETY: both fds are valid for the duration of the call;
+    // FICLONE takes the source fd as its integer argument.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, ancestor.as_raw_fd()) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        drop(file);
+        let _ = fs::remove_file(tmp_path);
+        return Err(SnapshotError::ReflinkUnsupported {
+            ancestor: ancestor_mem.to_path_buf(),
+            dest: tmp_path.to_path_buf(),
+            detail: err.to_string(),
+        });
+    }
+    Ok(file)
+}
+
 struct ClonedKeyframe {
     file: fs::File,
     tmp_path: PathBuf,
@@ -1204,43 +1246,11 @@ impl ClonedKeyframe {
         ancestor_mem: &Path,
         mem_span: u64,
     ) -> Result<Self, SnapshotError> {
-        use std::os::fd::AsRawFd;
-
         // Same tmp + rename discipline as the full dump (#130): the file
         // we are about to publish may already be MAP_PRIVATE-mapped by a
         // live VM, so the old inode must stay alive.
         let tmp_path = snapshot_dir.join("memory.bin.tmp");
-        // A tmp file left behind by a crashed prepare would make
-        // `create_new` fail EEXIST forever.
-        let _ = fs::remove_file(&tmp_path);
-
-        let ancestor = fs::File::open(ancestor_mem)?;
-        let ancestor_len = ancestor.metadata()?.len();
-        if ancestor_len != mem_span {
-            return Err(SnapshotError::Kvm(format!(
-                "ancestor keyframe {} is {ancestor_len} bytes but this VM's guest-physical \
-                 span is {mem_span} — refusing to clone a base of a different shape",
-                ancestor_mem.display(),
-            )));
-        }
-
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
-        // SAFETY: both fds are valid for the duration of the call;
-        // FICLONE takes the source fd as its integer argument.
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, ancestor.as_raw_fd()) };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            drop(file);
-            let _ = fs::remove_file(&tmp_path);
-            return Err(SnapshotError::ReflinkUnsupported {
-                ancestor: ancestor_mem.to_path_buf(),
-                dest: tmp_path,
-                detail: err.to_string(),
-            });
-        }
+        let file = clone_ancestor_into(&tmp_path, ancestor_mem, mem_span)?;
         Ok(Self {
             file,
             tmp_path,
@@ -1284,51 +1294,384 @@ impl ClonedKeyframe {
         Ok(written)
     }
 
-    /// Write the dirty set a **run at a time**, not a page at a time.
-    ///
-    /// Guest dirt is clustered, and one `pwrite` per 4 KiB page is what
-    /// made the first measured incremental keyframe slower than the full
-    /// dump it was meant to replace: ~400 000 syscalls for a 30 s-idle
-    /// k3s node (CHALLENGES #154). Coalescing adjacent
-    /// pages into a single write turns that into a few thousand.
     fn patch(
         &self,
         dirty_bitmap: &[u64],
         host_addr: *const u8,
         mem_span: u64,
     ) -> Result<(u64, u64), SnapshotError> {
-        use std::os::unix::fs::FileExt;
+        // SAFETY: the caller's VM is borrowed for this call, so its
+        // mapping of `mem_span` bytes at `host_addr` stays alive.
+        unsafe { write_dirty_runs(&self.file, dirty_bitmap, host_addr, mem_span) }
+    }
+}
 
-        let pages = mem_span.div_ceil(4096);
-        // Checked up front, and once, so the walk below stays total and
-        // allocation-free — which is what makes it model-checkable.
-        if let Some(top) = highest_dirty_page(dirty_bitmap) {
-            if top >= pages {
+/// Write the dirty set from the guest mapping into `file` a **run at a
+/// time**, not a page at a time. Returns `(bytes, runs)`.
+///
+/// Guest dirt is clustered, and one `pwrite` per 4 KiB page is what
+/// made the first measured incremental keyframe slower than the full
+/// dump it was meant to replace: ~400 000 syscalls for a 30 s-idle
+/// k3s node (CHALLENGES #154). Coalescing adjacent
+/// pages into a single write turns that into a few thousand.
+///
+/// # Safety
+///
+/// `host_addr` must point at a mapping of at least `mem_span` bytes that
+/// stays alive for the call. The guest may be running: bytes are copied
+/// by the kernel (`pwrite`), never through a Rust reference.
+unsafe fn write_dirty_runs(
+    file: &fs::File,
+    dirty_bitmap: &[u64],
+    host_addr: *const u8,
+    mem_span: u64,
+) -> Result<(u64, u64), SnapshotError> {
+    let pages = mem_span.div_ceil(4096);
+    // Checked up front, and once, so the walk below stays total and
+    // allocation-free — which is what makes it model-checkable.
+    if let Some(top) = highest_dirty_page(dirty_bitmap) {
+        if top >= pages {
+            return Err(SnapshotError::Kvm(format!(
+                "dirty bitmap marks page {top}, beyond the {pages}-page \
+                 guest-physical span — refusing to write a keyframe from a \
+                 bitmap that does not describe this VM"
+            )));
+        }
+    }
+
+    let mut written: u64 = 0;
+    let mut runs: u64 = 0;
+    for_each_dirty_run(dirty_bitmap, |start, end| {
+        let offset = start * 4096;
+        let len = (end - start) * 4096;
+        // SAFETY: every run lies within the set bits of the bitmap, whose
+        // highest is below `pages` by the check above, so
+        // `offset + len <= mem_span`, inside the caller's mapping.
+        unsafe { pwrite_all_raw(file, host_addr, offset, len)? };
+        written += len;
+        runs += 1;
+        Ok::<(), SnapshotError>(())
+    })?;
+    Ok((written, runs))
+}
+
+/// `pwrite` `len` bytes from `host_addr + offset` to file offset
+/// `offset`, retrying short writes and `EINTR`.
+///
+/// # Safety
+///
+/// `[host_addr + offset, host_addr + offset + len)` must be mapped for
+/// the call. Concurrent writers to that memory are fine: the kernel
+/// copies it.
+unsafe fn pwrite_all_raw(
+    file: &fs::File,
+    host_addr: *const u8,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<()> {
+    let mut done = 0u64;
+    while done < len {
+        // Linux caps one write at 0x7fff_f000 bytes anyway.
+        let chunk = (len - done).min(1 << 30) as usize;
+        let at = offset + done;
+        // SAFETY: the caller guarantees the source range is mapped; the
+        // fd is valid for the borrow of `file`.
+        #[allow(clippy::cast_possible_wrap)]
+        let n = unsafe {
+            libc::pwrite(
+                file.as_raw_fd(),
+                host_addr.add(at as usize).cast::<libc::c_void>(),
+                chunk,
+                at as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("pwrite of {chunk} bytes at {at} wrote nothing"),
+            ));
+        }
+        done += n as u64;
+    }
+    Ok(())
+}
+
+/// Stop live pre-copy rounds once one is at most this many bytes: the
+/// paused residual is then about one more such round.
+pub const PRECOPY_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on live pre-copy rounds after pass 0, for a guest that
+/// dirties faster than the host writes.
+pub const PRECOPY_MAX_ROUNDS: u32 = 8;
+
+/// A keyframe written while its guest **runs**: pass 0 copies
+/// every RAM extent from the live mapping into `memory.bin.tmp`, dirty
+/// rounds re-copy what the guest changed meanwhile, and
+/// [`Self::finish`] writes the residual with the guest paused and
+/// publishes the file. Correct because every copy of a page follows the
+/// [`Vm::harvest_dirty`] that cleared its bit.
+///
+/// With an ancestor keyframe, pass 0 is a `FICLONE` of it plus the pages
+/// dirtied since (the accumulated bitmap), as
+/// [`snapshot_vm_incremental`] writes while paused.
+///
+/// The tmp file is removed on Drop unless published.
+pub struct LiveKeyframe {
+    file: fs::File,
+    dir: PathBuf,
+    tmp_path: PathBuf,
+    mem_span: u64,
+    published: bool,
+    /// Union of every page written, for an incremental keyframe's
+    /// physical cost (a page re-copied in a later round adds nothing).
+    touched: Option<Vec<u64>>,
+    /// Host ns the arm stop (`enable_dirty_tracking`) paused the guest.
+    pub arm_pause_ns: u64,
+    /// Bytes written while the guest ran (pass 0 + rounds).
+    pub precopied_bytes: u64,
+    /// Live rounds after pass 0.
+    pub rounds: u32,
+}
+
+impl Drop for LiveKeyframe {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+impl LiveKeyframe {
+    /// Arm dirty tracking, drain the log, and write pass 0 of `vm`'s RAM
+    /// into `snapshot_dir/memory.bin.tmp` while the guest keeps running.
+    ///
+    /// `ancestor` makes pass 0 incremental against that `memory.bin`.
+    /// It falls back to a full pass 0, loudly, when the divergence is
+    /// unknown (tracking was off) or the filesystem cannot `FICLONE`.
+    pub fn begin(
+        vm: &mut Vm,
+        snapshot_dir: &Path,
+        ancestor: Option<&Path>,
+    ) -> Result<Self, SnapshotError> {
+        let t = Instant::now();
+        let was_tracking = vm.accumulated_dirty_pages().is_some();
+        vm.enable_dirty_tracking()?;
+        let arm_pause_ns = if was_tracking {
+            0
+        } else {
+            u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        };
+        fs::create_dir_all(snapshot_dir)?;
+        let tmp_path = snapshot_dir.join("memory.bin.tmp");
+        let mem_span = vm.mem_span();
+        let cloned = match ancestor {
+            Some(a) if !was_tracking => {
+                log::warn!(
+                    "live keyframe: VM (cid {}) had no dirty tracking — the divergence \
+                     from {} is unknown, writing a full keyframe instead",
+                    vm.guest_cid(),
+                    a.display()
+                );
+                None
+            }
+            Some(a) => match clone_ancestor_into(&tmp_path, a, mem_span) {
+                Ok(f) => Some(f),
+                Err(SnapshotError::ReflinkUnsupported { detail, .. }) => {
+                    log::warn!(
+                        "live keyframe: FICLONE {} -> {} failed ({detail}); falling back \
+                         to a FULL keyframe — put the tree root on a reflink-capable \
+                         filesystem to get O(divergence) fork points",
+                        a.display(),
+                        tmp_path.display()
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        let incremental = cloned.is_some();
+        let file = if let Some(f) = cloned {
+            f
+        } else {
+            // Left behind by a crashed prepare; see `ClonedKeyframe`.
+            let _ = fs::remove_file(&tmp_path);
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?
+        };
+        let mut kf = Self {
+            file,
+            dir: snapshot_dir.to_path_buf(),
+            tmp_path,
+            mem_span,
+            published: false,
+            touched: None,
+            arm_pause_ns,
+            precopied_bytes: 0,
+            rounds: 0,
+        };
+        let t0 = Instant::now();
+        let host_addr = kf.host_addr(vm)?;
+        if incremental {
+            // Drain first, then copy: every page since the ancestor is in
+            // the accumulated bitmap, and each is copied after its clear.
+            let since = vm.get_and_accumulate_dirty()?.to_vec();
+            // SAFETY: the borrowed VM keeps its mapping of `mem_span` alive.
+            let (bytes, _) = unsafe { write_dirty_runs(&kf.file, &since, host_addr, mem_span)? };
+            kf.precopied_bytes = bytes;
+            kf.touched = Some(since);
+            log::info!(
+                "live keyframe: pass 0 {} MiB dirt over the ancestor in {:?}",
+                bytes >> 20,
+                t0.elapsed()
+            );
+            return Ok(kf);
+        }
+        // Empty the log and drain the device bitmaps before anything is
+        // read: pass 0 then copies every page after its last clear.
+        vm.harvest_dirty()?;
+        // Sparse: holes read as zero, like the never-touched memfd pages
+        // and the MMIO hole that are never written.
+        kf.file.set_len(mem_span)?;
+        for (start, end) in vm.ram_data_extents()? {
+            if end > mem_span {
                 return Err(SnapshotError::Kvm(format!(
-                    "dirty bitmap marks page {top}, beyond the {pages}-page \
-                     guest-physical span — refusing to write a keyframe from a \
-                     bitmap that does not describe this VM"
+                    "RAM extent {start:#x}..{end:#x} past the {mem_span:#x} span"
                 )));
             }
+            // SAFETY: `end <= mem_span` (checked above) and the borrowed
+            // VM keeps its mapping of `mem_span` bytes alive.
+            unsafe { pwrite_all_raw(&kf.file, host_addr, start, end - start)? };
+            kf.precopied_bytes += end - start;
         }
+        log::info!(
+            "live keyframe: pass 0 {} MiB of {} MiB span in {:?} (arm stop {} µs)",
+            kf.precopied_bytes >> 20,
+            mem_span >> 20,
+            t0.elapsed(),
+            arm_pause_ns / 1000
+        );
+        Ok(kf)
+    }
 
-        let mut written: u64 = 0;
-        let mut runs: u64 = 0;
-        for_each_dirty_run(dirty_bitmap, |start, end| {
-            let offset = start * 4096;
-            let len = ((end - start) * 4096) as usize;
-            // SAFETY: every run lies within the set bits of the bitmap,
-            // whose highest is below `pages` by the check above, so
-            // `offset + len <= mem_span`; `host_addr` points at a
-            // mapping of at least `mem_span` bytes kept alive by the
-            // borrowed (paused) VM.
-            let bytes = unsafe { std::slice::from_raw_parts(host_addr.add(offset as usize), len) };
-            self.file.write_all_at(bytes, offset)?;
-            written += len as u64;
-            runs += 1;
-            Ok::<(), SnapshotError>(())
-        })?;
-        Ok((written, runs))
+    fn host_addr(&self, vm: &Vm) -> Result<*const u8, SnapshotError> {
+        if vm.mem_span() != self.mem_span {
+            return Err(SnapshotError::Kvm(format!(
+                "live keyframe for a {}-byte span handed a {}-byte VM",
+                self.mem_span,
+                vm.mem_span()
+            )));
+        }
+        dump_host_addr(vm)
+    }
+
+    /// One live round: harvest and re-copy what changed since the last.
+    /// Returns the bytes written.
+    pub fn round(&mut self, vm: &mut Vm) -> Result<u64, SnapshotError> {
+        let dirty = vm.harvest_dirty()?;
+        let host_addr = self.host_addr(vm)?;
+        // SAFETY: the borrowed VM keeps its mapping of `mem_span` alive.
+        let (bytes, _) = unsafe { write_dirty_runs(&self.file, &dirty, host_addr, self.mem_span)? };
+        self.touch(&dirty);
+        self.precopied_bytes += bytes;
+        self.rounds += 1;
+        Ok(bytes)
+    }
+
+    fn touch(&mut self, dirty: &[u64]) {
+        if let Some(t) = self.touched.as_mut() {
+            for (t, d) in t.iter_mut().zip(dirty) {
+                *t |= d;
+            }
+        }
+    }
+
+    /// Whether pass 0 was a clone of the ancestor.
+    #[must_use]
+    pub fn incremental(&self) -> bool {
+        self.touched.is_some()
+    }
+
+    /// Live rounds until one is ≤ [`PRECOPY_TARGET_BYTES`], stops
+    /// shrinking, or [`PRECOPY_MAX_ROUNDS`] ran; then, for a full
+    /// keyframe, `fdatasync` so the paused write does not queue behind
+    /// gigabytes of dirty page cache.
+    pub fn converge(&mut self, vm: &mut Vm) -> Result<(), SnapshotError> {
+        let mut last = u64::MAX;
+        for _ in 0..PRECOPY_MAX_ROUNDS {
+            let bytes = self.round(vm)?;
+            if bytes <= PRECOPY_TARGET_BYTES || bytes >= last {
+                break;
+            }
+            last = bytes;
+        }
+        let t = Instant::now();
+        // Not for a clone: syncing a patched reflinked file breaks shared
+        // extents page by page (2–5 s per member, CHALLENGES #154), and
+        // its dirty set is small next to a full keyframe's page cache.
+        if !self.incremental() {
+            self.file.sync_data()?;
+        }
+        log::info!(
+            "live keyframe: {} round(s), {} MiB live, fdatasync {:?}",
+            self.rounds,
+            self.precopied_bytes >> 20,
+            t.elapsed()
+        );
+        Ok(())
+    }
+
+    /// With `vm` **paused**: final harvest, `TRANSPORT_RESET` injection,
+    /// write the residual, publish `memory.bin`, write the state files.
+    /// Returns the bytes written while paused and the keyframe's
+    /// physical cost: the pages it holds over the ancestor, or the whole
+    /// span for a full keyframe (as [`crate::vm::Vm::write_keyframe_paused`]).
+    pub fn finish(mut self, vm: &mut Vm) -> Result<(u64, u64), SnapshotError> {
+        if vm.is_running() || vm.vcpu_fds().len() != vm.vcpu_count() as usize {
+            return Err(SnapshotError::NotPaused);
+        }
+        let start = Instant::now();
+        let mut dirty = vm.harvest_dirty()?;
+        let device_states = vm.mmio_registry().lock().unwrap().snapshot_device_states();
+        for page in
+            inject_vsock_transport_reset_into(self.mem_span, &device_states, vm.mem_host_addr())
+        {
+            let word = (page / 64) as usize;
+            let w = dirty.get_mut(word).ok_or_else(|| {
+                SnapshotError::Kvm(format!(
+                    "TRANSPORT_RESET injection wrote page {page}, outside this VM's dirty bitmap"
+                ))
+            })?;
+            *w |= 1u64 << (page % 64);
+        }
+        let host_addr = self.host_addr(vm)?;
+        // SAFETY: the borrowed (paused) VM keeps its mapping alive.
+        let (bytes, runs) =
+            unsafe { write_dirty_runs(&self.file, &dirty, host_addr, self.mem_span)? };
+        self.touch(&dirty);
+        let disk_bytes = match &self.touched {
+            Some(t) => t.iter().map(|w| u64::from(w.count_ones())).sum::<u64>() * 4096,
+            None => self.mem_span,
+        };
+        // No fsync, as the full dump (see `patch_and_publish`).
+        fs::rename(&self.tmp_path, self.dir.join("memory.bin"))?;
+        self.published = true;
+        write_state_files(vm, &self.dir)?;
+        log::info!(
+            "live keyframe: residual {} KiB in {runs} run(s), paused write {:?} to {}",
+            bytes >> 10,
+            start.elapsed(),
+            self.dir.display()
+        );
+        Ok((bytes, disk_bytes))
     }
 }
 

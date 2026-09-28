@@ -752,6 +752,8 @@ fn test_data_disk_lifetime_through_the_daemon() {
             config: payload,
             budget: None,
             tree_id: Some("datadisk-tree".to_string()),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::Error { message } => assert!(
@@ -845,6 +847,8 @@ fn test_daemon_tree_lifecycle() {
             config: default_config(),
             budget: None,
             tree_id: Some("dtree".to_string()),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -873,6 +877,8 @@ fn test_daemon_tree_lifecycle() {
             source_id: root_id.clone(),
             label: "branch-a".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked {
@@ -1047,6 +1053,8 @@ fn test_daemon_tree_lifecycle() {
                 source_id: "root".to_string(),
                 label: "zombie".to_string(),
                 dilation: None,
+                dilation_policy: None,
+                dilation_config: None,
             }
         ),
         Response::Error { .. }
@@ -1068,6 +1076,8 @@ fn test_daemon_tree_rl_verbs() {
             config: default_config(),
             budget: None,
             tree_id: Some("rl-tree".to_string()),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -1089,6 +1099,8 @@ fn test_daemon_tree_rl_verbs() {
                 source_id: root_id.clone(),
                 labels: vec![],
                 dilation: None,
+                dilation_policy: None,
+                dilation_config: None,
             }
         ),
         Response::Error { .. }
@@ -1101,6 +1113,8 @@ fn test_daemon_tree_rl_verbs() {
             source_id: root_id.clone(),
             labels: vec!["a".into(), "b".into(), "c".into()],
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForkBatch {
@@ -1228,19 +1242,29 @@ fn test_daemon_cluster_tree_fork() {
     let (tree_id, root_id, root_cids) = match call(
         &guard,
         &Request::TreeCreateCluster {
+            ksm: false,
             vm_count: 2,
             config: default_config(),
             budget: None,
             tree_id: Some("dctree".to_string()),
             egress: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
             tree_id,
             root_id,
             guest_cids,
+            pause_ns,
+            max_pause_ns,
             ..
-        } => (tree_id, root_id, guest_cids),
+        } => {
+            // `tree_create_cluster` shares the adopt path's coordinated cut.
+            assert_eq!(pause_ns.len(), 2, "{pause_ns:?}");
+            assert_eq!(Some(&max_pause_ns), pause_ns.iter().max());
+            (tree_id, root_id, guest_cids)
+        }
         other => panic!("unexpected tree_create_cluster response: {other:?}"),
     };
     assert_eq!(root_cids.len(), 2, "cluster root has two members");
@@ -1253,6 +1277,8 @@ fn test_daemon_cluster_tree_fork() {
             source_id: root_id.clone(),
             label: "twin".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked {
@@ -1323,6 +1349,8 @@ fn test_daemon_cluster_tree_fork() {
             source_id: fork_node.clone(),
             label: "grand".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked {
@@ -1390,11 +1418,14 @@ fn test_daemon_tree_open_after_drop() {
     let (tree_id, root_id, _) = match call(
         &guard,
         &Request::TreeCreateCluster {
+            ksm: false,
             vm_count: 1,
             config: default_config(),
             budget: None,
             tree_id: Some("topen-drop".to_string()),
             egress: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -1510,10 +1541,13 @@ fn test_daemon_tree_adopt_cluster() {
         call(
             &guard,
             &Request::TreeAdoptCluster {
+                ksm: false,
                 vm_ids: vec!["vm-nope".to_string()],
                 budget: None,
                 tree_id: None,
                 egress: None,
+                dilation_policy: None,
+                dilation_config: None,
             }
         ),
         Response::Error { .. }
@@ -1527,10 +1561,13 @@ fn test_daemon_tree_adopt_cluster() {
         call(
             &guard,
             &Request::TreeAdoptCluster {
+                ksm: false,
                 vm_ids: vec![lone_id.clone()],
                 budget: None,
                 tree_id: None,
                 egress: None,
+                dilation_policy: None,
+                dilation_config: None,
             }
         ),
         Response::Error { .. }
@@ -1560,18 +1597,32 @@ fn test_daemon_tree_adopt_cluster() {
     let (tree_id, root_id, root_cids) = match call(
         &guard,
         &Request::TreeAdoptCluster {
-            vm_ids: vec![id1, id0],
+            ksm: false,
+            vm_ids: vec![id1.clone(), id0.clone()],
             budget: None,
             tree_id: Some("dadopt-tree".to_string()),
             egress: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
             tree_id,
             root_id,
             guest_cids,
+            pause_ns,
+            max_pause_ns,
             ..
-        } => (tree_id, root_id, guest_cids),
+        } => {
+            // The adopt keyframe is measured per member; the overlap
+            // itself is asserted where the timeline is visible
+            // (`test_cluster_tree_root_keyframe_is_one_cut`).
+            eprintln!("adopt pause_ns {pause_ns:?} max {max_pause_ns}");
+            assert_eq!(pause_ns.len(), 2, "one pause per adopted member");
+            assert!(pause_ns.iter().all(|&p| p > 0), "{pause_ns:?}");
+            assert_eq!(Some(&max_pause_ns), pause_ns.iter().max());
+            (tree_id, root_id, guest_cids)
+        }
         other => panic!("unexpected tree_adopt_cluster response: {other:?}"),
     };
     assert_eq!(root_cids.len(), 2, "adopted root keeps both members");
@@ -1580,6 +1631,35 @@ fn test_daemon_tree_adopt_cluster() {
     match call(&guard, &Request::ListVms) {
         Response::VmList { vms } => assert!(vms.is_empty(), "registry not empty: {vms:?}"),
         other => panic!("unexpected list_vms response: {other:?}"),
+    }
+
+    // Adopted ids are not "no such VM" — point the caller at prune/drop.
+    for id in [&id0, &id1] {
+        match call(&guard, &Request::StopVm { vm_id: id.clone() }) {
+            Response::Error { message } => {
+                assert!(
+                    message.contains(&tree_id)
+                        && message.contains("tree_prune")
+                        && message.contains("tree_drop"),
+                    "adopted StopVm message: {message}"
+                );
+            }
+            other => panic!("expected adopted-id StopVm error, got {other:?}"),
+        }
+    }
+    match call(
+        &guard,
+        &Request::StopVm {
+            vm_id: "vm-never-existed".to_string(),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("no such VM") && !message.contains("adopted"),
+                "unknown StopVm message: {message}"
+            );
+        }
+        other => panic!("expected no-such-VM StopVm error, got {other:?}"),
     }
 
     // Members answer on their post-prepare CIDs; a fork clones state
@@ -1592,6 +1672,8 @@ fn test_daemon_tree_adopt_cluster() {
             source_id: root_id,
             label: "twin".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked { guest_cids, .. } => guest_cids,
@@ -1897,6 +1979,8 @@ fn test_daemon_tree_watch() {
             config: default_config(),
             budget: None,
             tree_id: Some("watch-tree".to_string()),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -1948,6 +2032,8 @@ fn test_daemon_tree_watch() {
             source_id: root_id,
             label: "watched".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     );
     let (node_id, latency_ns) = match forked {
@@ -2040,6 +2126,7 @@ fn test_doctor_verb_reports_host() {
             cgroup_v2,
             ok,
             fc_fork_mode,
+            ksm_run,
             details,
         } => {
             assert!(kvm, "kvm");
@@ -2069,6 +2156,10 @@ fn test_doctor_verb_reports_host() {
             assert!(
                 details.iter().any(|d| d.as_str() == "hardening:"),
                 "doctor must report hardening: {details:?}"
+            );
+            assert!(
+                details.iter().any(|d| d.contains("ksmd")),
+                "doctor must say whether host ksmd is running (ksm_run={ksm_run:?}): {details:?}"
             );
         }
         other => panic!("unexpected doctor response: {other:?}"),
@@ -2128,6 +2219,8 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             config: default_config(),
             budget: None,
             tree_id: Some("dild0".to_string()),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -2146,6 +2239,8 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             source_id: root_id.clone(),
             label: "zero".to_string(),
             dilation: Some(0),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::Error { message } => {
@@ -2164,6 +2259,8 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             source_id: root_id.clone(),
             label: "x8".to_string(),
             dilation: Some(8),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::Error { message } => {
@@ -2182,6 +2279,8 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             source_id: root_id.clone(),
             label: "one".to_string(),
             dilation: Some(1),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked { dilation, .. } => {
@@ -2197,12 +2296,173 @@ fn test_daemon_tree_fork_dilation_override_on_stock_host() {
             source_id: root_id,
             label: "inherit".to_string(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForked { dilation, .. } => {
             assert_eq!(dilation, 1);
         }
         other => panic!("dilation: None must inherit, got {other:?}"),
+    }
+
+    assert!(matches!(
+        call(&guard, &Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
+}
+
+/// A bad dilation config is an error and does not boot a tree. A fork
+/// that sets `cadence_ms` is refused before the child exists; omitting
+/// the struct still forks.
+#[test]
+fn test_daemon_dilation_config_refuses_before_boot() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("dilknob");
+
+    let mut fast = default_config();
+    fast.dilation = Some(8);
+    match call(
+        &guard,
+        &Request::TreeCreate {
+            config: fast,
+            budget: None,
+            tree_id: Some("no-boot".to_string()),
+            dilation_policy: Some(k7d::dilation::DilationPolicyMode::Down),
+            dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+                window: Some(0),
+                ladder: Some(vec![4, 1]),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("window"),
+                "a zero window must be named, got {message}"
+            );
+        }
+        other => panic!("a zero window must not boot a tree, got {other:?}"),
+    }
+    match call(
+        &guard,
+        &Request::TreeNodes {
+            tree_id: "no-boot".to_string(),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("no such tree"),
+                "the refused create must not have registered a tree, got {message}"
+            );
+        }
+        other => panic!("refused tree is registered: {other:?}"),
+    }
+
+    let mut off_ladder = default_config();
+    off_ladder.dilation = Some(8);
+    match call(
+        &guard,
+        &Request::TreeCreate {
+            config: off_ladder,
+            budget: None,
+            tree_id: Some("off-ladder".to_string()),
+            dilation_policy: Some(k7d::dilation::DilationPolicyMode::Down),
+            dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+                ladder: Some(vec![4, 1]),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("not on the ladder"),
+                "factor 8 on [4, 1] must be refused before boot, got {message}"
+            );
+        }
+        other => panic!("an off-ladder factor must not boot, got {other:?}"),
+    }
+
+    let (tree_id, root_id, _) = match call(
+        &guard,
+        &Request::TreeCreate {
+            config: default_config(),
+            budget: None,
+            tree_id: Some("knob-tree".to_string()),
+            dilation_policy: Some(k7d::dilation::DilationPolicyMode::Fixed),
+            dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+                window: Some(1),
+                ladder: Some(vec![4, 1]),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::TreeCreated {
+            tree_id,
+            root_id,
+            guest_cids,
+            ..
+        } => (tree_id, root_id, guest_cids),
+        other => panic!("fixed ignores knobs and must boot, got {other:?}"),
+    };
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id.clone(),
+            label: "cadence".to_string(),
+            dilation: None,
+            dilation_policy: None,
+            dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+                cadence_ms: Some(500),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("cadence"),
+                "a fork cadence must be refused, got {message}"
+            );
+        }
+        other => panic!("a fork that sets cadence_ms must not boot, got {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeFork {
+            tree_id: tree_id.clone(),
+            source_id: root_id,
+            label: "inherit".to_string(),
+            dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeForked { .. } => {}
+        other => panic!("a fork that omits knobs must inherit, got {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeNodes {
+            tree_id: tree_id.clone(),
+        },
+    ) {
+        Response::TreeNodeList { nodes, .. } => {
+            let ids: Vec<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+            assert!(ids.contains(&"root"), "{ids:?}");
+            assert!(
+                ids.iter().any(|id| id.contains("inherit")),
+                "the inheriting fork must exist: {ids:?}"
+            );
+            assert!(
+                !ids.iter().any(|id| id.contains("cadence")),
+                "the cadence fork must not exist: {ids:?}"
+            );
+        }
+        other => panic!("unexpected tree_nodes: {other:?}"),
     }
 
     assert!(matches!(

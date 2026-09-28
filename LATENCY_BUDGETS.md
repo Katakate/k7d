@@ -254,6 +254,11 @@ at the measured divergence levels with 30 s of divergence each
 | Child keyframe — k8s churn | 4.5 s | **0.84 s** / 1.66 GiB (27.8 %) | same |
 | Child keyframe — kafka | 4.5 s | **1.14 s** / 3.06 GiB (51.0 %) | same |
 
+Since root and child keyframes became one coordinated cut
+(CHALLENGES #273), both columns shrink together. AMD-0, 2026-09-27: root **2.13 s**; children idle **0.50 s**,
+k8s **0.48 s**, kafka **0.78 s** (49.8 %). With a parallel root and
+serial children, kafka had measured 2.61 s against a 2.16 s root.
+
 Two things worth knowing before reading these numbers:
 
 - **The disk figure is the workload's, not the clone's.** `FICLONE`
@@ -270,6 +275,58 @@ The disk column is the daemon's own `base_disk_bytes`, reported on the
 prepare reply and counted by the tree's disk budget. Do not measure a
 reflinked keyframe with `du` or `stat`: both report a shared extent as
 if the child owned it (CHALLENGES #152).
+
+## tree_adopt_cluster / tree_create_cluster pause
+
+`tree_adopt_cluster`, `tree_create_cluster` and in-tree child
+keyframes write native members as one coordinated cut
+(`fork::prepare_cluster_fork_source`) whose pause does not grow with
+guest RAM:
+
+1. While the members **run**, each one's RAM is pre-copied into
+   `memory.bin.tmp`. For a root, pass 0 writes the memfd's `SEEK_DATA`
+   extents (about 0.7 GiB/s on AMD-0) and `fdatasync` follows the
+   rounds. For a child, pass 0 is a `FICLONE` of the ancestor plus the
+   pages dirtied since it, with no sync (CHALLENGES #154). Dirty-log
+   rounds re-copy what changed. Then every member runs one catch-up
+   round.
+2. Pause every member, write each residual in parallel, and
+   restore-swap each member straight from the pause.
+
+The keyframes are one instant of the cluster. A member is not resumed
+before its swap: the swap restores it from its keyframe, so work done
+after a resume would be rewound after its peers had seen it. Members
+with virtiofs shares, and members whose workers miss the 200 ms park,
+still take a full paused dump (loud warning). Firecracker roots still
+prepare member by member.
+
+Enabling dirty logging on a member that does not have it yet is one
+short, separate stop before the cut (`arm_pause_ns`; it write-protects
+the slots).
+
+| Measurement | Result | Test |
+|---|---|---|
+| 30 GiB member (22 GiB touched, guest writer running) + 512 MiB member, AMD-0 | max pause **0.044 s**; paused write 16 ms / 10 MiB; 22 GiB copied live; arm stop 0.244 s; prepare wall 57 s | `test_cluster_tree_root_keyframe_precopy_large` |
+| Same member, full paused `snapshot` | **48.9 s** | same |
+| Child keyframe of that cluster (256 MiB written in the child, writer running), after that coordinated child cut | max pause **0.038 s**; 298 MiB disk; wall 0.23 s | same |
+| Same test on Intel | root max pause **0.027 s** vs **33.6 s** full dump; child **0.022 s** | same |
+| 3 × 1 GiB, AMD-0 | max pause 0.054 s (the earlier full-dump coordinated cut: 1.19 s, CHALLENGES #271) | `test_cluster_tree_root_keyframe_is_one_cut` |
+
+The pause is about the residual (what the guest dirtied since its
+last round) over page-cache write bandwidth, plus state and swap. A
+guest that dirties faster than the host writes stops after
+`PRECOPY_MAX_ROUNDS` rounds; its pause is then about one round of its
+dirty rate, not its RAM size. The wall time of the prepare is still
+O(guest RAM), but the guest runs during it.
+
+Any guest keepalive shorter than the pause can still break silently.
+k3s remotedialer's tunnel timeout is 60 s: the peer that stays up
+times out a frozen member, and `kubectl exec` / `logs` to that node
+then 502 until the agent reconnects.
+
+`TreeCreated` carries `pause_ns` (per member: pause through its
+restored copy's start) and `max_pause_ns`. They are the measured
+stall, not a budget. There is no latency constant here.
 
 ## Ubuntu bare-VM ML-mock cluster
 

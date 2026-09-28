@@ -1200,10 +1200,13 @@ fn annotation_adopt_cluster(
          into tree {tree_id}"
     ));
     match daemon.call(&k7d::control::Request::TreeAdoptCluster {
+        ksm: false,
         vm_ids,
         budget,
         tree_id: Some(tree_id.to_string()),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     })? {
         k7d::control::Response::TreeCreated { ref guest_cids, .. } => {
             if *guest_cids != pre_adopt_cids {
@@ -1239,6 +1242,8 @@ fn annotation_fork_tree(
         source_id,
         label,
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     })? {
         k7d::control::Response::TreeForked {
             node_id,
@@ -3562,18 +3567,32 @@ fn runc_version_has_libseccomp(stdout: &str) -> bool {
 
 /// Fail loud if `runc --version` does not report libseccomp.
 fn assert_runc_links_libseccomp(runc: &Path) -> Result<(), String> {
-    let output = std::process::Command::new(runc)
+    use std::io::Read;
+    let err = |e: std::io::Error| format!("{} --version: {e}", runc.display());
+    let mut child = std::process::Command::new(runc)
         .arg("--version")
-        .output()
-        .map_err(|e| format!("{} --version: {e}", runc.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        return Err(format!(
-            "{} --version failed ({}): {stdout}{}",
-            runc.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(err)?;
+    let mut raw = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{}: no stdout pipe", runc.display()))?
+        .read_to_end(&mut raw)
+        .map_err(err)?;
+    let stdout = String::from_utf8_lossy(&raw);
+    // The shim's Tokio SIGCHLD reaper can collect the status first
+    // (ECHILD); the libseccomp check below still needs a full stdout.
+    match child.wait() {
+        Ok(status) if !status.success() => {
+            return Err(format!(
+                "{} --version failed ({status}): {stdout}",
+                runc.display()
+            ));
+        }
+        Err(e) if e.raw_os_error() != Some(libc::ECHILD) => return Err(err(e)),
+        _ => {}
     }
     if !runc_version_has_libseccomp(&stdout) {
         return Err(format!(

@@ -732,6 +732,19 @@ pub enum Request {
         /// Caller-supplied tree identity; generated when omitted.
         #[serde(default)]
         tree_id: Option<String>,
+        /// Adaptive dilation loop for the root node.
+        /// Omitted or `fixed` leaves the create-time factor alone.
+        /// `down` and `track` sample `KVM_GET_MP_STATE` and call the
+        /// live `SetDilation` path. Forks inherit it unless they set
+        /// their own.
+        #[serde(default)]
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        /// Window, thresholds, cadence, and ladder. Omitted is today's
+        /// constants. Forks inherit the source node's knobs unless they
+        /// set their own. A fork that sets `cadence_ms` is refused.
+        /// `fixed` validates this and still starts no thread.
+        #[serde(default)]
+        dilation_config: Option<crate::dilation::DilationPolicyConfig>,
     },
     /// Root a cluster snapshot tree: `vm_count` members on a
     /// tree-owned bridge, forked/suspended/resumed as one unit.
@@ -753,6 +766,29 @@ pub enum Request {
         /// a `whitelist` policy that needs it must name port 4791.
         #[serde(default)]
         egress: Option<crate::netjail::EgressPolicy>,
+        /// Adaptive dilation loop for the root. See
+        /// [`Request::TreeCreate::dilation_policy`].
+        #[serde(default)]
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        /// See [`Request::TreeCreate::dilation_config`].
+        #[serde(default)]
+        dilation_config: Option<crate::dilation::DilationPolicyConfig>,
+        /// Opt in to Kernel Samepage Merging on this tree's guest RAM.
+        ///
+        /// Off by default. Forks inherit it. When set, the process that
+        /// owns the mappings (the VM broker under privilege separation,
+        /// otherwise the daemon) calls `madvise(MADV_MERGEABLE)` on each
+        /// `MAP_PRIVATE` keyframe mapping after the guest is running.
+        /// `PR_SET_MEMORY_MERGE` is not used: it is process-wide.
+        ///
+        /// **Same-tenant hosts only.** KSM merges identical pages across
+        /// every mergeable mapping on the host, including other trees
+        /// that also opted in, and that is a cross-VM timing side
+        /// channel. k7d never writes `/sys/kernel/mm/ksm`; an operator
+        /// starts `ksmd`. The flag is sticky for the life of a mapping
+        /// (`MADV_UNMERGEABLE` unmerges eagerly and can OOM).
+        #[serde(default)]
+        ksm: bool,
     },
     /// Adopt live daemon-owned sandbox VMs + their shared
     /// [`ClusterNetwork`] as a [`ClusterSnapshotTree`] root.
@@ -786,6 +822,18 @@ pub enum Request {
         /// are born `Open`); forks inherit whatever is set here.
         #[serde(default)]
         egress: Option<crate::netjail::EgressPolicy>,
+        /// Adaptive dilation loop for the adopted root. See
+        /// [`Request::TreeCreate::dilation_policy`].
+        #[serde(default)]
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        /// See [`Request::TreeCreate::dilation_config`].
+        #[serde(default)]
+        dilation_config: Option<crate::dilation::DilationPolicyConfig>,
+        /// Same opt-in as [`Request::TreeCreateCluster::ksm`]. Off when
+        /// omitted. Inherited by forks. Same-tenant hosts only; k7d
+        /// never writes `/sys/kernel/mm/ksm`.
+        #[serde(default)]
+        ksm: bool,
     },
     /// Fork a new branch from a live or suspended tree node.
     TreeFork {
@@ -800,6 +848,14 @@ pub enum Request {
         /// member. `0` is a loud error.
         #[serde(default)]
         dilation: Option<u32>,
+        /// Child dilation loop. `None` inherits the source node's
+        /// mode (a tree created without one inherits `fixed`).
+        #[serde(default)]
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        /// Child knobs. `None` inherits the source node's. A set
+        /// `cadence_ms` is an error. See [`Request::TreeCreate::dilation_config`].
+        #[serde(default)]
+        dilation_config: Option<crate::dilation::DilationPolicyConfig>,
     },
     /// Fork N branches from the same source in one call.
     /// Single-VM trees share one dirty-bitmap capture; cluster trees
@@ -816,18 +872,32 @@ pub enum Request {
         /// `None` inherits the source's.
         #[serde(default)]
         dilation: Option<u32>,
+        /// One dilation loop mode for every branch in the batch.
+        /// `None` inherits the source node's. See [`Request::TreeFork`].
+        #[serde(default)]
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        /// One knob set for every branch. `None` inherits. A set
+        /// `cadence_ms` refuses the batch before any branch boots.
+        #[serde(default)]
+        dilation_config: Option<crate::dilation::DilationPolicyConfig>,
     },
     /// Snapshot a live tree node so it can be a warm-fork source.
     ///
     /// Root nodes are prepared at `tree_create*`. Children from
     /// `tree_fork*` are not. `tree_fork` / `tree_fork_batch` will call
     /// this on demand; the explicit op exists so a controller can show
-    /// the checkpoint as its own (slow) step. Idempotent.
+    /// the checkpoint as its own (slow) step. Idempotent unless
+    /// `refresh` is set.
     TreePrepareForkSource {
         /// Tree identifier.
         tree_id: String,
         /// Live (or suspended — resumed first) node to checkpoint.
         node_id: String,
+        /// Re-keyframe a node that already has one. The new files are a
+        /// new generation; live children keep the previous path. The
+        /// write is incremental against the node's own keyframe.
+        #[serde(default)]
+        refresh: bool,
     },
     /// Non-destructive rollback: create a new branch from `node_id`'s
     /// state. Semantically equivalent to `tree_fork`.
@@ -1200,6 +1270,15 @@ pub enum Response {
         /// `guest_cids` plus `FcUds` entries here is a Firecracker tree.
         #[serde(default)]
         agent_endpoints: Vec<AgentEndpoint>,
+        /// Per-member host-ns the guest did not run for the root
+        /// keyframe of a native cluster tree (same order as
+        /// `guest_cids`): pause, the coordinated parallel dump, and the
+        /// restore-swap. Empty for single-VM and Firecracker trees.
+        #[serde(default)]
+        pause_ns: Vec<u64>,
+        /// `max(pause_ns)`, or 0 when unmeasured.
+        #[serde(default)]
+        max_pause_ns: u64,
     },
     /// Reply to `tree_fork` / `tree_rollback`.
     TreeForked {
@@ -1249,11 +1328,12 @@ pub enum Response {
         /// the node was already prepared (idempotent no-op).
         wrote_base: bool,
         /// `true` when the keyframe was written **incrementally** —
-        /// `FICLONE` of the nearest ancestor's `memory.bin` plus this
-        /// node's dirty pages, costing O(divergence) instead
-        /// of O(guest RAM). `false` for a root, a virtiofs payload, an
-        /// idempotent no-op, or a loud fallback to the full dump because
-        /// the tree root is not on a reflink filesystem.
+        /// `FICLONE` of an ancestor `memory.bin` plus this node's dirty
+        /// pages, costing O(divergence) instead of O(guest RAM). A
+        /// refresh of an adopted root is incremental against that root's
+        /// own keyframe. `false` for a first full dump, a virtiofs
+        /// payload, an idempotent no-op, or a loud fallback because the
+        /// tree root is not on a reflink filesystem.
         #[serde(default)]
         wrote_base_incremental: bool,
         /// Physical bytes the keyframe added to the filesystem — the
@@ -1362,6 +1442,27 @@ pub enum Response {
         /// tree runs at the factor its config promises.
         #[serde(default)]
         live_dilation: HashMap<String, u32>,
+        /// Dilation loop mode of each node, including `fixed`.
+        /// Absent for a node this daemon did not arm (a tree opened
+        /// from disk has none — the loop is not persisted).
+        #[serde(default)]
+        dilation_policy: HashMap<String, crate::dilation::DilationPolicyMode>,
+        /// Factors the loop has run this node at, oldest first,
+        /// including the factor it started at. A change appends one
+        /// rung. Empty for `fixed` and for a node whose loop has not
+        /// been armed. `live_dilation` is the factor the VM is at now
+        /// (the last entry, once the loop has applied a change).
+        #[serde(default)]
+        dilation_trajectory: Box<HashMap<String, Vec<u32>>>,
+        /// Per live node, one entry per native member, in member order.
+        /// `ksm_merging_pages` is that guest VMA's smaps KSM pages;
+        /// `ksm_stat` is the owning process's `/proc/<pid>/ksm_stat`
+        /// (process-wide, so it repeats). Empty when the node has no
+        /// live native members. A tree that did not opt in still
+        /// reports zeros, which is how "ksm off means no merging" is
+        /// observed.
+        #[serde(default)]
+        live_ksm: Box<HashMap<String, Vec<crate::ksm::KsmMember>>>,
     },
     /// Reply to `tree_list`.
     TreeList {
@@ -1420,6 +1521,12 @@ pub enum Response {
         /// silent fallback.
         #[serde(default)]
         fc_fork_mode: String,
+        /// `/sys/kernel/mm/ksm/run` (`0` stopped, `1` ksmd scanning,
+        /// `2` unmerge). `None` when the kernel has no KSM sysfs.
+        /// Read-only: k7d never writes that directory. Does not decide
+        /// `ok` — a node with ksmd stopped is healthy.
+        #[serde(default)]
+        ksm_run: Option<u32>,
         /// One line per check (`ok`/`FAIL` + name + detail).
         details: Vec<String>,
     },
@@ -1557,12 +1664,13 @@ impl TreePayload {
     fn prepare_fork_source(
         &mut self,
         node_id: &String,
+        refresh: bool,
     ) -> Result<crate::tree::PrepareOutcome, String> {
         match self {
-            Self::Single(t) => t.prepare_fork_source(node_id),
-            Self::Cluster(t) => t.prepare_fork_source(node_id),
+            Self::Single(t) => t.prepare_fork_source_with(node_id, refresh),
+            Self::Cluster(t) => t.prepare_fork_source_with(node_id, refresh),
         }
-        .map_err(|e| format!("tree prepare_fork_source({node_id}): {e}"))
+        .map_err(|e| format!("tree prepare_fork_source({node_id}, refresh={refresh}): {e}"))
     }
 
     /// Find a live VM by guest CID (debug introspection for
@@ -1624,12 +1732,27 @@ impl TreePayload {
         .map_err(|e| format!("tree resume({node_id}): {e}"))
     }
 
-    fn prune(&mut self, node_id: &String) -> Result<(), String> {
+    /// Adopted `CreateVm` ids whose broker pins this prune released.
+    /// Empty for a single-VM tree, a `tree_create_cluster` tree, and a
+    /// cluster prune that left the root in place.
+    fn prune(&mut self, node_id: &String) -> Result<Vec<String>, String> {
         match self {
-            Self::Single(t) => t.prune(node_id),
-            Self::Cluster(t) => t.prune(node_id),
+            Self::Single(t) => t
+                .prune(node_id)
+                .map(|()| Vec::new())
+                .map_err(|e| format!("tree prune({node_id}): {e}")),
+            Self::Cluster(t) => t
+                .prune(node_id)
+                .map_err(|e| format!("tree prune({node_id}): {e}")),
         }
-        .map_err(|e| format!("tree prune({node_id}): {e}"))
+    }
+
+    /// `CreateVm` ids this cluster tree still holds broker pins for.
+    fn take_adopted_vm_ids(&mut self) -> Vec<String> {
+        match self {
+            Self::Cluster(t) => t.take_adopted_vm_ids(),
+            Self::Single(_) => Vec::new(),
+        }
     }
 
     fn auto_evict(&mut self) -> Result<Vec<String>, String> {
@@ -1715,6 +1838,14 @@ impl TreePayload {
         }
     }
 
+    /// Whether `node_id`'s live payload is a native VM. Firecracker has
+    /// no dilation ioctl, so an adaptive loop on one is refused.
+    fn node_is_native(&self, node_id: &str) -> bool {
+        self.node_guests(node_id)
+            .first()
+            .is_some_and(|g| g.backend() == Backend::Native)
+    }
+
     /// Per-member `fork_memory_is_full_copy` of a node's live members,
     /// ordered like [`Self::node_cids`]. Empty when the node has no
     /// live payload.
@@ -1781,6 +1912,10 @@ impl TreePayload {
             .iter()
             .filter_map(|n| self.node_dilation(&n.id).map(|d| (n.id.clone(), d)))
             .collect();
+        let live_ksm = match self.live_ksm() {
+            Ok(v) => v,
+            Err(message) => return Response::Error { message },
+        };
         Response::TreeNodeList {
             nodes,
             usage: self.usage().into(),
@@ -1788,7 +1923,50 @@ impl TreePayload {
             live_guest_cids: self.live_guest_cids(),
             live_agent_endpoints: self.live_agent_endpoints(),
             live_dilation,
+            dilation_policy: HashMap::new(),
+            dilation_trajectory: Box::new(HashMap::new()),
+            live_ksm: Box::new(live_ksm),
         }
+    }
+
+    /// Per-VM KSM counters for live native members. Reads smaps in this
+    /// process when the daemon is unsplit, and asks the node broker
+    /// when privilege separation owns the mappings in the VM broker
+    /// (those `/proc` files are root-owned under `DUMPABLE=0`).
+    fn live_ksm(&self) -> Result<HashMap<String, Vec<crate::ksm::KsmMember>>, String> {
+        let Self::Cluster(tree) = self else {
+            return Ok(HashMap::new());
+        };
+        let grouped = tree.live_ram_ranges();
+        let flat: Vec<(u64, u64)> = grouped
+            .iter()
+            .flat_map(|(_, ranges)| ranges.iter().copied())
+            .collect();
+        if flat.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let snap = query_ksm(&flat).map_err(|e| format!("tree_nodes ksm: {e}"))?;
+        if snap.merging_pages.len() != flat.len() {
+            return Err(format!(
+                "tree_nodes ksm: got {} range(s), asked for {}",
+                snap.merging_pages.len(),
+                flat.len()
+            ));
+        }
+        let mut out = HashMap::new();
+        let mut index = 0;
+        for (id, ranges) in grouped {
+            let mut members = Vec::with_capacity(ranges.len());
+            for _ in &ranges {
+                members.push(crate::ksm::KsmMember {
+                    ksm_merging_pages: snap.merging_pages[index],
+                    ksm_stat: snap.stat.clone(),
+                });
+                index += 1;
+            }
+            out.insert(id, members);
+        }
+        Ok(out)
     }
 
     fn watch_snapshot(&self, tree_id: String) -> TreeWatchSnapshot {
@@ -1802,6 +1980,41 @@ impl TreePayload {
             pause_skew_ns: self.last_pause_skew_ns(),
         }
     }
+}
+
+/// KSM counters for guest mappings owned by this process.
+///
+/// Under privilege separation the mappings belong to the VM broker and
+/// `/proc/<pid>/smaps` is root-owned (`DUMPABLE=0`), so the node broker
+/// reads them. Unsplit, this process is root and reads its own.
+fn query_ksm(ranges: &[(u64, u64)]) -> std::io::Result<crate::ksm::KsmSnapshot> {
+    if crate::broker::client::is_split() {
+        let asked: Vec<crate::broker::KsmRange> = ranges
+            .iter()
+            .map(|(start, len)| crate::broker::KsmRange {
+                start: *start,
+                len: *len,
+            })
+            .collect();
+        let (reply, _) =
+            crate::broker::client::call(&crate::broker::Verb::KsmQuery { ranges: asked }, &[])?;
+        return match reply {
+            crate::broker::Reply::KsmQuery {
+                merging_pages,
+                stat,
+            } => Ok(crate::ksm::KsmSnapshot {
+                merging_pages,
+                stat,
+            }),
+            crate::broker::Reply::Failed { errno, message } => {
+                Err(crate::broker::reply_error(errno, message))
+            }
+            other => Err(std::io::Error::other(format!(
+                "ksm query: unexpected reply {other:?}"
+            ))),
+        };
+    }
+    crate::ksm::read_proc(std::process::id(), ranges)
 }
 
 /// The daemon's VM registry and request dispatcher.
@@ -1833,10 +2046,18 @@ pub struct Daemon {
     watchers: Mutex<Vec<WatchSub>>,
     /// Auto-warp policy loops, keyed by `cluster_id`.
     auto_warps: Mutex<HashMap<String, AutoWarpLoop>>,
+    /// Per-tree dilation loops, keyed by `tree_id`. Declared before
+    /// `trees` is not required: each thread holds its own `Arc` clone.
+    /// `shutdown_all` joins these before draining `trees`.
+    dilation_loops: Mutex<HashMap<String, TreeDilationLoop>>,
     /// Auto-warp holds, keyed by `cluster_id`. Read by every cycle of
     /// every loop, so it is its own lock and never nested inside
     /// `vms` — a hold must be takeable while a cycle is running.
     auto_warp_holds: Arc<Mutex<HashMap<String, BTreeSet<String>>>>,
+    /// `vm_id → tree_id` for VMs `tree_adopt_cluster` pulled out of
+    /// `vms`. `stop_vm` on a miss consults this so an adopted id is
+    /// not reported as `no such VM`.
+    adopted: Mutex<HashMap<String, String>>,
     counter: AtomicU64,
 }
 
@@ -1867,6 +2088,82 @@ impl AutoWarpLoop {
             }
         }
         self.mode = crate::autowarp::AutoWarpMode::Off;
+    }
+}
+
+/// One tree's dilation control loop.
+///
+/// `modes` records every node, including `fixed`, so a fork can inherit.
+/// `configs` is the resolved knobs for the same nodes. `nodes` holds the
+/// policy state of nodes the thread actually samples. `cadence` is taken
+/// from the root and is the one sleep the thread uses. [`Drop`] joins
+/// the thread: a cycle holds the trees lock and may have the node paused,
+/// so dropping the tree out from under it would race a pause the loop
+/// still owns.
+struct TreeDilationLoop {
+    stop: Arc<AtomicBool>,
+    modes: Arc<Mutex<HashMap<String, crate::dilation::DilationPolicyMode>>>,
+    configs: Arc<Mutex<HashMap<String, crate::dilation::PolicyConfig>>>,
+    nodes: Arc<Mutex<HashMap<String, DilationNode>>>,
+    cadence: Duration,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Policy state for one live node the loop is sampling.
+struct DilationNode {
+    policy: DilationInner,
+    /// Factors applied, oldest first, including the one the node
+    /// started at.
+    trajectory: Vec<u32>,
+}
+
+enum DilationInner {
+    Down(crate::dilation::DilationPolicy),
+    Track(crate::dilation::TrackingPolicy),
+}
+
+impl DilationInner {
+    fn observe(&mut self, samples: &[crate::vm::TimeSample]) -> crate::dilation::Verdict {
+        match self {
+            Self::Down(p) => p.observe_samples(samples),
+            Self::Track(p) => p.observe_samples(samples),
+        }
+    }
+
+    fn align_to(&mut self, factor: u32) -> Result<(), String> {
+        match self {
+            Self::Down(p) => p.align_to(factor),
+            Self::Track(p) => p.align_to(factor),
+        }
+    }
+}
+
+impl TreeDilationLoop {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            modes: Arc::new(Mutex::new(HashMap::new())),
+            configs: Arc::new(Mutex::new(HashMap::new())),
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            cadence: Duration::from_secs(1),
+            thread: None,
+        }
+    }
+
+    /// Signal the thread and wait for the sample in flight to finish.
+    fn stop_join(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("dilation: a policy loop thread panicked; its tree may be left paused");
+            }
+        }
+    }
+}
+
+impl Drop for TreeDilationLoop {
+    fn drop(&mut self) {
+        self.stop_join();
     }
 }
 
@@ -2315,7 +2612,9 @@ impl Daemon {
             pool,
             watchers: Mutex::new(Vec::new()),
             auto_warps: Mutex::new(HashMap::new()),
+            dilation_loops: Mutex::new(HashMap::new()),
             auto_warp_holds: Arc::new(Mutex::new(HashMap::new())),
+            adopted: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
         }
     }
@@ -2733,29 +3032,76 @@ impl Daemon {
                 config,
                 budget,
                 tree_id,
-            } => self.tree_create(&config, budget, tree_id),
+                dilation_policy,
+                dilation_config,
+            } => self.tree_create(
+                &config,
+                budget,
+                tree_id,
+                dilation_policy,
+                dilation_config.as_ref(),
+            ),
             Request::TreeCreateCluster {
                 vm_count,
                 config,
                 budget,
                 tree_id,
                 egress,
-            } => self.tree_create_cluster(vm_count, &config, budget, tree_id, egress),
+                dilation_policy,
+                dilation_config,
+                ksm,
+            } => self.tree_create_cluster(
+                vm_count,
+                &config,
+                budget,
+                tree_id,
+                egress,
+                dilation_policy,
+                dilation_config.as_ref(),
+                ksm,
+            ),
             Request::TreeAdoptCluster {
                 vm_ids,
                 budget,
                 tree_id,
                 egress,
-            } => self.tree_adopt_cluster(&vm_ids, budget, tree_id, egress),
+                dilation_policy,
+                dilation_config,
+                ksm,
+            } => self.tree_adopt_cluster(
+                &vm_ids,
+                budget,
+                tree_id,
+                egress,
+                dilation_policy,
+                dilation_config.as_ref(),
+                ksm,
+            ),
             Request::TreeFork {
                 tree_id,
                 source_id,
                 label,
                 dilation,
+                dilation_policy,
+                dilation_config,
             } => {
+                let (mode, knobs) = match self.resolve_fork_arm(
+                    &tree_id,
+                    &source_id,
+                    dilation_policy,
+                    dilation_config.as_ref(),
+                ) {
+                    Ok(v) => v,
+                    Err(message) => return Response::Error { message },
+                };
                 let resp = match validate_fork_dilation(dilation) {
                     Err(message) => Response::Error { message },
                     Ok(d) => self.with_tree(&tree_id, |t| {
+                        if let Err(message) =
+                            Self::check_node_policy(t, &source_id, mode, d, &knobs.ladder)
+                        {
+                            return Response::Error { message };
+                        }
                         let start = Instant::now();
                         match t.fork(&source_id, &label, d) {
                             Ok(node_id) => {
@@ -2780,6 +3126,10 @@ impl Daemon {
                         }
                     }),
                 };
+                if let Err(message) = self.arm_forked(&tree_id, mode, &knobs, false, &resp) {
+                    self.emit_from_response(&tree_id, &resp);
+                    return Response::Error { message };
+                }
                 self.emit_from_response(&tree_id, &resp);
                 resp
             }
@@ -2788,10 +3138,26 @@ impl Daemon {
                 source_id,
                 labels,
                 dilation,
+                dilation_policy,
+                dilation_config,
             } => {
+                let (mode, knobs) = match self.resolve_fork_arm(
+                    &tree_id,
+                    &source_id,
+                    dilation_policy,
+                    dilation_config.as_ref(),
+                ) {
+                    Ok(v) => v,
+                    Err(message) => return Response::Error { message },
+                };
                 let resp = match validate_fork_dilation(dilation) {
                     Err(message) => Response::Error { message },
                     Ok(d) => self.with_tree(&tree_id, |t| {
+                        if let Err(message) =
+                            Self::check_node_policy(t, &source_id, mode, d, &knobs.ladder)
+                        {
+                            return Response::Error { message };
+                        }
                         let start = Instant::now();
                         match t.fork_batch(&source_id, &labels, d) {
                             Ok(node_ids) => {
@@ -2820,13 +3186,21 @@ impl Daemon {
                         }
                     }),
                 };
+                if let Err(message) = self.arm_forked(&tree_id, mode, &knobs, false, &resp) {
+                    self.emit_from_response(&tree_id, &resp);
+                    return Response::Error { message };
+                }
                 self.emit_from_response(&tree_id, &resp);
                 resp
             }
-            Request::TreePrepareForkSource { tree_id, node_id } => {
+            Request::TreePrepareForkSource {
+                tree_id,
+                node_id,
+                refresh,
+            } => {
                 let resp = self.with_tree(&tree_id, |t| {
                     let start = Instant::now();
-                    match t.prepare_fork_source(&node_id) {
+                    match t.prepare_fork_source(&node_id, refresh) {
                         Ok(outcome) => {
                             let latency_ns =
                                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -2863,7 +3237,18 @@ impl Daemon {
                 node_id,
                 label,
             } => {
+                // Rollback is a fork: the new branch inherits the source
+                // node's dilation loop and knobs. There is no override field.
+                let (mode, knobs) = match self.resolve_fork_arm(&tree_id, &node_id, None, None) {
+                    Ok(v) => v,
+                    Err(message) => return Response::Error { message },
+                };
                 let resp = self.with_tree(&tree_id, |t| {
+                    if let Err(message) =
+                        Self::check_node_policy(t, &node_id, mode, None, &knobs.ladder)
+                    {
+                        return Response::Error { message };
+                    }
                     let start = Instant::now();
                     match t.rollback(&node_id, &label) {
                         Ok(node_id) => {
@@ -2883,6 +3268,10 @@ impl Daemon {
                         Err(message) => Response::Error { message },
                     }
                 });
+                if let Err(message) = self.arm_forked(&tree_id, mode, &knobs, false, &resp) {
+                    self.emit_from_response(&tree_id, &resp);
+                    return Response::Error { message };
+                }
                 self.emit_from_response(&tree_id, &resp);
                 resp
             }
@@ -2931,11 +3320,38 @@ impl Daemon {
                 resp
             }
             Request::TreePrune { tree_id, node_id } => {
-                let resp = self.with_tree(&tree_id, |t| match t.prune(&node_id) {
-                    Ok(()) => Response::Ok,
-                    Err(message) => Response::Error { message },
+                let mut released = Vec::new();
+                let mut removed_nodes = Vec::new();
+                let resp = self.with_tree(&tree_id, |t| {
+                    let before: std::collections::HashSet<String> =
+                        t.list_nodes().into_iter().map(|n| n.id).collect();
+                    match t.prune(&node_id) {
+                        Ok(ids) => {
+                            released = ids;
+                            let after: std::collections::HashSet<String> =
+                                t.list_nodes().into_iter().map(|n| n.id).collect();
+                            removed_nodes = before
+                                .into_iter()
+                                .filter(|id| !after.contains(id))
+                                .collect();
+                            Response::Ok
+                        }
+                        Err(message) => Response::Error { message },
+                    }
                 });
                 if matches!(resp, Response::Ok) {
+                    // `prune` already released these after the payloads
+                    // dropped. Idempotent: this is the control-plane site
+                    // that also clears the adopted map. A child prune
+                    // returns an empty list and leaves the root's pins.
+                    for id in &released {
+                        crate::broker::client::release_vm(id);
+                    }
+                    self.forget_adopted(&released);
+                    // Join the loop when the pruned subtree was the last
+                    // thing it was sampling. Drop of the loop handle is
+                    // what joins; this is that path for a live tree.
+                    self.dilation_forget_nodes(&tree_id, &removed_nodes);
                     self.emit_tree_event(&tree_id, "prune", Some(&node_id), None);
                 }
                 resp
@@ -2946,13 +3362,14 @@ impl Daemon {
                     Err(message) => Response::Error { message },
                 });
                 if let Response::TreeEvicted { ref evicted } = resp {
+                    self.dilation_forget_nodes(&tree_id, evicted);
                     for id in evicted {
                         self.emit_tree_event(&tree_id, "evict", Some(id), None);
                     }
                 }
                 resp
             }
-            Request::TreeNodes { tree_id } => self.with_tree(&tree_id, |t| t.node_list_response()),
+            Request::TreeNodes { tree_id } => self.tree_nodes(&tree_id),
             Request::TreeList => self.tree_list(),
             Request::TreeWatch { tree_id } => self.watch_snapshot(tree_id.as_deref()),
             Request::TreeDrop { tree_id } => self.tree_drop(&tree_id),
@@ -2974,6 +3391,7 @@ impl Daemon {
                     ok: report.ok(),
                     fc_fork_mode: crate::fc::snapshot::fork_mode()
                         .map_or_else(|e| format!("invalid ({e})"), |m| m.env_name().to_string()),
+                    ksm_run: report.ksm_run(),
                     details: report.lines(),
                 }
             }
@@ -4867,6 +5285,13 @@ impl Daemon {
     fn insert_tree(&self, tree_id: String, payload: TreePayload, guest_cids: Vec<u64>) -> Response {
         use std::collections::hash_map::Entry;
         let agent_endpoints = payload.node_endpoints(&"root".to_string());
+        let (pause_ns, max_pause_ns) = match &payload {
+            TreePayload::Cluster(t) => t
+                .root_cut()
+                .map(|c| (c.pause_ns(), c.max_pause_ns()))
+                .unwrap_or_default(),
+            TreePayload::Single(_) => (Vec::new(), 0),
+        };
         match self.trees.lock().unwrap().entry(tree_id.clone()) {
             Entry::Occupied(_) => Response::Error {
                 message: format!("tree {tree_id} already exists (created concurrently)"),
@@ -4879,6 +5304,8 @@ impl Daemon {
                     root_id: "root".to_string(),
                     guest_cids,
                     agent_endpoints,
+                    pause_ns,
+                    max_pause_ns,
                 }
             }
         }
@@ -4893,7 +5320,17 @@ impl Daemon {
         config: &VmConfig,
         budget: Option<TreeBudget>,
         tree_id: Option<String>,
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        dilation_config: Option<&crate::dilation::DilationPolicyConfig>,
     ) -> Response {
+        let mode = dilation_policy.unwrap_or_default();
+        let knobs = match crate::dilation::PolicyConfig::from_request(dilation_config) {
+            Ok(knobs) => knobs,
+            Err(message) => return Response::Error { message },
+        };
+        if let Err(message) = Self::reject_adaptive_config(mode, config, &knobs.ladder) {
+            return Response::Error { message };
+        }
         if config.network.is_some() {
             return Response::Error {
                 message: "tree_create: config.network must be None (single-VM trees are \
@@ -4935,20 +5372,34 @@ impl Daemon {
         if let Err(message) = Self::verify_node_agents(&payload, &root_id) {
             return Response::Error { message };
         }
+        let factor = payload.node_dilation(&root_id).unwrap_or(1);
         let guest_cids = payload.node_cids(&root_id);
-        self.insert_tree(tree_id, payload, guest_cids)
+        let resp = self.insert_tree(tree_id.clone(), payload, guest_cids);
+        if let Err(message) = self.arm_after_create(&tree_id, mode, &knobs, factor, &resp) {
+            return Response::Error { message };
+        }
+        resp
     }
 
     /// Adopt live sandbox VMs + their shared bridge as a cluster
     /// snapshot-tree root. See [`Request::TreeAdoptCluster`].
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn tree_adopt_cluster(
         &self,
         vm_ids: &[String],
         budget: Option<TreeBudget>,
         tree_id: Option<String>,
         egress: Option<crate::netjail::EgressPolicy>,
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        dilation_config: Option<&crate::dilation::DilationPolicyConfig>,
+        ksm: bool,
     ) -> Response {
+        let mode = dilation_policy.unwrap_or_default();
+        let knobs = match crate::dilation::PolicyConfig::from_request(dilation_config) {
+            Ok(knobs) => knobs,
+            Err(message) => return Response::Error { message },
+        };
         if let Some(ref policy) = egress {
             if let Err(e) = policy.validate() {
                 return Response::Error {
@@ -5057,6 +5508,12 @@ impl Daemon {
             put_back(extracted);
             return Response::Error { message };
         }
+        if mode != crate::dilation::DilationPolicyMode::Fixed {
+            if let Err(message) = Self::check_adopted_dilation(&extracted, mode, &knobs.ladder) {
+                put_back(extracted);
+                return Response::Error { message };
+            }
+        }
 
         // Contiguous 0..N-1 indices — ClusterPayload.members[i] is
         // vm_index i for fork_cluster_warm / add_tap_at.
@@ -5158,8 +5615,11 @@ impl Daemon {
 
         // Drop sandbox index + on-disk records: these VMs are no longer
         // reattachable as sandboxes (they're tree members).
-        // StopVm on pod teardown then sees "no such VM", which the shim
-        // already treats as best-effort.
+        // StopVm on an adopted id returns "was adopted into tree …"
+        // (not "no such VM"); the shim still treats any non-Ok as
+        // best-effort (`stop_daemon_vm`). Broker pins for these ids
+        // stay until root `tree_prune` / `tree_drop` — not this call,
+        // and not the restore-swap inside `new_cluster`.
         {
             let mut sandboxes = self.sandboxes.lock().unwrap();
             for (_, _, entry) in &indexed {
@@ -5213,24 +5673,51 @@ impl Daemon {
         // `new_cluster` (success or failure) — safe to remove the
         // cgroup dirs now.
         drop(cgroups);
-        let (tree, root_id) = match result {
+        let (mut tree, root_id) = match result {
             Ok(v) => v,
             Err(e) => {
+                // `new_cluster` dropped the members. Nothing is left to
+                // reopen the caller images, so the CreateVm pins go too.
+                // The adopted map stays empty: the ids are not in a tree.
+                for id in vm_ids {
+                    crate::broker::client::release_vm(id);
+                }
                 return Response::Error {
                     message: format!("ClusterSnapshotTree::new_cluster (adopt): {e}"),
-                }
+                };
             }
         };
+        tree.set_adopted_vm_ids(vm_ids.to_vec());
+        if ksm {
+            if let Err(e) = tree.enable_ksm() {
+                return Response::Error {
+                    message: format!("tree_adopt_cluster: ksm: {e}"),
+                };
+            }
+        }
         let payload = TreePayload::Cluster(tree);
         if let Err(message) = Self::verify_node_agents(&payload, &root_id) {
             return Response::Error { message };
         }
+        let factor = payload.node_dilation(&root_id).unwrap_or(1);
         let guest_cids = payload.node_cids(&root_id);
-        self.insert_tree(tree_id, payload, guest_cids)
+        let tree_id_for_map = tree_id.clone();
+        let resp = self.insert_tree(tree_id, payload, guest_cids);
+        if let Err(message) = self.arm_after_create(&tree_id_for_map, mode, &knobs, factor, &resp) {
+            return Response::Error { message };
+        }
+        if matches!(resp, Response::TreeCreated { .. }) {
+            let mut adopted = self.adopted.lock().unwrap();
+            for id in vm_ids {
+                adopted.insert(id.clone(), tree_id_for_map.clone());
+            }
+        }
+        resp
     }
 
     /// Root a cluster snapshot tree: a tree-owned bridge plus
     /// `vm_count` members, each agent-ready before the root snapshot.
+    #[allow(clippy::too_many_arguments)]
     fn tree_create_cluster(
         &self,
         vm_count: u32,
@@ -5238,8 +5725,19 @@ impl Daemon {
         budget: Option<TreeBudget>,
         tree_id: Option<String>,
         egress: Option<crate::netjail::EgressPolicy>,
+        dilation_policy: Option<crate::dilation::DilationPolicyMode>,
+        dilation_config: Option<&crate::dilation::DilationPolicyConfig>,
+        ksm: bool,
     ) -> Response {
         type BuiltCluster = (ClusterPayload, Vec<crate::api::AgentClient>);
+        let mode = dilation_policy.unwrap_or_default();
+        let knobs = match crate::dilation::PolicyConfig::from_request(dilation_config) {
+            Ok(knobs) => knobs,
+            Err(message) => return Response::Error { message },
+        };
+        if let Err(message) = Self::reject_adaptive_config(mode, config, &knobs.ladder) {
+            return Response::Error { message };
+        }
         if vm_count == 0 {
             return Response::Error {
                 message: "tree_create_cluster: vm_count must be >= 1".to_string(),
@@ -5295,7 +5793,7 @@ impl Daemon {
         };
 
         let root_dir = tree_root_dir().join(&tree_id);
-        let (tree, root_id) = match ClusterSnapshotTree::new_cluster(
+        let (mut tree, root_id) = match ClusterSnapshotTree::new_cluster(
             root,
             root_dir,
             budget.unwrap_or_else(default_tree_budget),
@@ -5307,13 +5805,25 @@ impl Daemon {
                 }
             }
         };
+        if ksm {
+            if let Err(e) = tree.enable_ksm() {
+                return Response::Error {
+                    message: format!("tree_create_cluster: ksm: {e}"),
+                };
+            }
+        }
         drop(agents);
         let payload = TreePayload::Cluster(tree);
         if let Err(message) = Self::verify_node_agents(&payload, &root_id) {
             return Response::Error { message };
         }
+        let factor = payload.node_dilation(&root_id).unwrap_or(1);
         let guest_cids = payload.node_cids(&root_id);
-        self.insert_tree(tree_id, payload, guest_cids)
+        let resp = self.insert_tree(tree_id.clone(), payload, guest_cids);
+        if let Err(message) = self.arm_after_create(&tree_id, mode, &knobs, factor, &resp) {
+            return Response::Error { message };
+        }
+        resp
     }
 
     /// Run `f` against one registered tree, holding the trees lock for
@@ -5483,14 +5993,497 @@ impl Daemon {
         }
     }
 
+    /// Record `mode` on `node_id` and, unless it is `fixed`, start the
+    /// tree's sample loop. The loop calls [`crate::vm::set_dilation_lockstep`],
+    /// the same pause → set → resume path as [`Request::SetDilation`].
+    fn arm_dilation(
+        &self,
+        tree_id: &str,
+        node_id: &str,
+        mode: crate::dilation::DilationPolicyMode,
+        config: &crate::dilation::PolicyConfig,
+        factor: u32,
+        set_cadence: bool,
+    ) -> Result<(), String> {
+        use crate::dilation::DilationPolicyMode;
+
+        let mut loops = self.dilation_loops.lock().unwrap();
+        let entry = loops
+            .entry(tree_id.to_string())
+            .or_insert_with(TreeDilationLoop::new);
+        // The root owns the tree's one sleep. A fork that reaches here
+        // has already been refused if it tried to set its own.
+        if set_cadence {
+            entry.cadence = config.cadence;
+        }
+        entry
+            .configs
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string(), config.clone());
+        if mode == DilationPolicyMode::Fixed {
+            // `fixed` stores the knobs so a child can inherit them, and
+            // starts no thread.
+            entry
+                .modes
+                .lock()
+                .unwrap()
+                .insert(node_id.to_string(), mode);
+            entry.nodes.lock().unwrap().remove(node_id);
+            return Ok(());
+        }
+        let mut policy = if mode == DilationPolicyMode::Down {
+            DilationInner::Down(config.down_policy()?)
+        } else {
+            DilationInner::Track(config.track_policy()?)
+        };
+        policy.align_to(factor)?;
+        entry
+            .modes
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string(), mode);
+        entry.nodes.lock().unwrap().insert(
+            node_id.to_string(),
+            DilationNode {
+                policy,
+                trajectory: vec![factor],
+            },
+        );
+        Self::ensure_dilation_thread(entry, tree_id, &self.trees)
+    }
+
+    /// Spawn the tree's loop if it is not already running.
+    fn ensure_dilation_thread(
+        entry: &mut TreeDilationLoop,
+        tree_id: &str,
+        trees: &Arc<Mutex<HashMap<String, TreePayload>>>,
+    ) -> Result<(), String> {
+        if entry.nodes.lock().unwrap().is_empty() {
+            return Ok(());
+        }
+        if let Some(thread) = &entry.thread {
+            if !thread.is_finished() {
+                return Ok(());
+            }
+        }
+        if let Some(thread) = entry.thread.take() {
+            if thread.join().is_err() {
+                log::error!("dilation: the previous loop on {tree_id} panicked");
+            }
+        }
+        entry.stop.store(false, Ordering::SeqCst);
+        let stop = Arc::clone(&entry.stop);
+        let nodes = Arc::clone(&entry.nodes);
+        let trees = Arc::clone(trees);
+        let id = tree_id.to_string();
+        let cadence = entry.cadence;
+        let thread = std::thread::Builder::new()
+            .name("k7d-dilate".to_string())
+            .spawn(move || Self::dilation_loop(&trees, &id, &nodes, &stop, cadence))
+            .map_err(|e| format!("dilation({tree_id}): spawning the policy loop: {e}"))?;
+        entry.thread = Some(thread);
+        log::info!("dilation: policy loop started on tree {tree_id}");
+        Ok(())
+    }
+
+    /// Arm the root after a successful create or adopt. A failed arm
+    /// drops the tree it just inserted — a tree whose loop did not
+    /// start is not left running at a factor the caller thinks is adaptive.
+    fn arm_after_create(
+        &self,
+        tree_id: &str,
+        mode: crate::dilation::DilationPolicyMode,
+        config: &crate::dilation::PolicyConfig,
+        factor: u32,
+        resp: &Response,
+    ) -> Result<(), String> {
+        if !matches!(resp, Response::TreeCreated { .. }) {
+            return Ok(());
+        }
+        if let Err(message) = self.arm_dilation(tree_id, "root", mode, config, factor, true) {
+            self.tree_drop(tree_id);
+            return Err(message);
+        }
+        Ok(())
+    }
+
+    /// Mode and knobs a fork or rollback should arm with.
+    ///
+    /// An omitted mode or config inherits the source. A fork that sets
+    /// `cadence_ms` is an error before any child VM exists.
+    fn resolve_fork_arm(
+        &self,
+        tree_id: &str,
+        source_id: &str,
+        mode: Option<crate::dilation::DilationPolicyMode>,
+        config: Option<&crate::dilation::DilationPolicyConfig>,
+    ) -> Result<
+        (
+            crate::dilation::DilationPolicyMode,
+            crate::dilation::PolicyConfig,
+        ),
+        String,
+    > {
+        let mode = mode.unwrap_or_else(|| self.dilation_mode(tree_id, source_id));
+        let parent = self.dilation_config(tree_id, source_id);
+        let config = parent.for_fork(config)?;
+        Ok((mode, config))
+    }
+
+    /// Arm every node a fork or rollback just produced.
+    fn arm_forked(
+        &self,
+        tree_id: &str,
+        mode: crate::dilation::DilationPolicyMode,
+        config: &crate::dilation::PolicyConfig,
+        set_cadence: bool,
+        resp: &Response,
+    ) -> Result<(), String> {
+        let branched: Vec<(String, u32)> = match resp {
+            Response::TreeForked {
+                node_id, dilation, ..
+            } => vec![(node_id.clone(), *dilation)],
+            Response::TreeForkBatch { forks, .. } => forks
+                .iter()
+                .map(|f| (f.node_id.clone(), f.dilation))
+                .collect(),
+            _ => return Ok(()),
+        };
+        for (node_id, factor) in branched {
+            self.arm_dilation(tree_id, &node_id, mode, config, factor, set_cadence)
+                .map_err(|e| {
+                    format!("forked {node_id} but its dilation loop did not start: {e}")
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Mode recorded for `node_id`, or `fixed` when the tree never set one.
+    fn dilation_mode(&self, tree_id: &str, node_id: &str) -> crate::dilation::DilationPolicyMode {
+        self.dilation_loops
+            .lock()
+            .unwrap()
+            .get(tree_id)
+            .and_then(|loop_| loop_.modes.lock().unwrap().get(node_id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Knobs recorded for `node_id`, or the module constants when the
+    /// tree never set any. A tree opened from disk has none — the loop
+    /// is not persisted.
+    fn dilation_config(&self, tree_id: &str, node_id: &str) -> crate::dilation::PolicyConfig {
+        self.dilation_loops
+            .lock()
+            .unwrap()
+            .get(tree_id)
+            .and_then(|loop_| loop_.configs.lock().unwrap().get(node_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Drop loop state for nodes a prune or eviction removed, and join
+    /// the thread when nothing adaptive is left.
+    fn dilation_forget_nodes(&self, tree_id: &str, node_ids: &[String]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut by_tree = self.dilation_loops.lock().unwrap();
+        let Some(entry) = by_tree.get_mut(tree_id) else {
+            return;
+        };
+        {
+            let mut modes = entry.modes.lock().unwrap();
+            let mut configs = entry.configs.lock().unwrap();
+            let mut recorded = entry.nodes.lock().unwrap();
+            for id in node_ids {
+                modes.remove(id);
+                configs.remove(id);
+                recorded.remove(id);
+            }
+        }
+        if entry.nodes.lock().unwrap().is_empty() {
+            entry.stop_join();
+        }
+    }
+
+    fn tree_nodes(&self, tree_id: &str) -> Response {
+        let mut resp = self.with_tree(tree_id, |t| t.node_list_response());
+        if let Response::TreeNodeList {
+            dilation_policy,
+            dilation_trajectory,
+            ..
+        } = &mut resp
+        {
+            if let Some(loop_) = self.dilation_loops.lock().unwrap().get(tree_id) {
+                dilation_policy.clone_from(&loop_.modes.lock().unwrap());
+                **dilation_trajectory = loop_
+                    .nodes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, node)| (id.clone(), node.trajectory.clone()))
+                    .collect();
+            }
+        }
+        resp
+    }
+
+    /// Refuse an adaptive mode the live factor or the backend cannot honour.
+    fn reject_adaptive_config(
+        mode: crate::dilation::DilationPolicyMode,
+        config: &VmConfig,
+        ladder: &[u32],
+    ) -> Result<(), String> {
+        if mode == crate::dilation::DilationPolicyMode::Fixed {
+            return Ok(());
+        }
+        if config.backend != Backend::Native {
+            return Err(format!(
+                "dilation_policy {} needs the native backend — Firecracker has no dilation ioctl",
+                mode.as_str()
+            ));
+        }
+        let factor = config.dilation.unwrap_or(1);
+        if crate::dilation::ladder_rung(ladder, factor).is_none() {
+            return Err(crate::dilation::ladder_factor_error(ladder, factor));
+        }
+        Ok(())
+    }
+
+    /// Same check for VMs already running, before adopt becomes irreversible.
+    fn check_adopted_dilation(
+        extracted: &[(String, VmEntry)],
+        mode: crate::dilation::DilationPolicyMode,
+        ladder: &[u32],
+    ) -> Result<(), String> {
+        let mut seen: Option<u32> = None;
+        for (vm_id, entry) in extracted {
+            if entry.vm.backend() != Backend::Native {
+                return Err(format!(
+                    "dilation_policy {} needs the native backend — VM {vm_id} is {:?}",
+                    mode.as_str(),
+                    entry.vm.backend()
+                ));
+            }
+            let factor = native(&entry.vm)?.dilation();
+            if crate::dilation::ladder_rung(ladder, factor).is_none() {
+                return Err(crate::dilation::ladder_factor_error(ladder, factor));
+            }
+            if let Some(prev) = seen {
+                if prev != factor {
+                    return Err(format!(
+                        "dilation_policy {}: VM {vm_id} is at x{factor} but another member is at x{prev} — a cluster has one factor",
+                        mode.as_str()
+                    ));
+                }
+            }
+            seen = Some(factor);
+        }
+        Ok(())
+    }
+
+    /// `factor_override` is the fork's dilation field (`None` inherits).
+    fn check_node_policy(
+        tree: &TreePayload,
+        source_id: &String,
+        mode: crate::dilation::DilationPolicyMode,
+        factor_override: Option<u32>,
+        ladder: &[u32],
+    ) -> Result<(), String> {
+        if mode == crate::dilation::DilationPolicyMode::Fixed {
+            return Ok(());
+        }
+        // No live payload: a missing node, or one that is suspended.
+        // Let the fork itself report the missing node. A suspended
+        // source's factor is on the fork reply, and `arm_dilation`
+        // refuses it there if it is not a rung.
+        if tree.node_guests(source_id).is_empty() {
+            return Ok(());
+        }
+        if !tree.node_is_native(source_id) {
+            return Err(format!(
+                "dilation_policy {} needs the native backend — Firecracker has no dilation ioctl",
+                mode.as_str()
+            ));
+        }
+        let factor = factor_override.unwrap_or_else(|| tree.node_dilation(source_id).unwrap_or(1));
+        if crate::dilation::ladder_rung(ladder, factor).is_none() {
+            return Err(crate::dilation::ladder_factor_error(ladder, factor));
+        }
+        Ok(())
+    }
+
+    /// One sample of every adaptive node on `tree_id`, then one cadence.
+    ///
+    /// The trees lock is held across the pause. [`Request::SetDilation`]
+    /// takes the same lock for a tree-owned cluster; this does not call
+    /// back into it (that would deadlock) and instead calls
+    /// [`crate::vm::set_dilation_lockstep`], which is what that handler
+    /// calls once it has the members.
+    fn dilation_loop(
+        trees: &Mutex<HashMap<String, TreePayload>>,
+        tree_id: &str,
+        nodes: &Mutex<HashMap<String, DilationNode>>,
+        stop: &AtomicBool,
+        cadence: Duration,
+    ) {
+        while !stop.load(Ordering::SeqCst) {
+            if nodes.lock().unwrap().is_empty() {
+                log::info!("dilation: tree {tree_id} has no adaptive node left — stopping");
+                break;
+            }
+            let tree_gone = {
+                let mut guard = trees.lock().unwrap();
+                match guard.get_mut(tree_id) {
+                    None => true,
+                    Some(tree) => {
+                        let mut runtimes = nodes.lock().unwrap();
+                        let ids: Vec<String> = runtimes.keys().cloned().collect();
+                        for id in ids {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Some(runtime) = runtimes.get_mut(&id) else {
+                                continue;
+                            };
+                            match Self::dilation_sample_node(tree, &id, runtime) {
+                                Ok(Some(factor)) => {
+                                    log::info!("dilation {tree_id}/{id}: x{factor}");
+                                    if runtime.trajectory.last().copied() != Some(factor) {
+                                        runtime.trajectory.push(factor);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(message) => {
+                                    if message.contains("no live") {
+                                        log::debug!("dilation {tree_id}/{id}: {message}");
+                                    } else {
+                                        log::warn!("dilation {tree_id}/{id}: {message}");
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                }
+            };
+            if tree_gone {
+                log::info!("dilation: tree {tree_id} is gone — stopping");
+                break;
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            Self::dilation_wait(stop, cadence);
+        }
+        log::info!("dilation: tree {tree_id} loop exiting");
+    }
+
+    fn dilation_wait(stop: &AtomicBool, cadence: Duration) {
+        let tick = Duration::from_millis(50);
+        let mut left = cadence;
+        while !left.is_zero() && !stop.load(Ordering::SeqCst) {
+            let slice = left.min(tick);
+            std::thread::sleep(slice);
+            left = left.saturating_sub(slice);
+        }
+    }
+
+    fn dilation_sample_node(
+        tree: &mut TreePayload,
+        node_id: &str,
+        runtime: &mut DilationNode,
+    ) -> Result<Option<u32>, String> {
+        match tree {
+            TreePayload::Single(t) => {
+                let key = node_id.to_string();
+                let Some(guest) = t.get_vm_mut(&key) else {
+                    return Err(format!("node {node_id} has no live VM"));
+                };
+                let vm = native_mut(guest)?;
+                let mut vms = [vm];
+                Self::apply_dilation_sample(&mut vms, runtime)
+            }
+            TreePayload::Cluster(t) => {
+                let Some(members) = t.live_members_mut(node_id) else {
+                    return Err(format!("node {node_id} has no live cluster"));
+                };
+                if members.is_empty() {
+                    return Err(format!("node {node_id} has no live members"));
+                }
+                let mut vms = native_vms_mut(members).map_err(|e| e.to_string())?;
+                Self::apply_dilation_sample(vms.as_mut_slice(), runtime)
+            }
+        }
+    }
+
+    /// Pause, read `KVM_GET_MP_STATE`, resume, and on a drop or raise
+    /// call the lockstep live set.
+    fn apply_dilation_sample(
+        vms: &mut [&mut Vm],
+        runtime: &mut DilationNode,
+    ) -> Result<Option<u32>, String> {
+        let samples = Self::pause_sample_resume(vms)?;
+        let n_cpus: usize = samples.iter().map(|s| s.cpus.len()).sum();
+        if n_cpus == 0 {
+            return Err("dilation sample had no vCPUs".into());
+        }
+        let verdict = runtime.policy.observe(&samples);
+        match verdict {
+            crate::dilation::Verdict::Drop(factor) | crate::dilation::Verdict::Raise(factor) => {
+                crate::vm::set_dilation_lockstep(vms, factor).map_err(|e| e.to_string())?;
+                Ok(Some(factor))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn pause_sample_resume(vms: &mut [&mut Vm]) -> Result<Vec<crate::vm::TimeSample>, String> {
+        let failures = std::cell::RefCell::new(Vec::new());
+        let mut guard = scopeguard::guard(&mut *vms, |vms| {
+            for (i, vm) in vms.iter_mut().enumerate() {
+                if let Err(e) = vm.resume() {
+                    failures.borrow_mut().push(format!("VM {i} ({e})"));
+                }
+            }
+        });
+        for vm in guard.iter_mut() {
+            vm.pause().map_err(|e| e.to_string())?;
+        }
+        let mut samples = Vec::with_capacity(guard.len());
+        for vm in guard.iter() {
+            samples.push(vm.sample_time_state().map_err(|e| e.to_string())?);
+        }
+        drop(guard);
+        let failures = failures.into_inner();
+        if !failures.is_empty() {
+            return Err(format!(
+                "resume after a dilation sample: {}",
+                failures.join(", ")
+            ));
+        }
+        Ok(samples)
+    }
+
     /// Forget a tree. Dropping the payload outside the lock tears down
     /// every live VM (and, for clusters, the tree-owned bridges); the
     /// on-disk `tree.json` + node dirs stay for later re-open.
+    ///
+    /// Adopted `CreateVm` pins are released after that drop. Restore-swap
+    /// does not release them: the same caller images are still live.
     fn tree_drop(&self, tree_id: &str) -> Response {
+        // Join the loop before taking the trees lock. A sample in flight
+        // holds that lock; joining while holding it deadlocks.
+        self.dilation_loops.lock().unwrap().remove(tree_id);
         let removed = self.trees.lock().unwrap().remove(tree_id);
         match removed {
-            Some(payload) => {
+            Some(mut payload) => {
+                let adopted = payload.take_adopted_vm_ids();
                 drop(payload);
+                for id in &adopted {
+                    crate::broker::client::release_vm(id);
+                }
+                self.forget_adopted(&adopted);
                 log::info!("dropped tree {tree_id}");
                 self.emit_tree_event(tree_id, "drop", None, None);
                 Response::Ok
@@ -5498,6 +6491,17 @@ impl Daemon {
             None => Response::Error {
                 message: format!("no such tree: {tree_id}"),
             },
+        }
+    }
+
+    /// Drop `vm_id → tree_id` entries once those ids' broker pins are gone.
+    fn forget_adopted(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut adopted = self.adopted.lock().unwrap();
+        for id in ids {
+            adopted.remove(id);
         }
     }
 
@@ -5721,9 +6725,19 @@ impl Daemon {
                 log::info!("stopped {vm_id}");
                 Response::Ok
             }
-            None => Response::Error {
-                message: format!("no such VM: {vm_id}"),
-            },
+            None => {
+                if let Some(tree_id) = self.adopted.lock().unwrap().get(vm_id).cloned() {
+                    Response::Error {
+                        message: format!(
+                            "VM {vm_id} was adopted into tree {tree_id}; use tree_prune / tree_drop"
+                        ),
+                    }
+                } else {
+                    Response::Error {
+                        message: format!("no such VM: {vm_id}"),
+                    }
+                }
+            }
         }
     }
 
@@ -5822,6 +6836,13 @@ impl Daemon {
         for (cluster_id, mut policy) in self.auto_warps.lock().unwrap().drain() {
             log::info!("shutdown: stopping the auto-warp loop on {cluster_id}");
             policy.stop();
+        }
+        // Dilation loops hold the trees lock for each sample. Join them
+        // before the trees are dropped, or a sample pauses a VM `drop`
+        // is tearing down.
+        for (tree_id, loop_) in self.dilation_loops.lock().unwrap().drain() {
+            log::info!("shutdown: stopping the dilation loop on {tree_id}");
+            drop(loop_);
         }
         let drained: Vec<(String, VmEntry)> = self.vms.lock().unwrap().drain().collect();
         for (vm_id, entry) in drained {
@@ -6306,5 +7327,63 @@ mod tests {
             ..VmConfig::default()
         })
         .expect("scratch and data disks are Firecracker drives");
+    }
+
+    #[test]
+    fn omitted_dilation_policy_is_fixed_on_create_and_inherit_on_fork() {
+        // Old clients that do not send the field keep today's behaviour:
+        // create stays at the boot factor, a fork copies the source mode.
+        let created: Request =
+            serde_json::from_str(r#"{"op":"tree_create","config":{"memory_mb":256,"vcpus":1}}"#)
+                .unwrap();
+        assert!(matches!(
+            created,
+            Request::TreeCreate {
+                dilation_policy: None,
+                dilation_config: None,
+                ..
+            }
+        ));
+        let forked: Request = serde_json::from_str(
+            r#"{"op":"tree_fork","tree_id":"t","source_id":"root","label":"a"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            forked,
+            Request::TreeFork {
+                dilation_policy: None,
+                dilation_config: None,
+                dilation: None,
+                ..
+            }
+        ));
+        let tracked: Request = serde_json::from_str(
+            r#"{"op":"tree_create_cluster","vm_count":1,"config":{"memory_mb":256,"vcpus":1},"dilation_policy":"track"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            tracked,
+            Request::TreeCreateCluster {
+                dilation_policy: Some(crate::dilation::DilationPolicyMode::Track),
+                dilation_config: None,
+                ..
+            }
+        ));
+        let knobs: Request = serde_json::from_str(
+            r#"{"op":"tree_create","config":{"memory_mb":256,"vcpus":1},"dilation_policy":"down","dilation_config":{"window":1,"ladder":[4,1]}}"#,
+        )
+        .unwrap();
+        match knobs {
+            Request::TreeCreate {
+                dilation_policy: Some(crate::dilation::DilationPolicyMode::Down),
+                dilation_config: Some(cfg),
+                ..
+            } => {
+                assert_eq!(cfg.window, Some(1));
+                assert_eq!(cfg.ladder.as_deref(), Some(&[4, 1][..]));
+                assert_eq!(cfg.cadence_ms, None);
+            }
+            other => panic!("custom knobs did not parse: {other:?}"),
+        }
     }
 }

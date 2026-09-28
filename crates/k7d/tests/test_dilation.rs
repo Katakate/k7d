@@ -46,6 +46,10 @@
 //! - **Four-policy episode** (`test_dilation_four_policy_idle_busy_idle`):
 //!   the same 240 s guest-time script under fixed8 / fixed4 / down /
 //!   track, idle/busy/idle in 80 s guest windows. Shape, not values.
+//! - **Daemon loop** (`test_dilation_policy_loop_*`): the same walk, but
+//!   the daemon's per-tree loop owns the samples and the live
+//!   `SetDilation`. `track` walks 8→1→8, `down` walks 8→1 and stays,
+//!   `fixed` never moves, and `tree_drop` joins the thread.
 //!
 //! Episode kubectl talks to the API server from *inside* the guest
 //! (CHALLENGES #191): at N=16 the serving cert's `notBefore` is far
@@ -56,19 +60,23 @@
 
 mod common;
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use k7d::api::AgentClient;
-use k7d::control::{NetConfig, Request, Response, VmConfig};
+use k7d::control::{BlockDeviceConfig, NetConfig, Request, Response, VmConfig};
+use k7d::dilation::DilationPolicyMode;
+use k7d::latency::BOOT_UBUNTU_K3S_CLUSTER_3NODE;
 use k7d::vm::{TimeSample, Vm};
 
 use common::ubuntu::{
-    build_node_vm_sized, connect_or_dump, node_image, sh_ok, NodeCmdlineExtra, NodeSize, VmDisk,
-    NODE_VCPUS,
+    build_node_vm_tuned, connect_or_dump, node_cmdline_with, node_image, sh_ok, NodeCmdlineExtra,
+    NodeSize, VmDisk, BOOT_TO_AGENT_CEILING, NODE_MEMORY_MB, NODE_VCPUS,
 };
 use common::ubuntu_k3s::{
-    bring_up_cluster_sized, guest_apply_yaml, guest_kubectl, guest_nodes_ready,
+    bring_up_cluster_sized, guest_apply_yaml, guest_kubectl, guest_nodes_ready, wait_guest_readyz,
     wait_nodes_ready_via_guest, UbuntuCluster, UbuntuCni, BUSYBOX, CHURN_PAUSE, CONVERGE,
+    K3S_TOKEN,
 };
 use common::warp::{check_clocksource, check_no_ntp_client, check_no_splats, guest_clocks};
 
@@ -145,11 +153,20 @@ fn require_patched_host() {
 
 /// Boot one Ubuntu node VM (no k3s) at dilation `n`.
 fn boot_node(tag: &str, n: u32) -> (Vm, AgentClient, k7d::network::ClusterNetwork, VmDisk) {
+    boot_node_tuned(tag, n, |b| b)
+}
+
+/// [`boot_node`], with `tune` applied to the VM builder.
+fn boot_node_tuned(
+    tag: &str,
+    n: u32,
+    tune: impl FnOnce(k7d::vm::VmBuilder) -> k7d::vm::VmBuilder,
+) -> (Vm, AgentClient, k7d::network::ClusterNetwork, VmDisk) {
     let image = node_image();
     let disk = VmDisk::clone_of(&image.base_image(), tag);
     let mut net = k7d::network::ClusterNetwork::create(tag).expect("bridge");
     let tap = net.add_tap().expect("tap");
-    let mut vm = build_node_vm_sized(
+    let mut vm = build_node_vm_tuned(
         &image,
         &disk,
         tap,
@@ -159,6 +176,7 @@ fn boot_node(tag: &str, n: u32) -> (Vm, AgentClient, k7d::network::ClusterNetwor
         },
         &[],
         NodeSize::DEFAULT.dilated(n),
+        tune,
     );
     vm.start().expect("dilated Ubuntu node should start");
     let agent = connect_or_dump(&mut vm, tag);
@@ -1183,11 +1201,11 @@ fn test_dilation_live_drop_changes_slope_not_the_clock() {
     vm.pause().expect("pause");
     vm.set_dilation_live(1)
         .expect("the bottom rung is a legal factor");
-    vm.resume().expect("resume");
     assert_eq!(vm.dilation(), 1);
     assert_eq!(vm.dilation_peak(), DROP_FROM);
     let state = k7d::snapshot::capture_vm_state(&vm)
         .expect("a VM that has been dilated is capturable at x1");
+    vm.resume().expect("resume");
     assert_eq!(
         state.dilation, 1,
         "capture records the current factor, not the peak"
@@ -1532,6 +1550,173 @@ fn test_dilation_live_raise_changes_slope_not_the_clock() {
 
     check_no_splats(&mut agent, "raise");
     vm.shutdown();
+}
+
+/// Guest-time length of one sleep in the in-flight timer test, as
+/// `sleep(1)` wants it and in microseconds.
+const SLEEPER_ARG: &str = "0.25";
+const SLEEPER_US: i64 = 250_000;
+const SLEEPER_LOG: &str = "/var/tmp/k7-oversleep";
+
+/// Live changes in the toggle phase, each a raise then a drop.
+const TOGGLES: u32 = 20;
+
+/// Rate window per rung of the in-flight timer test.
+const TIMER_RATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// How far past its 250 ms a guest `sleep` may return, in guest time.
+/// The fork/exec of `sleep` and two `date`s sits inside the measured
+/// span and runs in wall time, so it is worth N times more guest time
+/// at N. Intel Core Ultra 7 265, 6.8, preemption timer on: quiet max
+/// 37.0 ms at x8, 36.3 ms across 20 live 4↔8 pairs once re-armed. A
+/// timer left armed at the old rate fires up to its whole remaining
+/// interval late: 249.3 ms on the same host with patch ABI 2.
+const OVERSLEEP_MAX_US: i64 = 80_000;
+
+/// Start a guest loop that sleeps [`SLEEPER_ARG`] forever and logs how
+/// many microseconds of guest time each sleep overran by.
+fn start_sleeper(agent: &mut AgentClient) {
+    sh_ok(
+        agent,
+        &format!(
+            "rm -f {SLEEPER_LOG} {BURNERS}; setsid nohup sh -c 'echo $$ >> {BURNERS}; \
+             while :; do s=$(date +%s%N); sleep {SLEEPER_ARG}; e=$(date +%s%N); \
+             echo $(( (e - s) / 1000 - {SLEEPER_US} )) >> {SLEEPER_LOG}; done' \
+             </dev/null >/dev/null 2>&1 & echo sleeper"
+        ),
+    );
+}
+
+/// Overruns logged since the last drain, in guest microseconds.
+fn drain_oversleep(agent: &mut AgentClient, whose: &str) -> Vec<i64> {
+    let out = sh_ok(
+        agent,
+        &format!("mv {SLEEPER_LOG} {SLEEPER_LOG}.r 2>/dev/null; cat {SLEEPER_LOG}.r 2>/dev/null; rm -f {SLEEPER_LOG}.r; true"),
+    );
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            l.trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("{whose}: oversleep line {l:?}: {e}"))
+        })
+        .collect()
+}
+
+/// Print and check one batch of overruns: none early, none past the
+/// budget, and at least one sleep finished.
+fn assert_oversleep(over: &[i64], whose: &str, what: &str, abi: u32) -> i64 {
+    assert!(
+        !over.is_empty(),
+        "{whose} {what}: the guest sleeper logged nothing"
+    );
+    let mut sorted = over.to_vec();
+    sorted.sort_unstable();
+    let (min, max) = (sorted[0], sorted[sorted.len() - 1]);
+    eprintln!(
+        "MEASUREMENT {whose} {what}: {} sleeps of {SLEEPER_ARG} s, overrun guest ms \
+         min {:.1} median {:.1} max {:.1}",
+        sorted.len(),
+        min as f64 / 1e3,
+        sorted[sorted.len() / 2] as f64 / 1e3,
+        max as f64 / 1e3
+    );
+    assert!(
+        min >= 0,
+        "{whose} {what}: a guest sleep returned {:.1} ms early by the guest's own clock — \
+         the clock stepped back or a timer fired before its expiry",
+        -min as f64 / 1e3
+    );
+    assert!(
+        max <= OVERSLEEP_MAX_US,
+        "{whose} {what}: a guest sleep overran by {:.1} ms of guest time (budget {:.1} ms). \
+         A timer armed before a live change kept the old rate; patch ABI here is {abi}, \
+         and generation 3 is the one that re-arms it (VMX preemption timer included)",
+        max as f64 / 1e3,
+        OVERSLEEP_MAX_US as f64 / 1e3
+    );
+    max
+}
+
+fn set_live(vm: &mut Vm, factor: u32) {
+    vm.pause().expect("pause for a factor change");
+    vm.set_dilation_live(factor)
+        .expect("a paused VM takes a live factor change");
+    vm.resume().expect("resume after a factor change");
+}
+
+/// Timers already armed when the factor changes. The raise and drop
+/// tests above start their `sleep 8` *after* the change, so they only
+/// see timers armed at the new rate. A timer in flight across the change
+/// was armed at the old one: on SVM that is a host hrtimer the patch
+/// rescales, on VMX it is the preemption timer, whose deadline
+/// `vmx_set_hv_timer` stores in host TSC cycles through the old ratio,
+/// plus a host-time `target_expiration` the vCPU falls back to at its
+/// next `HLT` (CHALLENGES #275).
+///
+/// Run once with the guest on the LAPIC one-shot (`lapic`, what kernel
+/// 6.8 gives it) and once on the TSC-deadline timer (`lapic-deadline`,
+/// advertised by hand, what 7.0 gives it). Each rung of the ladder gets
+/// a rate check and a batch of sleeps, then [`TOGGLES`] raise/drop pairs
+/// land on a guest that always has a sleep armed.
+#[test]
+fn test_dilation_live_change_rearms_in_flight_timers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    require_patched_host();
+    let abi = k7d::vm::host_dilation_abi().expect("patch generation");
+    eprintln!(
+        "MEASUREMENT host: dilation patch ABI {abi}, LAPIC timer on the VMX preemption \
+         timer: {}",
+        common::warp::host_runs_lapic_timer_on_preemption_timer()
+    );
+    for (deadline, clockevent) in [(false, "lapic"), (true, "lapic-deadline")] {
+        let whose = if deadline { "tsc-deadline" } else { "one-shot" };
+        let tag = if deadline { "dil-tdl" } else { "dil-one" };
+        let (mut vm, mut agent, _net, _disk) =
+            boot_node_tuned(tag, RAISE_FROM, |b| b.tsc_deadline_timer(deadline));
+        check_clocksource(&mut agent, whose);
+        check_no_ntp_client(&mut agent, whose);
+        let events = common::warp::check_clockevent(&mut agent, whose);
+        assert_eq!(
+            events.per_cpu, clockevent,
+            "{whose}: the guest registered the wrong per-CPU clockevent"
+        );
+        start_sleeper(&mut agent);
+
+        for factor in [8, 4, 2, 1, RAISE_FROM] {
+            set_live(&mut vm, factor);
+            drain_oversleep(&mut agent, whose);
+            assert_rate(&mut agent, whose, factor, TIMER_RATE_WINDOW);
+            let over = drain_oversleep(&mut agent, whose);
+            assert_oversleep(&over, whose, &format!("x{factor}"), abi);
+        }
+
+        drain_oversleep(&mut agent, whose);
+        let t0 = Instant::now();
+        for i in 0..TOGGLES {
+            // Uneven gaps, so the changes land at different points of
+            // the 250 ms sleep rather than in phase with it.
+            std::thread::sleep(Duration::from_millis(40 + u64::from(i * 37 % 90)));
+            set_live(&mut vm, RAISE_TO);
+            std::thread::sleep(Duration::from_millis(40 + u64::from(i * 53 % 90)));
+            set_live(&mut vm, RAISE_FROM);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let over = drain_oversleep(&mut agent, whose);
+        eprintln!(
+            "MEASUREMENT {whose}: {TOGGLES} raise/drop pairs x{RAISE_FROM}↔x{RAISE_TO} \
+             in {:.2} s wall",
+            t0.elapsed().as_secs_f64()
+        );
+        assert_oversleep(&over, whose, "across live changes", abi);
+
+        sh_ok(
+            &mut agent,
+            &format!("kill $(cat {BURNERS}) 2>/dev/null; rm -f {BURNERS}; echo stopped"),
+        );
+        check_no_splats(&mut agent, whose);
+        vm.shutdown();
+    }
 }
 
 #[test]
@@ -2599,13 +2784,22 @@ fn test_dilation_fork_cluster_warm_child_is_ready_and_dilated() {
     drop(fork_net);
 }
 
+/// `run_wall` is the wall from the child's `start()` to its first clock
+/// read (mostly its agent connecting). Across it the two clocks advance
+/// at `child_n` and `source_n`, so they drift `|child_n - source_n| ×
+/// run_wall` apart even when the handoff was exact: a 2 s agent connect
+/// is 14 s of guest time between ×8 and ×1.
 fn assert_lockstep(
     child_first: [f64; 3],
     src_before: [f64; 3],
     src_after: [f64; 3],
-    source_n: u32,
+    (source_n, child_n): (u32, u32),
     fork_wall: Duration,
+    run_wall: Duration,
 ) {
+    let run = run_wall.as_secs_f64();
+    let ahead = f64::from(child_n.saturating_sub(source_n)) * run;
+    let behind = f64::from(source_n.saturating_sub(child_n)) * run;
     for (i, name) in ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_BOOTTIME"]
         .iter()
         .enumerate()
@@ -2618,14 +2812,17 @@ fn assert_lockstep(
             src_before[i]
         );
         assert!(
-            child_first[i] <= src_after[i] + LOCKSTEP_SLACK,
+            child_first[i] <= src_after[i] + LOCKSTEP_SLACK + ahead,
             "child {name} {:.3} is ahead of the source's later read {:.3}",
             child_first[i],
             src_after[i]
         );
         assert!(
             child_first[i]
-                >= src_after[i] - LOCKSTEP_SLACK - f64::from(source_n) * fork_wall.as_secs_f64(),
+                >= src_after[i]
+                    - LOCKSTEP_SLACK
+                    - f64::from(source_n) * fork_wall.as_secs_f64()
+                    - behind,
             "child {name} {:.3} lags the source {:.3} by more than the fork itself took: the \
              rest was not handed back in the *source's* guest time",
             child_first[i],
@@ -2667,16 +2864,26 @@ fn test_dilation_fork_child_at_one_from_source_at_eight() {
     let fork_wall = t_fork.elapsed();
     let mut child = forks.pop().expect("one fork");
     assert_eq!(child.dilation(), 1, "the child did not take the override");
+    let t_run = Instant::now();
     child.start().expect("the fork starts");
     let mut child_agent = connect_or_dump(&mut child, "child");
     let child_first = guest_clocks(&mut child_agent, "child");
+    let run_wall = t_run.elapsed();
     let src_after = guest_clocks(&mut agent, "source");
     eprintln!(
-        "MEASUREMENT x{RATE_N} -> x1 warm fork in {fork_wall:?}; child clock at first \
-         read sits {:+.3} s of guest time from the source's next read",
+        "MEASUREMENT x{RATE_N} -> x1 warm fork in {fork_wall:?}, child start to first read \
+         {run_wall:?}; child clock at first read sits {:+.3} s of guest time from the \
+         source's next read",
         child_first[0] - src_after[0]
     );
-    assert_lockstep(child_first, src_before, src_after, RATE_N, fork_wall);
+    assert_lockstep(
+        child_first,
+        src_before,
+        src_after,
+        (RATE_N, 1),
+        fork_wall,
+        run_wall,
+    );
     assert_rates(
         measured_rates(&mut child_agent, "child", FORK_RATE_WINDOW),
         "child",
@@ -2732,16 +2939,26 @@ fn test_dilation_fork_child_at_eight_from_source_at_one() {
         RATE_N,
         "the child did not take the override"
     );
+    let t_run = Instant::now();
     child.start().expect("the fork starts");
     let mut child_agent = connect_or_dump(&mut child, "child");
     let child_first = guest_clocks(&mut child_agent, "child");
+    let run_wall = t_run.elapsed();
     let src_after = guest_clocks(&mut agent, "source");
     eprintln!(
-        "MEASUREMENT x1 -> x{RATE_N} warm fork in {fork_wall:?}; child clock at first \
-         read sits {:+.3} s of guest time from the source's next read",
+        "MEASUREMENT x1 -> x{RATE_N} warm fork in {fork_wall:?}, child start to first read \
+         {run_wall:?}; child clock at first read sits {:+.3} s of guest time from the \
+         source's next read",
         child_first[0] - src_after[0]
     );
-    assert_lockstep(child_first, src_before, src_after, 1, fork_wall);
+    assert_lockstep(
+        child_first,
+        src_before,
+        src_after,
+        (1, RATE_N),
+        fork_wall,
+        run_wall,
+    );
     assert_rates(
         measured_rates(&mut child_agent, "child", FORK_RATE_WINDOW),
         "child",
@@ -2771,6 +2988,7 @@ fn test_dilation_fork_batch_shares_one_factor() {
 
     let daemon = DilationDaemon::spawn("dilbat");
     let (tree_id, root_id) = match daemon.call(&Request::TreeCreateCluster {
+        ksm: false,
         vm_count: 2,
         config: VmConfig {
             kernel: Some(workspace_path("guest/kernel/vmlinux")),
@@ -2780,6 +2998,8 @@ fn test_dilation_fork_batch_shares_one_factor() {
         budget: None,
         tree_id: Some("dilbat".to_string()),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Response::TreeCreated {
             tree_id, root_id, ..
@@ -2792,6 +3012,8 @@ fn test_dilation_fork_batch_shares_one_factor() {
         source_id: root_id.clone(),
         labels: vec!["a".into(), "b".into()],
         dilation: Some(RATE_N),
+        dilation_policy: None,
+        dilation_config: None,
     }) {
         Response::TreeForkBatch { forks, .. } => forks,
         other => panic!("unexpected tree_fork_batch: {other:?}"),
@@ -3045,6 +3267,10 @@ impl DilationDaemon {
         daemon
     }
 
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn call(&self, req: &Request) -> Response {
         k7d::control::Client::connect(self.socket.to_str().expect("utf-8 socket path"))
             .expect("connect the control socket")
@@ -3070,4 +3296,866 @@ fn workspace_path(relative: &str) -> String {
         .join(relative);
     assert!(path.exists(), "the minimal guest is not built: {path:?}");
     path.to_string_lossy().into_owned()
+}
+
+/// Thread comm names of `pid` that are the dilation loop.
+///
+/// The loop's thread is named `k7d-dilate` (under Linux's 15-character
+/// comm limit). `tree_drop` joins it before returning, so the name is
+/// gone once that call comes back.
+fn dilate_threads(pid: u32) -> Vec<String> {
+    let mut found = Vec::new();
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap_or_else(|e| panic!("reading /proc/{pid}/task: {e}"));
+    for ent in tasks.flatten() {
+        let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
+        let comm = comm.trim();
+        if comm == "k7d-dilate" {
+            found.push(comm.to_string());
+        }
+    }
+    found
+}
+
+fn connect_cid(daemon: &DilationDaemon, cid: u64, whose: &str) -> AgentClient {
+    AgentClient::connect_vsock(cid, BOOT_TO_AGENT_CEILING).unwrap_or_else(|e| {
+        let serial = match daemon.call(&Request::DumpSerial {
+            vm_id: None,
+            guest_cid: Some(cid),
+        }) {
+            Response::SerialDump { console, .. } => console,
+            other => format!("{other:?}"),
+        };
+        panic!(
+            "{whose}: no agent on cid {cid} within {BOOT_TO_AGENT_CEILING:?}: {e}\n--- serial ---\n{serial}"
+        )
+    })
+}
+
+#[derive(Debug)]
+struct NodePolicyView {
+    live: u32,
+    mode: DilationPolicyMode,
+    trajectory: Vec<u32>,
+}
+
+fn root_policy(daemon: &DilationDaemon, tree_id: &str) -> NodePolicyView {
+    match daemon.call(&Request::TreeNodes {
+        tree_id: tree_id.to_string(),
+    }) {
+        Response::TreeNodeList {
+            live_dilation,
+            dilation_policy,
+            dilation_trajectory,
+            ..
+        } => NodePolicyView {
+            live: live_dilation
+                .get("root")
+                .copied()
+                .unwrap_or_else(|| panic!("root has no live dilation: {live_dilation:?}")),
+            mode: dilation_policy
+                .get("root")
+                .copied()
+                .unwrap_or_else(|| panic!("root has no dilation policy: {dilation_policy:?}")),
+            trajectory: dilation_trajectory.get("root").cloned().unwrap_or_default(),
+        },
+        other => panic!("unexpected tree_nodes: {other:?}"),
+    }
+}
+
+/// Forks copy the source mode unless the request sets one, and
+/// `tree_drop` joins the loop before it returns.
+#[test]
+fn test_dilation_policy_loop_inherits_and_stops() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    require_patched_host();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let daemon = DilationDaemon::spawn("dilinh");
+    let tree_id = "dilinh".to_string();
+    match daemon.call(&Request::TreeCreateCluster {
+        vm_count: 1,
+        config: VmConfig {
+            kernel: Some(workspace_path("guest/kernel/vmlinux")),
+            initrd: Some(workspace_path("guest/rootfs/initramfs.cpio.gz")),
+            dilation: Some(RATE_N),
+            ..VmConfig::default()
+        },
+        budget: None,
+        tree_id: Some(tree_id.clone()),
+        egress: None,
+        dilation_policy: Some(DilationPolicyMode::Track),
+        dilation_config: None,
+        ksm: false,
+    }) {
+        Response::TreeCreated { .. } => {}
+        other => panic!("unexpected tree_create_cluster: {other:?}"),
+    }
+
+    let root = root_policy(&daemon, &tree_id);
+    assert_eq!(root.mode, DilationPolicyMode::Track);
+    assert_eq!(
+        root.trajectory.first().copied(),
+        Some(RATE_N),
+        "the loop must record the factor it armed at, got {:?}",
+        root.trajectory
+    );
+    assert!(
+        !dilate_threads(daemon.pid()).is_empty(),
+        "track should have started k7d-dilate"
+    );
+
+    let (inherited, inherited_factor) = match daemon.call(&Request::TreeFork {
+        tree_id: tree_id.clone(),
+        source_id: "root".to_string(),
+        label: "inherit".to_string(),
+        dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
+    }) {
+        Response::TreeForked {
+            node_id, dilation, ..
+        } => (node_id, dilation),
+        other => panic!("unexpected inherit fork: {other:?}"),
+    };
+    let fixed = match daemon.call(&Request::TreeFork {
+        tree_id: tree_id.clone(),
+        source_id: "root".to_string(),
+        label: "fixed".to_string(),
+        dilation: None,
+        dilation_policy: Some(DilationPolicyMode::Fixed),
+        dilation_config: None,
+    }) {
+        Response::TreeForked { node_id, .. } => node_id,
+        other => panic!("unexpected fixed fork: {other:?}"),
+    };
+
+    match daemon.call(&Request::TreeNodes {
+        tree_id: tree_id.clone(),
+    }) {
+        Response::TreeNodeList {
+            dilation_policy,
+            dilation_trajectory,
+            ..
+        } => {
+            assert_eq!(
+                dilation_policy.get(&inherited).copied(),
+                Some(DilationPolicyMode::Track),
+                "a fork that omits dilation_policy inherits the source: {dilation_policy:?}"
+            );
+            assert_eq!(
+                dilation_policy.get(&fixed).copied(),
+                Some(DilationPolicyMode::Fixed),
+                "an explicit fixed override replaces the inherited mode: {dilation_policy:?}"
+            );
+            assert!(
+                dilation_trajectory.get(&fixed).is_none(),
+                "fixed does not record a trajectory: {dilation_trajectory:?}"
+            );
+            assert_eq!(
+                dilation_trajectory
+                    .get(&inherited)
+                    .and_then(|t| t.first().copied()),
+                Some(inherited_factor),
+                "the inherited loop starts at the child's factor: {dilation_trajectory:?}"
+            );
+        }
+        other => panic!("unexpected tree_nodes: {other:?}"),
+    }
+
+    assert!(matches!(
+        daemon.call(&Request::TreeDrop {
+            tree_id: tree_id.clone(),
+        }),
+        Response::Ok
+    ));
+    assert!(
+        dilate_threads(daemon.pid()).is_empty(),
+        "tree_drop must join k7d-dilate before it returns"
+    );
+    assert!(
+        matches!(daemon.call(&Request::Ping), Response::Pong { .. }),
+        "the daemon must still answer after the loop is joined"
+    );
+}
+
+fn minimal_guest(factor: u32) -> VmConfig {
+    VmConfig {
+        kernel: Some(workspace_path("guest/kernel/vmlinux")),
+        initrd: Some(workspace_path("guest/rootfs/initramfs.cpio.gz")),
+        dilation: Some(factor),
+        ..VmConfig::default()
+    }
+}
+
+fn custom_ladder() -> k7d::dilation::DilationPolicyConfig {
+    k7d::dilation::DilationPolicyConfig {
+        window: Some(1),
+        ladder: Some(vec![4, 1]),
+        ..k7d::dilation::DilationPolicyConfig::default()
+    }
+}
+
+fn node_policy(daemon: &DilationDaemon, tree_id: &str, node_id: &str) -> NodePolicyView {
+    match daemon.call(&Request::TreeNodes {
+        tree_id: tree_id.to_string(),
+    }) {
+        Response::TreeNodeList {
+            live_dilation,
+            dilation_policy,
+            dilation_trajectory,
+            ..
+        } => NodePolicyView {
+            live: live_dilation
+                .get(node_id)
+                .copied()
+                .unwrap_or_else(|| panic!("{node_id} has no live dilation: {live_dilation:?}")),
+            mode: dilation_policy
+                .get(node_id)
+                .copied()
+                .unwrap_or_else(|| panic!("{node_id} has no dilation policy: {dilation_policy:?}")),
+            trajectory: dilation_trajectory
+                .get(node_id)
+                .cloned()
+                .unwrap_or_default(),
+        },
+        other => panic!("unexpected tree_nodes: {other:?}"),
+    }
+}
+
+/// Spin one vCPU. The shell backgrounds the loop so the exec returns.
+fn start_minimal_burner(cid: u64, whose: &str) {
+    let mut agent = AgentClient::connect_vsock(cid, BOOT_TO_AGENT_CEILING)
+        .unwrap_or_else(|e| panic!("{whose}: agent on cid {cid}: {e}"));
+    let out = agent
+        .exec(&[
+            "sh",
+            "-c",
+            "while true; do :; done >/dev/null 2>&1 & echo burned",
+        ])
+        .unwrap_or_else(|e| panic!("{whose}: burner exec: {e}"));
+    assert_eq!(
+        out.exit_code, 0,
+        "{whose}: burner exited {}\n{}",
+        out.exit_code, out.stderr
+    );
+}
+
+/// `window: 1` and ladder `[4, 1]` walk 4 → 1 and never visit 8 or 2.
+/// `fixed` with the same struct stays put and starts no thread.
+///
+/// The loop samples as soon as it is armed, and that sample sees the
+/// vCPU still `RUNNING` after the snapshot resume (the reason
+/// [`k7d::dilation::WINDOW`] is 3). A window of 1 therefore spends the
+/// rung before this test can fork. A child of the `[4, 1]` tree starts
+/// at 1, which is also on the default ladder, so it cannot prove which
+/// ladder it inherited. The inherit tree uses `[4, 3]`: 3 is not a
+/// default rung, a fork that omits the struct must come up at 3, and a
+/// fork whose ladder is `[4, 1]` is refused before it boots.
+#[test]
+fn test_dilation_policy_knobs_custom_ladder() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    require_patched_host();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let daemon = DilationDaemon::spawn("dilknob");
+
+    // fixed stores the knobs and does not sample.
+    let fixed_id = "knob-fixed".to_string();
+    match daemon.call(&Request::TreeCreate {
+        config: minimal_guest(4),
+        budget: None,
+        tree_id: Some(fixed_id.clone()),
+        dilation_policy: Some(DilationPolicyMode::Fixed),
+        dilation_config: Some(custom_ladder()),
+    }) {
+        Response::TreeCreated { .. } => {}
+        other => panic!("fixed with custom knobs must boot, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let fixed = node_policy(&daemon, &fixed_id, "root");
+    assert_eq!(fixed.mode, DilationPolicyMode::Fixed);
+    assert_eq!(fixed.live, 4, "fixed must not move the factor");
+    assert!(
+        fixed.trajectory.is_empty(),
+        "fixed records no trajectory: {:?}",
+        fixed.trajectory
+    );
+    assert!(
+        dilate_threads(daemon.pid()).is_empty(),
+        "fixed must not start k7d-dilate"
+    );
+    assert!(matches!(
+        daemon.call(&Request::TreeDrop { tree_id: fixed_id }),
+        Response::Ok
+    ));
+
+    let tree_id = "knob-down".to_string();
+    let root_cid = match daemon.call(&Request::TreeCreate {
+        config: minimal_guest(4),
+        budget: None,
+        tree_id: Some(tree_id.clone()),
+        dilation_policy: Some(DilationPolicyMode::Down),
+        dilation_config: Some(custom_ladder()),
+    }) {
+        Response::TreeCreated { guest_cids, .. } => guest_cids[0],
+        other => panic!("down with a custom ladder must boot, got {other:?}"),
+    };
+    start_minimal_burner(root_cid, "root");
+    let root = wait_for_trajectory(&daemon, &tree_id, "root", &[4, 1]);
+    assert!(
+        root.trajectory.iter().all(|f| *f == 4 || *f == 1),
+        "root visited a rung outside [4, 1]: {:?}",
+        root.trajectory
+    );
+    assert_eq!(root.mode, DilationPolicyMode::Down);
+    assert_eq!(root.live, 1);
+    refuse_fork_cadence(&daemon, &tree_id);
+    assert!(matches!(
+        daemon.call(&Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
+
+    // 3 is not on the default ladder, so a child at 3 inherited [4, 3].
+    let inherit_tree = "knob-inherit".to_string();
+    let inherit_root = match daemon.call(&Request::TreeCreate {
+        config: minimal_guest(4),
+        budget: None,
+        tree_id: Some(inherit_tree.clone()),
+        dilation_policy: Some(DilationPolicyMode::Down),
+        dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+            window: Some(1),
+            ladder: Some(vec![4, 3]),
+            ..k7d::dilation::DilationPolicyConfig::default()
+        }),
+    }) {
+        Response::TreeCreated { guest_cids, .. } => guest_cids[0],
+        other => panic!("down on [4, 3] must boot, got {other:?}"),
+    };
+    start_minimal_burner(inherit_root, "inherit-root");
+    let parent = wait_for_trajectory(&daemon, &inherit_tree, "root", &[4, 3]);
+    assert!(
+        parent.trajectory.iter().all(|f| *f == 4 || *f == 3),
+        "inherit root visited a rung outside [4, 3]: {:?}",
+        parent.trajectory
+    );
+    assert_eq!(parent.live, 3);
+
+    match daemon.call(&Request::TreeFork {
+        tree_id: inherit_tree.clone(),
+        source_id: "root".to_string(),
+        label: "inherit".to_string(),
+        dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
+    }) {
+        Response::TreeForked {
+            node_id, dilation, ..
+        } => {
+            assert_eq!(dilation, 3, "an omitted config must keep the live rung");
+            let child = node_policy(&daemon, &inherit_tree, &node_id);
+            assert_eq!(child.mode, DilationPolicyMode::Down);
+            assert_eq!(
+                child.live, 3,
+                "the child inherited [4, 3], not the default ladder"
+            );
+            assert!(
+                child.trajectory.iter().all(|f| *f == 4 || *f == 3),
+                "child visited a rung outside [4, 3]: {:?}",
+                child.trajectory
+            );
+        }
+        other => panic!("a fork that omits knobs must inherit, got {other:?}"),
+    }
+    match daemon.call(&Request::TreeFork {
+        tree_id: inherit_tree.clone(),
+        source_id: "root".to_string(),
+        label: "replaced".to_string(),
+        dilation: None,
+        dilation_policy: None,
+        dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+            ladder: Some(vec![4, 1]),
+            ..k7d::dilation::DilationPolicyConfig::default()
+        }),
+    }) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("not on the ladder"),
+                "an override ladder that omits the live factor must be refused, got {message}"
+            );
+        }
+        other => panic!("replacing the ladder with [4, 1] must not boot at 3, got {other:?}"),
+    }
+    refuse_fork_cadence(&daemon, &inherit_tree);
+    match daemon.call(&Request::TreeNodes {
+        tree_id: inherit_tree.clone(),
+    }) {
+        Response::TreeNodeList { nodes, .. } => {
+            let ids: Vec<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+            assert!(
+                ids.iter().any(|id| id.contains("inherit")),
+                "the inheriting fork must exist: {ids:?}"
+            );
+            assert!(
+                !ids.iter()
+                    .any(|id| id.contains("replaced") || id.contains("cadence")),
+                "refused forks must not exist: {ids:?}"
+            );
+        }
+        other => panic!("unexpected tree_nodes: {other:?}"),
+    }
+    assert!(matches!(
+        daemon.call(&Request::TreeDrop {
+            tree_id: inherit_tree,
+        }),
+        Response::Ok
+    ));
+    assert!(
+        dilate_threads(daemon.pid()).is_empty(),
+        "tree_drop must join k7d-dilate"
+    );
+}
+
+fn wait_for_trajectory(
+    daemon: &DilationDaemon,
+    tree_id: &str,
+    node_id: &str,
+    expect: &[u32],
+) -> NodePolicyView {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = node_policy(daemon, tree_id, node_id);
+        if view.trajectory == expect {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{node_id} did not reach {expect:?}, trajectory {:?}",
+            view.trajectory
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn refuse_fork_cadence(daemon: &DilationDaemon, tree_id: &str) {
+    match daemon.call(&Request::TreeFork {
+        tree_id: tree_id.to_string(),
+        source_id: "root".to_string(),
+        label: "cadence".to_string(),
+        dilation: None,
+        dilation_policy: None,
+        dilation_config: Some(k7d::dilation::DilationPolicyConfig {
+            cadence_ms: Some(200),
+            ..k7d::dilation::DilationPolicyConfig::default()
+        }),
+    }) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("cadence"),
+                "a fork cadence must be refused, got {message}"
+            );
+        }
+        other => panic!("a fork that sets cadence_ms must not boot, got {other:?}"),
+    }
+}
+
+/// Full ladder the daemon loop is expected to walk in one 80 s guest
+/// phase per load. One rung per closed window, and a phase is long
+/// enough to finish the ladder.
+const TRACK_WALK: [u32; 7] = [8, 4, 2, 1, 2, 4, 8];
+const DOWN_WALK: [u32; 4] = [8, 4, 2, 1];
+
+struct DaemonArm {
+    mode: DilationPolicyMode,
+    wall_s: f64,
+    guest_s: f64,
+    restarts: u64,
+    elections: u64,
+    not_ready: u64,
+    splats: u64,
+    trajectory: Vec<u32>,
+    sleep_idle: [f64; 2],
+}
+
+/// `CreateVm` config for one Ubuntu node. `index` 0 is the server at
+/// `10.200.0.2`; agents follow. No initrd: `root=/dev/vda` is on the cmdline.
+fn ubuntu_member_config(
+    image: &common::ubuntu::NodeImage,
+    disk: &VmDisk,
+    cluster_id: &str,
+    index: u32,
+    role: &str,
+) -> VmConfig {
+    let server_ip = Ipv4Addr::new(10, 200, 0, 2);
+    let ip = Ipv4Addr::new(10, 200, 0, 2 + index as u8);
+    let spec = format!("{role},{server_ip},{K3S_TOKEN}");
+    VmConfig {
+        kernel: Some(image.kernel().to_string_lossy().into_owned()),
+        initrd: None,
+        cmdline: Some(node_cmdline_with(
+            ip,
+            NodeCmdlineExtra {
+                k3s: Some(&spec),
+                cni: None,
+            },
+        )),
+        memory_mb: NODE_MEMORY_MB,
+        vcpus: NODE_VCPUS,
+        dilation: Some(RATE_N),
+        block_devices: vec![BlockDeviceConfig {
+            host_path: disk.path.to_string_lossy().into_owned(),
+            readonly: false,
+            guest_mount: None,
+            fstype: None,
+        }],
+        network: Some(NetConfig {
+            cluster_id: cluster_id.to_string(),
+            vm_index: Some(index),
+            pod_netns: None,
+        }),
+        ..VmConfig::default()
+    }
+}
+
+/// One Ubuntu bare-VM tree, adopted only after the nodes are Ready, so
+/// boot saturation is not a sample the loop can spend a rung on.
+fn run_daemon_policy_arm(image: &common::ubuntu::NodeImage, mode: DilationPolicyMode) -> DaemonArm {
+    let letter = match mode {
+        DilationPolicyMode::Track => "t",
+        DilationPolicyMode::Down => "d",
+        DilationPolicyMode::Fixed => "f",
+    };
+    let tag = format!("d{letter}{:04x}", std::process::id() as u16);
+    let daemon = DilationDaemon::spawn(&tag);
+    let server_ip = Ipv4Addr::new(10, 200, 0, 2);
+    let names = UbuntuCluster::node_names(server_ip);
+    let disks: Vec<VmDisk> = (0..3)
+        .map(|i| VmDisk::clone_of(&image.base_image(), &format!("{tag}-{i}")))
+        .collect();
+
+    // Server first, then agents — agents must not race TLS bootstrap.
+    let (server_id, server_cid) =
+        daemon.create_vm(ubuntu_member_config(image, &disks[0], &tag, 0, "server"));
+    let mut server = connect_cid(&daemon, server_cid, "server");
+    wait_guest_readyz(&mut server, "server", BOOT_UBUNTU_K3S_CLUSTER_3NODE);
+    let (a1_id, a1_cid) =
+        daemon.create_vm(ubuntu_member_config(image, &disks[1], &tag, 1, "agent"));
+    let (a2_id, a2_cid) =
+        daemon.create_vm(ubuntu_member_config(image, &disks[2], &tag, 2, "agent"));
+    drop(server);
+    // The k7 agent answers before k7d-k3sconfig finishes starting
+    // k3s-agent. Poll; a single is-active races that oneshot.
+    for (cid, whose) in [(a1_cid, "agent-1"), (a2_cid, "agent-2")] {
+        let mut agent = connect_cid(&daemon, cid, whose);
+        let deadline = Instant::now() + BOOT_UBUNTU_K3S_CLUSTER_3NODE;
+        loop {
+            let active = sh_ok(&mut agent, "systemctl is-active k3s-agent.service || true");
+            if active.trim() == "active" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{whose}: k3s-agent stayed {active:?}\n{}",
+                sh_ok(
+                    &mut agent,
+                    "systemctl status k7d-k3s.service k3s-agent.service --no-pager -l || true; \
+                     journalctl -u k7d-k3s -u k3s-agent --no-pager -n 60 || true"
+                )
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    let mut server = connect_cid(&daemon, server_cid, "server");
+    wait_nodes_ready_via_guest(&mut server, &names, BOOT_UBUNTU_K3S_CLUSTER_3NODE);
+    guest_settle(&mut server, &tag);
+    // The probe deployment has to be up before the loop is armed.
+    // Rolling it out while the loop is sampling spends rungs on boot
+    // work, and the idle phase then starts somewhere down the ladder.
+    guest_apply_yaml(
+        &mut server,
+        "dil-probe",
+        &format!(
+            r"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dil-probe
+spec:
+  replicas: 6
+  selector:
+    matchLabels: {{app: dil-probe}}
+  template:
+    metadata:
+      labels: {{app: dil-probe}}
+    spec:
+      containers:
+      - name: p
+        image: {BUSYBOX}
+        imagePullPolicy: IfNotPresent
+        command: ['sh', '-c', 'sleep 3600']
+        livenessProbe:
+          exec:
+            command: ['true']
+          periodSeconds: 10
+"
+        ),
+    );
+    guest_wait_rollout(&mut server, "dil-probe", &tag);
+    drop(server);
+
+    let (tree_id, cids) = match daemon.call(&Request::TreeAdoptCluster {
+        vm_ids: vec![server_id, a1_id, a2_id],
+        budget: None,
+        tree_id: Some(tag.clone()),
+        egress: None,
+        dilation_policy: Some(mode),
+        dilation_config: None,
+        ksm: false,
+    }) {
+        Response::TreeCreated {
+            tree_id,
+            guest_cids,
+            ..
+        } => (tree_id, guest_cids),
+        other => panic!("unexpected tree_adopt_cluster: {other:?}"),
+    };
+    assert_eq!(cids.len(), 3, "adopt must hand back one CID per member");
+
+    // The loop is armed now. A decision needs a closed window, so the
+    // factor is still the boot factor.
+    let armed = root_policy(&daemon, &tree_id);
+    assert_eq!(armed.mode, mode);
+    assert_eq!(armed.live, RATE_N, "adopt must not have moved the factor");
+    match mode {
+        DilationPolicyMode::Fixed => {
+            assert!(
+                armed.trajectory.is_empty(),
+                "fixed records no trajectory: {:?}",
+                armed.trajectory
+            );
+            assert!(
+                dilate_threads(daemon.pid()).is_empty(),
+                "fixed must not start k7d-dilate"
+            );
+        }
+        _ => {
+            assert_eq!(armed.trajectory, vec![RATE_N]);
+            assert!(
+                !dilate_threads(daemon.pid()).is_empty(),
+                "{mode:?} should have started k7d-dilate"
+            );
+        }
+    }
+
+    let mut server = connect_cid(&daemon, cids[0], "server");
+    let restarts_before = guest_total_restarts(&mut server);
+    let elections_before = guest_event_count(&mut server, "LeaderElection");
+    let clock_before = guest_clocks(&mut server, "server");
+    drop(server);
+
+    let t0 = Instant::now();
+    let mut not_ready = 0_u64;
+    let mut sleep_idle = [0.0_f64; 2];
+    for (phase_i, phase) in [LoadPhase::Idle, LoadPhase::Busy, LoadPhase::Idle]
+        .into_iter()
+        .enumerate()
+    {
+        let mut server = connect_cid(&daemon, cids[0], "server");
+        let deadline = guest_clocks(&mut server, "server")[1] + PHASE_GUEST.as_secs_f64();
+        match phase {
+            LoadPhase::Idle => {
+                if phase_i == 2 {
+                    drop(server);
+                    let mut agents = [
+                        connect_cid(&daemon, cids[0], "server"),
+                        connect_cid(&daemon, cids[1], "agent-1"),
+                        connect_cid(&daemon, cids[2], "agent-2"),
+                    ];
+                    for agent in &mut agents {
+                        stop_node_burners(agent);
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    sleep_idle[1] = guest_sleep8(&mut agents[0], &format!("{tag} idle2")).wall;
+                    drop(agents);
+                } else {
+                    sleep_idle[0] = guest_sleep8(&mut server, &format!("{tag} idle1")).wall;
+                    drop(server);
+                }
+            }
+            LoadPhase::Busy => {
+                drop(server);
+                let mut agents = [
+                    connect_cid(&daemon, cids[0], "server"),
+                    connect_cid(&daemon, cids[1], "agent-1"),
+                    connect_cid(&daemon, cids[2], "agent-2"),
+                ];
+                for (agent, who) in agents.iter_mut().zip(["server", "agent-1", "agent-2"]) {
+                    start_node_burners(agent, who);
+                }
+                drop(agents);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        let mut polls = 0_u32;
+        loop {
+            let mut server = connect_cid(&daemon, cids[0], "server");
+            let now = guest_clocks(&mut server, "server");
+            if now[1] >= deadline {
+                drop(server);
+                break;
+            }
+            polls += 1;
+            if polls % READY_EVERY == 0 && !guest_nodes_ready(&mut server, &names) {
+                not_ready += 1;
+            }
+            drop(server);
+            if mode == DilationPolicyMode::Fixed {
+                let view = root_policy(&daemon, &tree_id);
+                assert_eq!(
+                    view.live, RATE_N,
+                    "fixed moved off x{RATE_N} during phase {phase_i}: {view:?}"
+                );
+                assert!(
+                    view.trajectory.is_empty(),
+                    "fixed grew a trajectory during phase {phase_i}: {:?}",
+                    view.trajectory
+                );
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(1800),
+                "{tag}: the guest never reached the end of phase {phase_i}"
+            );
+            std::thread::sleep(EPISODE_SAMPLE);
+        }
+        let mid = root_policy(&daemon, &tree_id);
+        eprintln!(
+            "MEASUREMENT daemon {tag} phase {phase_i}: live x{} traj {:?}",
+            mid.live, mid.trajectory
+        );
+    }
+
+    let wall = t0.elapsed();
+    let mut server = connect_cid(&daemon, cids[0], "server");
+    let clock_after = guest_clocks(&mut server, "server");
+    let restarts = guest_total_restarts(&mut server).saturating_sub(restarts_before);
+    let elections =
+        guest_event_count(&mut server, "LeaderElection").saturating_sub(elections_before);
+    let _ = guest_kubectl(
+        &mut server,
+        &["delete", "deployment", "dil-probe", "--ignore-not-found"],
+    );
+    drop(server);
+    let mut agents = [
+        connect_cid(&daemon, cids[0], "server"),
+        connect_cid(&daemon, cids[1], "agent-1"),
+        connect_cid(&daemon, cids[2], "agent-2"),
+    ];
+    let splats = agents.iter_mut().map(splat_count).sum::<u64>();
+    drop(agents);
+
+    let end = root_policy(&daemon, &tree_id);
+    let guest_s = clock_after[1] - clock_before[1];
+    eprintln!(
+        "MEASUREMENT daemon {} wall {:.1}s guest {:.1}s ({:.2}x) restarts {restarts} \
+         elections {elections} notready {not_ready} splats {splats} traj {:?}",
+        mode.as_str(),
+        wall.as_secs_f64(),
+        guest_s,
+        guest_s / wall.as_secs_f64(),
+        end.trajectory
+    );
+
+    assert!(matches!(
+        daemon.call(&Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
+    assert!(
+        dilate_threads(daemon.pid()).is_empty(),
+        "tree_drop must join k7d-dilate before it returns ({})",
+        mode.as_str()
+    );
+    assert!(matches!(daemon.call(&Request::Ping), Response::Pong { .. }));
+
+    DaemonArm {
+        mode,
+        wall_s: wall.as_secs_f64(),
+        guest_s,
+        restarts,
+        elections,
+        not_ready,
+        splats,
+        trajectory: end.trajectory,
+        sleep_idle,
+    }
+}
+
+/// The daemon loop, not the test, owns the samples. `track` walks
+/// 8→1→8, `down` walks 8→1 and never raises, `fixed` stays at 8.
+/// Restarts, NotReady lapses and leader elections stay at zero.
+#[test]
+fn test_dilation_policy_loop_ubuntu_idle_busy_idle() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    require_patched_host();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+    let image = node_image();
+
+    let mut arms = Vec::new();
+    for mode in [
+        DilationPolicyMode::Fixed,
+        DilationPolicyMode::Down,
+        DilationPolicyMode::Track,
+    ] {
+        arms.push(run_daemon_policy_arm(&image, mode));
+    }
+
+    eprintln!(
+        "\n| mode | wall s | guest s | obs. | rest. | elect. | NotR. | splat | traj | sleep8 idle1 | sleep8 idle2 |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|"
+    );
+    for arm in &arms {
+        eprintln!(
+            "| {} | {:.1} | {:.1} | {:.2}× | {} | {} | {} | {} | {:?} | {:.2}s | {:.2}s |",
+            arm.mode.as_str(),
+            arm.wall_s,
+            arm.guest_s,
+            arm.guest_s / arm.wall_s,
+            arm.restarts,
+            arm.elections,
+            arm.not_ready,
+            arm.splats,
+            arm.trajectory,
+            arm.sleep_idle[0],
+            arm.sleep_idle[1],
+        );
+    }
+
+    for arm in &arms {
+        assert_eq!(arm.restarts, 0, "{} restarted pods", arm.mode.as_str());
+        assert_eq!(
+            arm.elections,
+            0,
+            "{} had a leader election",
+            arm.mode.as_str()
+        );
+        assert_eq!(
+            arm.not_ready,
+            0,
+            "{} had a NotReady lapse",
+            arm.mode.as_str()
+        );
+        assert_eq!(arm.splats, 0, "{} had a dmesg splat", arm.mode.as_str());
+        match arm.mode {
+            DilationPolicyMode::Fixed => assert!(
+                arm.trajectory.is_empty(),
+                "fixed changed factor: {:?}",
+                arm.trajectory
+            ),
+            DilationPolicyMode::Down => {
+                assert_eq!(arm.trajectory, DOWN_WALK, "down must walk 8→1 and stop")
+            }
+            DilationPolicyMode::Track => {
+                assert_eq!(arm.trajectory, TRACK_WALK, "track must walk 8→1→8")
+            }
+        }
+    }
 }

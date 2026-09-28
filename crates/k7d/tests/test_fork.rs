@@ -493,16 +493,32 @@ fn test_fork_requeues_interrupted_injection() {
         .fork_source_base_path()
         .expect("fork source prepared")
         .to_path_buf();
-    source.pause().expect("pause source");
-    let dirty = source.get_and_accumulate_dirty().unwrap().to_vec();
-    let mut state = k7d::snapshot::capture_vm_state(&source).expect("capture state");
+    // KVM only stages an external interrupt when the guest can take one
+    // (RFLAGS.IF set, no STI/MOV-SS shadow), so forcing one onto any
+    // other capture is a state KVM never produces. VMX refuses to enter
+    // it (exit 0x80000021, SDM 26.3.1.5); SVM injects it anyway (#97).
+    // Capture again until the guest is interruptible.
+    // kvm_vcpu_events layout: interrupt.injected at byte 8, nr at 9, shadow at 11.
+    let (dirty, mut state) = (0..200)
+        .find_map(|_| {
+            source.pause().expect("pause source");
+            let dirty = source.get_and_accumulate_dirty().unwrap().to_vec();
+            let state = k7d::snapshot::capture_vm_state(&source).expect("capture state");
+            let events = state.cpus[0]
+                .vcpu_events
+                .as_ref()
+                .expect("capture records vcpu_events");
+            if state.cpus[0].regs.rflags & 0x200 != 0 && events.data[11] == 0 {
+                return Some((dirty, state));
+            }
+            source.resume().expect("resume source");
+            std::thread::sleep(Duration::from_millis(5));
+            None
+        })
+        .expect("vCPU 0 was never interruptible across 200 captures");
     let src_mem = source.mem_host_addr();
 
-    // kvm_vcpu_events layout: interrupt.injected at byte 8, nr at byte 9.
-    let events = state.cpus[0]
-        .vcpu_events
-        .as_mut()
-        .expect("capture records vcpu_events");
+    let events = state.cpus[0].vcpu_events.as_mut().unwrap();
     events.data[8] = 1;
     events.data[9] = 0x35;
 

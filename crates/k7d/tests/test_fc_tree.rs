@@ -210,6 +210,8 @@ fn create_tree(guard: &DaemonGuard, tag: &str) -> (String, AgentEndpoint) {
             config,
             budget: Some(budget()),
             tree_id: Some(common::unique_name(&format!("fct-{tag}"))),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -319,6 +321,8 @@ fn fork_batch(
             source_id: source.to_string(),
             labels: labels.iter().map(ToString::to_string).collect(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForkBatch {
@@ -382,6 +386,7 @@ fn prepare(guard: &DaemonGuard, tree_id: &str, node: &str) -> (bool, u64, Durati
         &Request::TreePrepareForkSource {
             tree_id: tree_id.to_string(),
             node_id: node.to_string(),
+            refresh: false,
         },
     ) {
         Response::TreePrepared {
@@ -784,6 +789,8 @@ fn test_fc_tree_refuses_suspend_and_dilation() {
             source_id: "root".to_string(),
             label: "slow".to_string(),
             dilation: Some(4),
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::Error { message } => assert!(

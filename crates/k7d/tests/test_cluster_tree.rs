@@ -24,18 +24,26 @@ fn workspace_path(relative: &str) -> PathBuf {
 }
 
 fn build_cluster(label: &str, n: usize) -> ClusterPayload {
+    build_cluster_sized(label, n, 256)
+}
+
+fn build_cluster_sized(label: &str, n: usize, memory_mb: u64) -> ClusterPayload {
+    build_cluster_sizes(label, &vec![memory_mb; n])
+}
+
+fn build_cluster_sizes(label: &str, sizes_mb: &[u64]) -> ClusterPayload {
     // Test-setup hygiene: see k7d::network::cleanup_stale_k7_bridges.
     let _ = k7d::network::cleanup_stale_k7_bridges();
     let kernel = workspace_path("guest/kernel/vmlinux");
     let initrd = workspace_path("guest/rootfs/initramfs.cpio.gz");
     let mut net = ClusterNetwork::create(label).expect("bridge");
-    let mut members: Vec<Guest> = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut members: Vec<Guest> = Vec::with_capacity(sizes_mb.len());
+    for &memory_mb in sizes_mb {
         let tap = net.add_tap().expect("tap");
         let mut vm = Vm::builder()
             .kernel(&kernel)
             .initrd(&initrd)
-            .memory_mb(256)
+            .memory_mb(memory_mb)
             .vsock(true)
             .guest_cid(k7d::vsock::allocate_cid())
             .network(tap)
@@ -51,6 +59,340 @@ fn build_cluster(label: &str, n: usize) -> ClusterPayload {
         network: net,
         members,
     }
+}
+
+/// The root keyframe is one coordinated cut: every member is paused
+/// before any dump starts and stays paused until every dump is done,
+/// and the dumps overlap — the longest per-member pause is well under
+/// what writing the same keyframes one member at a time costs.
+///
+/// The sequential baseline is each member's own `Vm::snapshot` (pause,
+/// dump, resume) — the dump half of the old per-member prepare loop,
+/// without its restore-swap, so it understates the old freeze.
+#[test]
+fn test_cluster_tree_root_keyframe_is_one_cut() {
+    const N: usize = 3;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut root = build_cluster_sized("ct-cut-root", N, 1024);
+    for (i, vm) in root.members.iter_mut().enumerate() {
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        agent
+            .exec(&["sh", "-c", &format!("echo member-{i} > /tmp/who")])
+            .expect("write marker");
+    }
+
+    // Two sequential passes; the first also faults in guest RAM, so
+    // keep the faster of the two per member.
+    let seq_dir = tempfile::tempdir().expect("seq tempdir");
+    let mut seq = [u64::MAX; N];
+    for pass in 0..2 {
+        for (i, vm) in root.members.iter_mut().enumerate() {
+            let dir = seq_dir.path().join(format!("{pass}-{i}"));
+            let t = Instant::now();
+            vm.as_native_mut()
+                .unwrap()
+                .snapshot(&dir)
+                .expect("sequential snapshot");
+            seq[i] = seq[i].min(u64::try_from(t.elapsed().as_nanos()).unwrap());
+            std::fs::remove_dir_all(&dir).expect("rm seq keyframe");
+        }
+    }
+    let seq_sum: u64 = seq.iter().sum();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let budget = TreeBudget {
+        max_live_ram_bytes: 8 * 1024 * 1024 * 1024,
+        ..cluster_tree_budget()
+    };
+    let (mut tree, root_id) =
+        ClusterSnapshotTree::new_cluster(root, dir.path().to_path_buf(), budget)
+            .expect("new_cluster");
+    let cut = tree
+        .root_cut()
+        .expect("native root records its cut")
+        .clone();
+    let dumps: Vec<u64> = cut.members.iter().map(|m| m.dump_ns()).collect();
+    eprintln!(
+        "cluster cut ({N} × 1024 MB): pause_ns {:?} max {} | parallel dump_ns {dumps:?} | \
+         sequential snapshot_ns {seq:?} sum {seq_sum}",
+        cut.pause_ns(),
+        cut.max_pause_ns()
+    );
+
+    assert_eq!(cut.members.len(), N);
+    assert!(
+        cut.is_consistent(),
+        "every dump must run while every member is paused: {cut:?}"
+    );
+    assert!(cut.pause_ns().iter().all(|&p| p > 0), "{cut:?}");
+    // Ideal is about (dump + swap) / (3 × dump) ≈ ½; a serialized
+    // cut would be ≥ 1.
+    assert!(
+        cut.max_pause_ns() * 3 < seq_sum * 2,
+        "dumps did not overlap: max pause {} ns vs sequential sum {seq_sum} ns",
+        cut.max_pause_ns()
+    );
+
+    // Each member was swapped onto its own keyframe, not a neighbour's.
+    for (i, vm) in tree
+        .get_payload_mut(&root_id)
+        .expect("root payload")
+        .members
+        .iter_mut()
+        .enumerate()
+    {
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        let who = agent.exec(&["cat", "/tmp/who"]).expect("read marker");
+        assert_eq!(who.stdout.trim(), format!("member-{i}"));
+    }
+
+    tree.prune(&root_id).expect("prune");
+}
+
+/// Host `MemAvailable` in MiB.
+fn host_mem_available_mb() -> u64 {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read /proc/meminfo");
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|r| r.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("MemAvailable in /proc/meminfo");
+    kib / 1024
+}
+
+/// The pause of a pre-copied cut does not grow with guest RAM.
+/// One member is as big as the node allows (≤ 48 GiB) with
+/// most of its RAM touched and a writer dirtying memory throughout; the
+/// other is small. The cut must stay one consistent instant, pause the
+/// big member far less than its own full paused dump takes, keep the
+/// writer's pre-cut data, and fork correctly.
+#[test]
+fn test_cluster_tree_root_keyframe_precopy_large() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Half of what the host has free: the guest's memfd and the live
+    // phase's dirty page cache peak together; after the swap the member
+    // runs on reclaimable page cache of its keyframe.
+    let big_mb = (host_mem_available_mb() / 2 / 1024 * 1024).min(48 * 1024);
+    assert!(
+        big_mb >= 8 * 1024,
+        "node has too little free RAM for a large member: {big_mb} MiB"
+    );
+    let fill_mb = big_mb * 3 / 4;
+    eprintln!("precopy_large: booting a {big_mb} MiB member");
+    let root = build_cluster_sizes("ct-precopy", &[big_mb, 512]);
+    eprintln!("precopy_large: booted");
+
+    let mut root = root;
+    let precious_md5 = {
+        let mut agent = root.members[0]
+            .connect_agent(Duration::from_secs(30))
+            .expect("agent");
+        let t = Instant::now();
+        let mut sh = |cmd: &str| {
+            let out = agent.exec(&["sh", "-c", cmd]).expect("exec");
+            assert_eq!(out.exit_code, 0, "{cmd}: {}", out.stderr);
+            out
+        };
+        sh("mount -o remount,size=90% /tmp");
+        // One GiB per exec: a single exec is bounded by the agent's reply
+        // timeout.
+        for gib in 0..fill_mb / 1024 {
+            eprintln!("precopy_large: fill GiB {gib} at {:?}", t.elapsed());
+            sh(&format!(
+                "dd if=/dev/zero of=/tmp/fill.{gib} bs=1M count=1024 2>/dev/null"
+            ));
+        }
+        let out = sh(
+            "dd if=/dev/urandom of=/tmp/precious bs=1M count=64 2>/dev/null && \
+             md5sum /tmp/precious",
+        );
+        eprintln!(
+            "filled {fill_mb} MiB of a {big_mb} MiB guest in {:?}",
+            t.elapsed()
+        );
+        agent
+            .exec(&[
+                "sh",
+                "-c",
+                "i=0; while true; do i=$((i+1)); echo $i > /tmp/tick; \
+                 dd if=/dev/urandom of=/tmp/churn bs=1M count=32 2>/dev/null; done \
+                 </dev/null >/dev/null 2>&1 & echo started",
+            ])
+            .expect("start writer");
+        out.stdout.trim().to_string()
+    };
+    for (i, vm) in root.members.iter_mut().enumerate() {
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        agent
+            .exec(&["sh", "-c", &format!("echo member-{i} > /tmp/who")])
+            .expect("write marker");
+    }
+
+    // The daemon's tree root: child keyframes `FICLONE` their ancestor.
+    let dir = common::ReflinkTreeRoot::new("ct-precopy");
+    let big = big_mb * 1024 * 1024;
+    let budget = TreeBudget {
+        max_live_vms: 6,
+        max_live_ram_bytes: 4 * big,
+        max_disk_bytes: 4 * big,
+        max_chain_depth: 2,
+    };
+    let t = Instant::now();
+    let (mut tree, root_id) =
+        ClusterSnapshotTree::new_cluster(root, dir.path().to_path_buf(), budget)
+            .expect("new_cluster");
+    let prepare = t.elapsed();
+    let cut = tree
+        .root_cut()
+        .expect("native root records its cut")
+        .clone();
+    let m = cut.members[0];
+
+    let read = |tree: &mut ClusterSnapshotTree, id: &String, i: usize, cmd: &str| -> String {
+        let vm = &mut tree.get_payload_mut(id).expect("payload").members[i];
+        let mut agent = vm.connect_agent(Duration::from_secs(30)).expect("agent");
+        let out = agent.exec(&["sh", "-c", cmd]).expect("exec");
+        assert_eq!(out.exit_code, 0, "{cmd}: {}", out.stderr);
+        out.stdout.trim().to_string()
+    };
+    for i in 0..2 {
+        assert_eq!(
+            read(&mut tree, &root_id, i, "cat /tmp/who"),
+            format!("member-{i}")
+        );
+    }
+    assert_eq!(
+        read(&mut tree, &root_id, 0, "md5sum /tmp/precious"),
+        precious_md5,
+        "pre-cut data changed across the swap"
+    );
+    let tick0: u64 = read(&mut tree, &root_id, 0, "cat /tmp/tick")
+        .parse()
+        .expect("tick");
+    std::thread::sleep(Duration::from_secs(3));
+    let tick1: u64 = read(&mut tree, &root_id, 0, "cat /tmp/tick")
+        .parse()
+        .expect("tick");
+
+    let child = tree.fork(&root_id, "child").expect("fork");
+    assert_eq!(
+        read(&mut tree, &child, 0, "md5sum /tmp/precious"),
+        precious_md5,
+        "fork of the pre-copied keyframe lost pre-cut data"
+    );
+    assert_eq!(read(&mut tree, &child, 1, "cat /tmp/who"), "member-1");
+
+    // A child keyframe: incremental over the root's, pre-copied too. The
+    // root's writer runs on in the child (its RAM was forked).
+    let child_md5 = read(
+        &mut tree,
+        &child,
+        0,
+        "dd if=/dev/urandom of=/tmp/child bs=1M count=256 2>/dev/null && md5sum /tmp/child",
+    );
+    let t = Instant::now();
+    let outcome = tree.prepare_fork_source(&child).expect("child keyframe");
+    let child_prepare = t.elapsed();
+    let ccut = tree.last_child_cut().expect("child cut").clone();
+    let grand = tree.fork(&child, "grand").expect("fork of child");
+    assert_eq!(
+        read(&mut tree, &grand, 0, "md5sum /tmp/child"),
+        child_md5,
+        "fork of the pre-copied child keyframe lost pre-cut data"
+    );
+    assert_eq!(
+        read(&mut tree, &grand, 0, "md5sum /tmp/precious"),
+        precious_md5
+    );
+    assert_eq!(read(&mut tree, &grand, 1, "cat /tmp/who"), "member-1");
+
+    // Baseline: the same member's full paused dump, after the cut so its
+    // read faults could not fill the memfd holes pass 0 skips.
+    let seq_dir = tempfile::tempdir().expect("baseline tempdir");
+    let t = Instant::now();
+    tree.get_payload_mut(&root_id)
+        .expect("root payload")
+        .members[0]
+        .as_native_mut()
+        .unwrap()
+        .snapshot(seq_dir.path())
+        .expect("full snapshot");
+    let full_ns = u64::try_from(t.elapsed().as_nanos()).unwrap();
+    drop(seq_dir);
+
+    eprintln!(
+        "MEASUREMENT precopy cut ({big_mb} MiB + 512 MiB, {fill_mb} MiB touched): \
+         max pause {:.3} s, big member pause {:.3} s (paused write {:.3} s, {} MiB), \
+         live {} MiB, arm stop {:.3} s, prepare wall {prepare:?} | full paused dump {:.3} s",
+        cut.max_pause_ns() as f64 / 1e9,
+        m.pause_ns() as f64 / 1e9,
+        m.dump_ns() as f64 / 1e9,
+        m.final_bytes >> 20,
+        m.precopied_bytes >> 20,
+        m.arm_pause_ns as f64 / 1e9,
+        full_ns as f64 / 1e9,
+    );
+    eprintln!(
+        "MEASUREMENT precopy child cut: max pause {:.3} s, live MiB {:?}, paused MiB {:?}, \
+         disk MiB {:?}, prepare wall {child_prepare:?}",
+        ccut.max_pause_ns() as f64 / 1e9,
+        ccut.members
+            .iter()
+            .map(|c| c.precopied_bytes >> 20)
+            .collect::<Vec<_>>(),
+        ccut.members
+            .iter()
+            .map(|c| c.final_bytes >> 20)
+            .collect::<Vec<_>>(),
+        ccut.members
+            .iter()
+            .map(|c| c.disk_bytes >> 20)
+            .collect::<Vec<_>>(),
+    );
+    assert!(cut.is_consistent(), "not one cut: {cut:?}");
+    assert!(cut.members.iter().all(|c| c.precopied()), "{cut:?}");
+    assert!(
+        m.precopied_bytes >= fill_mb << 20,
+        "pass 0 did not carry the touched RAM: {m:?}"
+    );
+    assert!(
+        m.final_bytes * 8 < m.precopied_bytes,
+        "the paused residual is not small next to the live copy: {m:?}"
+    );
+    assert!(
+        cut.max_pause_ns() * 5 < full_ns,
+        "pause {} ns is not far below the full dump {full_ns} ns",
+        cut.max_pause_ns()
+    );
+    assert!(
+        m.arm_pause_ns * 5 < full_ns,
+        "arm stop {} ns is not far below the full dump {full_ns} ns",
+        m.arm_pause_ns
+    );
+    assert!(
+        tick1 > tick0,
+        "writer stopped after the cut: {tick0} -> {tick1}"
+    );
+
+    assert!(
+        outcome.incremental,
+        "child keyframe not incremental: {ccut:?}"
+    );
+    assert!(ccut.is_consistent(), "child: not one cut: {ccut:?}");
+    assert!(ccut.members.iter().all(|c| c.precopied()), "{ccut:?}");
+    assert!(
+        ccut.members[0].disk_bytes >= 256 << 20 && ccut.members[0].disk_bytes < big / 4,
+        "child keyframe cost is not its divergence: {ccut:?}"
+    );
+    assert!(
+        ccut.max_pause_ns() * 5 < full_ns,
+        "child pause {} ns is not far below the full dump {full_ns} ns",
+        ccut.max_pause_ns()
+    );
+
+    tree.prune(&root_id).expect("prune");
 }
 
 /// Like [`build_cluster`] but every member gets a **read-write** block

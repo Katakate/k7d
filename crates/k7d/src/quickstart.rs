@@ -131,11 +131,14 @@ pub fn run_busybox_demo(
 
     let t0 = Instant::now();
     let created = client.call(&Request::TreeCreateCluster {
+        ksm: false,
         vm_count: 3,
         config,
         budget: Some(quickstart_budget()),
         tree_id: Some(tree_id.to_string()),
         egress: None,
+        dilation_policy: None,
+        dilation_config: None,
     })?;
     let create_ms = elapsed_ms(t0);
     let (root_id, guest_cids) = parse_created(created)?;
@@ -154,6 +157,8 @@ pub fn run_busybox_demo(
         source_id: root_id.clone(),
         labels,
         dilation: None,
+        dilation_policy: None,
+        dilation_config: None,
     })?;
     let fork_ms = elapsed_ms(t1);
     let (forks, fork_daemon_ms) = parse_batch(batch, branches, tree_id, client)?;

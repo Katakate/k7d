@@ -24,14 +24,15 @@
 //!     ├── {node_id}/
 //!     │   ├── kind                     # literal "cluster"
 //!     │   ├── cluster.json             # bridge topology (subnet + per-VM tuple)
-//!     │   └── members/
-//!     │       ├── 0/                   # full snapshot (checkpoints) or delta only
-//!     │       │   ├── memory.bin       # checkpoint nodes only
-//!     │       │   ├── delta.pack
-//!     │       │   ├── vm_state.json
-//!     │       │   ├── cpu.json / devices.json / irqchip.json / metadata.json
-//!     │       ├── 1/ …
-//!     │       └── 2/ …
+//!     │   ├── members/
+//!     │   │   ├── 0/                   # first keyframe, or a delta only
+//!     │   │   │   ├── memory.bin       # checkpoint nodes only
+//!     │   │   │   ├── delta.pack
+//!     │   │   │   ├── vm_state.json
+//!     │   │   │   ├── cpu.json / devices.json / irqchip.json / metadata.json
+//!     │   │   ├── 1/ …
+//!     │   │   └── 2/ …
+//!     │   └── gen-<identity>/members/  # a later refresh; the old file stays
 //! ```
 //!
 //! `cluster.json` records the per-VM `(vm_index, guest_ip, guest_mac)`
@@ -59,8 +60,8 @@ use crate::guest::{
 use crate::network::ClusterNetwork;
 use crate::snapshot;
 use crate::tree::{
-    apply_delta, reap_dir_contents, write_delta, AppliedDelta, NodeId, NodeInfo, PrepareOutcome,
-    TreeError,
+    apply_delta, read_pack_identity, reap_dir_contents, write_delta, AppliedDelta, NodeId,
+    NodeInfo, PrepareOutcome, RetainedKeyframe, TreeError,
 };
 use crate::tree_model::{self, NodeState, PayloadKind, TreeBudget, TreeUsage};
 use crate::vm::Vm;
@@ -109,6 +110,45 @@ fn cluster_backend(members: &[Guest]) -> Result<Backend, TreeError> {
         ));
     }
     Ok(backend)
+}
+
+/// Prepare every root member as a warm-fork source under
+/// `root_node_dir/members/{i}/`. Returns the root's disk span and, for
+/// native members, the timeline of their coordinated cut.
+///
+/// Native members are keyframed as one cut (pause all, dump in
+/// parallel, swap); a per-member loop would freeze them one after
+/// another and the keyframes would not be one instant of the cluster.
+fn prepare_root_members(
+    root: &mut ClusterPayload,
+    backend: Backend,
+    root_node_dir: &Path,
+) -> Result<(u64, Option<crate::fork::ClusterCut>), TreeError> {
+    let member_dirs: Vec<PathBuf> = (0..root.members.len())
+        .map(|i| root_node_dir.join("members").join(i.to_string()))
+        .collect();
+    let mut span = 0u64;
+    if backend == Backend::Firecracker {
+        for (vm, member_dir) in root.members.iter_mut().zip(&member_dirs) {
+            fs::create_dir_all(member_dir)?;
+            let report = vm.as_fc_mut()?.prepare_fork_source()?;
+            span = span.saturating_add(report.diff_bytes);
+        }
+        return Ok((span, None));
+    }
+    let mut natives = Vec::with_capacity(root.members.len());
+    for vm in &mut root.members {
+        if !vm.virtiofs_shares().is_empty() {
+            vm.as_native_mut()?.allow_slow_fork();
+        }
+        natives.push(vm.as_native_mut()?);
+    }
+    let no_ancestors = vec![None; natives.len()];
+    let cut = crate::fork::prepare_cluster_fork_source(&mut natives, &member_dirs, &no_ancestors)?;
+    for vm in &root.members {
+        span = span.saturating_add(vm.as_native()?.mem_span());
+    }
+    Ok((span, Some(cut)))
 }
 
 /// On-disk topology record for one cluster node — written into
@@ -180,6 +220,10 @@ struct ClusterTreeDoc {
     created_at_unix: u64,
     budget: TreeBudget,
     nodes: HashMap<NodeId, NodeInfo>,
+    /// Opt-in KSM. Forks inherit it because they are nodes of this
+    /// tree. Legacy `tree.json` files load as off.
+    #[serde(default)]
+    ksm: bool,
 }
 
 /// Snapshot tree of clusters.
@@ -220,6 +264,33 @@ pub struct ClusterSnapshotTree {
     /// Last cluster-fork pause skew (`max − min` pause-completion
     /// timestamps). Native lockstep forks leave this `None`.
     last_pause_skew_ns: Option<u64>,
+    /// `CreateVm` ids `tree_adopt_cluster` pulled out of the daemon
+    /// registry. Empty for `tree_create_cluster`.
+    ///
+    /// The node broker's `O_PATH` pins for these ids stay until the
+    /// live payloads that still reopen those files are gone: `prune`
+    /// of a subtree that includes the root, `tree_drop`, or `Drop`.
+    /// Restore-swap must not release them — it reopens the same caller
+    /// images through `disk.open` / `open_pinned`. A child prune leaves
+    /// the root running, so it leaves the pins too. Tree-created
+    /// `register_disk` auto-entries are not in this list.
+    adopted_vm_ids: Vec<String>,
+    /// Guest RAM of every native member is `MADV_MERGEABLE`. Off by
+    /// default. Inherited by forks (they are nodes of this tree).
+    /// Same-tenant hosts only: KSM merges across every opted-in tree
+    /// on the machine. Sticky for the life of a mapping.
+    ksm: bool,
+    /// Timeline of the root keyframe's coordinated cut. `None` for
+    /// Firecracker roots and for a tree re-opened from disk.
+    root_cut: Option<crate::fork::ClusterCut>,
+    /// Timeline of the latest in-tree (child) keyframe cut.
+    last_child_cut: Option<crate::fork::ClusterCut>,
+    /// Timeline of the last native `prepare_fork_source` (a refresh, or
+    /// an in-tree child's first keyframe). Adoption's cut is
+    /// [`Self::root_cut`].
+    last_prepare_cut: Option<crate::fork::ClusterCut>,
+    /// Per-member pages the last native `fork_batch` memcpy'd.
+    last_fork_copied_pages: Vec<u64>,
 }
 
 impl ClusterSnapshotTree {
@@ -244,6 +315,34 @@ impl ClusterSnapshotTree {
         self.last_pause_skew_ns
     }
 
+    /// How long each root member stayed paused for the root keyframe,
+    /// and whether the dumps formed one cut. `None` for Firecracker
+    /// roots and re-opened trees.
+    #[must_use]
+    pub fn root_cut(&self) -> Option<&crate::fork::ClusterCut> {
+        self.root_cut.as_ref()
+    }
+
+    /// Like [`Self::root_cut`], for the latest native child keyframe.
+    #[must_use]
+    pub fn last_child_cut(&self) -> Option<&crate::fork::ClusterCut> {
+        self.last_child_cut.as_ref()
+    }
+
+    /// Timeline of the last native [`Self::prepare_fork_source_with`].
+    /// `None` until one runs, and for a Firecracker prepare.
+    #[must_use]
+    pub fn prepare_cut(&self) -> Option<&crate::fork::ClusterCut> {
+        self.last_prepare_cut.as_ref()
+    }
+
+    /// Pages each member memcpy'd on the last native [`Self::fork_batch`],
+    /// in `vm_index` order. Empty until a native fork runs.
+    #[must_use]
+    pub fn last_fork_copied_pages(&self) -> &[u64] {
+        &self.last_fork_copied_pages
+    }
+
     /// Put every VM of a live cluster node into the tree's cgroup jail.
     fn jail_payload(&self, node_id: &NodeId) -> Result<(), TreeError> {
         let Some(jail) = &self.jail else {
@@ -264,8 +363,10 @@ impl ClusterSnapshotTree {
 
     /// Create a new cluster snapshot tree rooted at a running cluster.
     ///
-    /// Each member is `Vm::prepare_fork_source_in`'d against
-    /// `nodes/root/members/{i}/`, the bridge topology is written to
+    /// Native members are keyframed together into
+    /// `nodes/root/members/{i}/` by
+    /// [`crate::fork::prepare_cluster_fork_source`] (one coordinated cut,
+    /// see [`Self::root_cut`]), the bridge topology is written to
     /// `nodes/root/cluster.json`, and the root node enters `Live` state
     /// with `kind = Cluster, vm_count = N`.
     pub fn new_cluster(
@@ -310,32 +411,7 @@ impl ClusterSnapshotTree {
 
         let mut root = root;
 
-        // Prepare every member as a warm-fork source.
-        let mut root_span = 0u64;
-        for (i, vm) in root.members.iter_mut().enumerate() {
-            let member_dir = root_node_dir.join("members").join(i.to_string());
-            fs::create_dir_all(&member_dir)?;
-            match vm {
-                Guest::Firecracker(fc) => {
-                    let report = fc
-                        .prepare_fork_source()
-                        .map_err(|e| TreeError::Firecracker(e.to_string()))?;
-                    root_span = root_span.saturating_add(report.diff_bytes);
-                }
-                Guest::Native(_) => {
-                    if !vm.virtiofs_shares().is_empty() {
-                        vm.as_native_mut()?.allow_slow_fork();
-                    }
-                    vm.as_native_mut()?.prepare_fork_source_in(&member_dir)?;
-                }
-            }
-        }
-        if backend == Backend::Native {
-            root_span = 0;
-            for vm in &root.members {
-                root_span = root_span.saturating_add(vm.as_native()?.mem_span());
-            }
-        }
+        let (root_span, root_cut) = prepare_root_members(&mut root, backend, &root_node_dir)?;
 
         // Write cluster.json describing the bridge topology.
         let topology = topology_from_network(&root.network);
@@ -357,6 +433,7 @@ impl ClusterSnapshotTree {
             parked_disk_dirs: Vec::new(),
             base_identity: 1,
             base_disk_bytes: Some(root_span),
+            retained_keyframes: Vec::new(),
         };
 
         let mut nodes = HashMap::new();
@@ -382,10 +459,139 @@ impl ClusterSnapshotTree {
             reflink_root: crate::tree::probe_reflink_root(&root_dir_for_probe),
             jail,
             last_pause_skew_ns: None,
+            adopted_vm_ids: Vec::new(),
+            ksm: false,
+            root_cut,
+            last_child_cut: None,
+            last_prepare_cut: None,
+            last_fork_copied_pages: Vec::new(),
         };
         tree.jail_payload(&root_id)?;
         tree.save_metadata()?;
         Ok((tree, root_id))
+    }
+
+    /// Record the `CreateVm` ids adopted into this tree.
+    ///
+    /// Called after [`Self::new_cluster`] returns, so a failed prepare
+    /// never has ids to release from a half-built tree. Empty for a
+    /// tree created by `tree_create_cluster`.
+    pub(crate) fn set_adopted_vm_ids(&mut self, ids: Vec<String>) {
+        self.adopted_vm_ids = ids;
+    }
+
+    /// Whether this tree marks guest RAM mergeable. Forks inherit it.
+    #[must_use]
+    pub fn ksm_enabled(&self) -> bool {
+        self.ksm
+    }
+
+    /// Turn KSM on for this tree and mark every live native member.
+    ///
+    /// Called once, after [`Self::new_cluster`] has restore-swapped the
+    /// root onto its `MAP_PRIVATE` keyframe, so the advise runs on the
+    /// mapping the guest is actually using and not during that pause.
+    /// Idempotent. Firecracker and virtiofs members fail loudly: their
+    /// RAM is not a private mapping in this process.
+    pub fn enable_ksm(&mut self) -> Result<(), TreeError> {
+        if self.ksm {
+            return Ok(());
+        }
+        for payload in self.live.values() {
+            for vm in &payload.members {
+                if vm.backend() != Backend::Native {
+                    return Err(TreeError::Firecracker(
+                        "ksm applies to native MAP_PRIVATE guest RAM; Firecracker \
+                         memory lives in another process and cannot be marked"
+                            .into(),
+                    ));
+                }
+                if !vm.virtiofs_shares().is_empty() {
+                    return Err(TreeError::InvalidDelta(
+                        "ksm cannot mark MAP_SHARED virtiofs guest RAM (the kernel \
+                         rejects MADV_MERGEABLE on shared mappings)"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        self.ksm = true;
+        let ids: Vec<NodeId> = self.live.keys().cloned().collect();
+        for id in &ids {
+            self.mark_node(id)?;
+        }
+        self.save_metadata()?;
+        Ok(())
+    }
+
+    /// Host `(addr, len)` of each live native member, keyed by node id
+    /// (sorted). Firecracker members are omitted: their RAM is not in
+    /// this process.
+    pub(crate) fn live_ram_ranges(&self) -> Vec<(String, Vec<(u64, u64)>)> {
+        let mut ids: Vec<String> = self.live.keys().cloned().collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let ranges = self
+                    .live
+                    .get(&id)
+                    .map(|payload| {
+                        payload
+                            .members
+                            .iter()
+                            .filter_map(|guest| {
+                                guest
+                                    .as_native()
+                                    .ok()
+                                    .map(|vm| (vm.mem_host_addr(), vm.mem_span()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (id, ranges)
+            })
+            .collect()
+    }
+
+    /// `madvise(MADV_MERGEABLE)` on a live node's guest mappings.
+    /// No-op when the tree did not opt in. Runs after the guest is
+    /// back, so it is not inside the fork pause.
+    fn mark_node(&self, node_id: &NodeId) -> Result<(), TreeError> {
+        if !self.ksm {
+            return Ok(());
+        }
+        let payload = self
+            .live
+            .get(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        self.mark_guests(&payload.members)
+    }
+
+    /// Mark `members`. No-op when the tree did not opt in.
+    fn mark_guests(&self, members: &[Guest]) -> Result<(), TreeError> {
+        if !self.ksm {
+            return Ok(());
+        }
+        for vm in members {
+            vm.as_native()?.advise_memory_mergeable()?;
+        }
+        Ok(())
+    }
+
+    /// Ids whose broker pins this tree still owes, taking them so a
+    /// later `Drop` does not release twice.
+    pub(crate) fn take_adopted_vm_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.adopted_vm_ids)
+    }
+
+    /// `release_vm` each adopted id. The caller has already dropped the
+    /// live payloads that hold those disks open.
+    fn release_adopted_pins(&mut self) -> Vec<String> {
+        let ids = self.take_adopted_vm_ids();
+        for id in &ids {
+            crate::broker::client::release_vm(id);
+        }
+        ids
     }
 
     /// Find a live member VM by guest CID (debug introspection:
@@ -449,7 +655,14 @@ impl ClusterSnapshotTree {
         if !virtiofs {
             if let Ok(ckpt) = self.nearest_checkpoint(source_id) {
                 if ckpt != *source_id {
-                    let dir = self.node_dir(&ckpt);
+                    let identity = self.nodes.get(&ckpt).map_or(0, |n| n.base_identity);
+                    let n = self
+                        .nodes
+                        .get(source_id)
+                        .map_or(0, |info| info.vm_count as usize);
+                    let mems: Vec<PathBuf> = (0..n)
+                        .map(|i| self.member_memory_bin(&ckpt, identity, i))
+                        .collect::<Result<_, _>>()?;
                     let source = self
                         .live
                         .get_mut(source_id)
@@ -458,7 +671,11 @@ impl ClusterSnapshotTree {
                         if vm.as_native()?.fork_source_base_path().is_some() {
                             continue;
                         }
-                        let mem = dir.join("members").join(i.to_string()).join("memory.bin");
+                        let Some(mem) = mems.get(i).cloned() else {
+                            return Err(TreeError::InvalidDelta(format!(
+                                "ensure_forkable({source_id}): member {i} has no keyframe path"
+                            )));
+                        };
                         if !mem.is_file() {
                             return Err(TreeError::InvalidDelta(format!(
                                 "ensure_forkable({source_id}): ancestor '{ckpt}' member {i} \
@@ -484,17 +701,38 @@ impl ClusterSnapshotTree {
     /// Snapshot a live cluster so later forks from it take the warm path
     /// against *this* node's per-member `memory.bin` (dirty set reset).
     ///
+    /// Same as [`Self::prepare_fork_source_with`] with `refresh = false`.
+    pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
+        self.prepare_fork_source_with(node_id, false)
+    }
+
+    /// [`Self::prepare_fork_source`], and when `refresh` is set, re-keyframe
+    /// a node that already has one.
+    ///
     /// Root members are prepared at [`Self::new_cluster`]. In-tree
     /// children inherit an ancestor path at fork and are not
-    /// checkpoints until this runs. Idempotent on `has_base_snapshot` —
-    /// an inherited `fork_source_base_path` is not a keyframe this node
-    /// owns (CHALLENGES.md #59, #182).
+    /// checkpoints until this runs. Without `refresh` the call is
+    /// idempotent on `has_base_snapshot` — an inherited
+    /// `fork_source_base_path` is not a keyframe this node owns
+    /// (CHALLENGES.md #59, #182).
     ///
-    /// A child whose members still map their source's keyframes takes
-    /// the **incremental** path per member — this is the GRPO
-    /// path, where a generation's keyframe would otherwise cost
-    /// `N × guest RAM`.
-    pub fn prepare_fork_source(&mut self, node_id: &NodeId) -> Result<PrepareOutcome, TreeError> {
+    /// `refresh` on a checkpoint writes a **new** generation. The
+    /// ancestor is each member's own current keyframe (the root has no
+    /// `cow_base`; its members are that file plus the dirty bitmap the
+    /// last swap zeroed). The file is
+    /// `nodes/<id>/gen-<identity>/members/<i>/memory.bin`. Live children
+    /// re-open the previous path, so this must not rename over it.
+    ///
+    /// A child whose members still map an ancestor's keyframes, and a
+    /// refresh, both take the incremental cut: pause every member, write
+    /// in parallel, swap in parallel. One member falling back to a full
+    /// dump makes `incremental` false.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_fork_source_with(
+        &mut self,
+        node_id: &NodeId,
+        refresh: bool,
+    ) -> Result<PrepareOutcome, TreeError> {
         self.ensure_live(node_id)?;
         // Firecracker: a point is a file children load, so re-take whenever
         // the guest has dirtied anything — not idempotent on
@@ -502,70 +740,125 @@ impl ClusterSnapshotTree {
         if self.is_fc(node_id) {
             return self.prepare_fork_source_fc(node_id);
         }
-        if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
+        let has_base = self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot);
+        if has_base && !refresh {
             return Ok(PrepareOutcome::already_prepared());
         }
+        let refresh_self = has_base && refresh;
+        // Mint before the write so the new files are named with the
+        // identity we are about to publish. A failed cut does not save
+        // it, so the next attempt reuses the same number.
+        let minted = if refresh_self {
+            Some(self.mint_base_identity())
+        } else {
+            None
+        };
         let node_dir = self.node_dir(node_id);
-        let ancestor_dir = self.cow_base_keyframe_dir(node_id);
-        // Make disk headroom for the per-member keyframes BEFORE writing
-        // them — `usage()` only sees the files after the
-        // fact, so without this the writes silently blow `max_disk_bytes`
-        // until the next auto_evict. On the incremental path the
-        // projection is the members' dirty estimate, not their spans.
-        {
+        let ancestor_dir = if refresh_self {
+            None
+        } else {
+            self.cow_base_keyframe_dir(node_id)
+        };
+        let (out_dirs, ancestors, projected) = {
             let source = self
                 .live
                 .get(node_id)
                 .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-            let projected: u64 = {
-                let mut total = 0u64;
-                for vm in &source.members {
-                    let native = vm.as_native()?;
-                    total = total.saturating_add(if ancestor_dir.is_some() {
-                        native.accumulated_dirty_pages().unwrap_or(0) * 4096
-                    } else {
-                        native.mem_span()
-                    });
-                }
-                total
-            };
-            if projected > 0 {
-                self.evict_disk_for_incoming(projected)?;
+            let mut out_dirs = Vec::with_capacity(source.members.len());
+            let mut ancestors = Vec::with_capacity(source.members.len());
+            let mut projected = 0u64;
+            for (i, vm) in source.members.iter().enumerate() {
+                let native = vm.as_native()?;
+                let out = match minted {
+                    Some(id) => node_dir
+                        .join(format!("gen-{id}"))
+                        .join("members")
+                        .join(i.to_string()),
+                    None => node_dir.join("members").join(i.to_string()),
+                };
+                let ancestor = if refresh_self {
+                    Some(
+                        native
+                            .fork_source_base_path()
+                            .map(Path::to_path_buf)
+                            .ok_or_else(|| {
+                                TreeError::InvalidDelta(format!(
+                            "prepare_fork_source({node_id}): refresh of member {i} but it has no \
+                             keyframe path (an adopted root has no cow_base; the member's own \
+                             memory.bin is the ancestor)"
+                        ))
+                            })?,
+                    )
+                } else {
+                    ancestor_dir
+                        .as_ref()
+                        .map(|d| d.join("members").join(i.to_string()).join("memory.bin"))
+                        .filter(|p| p.is_file())
+                };
+                projected = projected.saturating_add(if ancestor.is_some() {
+                    native.accumulated_dirty_pages().unwrap_or(0) * 4096
+                } else {
+                    native.mem_span()
+                });
+                out_dirs.push(out);
+                ancestors.push(ancestor);
             }
+            (out_dirs, ancestors, projected)
+        };
+        // Make disk headroom BEFORE writing — `usage()` only sees the
+        // files after the fact. On the incremental path the projection
+        // is the dirty estimate, not the whole span.
+        if projected > 0 {
+            self.evict_disk_for_incoming(projected)?;
         }
+        // Copied out before the `live` borrow: the restore-swap below
+        // replaces the mapping, and KSM has to be re-applied to the new
+        // one after the guest is back (not during the pause).
+        let ksm = self.ksm;
         let source = self
             .live
             .get_mut(node_id)
             .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
-        log::info!("cluster_tree: prepare_fork_source({node_id})");
-        // A cluster's keyframe is incremental only if *every* member's
-        // was: one member falling back to a full dump makes the node's
-        // recorded disk cost a mixture, and the wire flag must not claim
-        // more than happened.
-        let mut incremental = ancestor_dir.is_some();
-        let mut disk_bytes: u64 = 0;
-        for (i, vm) in source.members.iter_mut().enumerate() {
-            let member_dir = node_dir.join("members").join(i.to_string());
-            fs::create_dir_all(&member_dir)?;
+        log::info!("cluster_tree: prepare_fork_source({node_id}, refresh={refresh})");
+        for vm in &mut source.members {
             if !vm.virtiofs_shares().is_empty() {
                 vm.as_native_mut()?.allow_slow_fork();
             }
-            let ancestor_mem = ancestor_dir
-                .as_ref()
-                .map(|d| d.join("members").join(i.to_string()).join("memory.bin"))
-                .filter(|p| p.is_file());
-            let native = vm.as_native_mut()?;
-            let prepared = if let Some(ancestor) = &ancestor_mem {
-                native.prepare_fork_source_incremental_in(&member_dir, ancestor)?
-            } else {
-                let span = native.mem_span();
-                crate::vm::PreparedBase::full(native.prepare_fork_source_in(&member_dir)?, span)
-            };
-            incremental &= prepared.incremental;
-            disk_bytes = disk_bytes.saturating_add(prepared.disk_bytes);
         }
-        let identity = self.mint_base_identity();
+        let mut natives = Vec::with_capacity(source.members.len());
+        for vm in &mut source.members {
+            natives.push(vm.as_native_mut()?);
+        }
+        let cut = crate::fork::prepare_cluster_fork_source(&mut natives, &out_dirs, &ancestors)?;
+        drop(natives);
+        // Incremental only if every member's write was. A refresh's
+        // ancestors are the members' own keyframes, so `ancestor_dir`
+        // is empty there and must not veto the flag.
+        let incremental = !cut.members.is_empty() && cut.members.iter().all(|m| m.incremental);
+        let disk_bytes = cut
+            .members
+            .iter()
+            .fold(0u64, |acc, m| acc.saturating_add(m.disk_bytes));
+        self.last_prepare_cut = Some(cut.clone());
+        self.last_child_cut = Some(cut);
+        // The cut's restore-swap replaced the mappings and already
+        // resumed the guests. Re-mark after that, not inside the pause.
+        if ksm {
+            for vm in &source.members {
+                vm.as_native()?.advise_memory_mergeable()?;
+            }
+        }
+        let identity = minted.unwrap_or_else(|| self.mint_base_identity());
         if let Some(info) = self.nodes.get_mut(node_id) {
+            if refresh_self {
+                if let Some(bytes) = info.base_disk_bytes {
+                    let old = info.base_identity;
+                    info.retained_keyframes.push(RetainedKeyframe {
+                        identity: old,
+                        disk_bytes: bytes,
+                    });
+                }
+            }
             info.has_base_snapshot = true;
             info.base_identity = identity;
             info.base_disk_bytes = Some(disk_bytes);
@@ -607,31 +900,261 @@ impl ClusterSnapshotTree {
         })
     }
 
-    /// The node directory whose per-member `memory.bin` files this
-    /// node's live payload maps, if that generation is still current.
-    /// See `SnapshotTree::cow_base_keyframe`.
+    /// Directory of the keyframe generation `node_id`'s live payload
+    /// maps. A refresh leaves the old generation on disk, so this stays
+    /// the recorded identity even after the ancestor re-prepares.
     fn cow_base_keyframe_dir(&self, node_id: &NodeId) -> Option<PathBuf> {
         if !self.reflink_root {
             return None;
         }
         let (ancestor, identity) = self.cow_base.get(node_id)?;
-        if self.nodes.get(ancestor)?.base_identity != *identity {
+        let dir = match self.generation_dir(ancestor, *identity) {
+            Ok(dir) => dir,
+            Err(e) => {
+                log::warn!(
+                    "cluster_tree: node '{node_id}' maps '{ancestor}' generation {identity}, \
+                     but that keyframe is not on disk ({e}) — writing full keyframes"
+                );
+                return None;
+            }
+        };
+        let probe = dir.join("members").join("0").join("memory.bin");
+        if !probe.is_file() {
             log::warn!(
-                "cluster_tree: node '{node_id}' was forked off '{ancestor}' generation \
-                 {identity}, which has since re-prepared — writing full keyframes"
+                "cluster_tree: node '{node_id}' maps '{ancestor}' generation {identity}, \
+                 but {} is missing — writing full keyframes",
+                probe.display()
             );
             return None;
         }
-        Some(self.node_dir(ancestor))
+        Some(dir)
     }
 
-    /// Record that `node_id`'s payload maps `ancestor`'s keyframes.
-    fn record_cow_base(&mut self, node_id: &NodeId, ancestor: &NodeId) {
-        let Some(identity) = self.nodes.get(ancestor).map(|n| n.base_identity) else {
+    /// `gen-<identity>/` when that generation was a refresh, otherwise
+    /// the node's own directory (the first keyframe).
+    ///
+    /// An identity this node never wrote is an error. The node directory
+    /// is only the original keyframe, not a stand-in for a missing one.
+    fn generation_dir(&self, node_id: &NodeId, identity: u64) -> Result<PathBuf, TreeError> {
+        let versioned = self.node_dir(node_id).join(format!("gen-{identity}"));
+        if versioned
+            .join("members")
+            .join("0")
+            .join("memory.bin")
+            .is_file()
+        {
+            return Ok(versioned);
+        }
+        if self.legacy_generation(node_id) == Some(identity) {
+            let legacy = self
+                .node_dir(node_id)
+                .join("members")
+                .join("0")
+                .join("memory.bin");
+            if legacy.is_file() {
+                return Ok(self.node_dir(node_id));
+            }
+        }
+        Err(TreeError::InvalidDelta(format!(
+            "keyframe '{node_id}' generation {identity} has no memory.bin — \
+             a pack names a base generation that is not on disk"
+        )))
+    }
+
+    /// The generation stored under `members/` rather than `gen-<id>/`.
+    fn legacy_generation(&self, node_id: &NodeId) -> Option<u64> {
+        let info = self.nodes.get(node_id)?;
+        let mut found = None;
+        for id in std::iter::once(info.base_identity)
+            .chain(info.retained_keyframes.iter().map(|g| g.identity))
+        {
+            let versioned = self
+                .node_dir(node_id)
+                .join(format!("gen-{id}"))
+                .join("members")
+                .join("0")
+                .join("memory.bin");
+            if versioned.is_file() {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
+        }
+        found
+    }
+
+    /// `memory.bin` for one member of generation `identity`.
+    fn member_memory_bin(
+        &self,
+        node_id: &NodeId,
+        identity: u64,
+        member: usize,
+    ) -> Result<PathBuf, TreeError> {
+        Ok(self
+            .generation_dir(node_id, identity)?
+            .join("members")
+            .join(member.to_string())
+            .join("memory.bin"))
+    }
+
+    /// The generation a fork of `source_id` actually maps.
+    ///
+    /// A checkpoint maps its own current keyframe (a refresh swapped
+    /// the members onto the new file and bumped `base_identity`
+    /// together). An inherited child maps whatever `cow_base` recorded
+    /// at its own fork, which stays valid after the checkpoint refreshes
+    /// because that file is not overwritten.
+    fn fork_cow_generation(&self, source_id: &NodeId) -> Result<(NodeId, u64), TreeError> {
+        if self
+            .nodes
+            .get(source_id)
+            .is_some_and(|n| n.has_base_snapshot)
+        {
+            let id = self.nodes.get(source_id).map_or(0, |n| n.base_identity);
+            return Ok((source_id.clone(), id));
+        }
+        if let Some(entry) = self.cow_base.get(source_id) {
+            return Ok(entry.clone());
+        }
+        let ckpt = self.nearest_checkpoint(source_id)?;
+        let id = self.nodes.get(&ckpt).map_or(0, |n| n.base_identity);
+        Ok((ckpt, id))
+    }
+
+    /// Identity a suspend pack must name.
+    ///
+    /// A prepared node was swapped onto its own keyframe, so the pack
+    /// names that generation. An unprepared child names the generation
+    /// it was materialized from, which stays put when the checkpoint
+    /// refreshes.
+    fn suspend_base_identity(&self, node_id: &NodeId) -> u64 {
+        if self.nodes.get(node_id).is_some_and(|n| n.has_base_snapshot) {
+            return self.nodes.get(node_id).map_or(0, |n| n.base_identity);
+        }
+        if let Some((_, id)) = self.cow_base.get(node_id) {
+            return *id;
+        }
+        self.nearest_checkpoint(node_id)
+            .ok()
+            .and_then(|base| self.nodes.get(&base).map(|n| n.base_identity))
+            .unwrap_or(0)
+    }
+
+    /// Drop retired generations nothing still names.
+    ///
+    /// A generation stays while a live `cow_base` entry, a live member's
+    /// `fork_source_base_path`, or a suspended `delta.pack` names it.
+    /// The node's current generation is `base_identity`, not a retained
+    /// entry, so this never deletes the keyframe the checkpoint itself
+    /// maps.
+    fn reap_unreferenced_keyframes(&mut self) {
+        let owners: Vec<NodeId> = self.nodes.keys().cloned().collect();
+        for owner in owners {
+            let retained = match self.nodes.get(&owner) {
+                Some(info) => info.retained_keyframes.clone(),
+                None => continue,
+            };
+            let mut keep = Vec::with_capacity(retained.len());
+            for gen in retained {
+                if self.generation_referenced(&owner, gen.identity) {
+                    keep.push(gen);
+                } else {
+                    self.delete_generation_files(&owner, gen.identity);
+                    log::info!(
+                        "cluster_tree: reaped keyframe {} generation {}",
+                        owner,
+                        gen.identity
+                    );
+                }
+            }
+            if let Some(info) = self.nodes.get_mut(&owner) {
+                info.retained_keyframes = keep;
+            }
+        }
+    }
+
+    fn generation_referenced(&self, owner: &NodeId, identity: u64) -> bool {
+        if self
+            .cow_base
+            .values()
+            .any(|(node, id)| node == owner && *id == identity)
+        {
+            return true;
+        }
+        for payload in self.live.values() {
+            for vm in &payload.members {
+                let Ok(native) = vm.as_native() else {
+                    continue;
+                };
+                let Some(path) = native.fork_source_base_path() else {
+                    continue;
+                };
+                if self.path_names_generation(path, owner, identity) {
+                    return true;
+                }
+            }
+        }
+        for (id, info) in &self.nodes {
+            if info.state != NodeState::Suspended {
+                continue;
+            }
+            if self.nearest_checkpoint(id).ok().as_ref() != Some(owner) {
+                continue;
+            }
+            let pack = self
+                .node_dir(id)
+                .join("members")
+                .join("0")
+                .join("delta.pack");
+            if read_pack_identity(&pack).ok() == Some(identity) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn path_names_generation(&self, path: &Path, owner: &NodeId, identity: u64) -> bool {
+        let versioned = self.node_dir(owner).join(format!("gen-{identity}"));
+        if path.starts_with(&versioned) {
+            return true;
+        }
+        // The first keyframe lives in `members/`, not `gen-<id>/`. A
+        // later generation's path does not start with that directory.
+        if versioned
+            .join("members")
+            .join("0")
+            .join("memory.bin")
+            .is_file()
+        {
+            return false;
+        }
+        let members = self.node_dir(owner).join("members");
+        path.starts_with(&members) && path.file_name().is_some_and(|n| n == "memory.bin")
+    }
+
+    fn delete_generation_files(&self, owner: &NodeId, identity: u64) {
+        let versioned = self.node_dir(owner).join(format!("gen-{identity}"));
+        if versioned.is_dir() {
+            let _ = fs::remove_dir_all(&versioned);
             return;
-        };
-        self.cow_base
-            .insert(node_id.clone(), (ancestor.clone(), identity));
+        }
+        // The first generation shares `members/` with a later suspend's
+        // `delta.pack` and `vm_state.json`. Remove only the keyframe files.
+        let n = self.nodes.get(owner).map_or(1, |info| info.vm_count.max(1));
+        for i in 0..n {
+            let member = self.node_dir(owner).join("members").join(i.to_string());
+            for name in [
+                "memory.bin",
+                "cpu.json",
+                "devices.json",
+                "irqchip.json",
+                "metadata.json",
+            ] {
+                let _ = fs::remove_file(member.join(name));
+            }
+        }
     }
 
     /// The next unused base-generation number for this tree. Never 0.
@@ -698,6 +1221,13 @@ impl ClusterSnapshotTree {
         let t0 = Instant::now();
         self.evict_for_incoming(source_id, incoming)?;
         self.ensure_live(source_id)?;
+        if self.ksm && self.is_fc(source_id) {
+            return Err(TreeError::Firecracker(
+                "ksm is native MAP_PRIVATE guest RAM only; Firecracker memory \
+                 lives in another process and cannot be marked"
+                    .into(),
+            ));
+        }
         if self.is_fc(source_id) {
             return self.fork_batch_fc(source_id, labels, dilation, t0);
         }
@@ -779,7 +1309,11 @@ impl ClusterSnapshotTree {
                     .map(std::path::Path::to_path_buf),
             );
         }
-        let cow_ancestor = self.nearest_checkpoint(source_id)?;
+        self.last_fork_copied_pages = source_bitmaps
+            .iter()
+            .map(|b| b.iter().map(|w| u64::from(w.count_ones())).sum())
+            .collect();
+        let (cow_ancestor, cow_identity) = self.fork_cow_generation(source_id)?;
         // Hand the source back before starting forks so a later `start`
         // failure cannot strand the live map without the root cluster.
         self.live.insert(source_id.clone(), source);
@@ -833,11 +1367,16 @@ impl ClusterSnapshotTree {
                 parked_disk_dirs: Vec::new(),
                 base_identity: 0,
                 base_disk_bytes: None,
+                retained_keyframes: Vec::new(),
             };
             self.nodes.insert(new_id.clone(), info);
             self.live.insert(new_id.clone(), fork_payload);
-            self.record_cow_base(new_id, &cow_ancestor);
+            self.cow_base
+                .insert(new_id.clone(), (cow_ancestor.clone(), cow_identity));
             self.jail_payload(new_id)?;
+            // After `start`: the source's pause ended inside the warm
+            // batch, so this advise is not on the pause path.
+            self.mark_node(new_id)?;
             if let Some(src_info) = self.nodes.get_mut(source_id) {
                 src_info.children.push(new_id.clone());
                 touch(src_info);
@@ -966,6 +1505,7 @@ impl ClusterSnapshotTree {
                 parked_disk_dirs: Vec::new(),
                 base_identity: 0,
                 base_disk_bytes: Some(source_disk),
+                retained_keyframes: Vec::new(),
             };
             self.nodes.insert(new_id.clone(), info);
             self.live.insert(new_id.clone(), payload);
@@ -1049,11 +1589,7 @@ impl ClusterSnapshotTree {
         // Name the keyframe generation these packs diff against, so a
         // resume onto a base that has since re-prepared fails loud
         // (CHALLENGES #144).
-        let base_identity = self
-            .nearest_checkpoint(node_id)
-            .ok()
-            .and_then(|base| self.nodes.get(&base).map(|n| n.base_identity))
-            .unwrap_or(0);
+        let base_identity = self.suspend_base_identity(node_id);
         for (i, vm) in payload.members.iter_mut().enumerate() {
             let member_dir = node_dir.join("members").join(i.to_string());
             fs::create_dir_all(&member_dir)?;
@@ -1159,6 +1695,7 @@ impl ClusterSnapshotTree {
     /// per-VM identity tuples, every member restored from
     /// `members/{i}/delta.pack` + the nearest checkpoint ancestor's
     /// `members/{i}/memory.bin`.
+    #[allow(clippy::too_many_lines)]
     pub fn resume(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
         let info = self
             .nodes
@@ -1211,13 +1748,17 @@ impl ClusterSnapshotTree {
                 )))
             })?;
 
-        // Find the nearest checkpoint ancestor for each member.
+        // The pack names the generation it was diffed against. That may
+        // no longer be the checkpoint's current keyframe: a refresh
+        // writes a new file and leaves the old one in place.
         let base_node = self.nearest_checkpoint(node_id)?;
-        let base_dir = self.node_dir(&base_node);
-        let base_identity = self
-            .nodes
-            .get(&base_node)
-            .map_or(0, |info| info.base_identity);
+        let mapped_identity = if base_node == *node_id {
+            self.nodes
+                .get(&base_node)
+                .map_or(0, |info| info.base_identity)
+        } else {
+            read_pack_identity(&node_dir.join("members").join("0").join("delta.pack"))?
+        };
 
         let n = topology.members.len();
         let mut members: Vec<Guest> = Vec::with_capacity(n);
@@ -1230,23 +1771,28 @@ impl ClusterSnapshotTree {
             })?;
 
             let member_dir = node_dir.join("members").join(i.to_string());
-            let base_member_dir = base_dir.join("members").join(i.to_string());
-            let base_mem_path = base_member_dir.join("memory.bin");
+            let base_mem_path = self.member_memory_bin(&base_node, mapped_identity, i)?;
 
             let state = snapshot::load_vm_state(&member_dir)?;
 
             let mem_span = crate::mem_layout::MemLayout::from_ram(state.memory_size).span();
             let fork_mem_addr = crate::fork::mmap_base_mem_private(&base_mem_path, mem_span)?;
 
-            let applied = if base_node == *node_id {
+            // The pack is this member's divergence from `base_node`'s
+            // keyframe, including when this node *is* that checkpoint.
+            // Suspend writes that dirt and does not refresh `memory.bin`.
+            // A checkpoint with no pack was never suspended: `open`
+            // marks a killed live root Suspended, and the unsnapshotted
+            // dirt died with the process, so the keyframe is the resume.
+            let pack = member_dir.join("delta.pack");
+            let applied = if base_node == *node_id && !pack.is_file() {
+                log::info!(
+                    "cluster_tree: resume '{node_id}' member {i} has no delta.pack; \
+                     restoring the checkpoint keyframe only"
+                );
                 AppliedDelta::empty(mem_span)
             } else {
-                apply_delta(
-                    &member_dir.join("delta.pack"),
-                    fork_mem_addr,
-                    mem_span,
-                    base_identity,
-                )?
+                apply_delta(&pack, fork_mem_addr, mem_span, mapped_identity)?
             };
 
             let mut vm = crate::fork::build_vm_from_state_and_mem(
@@ -1267,12 +1813,20 @@ impl ClusterSnapshotTree {
             members.push(Guest::from(vm));
         }
 
+        // The resume mmap is new. Mark after start, outside the restore.
+        self.mark_guests(&members)?;
+
         let payload = ClusterPayload {
             network: net,
             members,
         };
         self.live.insert(node_id.clone(), payload);
-        self.record_cow_base(node_id, &base_node);
+        if base_node == *node_id {
+            self.cow_base.remove(node_id);
+        } else {
+            self.cow_base
+                .insert(node_id.clone(), (base_node, mapped_identity));
+        }
         self.jail_payload(node_id)?;
         if let Some(info) = self.nodes.get_mut(node_id) {
             info.state = NodeState::Live;
@@ -1331,7 +1885,12 @@ impl ClusterSnapshotTree {
     }
 
     /// Permanently delete a node and all its descendants.
-    pub fn prune(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+    ///
+    /// When the subtree includes the root, every live payload is gone
+    /// and the returned ids are the adopted `CreateVm` ids whose broker
+    /// pins this call released. A child prune returns an empty vec and
+    /// leaves those pins in place — the root still `disk.open`s them.
+    pub fn prune(&mut self, node_id: &NodeId) -> Result<Vec<String>, TreeError> {
         let mut queue = VecDeque::new();
         queue.push_back(node_id.clone());
         let mut subtree: Vec<NodeId> = Vec::new();
@@ -1346,6 +1905,9 @@ impl ClusterSnapshotTree {
                 }
             }
         }
+        let includes_root = subtree
+            .iter()
+            .any(|id| self.nodes.get(id).is_some_and(|info| info.parent.is_none()));
         for id in subtree.into_iter().rev() {
             if let Some(payload) = self.live.remove(&id) {
                 drop(payload);
@@ -1366,9 +1928,19 @@ impl ClusterSnapshotTree {
                 }
             }
         }
+        self.reap_unreferenced_keyframes();
         self.save_metadata()?;
+        // After the payloads: their virtio-blk fds are what keep the
+        // caller images open. Releasing sooner (adopt, restore-swap, a
+        // child prune) drops the only `O_PATH` a later `disk.open` of
+        // those root-owned files can use.
+        let released = if includes_root {
+            self.release_adopted_pins()
+        } else {
+            Vec::new()
+        };
         log::info!("cluster_tree: pruned '{node_id}'");
-        Ok(())
+        Ok(released)
     }
 
     /// Resource budget this tree was created with (or last `set_budget`).
@@ -1412,6 +1984,9 @@ impl ClusterSnapshotTree {
                         }
                     }
                 }
+            }
+            for gen in &info.retained_keyframes {
+                disk_bytes = disk_bytes.saturating_add(gen.disk_bytes);
             }
             for i in 0..n {
                 let member = dir.join("members").join(i.to_string());
@@ -1637,6 +2212,7 @@ impl ClusterSnapshotTree {
                 // no generation any pack may still claim.
                 info.base_disk_bytes = None;
                 info.base_identity = 0;
+                info.retained_keyframes.clear();
                 // Suspend parks RW disk-clone dirs on the record (see
                 // `suspend`); eviction must reap them the way prune does
                 // or usage() reports the space free while XFS still holds
@@ -1648,6 +2224,7 @@ impl ClusterSnapshotTree {
             }
             evicted.push(id);
         }
+        self.reap_unreferenced_keyframes();
         self.save_metadata()?;
         log::info!(
             "cluster_tree: evicted subtree rooted at '{node_id}' ({} nodes)",
@@ -1782,6 +2359,16 @@ impl ClusterSnapshotTree {
             reflink_root: crate::tree::probe_reflink_root(&root_dir_for_probe),
             jail,
             last_pause_skew_ns: None,
+            // Adopted ids are process-local. A re-opened tree has no
+            // live payloads yet; the process that dropped them already
+            // released the pins (or the broker exited and `release_all`
+            // did).
+            adopted_vm_ids: Vec::new(),
+            ksm: doc.ksm,
+            root_cut: None,
+            last_child_cut: None,
+            last_prepare_cut: None,
+            last_fork_copied_pages: Vec::new(),
         })
     }
 
@@ -1948,6 +2535,7 @@ impl ClusterSnapshotTree {
             created_at_unix: self.created_at_unix,
             budget: self.budget,
             nodes: self.nodes.clone(),
+            ksm: self.ksm,
         };
         let json = serde_json::to_vec_pretty(&doc)?;
         atomic_write(&self.root_dir.join("tree.json"), &json)?;
@@ -1958,9 +2546,13 @@ impl ClusterSnapshotTree {
 impl Drop for ClusterSnapshotTree {
     fn drop(&mut self) {
         // Drop live payloads explicitly first (frees RAM, closes KVM
-        // fds, tears down bridges); the root_dir is left on disk by
-        // default (callers prune() to delete).
+        // fds, tears down bridges, closes virtio-blk handles); the
+        // root_dir is left on disk by default (callers prune() to
+        // delete). Broker pins for any adopted ids still on the tree
+        // go after those handles — `tree_drop` and root `prune` usually
+        // take the ids first and release them themselves.
         self.live.clear();
+        self.release_adopted_pins();
     }
 }
 

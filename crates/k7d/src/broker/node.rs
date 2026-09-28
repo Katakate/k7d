@@ -727,6 +727,26 @@ fn dispatch(verb: Verb, fds: Vec<OwnedFd>) -> (Reply, Vec<OwnedFd>) {
         ),
         Verb::HelperWait { pid } => (helper_wait(pid), Vec::new()),
         Verb::HelperReap { pid } => (helper_reap(pid), Vec::new()),
+        Verb::KsmQuery { ranges } => (ksm_query(&ranges), Vec::new()),
+    }
+}
+
+/// Read the VM broker's smaps / `ksm_stat`. Never a caller-supplied pid.
+fn ksm_query(ranges: &[super::KsmRange]) -> Reply {
+    let pid = VM_BROKER_PID.load(Ordering::SeqCst);
+    if pid == 0 {
+        return Reply::failed(
+            libc::ESRCH,
+            "ksm query: the VM broker pid is not known yet".to_string(),
+        );
+    }
+    let ranges: Vec<(u64, u64)> = ranges.iter().map(|r| (r.start, r.len)).collect();
+    match crate::ksm::read_proc(pid, &ranges) {
+        Ok(snap) => Reply::KsmQuery {
+            merging_pages: snap.merging_pages,
+            stat: snap.stat,
+        },
+        Err(e) => Reply::failed(libc::EIO, format!("ksm query pid {pid}: {e}")),
     }
 }
 

@@ -50,8 +50,8 @@ use common::ubuntu_k3s::{
 };
 use common::warp::{
     check_clockevent, check_clocksource, check_no_ntp_client, check_no_splats, delete_crashloop,
-    guest_clocks, kubectl_round_trip, last_terminated_secs, start_crashloop, BACKOFF_SCHEDULE,
-    CRASHLOOP_POD,
+    guest_clocks, host_runs_lapic_timer_on_preemption_timer, kubectl_round_trip,
+    last_terminated_secs, start_crashloop, BACKOFF_SCHEDULE, CRASHLOOP_POD,
 };
 
 /// Guest-observed backoff that counts as "the ~5 min one" the spec's
@@ -68,16 +68,29 @@ const CAP_MIN: i64 = 240;
 /// well inside the survey's 3.59× ceiling for the backoff-wait phase.
 ///
 /// Measured (132.3 s, 2.34×) on guests whose timers are the LAPIC
-/// one-shot — the AMD nodes. There KVM's hrtimer is host-anchored, so a
-/// jump to `earliest − ε` does not make that timer fire: it fires when
-/// it was always going to, the guest wakes to find its clock past the
-/// expiry, and every idle cycle in between has jumped the same target
-/// again. That is suspend semantics, and part of the 2.34× is the guest
-/// believing more time passed than the timers it slept on.
+/// one-shot on SVM — the AMD nodes. There KVM's hrtimer is
+/// host-anchored, so a jump to `earliest − ε` does not make that timer
+/// fire: it fires when it was always going to, the guest wakes to find
+/// its clock past the expiry, and every idle cycle in between has
+/// jumped the same target again. That is suspend semantics, and part of
+/// the 2.34× is the guest believing more time passed than the timers it
+/// slept on — how much scales with the cycle rate (CHALLENGES #264).
 const BACKOFF_WALL_CEILING_ONE_SHOT: Duration = Duration::from_secs(150);
 
+/// The same one-shot under VMX's preemption timer — the Intel node on
+/// host kernel 6.8. The swap back from hrtimer to preemption timer that
+/// every pause signal causes re-reads the expiry in guest-TSC units, so
+/// the jumped one-shot fires at the next pause and each jump deletes
+/// one idle gap, as a deadline's does. Measured at 151 s, 159.3 s
+/// (312 s guest, 1.96×, 40% of cycles `vcpu_awake` against AMD's 18%)
+/// and 163.4 s (305 s guest, 1.87×); 22% over the slowest. The same
+/// host with the preemption timer turned off for the cluster's VMs
+/// gives the host-anchored semantics instead:
+/// 471 s guest in 57.2 s wall, 8.24×, past the idleness ceiling.
+const BACKOFF_WALL_CEILING_ONE_SHOT_PREEMPTION_TIMER: Duration = Duration::from_secs(200);
+
 /// The same claim on guests whose timers are TSC deadlines — the Intel
-/// node, where the host advertises `CPUID.1:ECX[24]` and Linux
+/// node on host kernel 7.0, which advertises `CPUID.1:ECX[24]` so Linux
 /// registers `lapic-deadline`. `Vm::warp_vcpus` rewrites the deadline
 /// after the offset moves, KVM fires it on the next entry, and the jump
 /// deletes exactly one idle gap: the guest wakes, does its work, and
@@ -442,10 +455,14 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
         );
         per_cpu[0] == "lapic-deadline"
     };
-    let backoff_wall_ceiling = if tsc_deadline {
-        BACKOFF_WALL_CEILING_DEADLINE
-    } else {
-        BACKOFF_WALL_CEILING_ONE_SHOT
+    let preemption_timer = host_runs_lapic_timer_on_preemption_timer();
+    let (backoff_wall_ceiling, timers) = match (tsc_deadline, preemption_timer) {
+        (true, _) => (BACKOFF_WALL_CEILING_DEADLINE, "TSC deadlines"),
+        (false, true) => (
+            BACKOFF_WALL_CEILING_ONE_SHOT_PREEMPTION_TIMER,
+            "LAPIC one-shots on the VMX preemption timer",
+        ),
+        (false, false) => (BACKOFF_WALL_CEILING_ONE_SHOT, "LAPIC one-shots"),
     };
 
     settle_cluster(&kubeconfig, "auto-warp");
@@ -511,15 +528,10 @@ fn test_auto_warp_jump_compresses_a_crash_loop_backoff() {
     eprintln!(
         "MEASUREMENT jump-mode compression: {}s of guest backoff in {:?} of wall \
          time = {:.2}× (idleness ceiling {ceiling:.2}×, measured bound 3.59×; timers are \
-         {}, wall ceiling {backoff_wall_ceiling:?})",
+         {timers}, wall ceiling {backoff_wall_ceiling:?})",
         capped.guest,
         capped.wall,
         capped.ratio(),
-        if tsc_deadline {
-            "TSC deadlines"
-        } else {
-            "LAPIC one-shots"
-        }
     );
     assert!(
         capped.wall < backoff_wall_ceiling,

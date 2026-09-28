@@ -19,6 +19,9 @@ use super::ubuntu_k3s::{kubectl, UbuntuCluster};
 /// kubelet.sock at the stock kubelet dir (CHALLENGES #146).
 pub const K3S_DEVICE_PLUGIN_DIR: &str = "/var/lib/rancher/k3s/agent/kubelet/device-plugins";
 pub const KUBELET_DEVICE_PLUGIN_DIR: &str = "/var/lib/kubelet/device-plugins";
+pub const KUBELET_POD_RESOURCES_SOCK: &str = "/var/lib/kubelet/pod-resources/kubelet.sock";
+pub const K3S_POD_RESOURCES_SOCK: &str =
+    "/var/lib/rancher/k3s/agent/kubelet/pod-resources/kubelet.sock";
 pub const RESOURCE: &str = "nvidia.com/gpu";
 pub const WRONG_RESOURCE: &str = "example.com/resource";
 pub const GPU_PER_NODE: u32 = 2;
@@ -355,7 +358,7 @@ pub fn gpu_diagnostics(kubeconfig: &Path) -> String {
         vec!["describe", "nodes"],
         vec!["get", "ds,deploy,pods,svc", "-A", "-o", "wide"],
         vec!["get", "jobsets.jobset.x-k8s.io", "-A", "-o", "wide"],
-        vec!["get", "rayclusters.ray.io", "-A", "-o", "wide"],
+        vec!["get", "rayclusters.ray.io,rayjobs.ray.io", "-A", "-o", "wide"],
         vec!["get", "trainjobs.trainer.kubeflow.org", "-A", "-o", "wide"],
         vec![
             "get",
@@ -429,10 +432,21 @@ pub fn gpu_diagnostics(kubeconfig: &Path) -> String {
 }
 
 /// Wait until every named node has `nvidia.com/gpu` Capacity **and**
-/// `status.allocatable` = 2. Allocatable here is the healthy device
-/// count (CHALLENGES #147); it does **not** drop when a pod requests
-/// a GPU.
+/// `status.allocatable` = [`GPU_PER_NODE`] (2). Allocatable here is the
+/// healthy device count (CHALLENGES #147); it does **not** drop when a
+/// pod requests a GPU.
 pub fn wait_gpu_registered(kubeconfig: &Path, names: &[String], ceiling: Duration) -> GpuCounts {
+    wait_gpu_registered_n(kubeconfig, names, GPU_PER_NODE, ceiling)
+}
+
+/// Like [`wait_gpu_registered`], but for a fixture that set
+/// `FAKE_GPU_COUNT` to `n` instead of the default 2.
+pub fn wait_gpu_registered_n(
+    kubeconfig: &Path,
+    names: &[String],
+    n: u32,
+    ceiling: Duration,
+) -> GpuCounts {
     let start = Instant::now();
     loop {
         let gpu = gpu_via_kubectl(kubeconfig);
@@ -444,16 +458,14 @@ pub fn wait_gpu_registered(kubeconfig: &Path, names: &[String], ceiling: Duratio
                 gpu_diagnostics(kubeconfig)
             );
         }
-        let cap_ok = names
-            .iter()
-            .all(|n| gpu.capacity.get(n) == Some(&GPU_PER_NODE));
+        let cap_ok = names.iter().all(|name| gpu.capacity.get(name) == Some(&n));
         let alloc_ok = names
             .iter()
-            .all(|n| gpu.allocatable.get(n) == Some(&GPU_PER_NODE));
+            .all(|name| gpu.allocatable.get(name) == Some(&n));
         if cap_ok && alloc_ok {
             eprintln!(
-                "ml-platform: {RESOURCE} Capacity={GPU_PER_NODE}/node \
-                 status.allocatable={GPU_PER_NODE}/node after {:?}",
+                "ml-platform: {RESOURCE} Capacity={n}/node \
+                 status.allocatable={n}/node after {:?}",
                 start.elapsed()
             );
             return gpu;
@@ -472,8 +484,8 @@ pub fn wait_gpu_registered(kubeconfig: &Path, names: &[String], ceiling: Duratio
                 );
             }
             panic!(
-                "{RESOURCE} never reached Capacity={GPU_PER_NODE}/node and \
-                 status.allocatable={GPU_PER_NODE}/node after {ceiling:?} \
+                "{RESOURCE} never reached Capacity={n}/node and \
+                 status.allocatable={n}/node after {ceiling:?} \
                  (capacity={:?} allocatable={:?})\n{diag}",
                 gpu.capacity, gpu.allocatable
             );
@@ -591,8 +603,130 @@ pub fn assert_gpu_consistent(
     );
 }
 
-/// Build the plugin, copy it onto every node, apply the DaemonSet
-/// + DCGM scrape, wait Capacity=2/node.
+/// One kubelet pod-resources row: devices assigned to one container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodResourceDevices {
+    pub namespace: String,
+    pub name: String,
+    pub container: String,
+    pub resource: String,
+    pub ids: Vec<String>,
+}
+
+fn cluster_vm_for_node<'a>(
+    cluster: &'a mut UbuntuCluster,
+    node: &str,
+) -> (&'a mut Vm, &'static str) {
+    let names = cluster.names();
+    if node == names[0] {
+        (&mut cluster.server, "server")
+    } else if node == names[1] {
+        (&mut cluster.agent1, "agent-1")
+    } else if node == names[2] {
+        (&mut cluster.agent2, "agent-2")
+    } else {
+        panic!("node {node} is not in this cluster ({names:?})")
+    }
+}
+
+fn json_string_list(v: &serde_json::Value) -> Vec<String> {
+    let empty = Vec::new();
+    v.as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Parse `fake-gpu-plugin -list-pod-resources` JSON; keep `resource`
+/// rows for `namespace`/`name`. Empty `resource` keeps every row.
+pub fn parse_pod_resource_devices(
+    body: &str,
+    namespace: &str,
+    name: &str,
+    resource: &str,
+) -> Vec<PodResourceDevices> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("pod-resources json: {e}: {body}"));
+    let empty = Vec::new();
+    let mut out = Vec::new();
+    for r in v.as_array().unwrap_or(&empty) {
+        let row = PodResourceDevices {
+            namespace: r["namespace"].as_str().unwrap_or("").to_string(),
+            name: r["name"].as_str().unwrap_or("").to_string(),
+            container: r["container"].as_str().unwrap_or("").to_string(),
+            resource: r["resource"].as_str().unwrap_or("").to_string(),
+            ids: json_string_list(&r["ids"]),
+        };
+        if row.namespace == namespace
+            && row.name == name
+            && (resource.is_empty() || row.resource == resource)
+        {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Assigned `nvidia.com/gpu` IDs for `namespace`/`pod` from the
+/// kubelet pod-resources API on the node that is running it.
+///
+/// Uses the already-installed fixture binary
+/// (`fake-gpu-plugin -list-pod-resources`) against
+/// [`KUBELET_POD_RESOURCES_SOCK`] (k3s fallback
+/// [`K3S_POD_RESOURCES_SOCK`]).
+pub fn pod_resource_gpu_ids(
+    cluster: &mut UbuntuCluster,
+    kubeconfig: &Path,
+    namespace: &str,
+    pod: &str,
+) -> Vec<String> {
+    let node = kubectl(
+        kubeconfig,
+        &[
+            "get",
+            "pod",
+            "-n",
+            namespace,
+            pod,
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "get {namespace}/{pod} nodeName: {e}\n{}",
+            gpu_diagnostics(kubeconfig)
+        )
+    })
+    .trim()
+    .to_string();
+    assert!(
+        !node.is_empty(),
+        "{namespace}/{pod} has no nodeName\n{}",
+        gpu_diagnostics(kubeconfig)
+    );
+    let (vm, whose) = cluster_vm_for_node(cluster, &node);
+    let mut ag = connect_or_dump(vm, whose);
+    let raw = sh_ok(&mut ag, &format!("{PLUGIN_GUEST_BIN} -list-pod-resources"));
+    let rows = parse_pod_resource_devices(&raw, namespace, pod, RESOURCE);
+    assert!(
+        !rows.is_empty(),
+        "{whose}: pod-resources at {KUBELET_POD_RESOURCES_SOCK} \
+         (or {K3S_POD_RESOURCES_SOCK}) has no {RESOURCE} for {namespace}/{pod}:\n{raw}\n{}",
+        gpu_diagnostics(kubeconfig)
+    );
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.extend(row.ids);
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Build the plugin, copy it onto every node, apply the GPU DaemonSet
+/// and the per-pod DCGM DaemonSet, wait Capacity=2/node.
 pub fn apply_gpu_dcgm_fixture(cluster: &mut UbuntuCluster) -> GpuCounts {
     let plugin = build_fake_gpu_plugin();
     install_plugin_binary(cluster, &plugin);
@@ -606,12 +740,7 @@ pub fn apply_gpu_dcgm_fixture(cluster: &mut UbuntuCluster) -> GpuCounts {
     .unwrap_or_else(|e| panic!("fake-gpu-plugin rollout: {e}\n{}", gpu_diagnostics(&kube)));
     kubectl(
         &kube,
-        &[
-            "rollout",
-            "status",
-            "deploy/dcgm-exporter",
-            "--timeout=180s",
-        ],
+        &["rollout", "status", "ds/dcgm-exporter", "--timeout=180s"],
     )
     .unwrap_or_else(|e| panic!("dcgm-exporter rollout: {e}\n{}", gpu_diagnostics(&kube)));
     let names = cluster.names();

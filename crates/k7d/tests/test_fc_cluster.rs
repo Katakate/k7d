@@ -175,11 +175,14 @@ fn create_cluster(
     match call(
         guard,
         &Request::TreeCreateCluster {
+            ksm: false,
             vm_count,
             config: fc_config(),
             budget: Some(cluster_budget(max_live_vms)),
             tree_id: Some(common::unique_name(&format!("fcc-{tag}"))),
             egress: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeCreated {
@@ -284,6 +287,8 @@ fn fork_batch(
             source_id: source.to_string(),
             labels: labels.iter().map(ToString::to_string).collect(),
             dilation: None,
+            dilation_policy: None,
+            dilation_config: None,
         },
     ) {
         Response::TreeForkBatch {

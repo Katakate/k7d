@@ -320,6 +320,11 @@ const FC_RECONNECT_ATTEMPTS: usize = 3;
 /// How long each redial waits for the guest agent to accept again.
 const FC_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default deadline for one agent request. A native vsock read does not
+/// treat EOF as fatal, so a connection whose backend `prepare_fork_source`
+/// already replaced is polled until this elapses.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A connection to the guest agent.
 pub struct AgentClient {
     transport: Transport,
@@ -328,6 +333,8 @@ pub struct AgentClient {
     leftover: Vec<u8>,
     /// Times an FC vsock proxy was redialled after a snapshot reset.
     fc_reconnects: u32,
+    /// Deadline for one request's response. See [`Self::set_request_timeout`].
+    request_timeout: Duration,
 }
 
 impl AgentClient {
@@ -337,6 +344,17 @@ impl AgentClient {
     #[must_use]
     pub fn fc_reconnects(&self) -> u32 {
         self.fc_reconnects
+    }
+
+    /// Bound one request/response. The default is 30s.
+    ///
+    /// Callers that cannot make progress until this returns — the shim's
+    /// log bridge, which owns the stdio FIFOs containerd waits on before
+    /// `task.Delete` — must shorten it. A native vsock client polls a
+    /// silent socket until the deadline, and `prepare_fork_source` leaves
+    /// the source's old connections silent.
+    pub fn set_request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = timeout;
     }
 
     /// Create an agent client over the COM2 serial pipe.
@@ -364,6 +382,7 @@ impl AgentClient {
             },
             leftover: Vec::new(),
             fc_reconnects: 0,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -479,6 +498,7 @@ impl AgentClient {
             },
             leftover: Vec::new(),
             fc_reconnects: 0,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -559,6 +579,7 @@ impl AgentClient {
             },
             leftover: Vec::new(),
             fc_reconnects: 0,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -632,7 +653,7 @@ impl AgentClient {
         let mut attempts = 0;
         loop {
             self.send_bytes(json.as_bytes());
-            match self.read_response_line(Duration::from_secs(30)) {
+            match self.read_response_line(self.request_timeout) {
                 Ok(line) => return Ok(serde_json::from_str(line.trim())?),
                 Err(AgentError::Io(e))
                     if e.kind() == io::ErrorKind::UnexpectedEof

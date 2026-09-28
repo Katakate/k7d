@@ -38,10 +38,248 @@
 //!   default — see the four-policy table.
 //!
 //! Applying a decision is [`crate::control::Request::SetDilation`].
-//! This module only decides, and it is deliberately not wired into the
-//! gym: the `dilate` mode stays create-time N=8.
+//! The daemon runs that path from a per-tree loop when the tree's
+//! [`DilationPolicyMode`] is [`DilationPolicyMode::Down`] or
+//! [`DilationPolicyMode::Track`]. [`DilationPolicyMode::Fixed`] (the
+//! default) does not start a loop. The gym's `dilate` mode is still
+//! create-time N=8; it does not opt a tree into the loop.
+//!
+//! [`PolicyConfig`] is the knob bag the loop passes to the constructors.
+//! An omitted [`DilationPolicyConfig`] on the tree request is these
+//! module constants. A request that sets one replaces window, saturated,
+//! quiet, cadence, and the ladder for that tree; a fork that omits it
+//! copies its parent's.
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::vm::TimeSample;
+
+/// Which way a tree's dilation loop may move the factor.
+///
+/// Set on `tree_create` / `tree_create_cluster` / `tree_adopt_cluster`.
+/// A fork copies the source node's mode unless the fork request sets
+/// one. [`Self::Fixed`] is the default and starts no loop, so a tree
+/// that omits the field keeps today's create-time factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DilationPolicyMode {
+    /// Do not sample and do not call `SetDilation`.
+    #[default]
+    Fixed,
+    /// [`DilationPolicy`]: drop when saturated, never raise.
+    Down,
+    /// [`TrackingPolicy`]: drop when saturated, raise when quiet.
+    Track,
+}
+
+impl DilationPolicyMode {
+    /// Wire / log name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Down => "down",
+            Self::Track => "track",
+        }
+    }
+}
+
+/// Caller knobs for one tree's dilation loop.
+///
+/// Omitted fields are the module constants ([`WINDOW`], [`SATURATED`],
+/// [`QUIET`], one second, [`LADDER`]). `None` for the whole struct — the
+/// request field was absent — is [`PolicyConfig::default`]. `fixed`
+/// still validates this and still starts no thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DilationPolicyConfig {
+    /// Observations a decision rests on. `None` is [`WINDOW`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<usize>,
+    /// Drop at this fraction of vCPUs awake. `None` is [`SATURATED`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saturated: Option<f64>,
+    /// Raise at this fraction or below. `None` is [`QUIET`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<f64>,
+    /// Milliseconds between samples. `None` is 1000. A fork that sets
+    /// this is refused: the tree has one loop and one sleep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_ms: Option<u64>,
+    /// Rungs, highest first. `None` is [`LADDER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder: Option<Vec<u32>>,
+}
+
+impl DilationPolicyConfig {
+    /// Resolve omitted fields onto the module constants.
+    pub fn resolve(&self) -> Result<PolicyConfig, String> {
+        PolicyConfig {
+            window: self.window.unwrap_or(WINDOW),
+            saturated: self.saturated.unwrap_or(SATURATED),
+            quiet: self.quiet.unwrap_or(QUIET),
+            cadence: Duration::from_millis(self.cadence_ms.unwrap_or(1_000)),
+            ladder: self.ladder.clone().unwrap_or_else(|| LADDER.to_vec()),
+        }
+        .validated()
+    }
+}
+
+/// Knobs the daemon loop passes into the existing policy types.
+///
+/// Built from [`DilationPolicyConfig::resolve`] or [`Self::default`].
+/// The ladder is per tree: [`Self::down_policy`], [`Self::track_policy`],
+/// and [`ladder_rung`] read this one, not the module constant, unless
+/// the caller left it at the default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyConfig {
+    /// Observations a decision rests on. See [`WINDOW`].
+    pub window: usize,
+    /// Drop at this fraction of vCPUs awake. See [`SATURATED`].
+    pub saturated: f64,
+    /// Raise at this fraction or below. See [`QUIET`]. Ignored by
+    /// [`DilationPolicy`].
+    pub quiet: f64,
+    /// Wall time between samples. The four-policy episode used 1s.
+    /// One value per tree: a fork cannot replace it.
+    pub cadence: Duration,
+    /// Rungs, highest first. See [`LADDER`].
+    pub ladder: Vec<u32>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            window: WINDOW,
+            saturated: SATURATED,
+            quiet: QUIET,
+            cadence: Duration::from_secs(1),
+            ladder: LADDER.to_vec(),
+        }
+    }
+}
+
+impl PolicyConfig {
+    /// The request field. `None` is [`Self::default`].
+    pub fn from_request(config: Option<&DilationPolicyConfig>) -> Result<Self, String> {
+        match config {
+            None => Ok(Self::default()),
+            Some(cfg) => cfg.resolve(),
+        }
+    }
+
+    /// Knobs a fork should arm with.
+    ///
+    /// `None` copies `self`. `Some` replaces the child, except a set
+    /// `cadence_ms` is an error and an omitted one keeps this tree's
+    /// cadence — one loop, one sleep.
+    pub fn for_fork(&self, requested: Option<&DilationPolicyConfig>) -> Result<Self, String> {
+        let Some(cfg) = requested else {
+            return Ok(self.clone());
+        };
+        if cfg.cadence_ms.is_some() {
+            return Err(
+                "a fork cannot set dilation cadence_ms — the tree has one loop and one sleep"
+                    .into(),
+            );
+        }
+        let mut resolved = cfg.resolve()?;
+        resolved.cadence = self.cadence;
+        Ok(resolved)
+    }
+
+    /// Refuse a config the constructors would either panic on or silently
+    /// rewrite. `window == 0` is rejected here; [`DilationPolicy::new`]
+    /// would otherwise clamp it to 1.
+    fn validated(self) -> Result<Self, String> {
+        if self.window == 0 {
+            return Err(
+                "dilation policy window must be >= 1 — a zero window spends a rung on every sample"
+                    .into(),
+            );
+        }
+        if self.cadence.is_zero() {
+            return Err(
+                "dilation policy cadence must be > 0 — a zero cadence spins the pause loop".into(),
+            );
+        }
+        if !self.quiet.is_finite() || !self.saturated.is_finite() || self.quiet >= self.saturated {
+            return Err(format!(
+                "dilation policy quiet ({}) must be below saturated ({}) — a missing deadband chatters",
+                self.quiet, self.saturated
+            ));
+        }
+        validate_ladder(&self.ladder)?;
+        Ok(self)
+    }
+
+    /// A down-only policy on this ladder's top rung.
+    pub fn down_policy(&self) -> Result<DilationPolicy, String> {
+        let cfg = self.clone().validated()?;
+        Ok(DilationPolicy::with_ladder(
+            cfg.window,
+            cfg.saturated,
+            cfg.ladder,
+        ))
+    }
+
+    /// A tracking policy on this ladder's top rung.
+    pub fn track_policy(&self) -> Result<TrackingPolicy, String> {
+        let cfg = self.clone().validated()?;
+        Ok(TrackingPolicy::with_ladder(
+            cfg.window,
+            cfg.saturated,
+            cfg.quiet,
+            cfg.ladder,
+        ))
+    }
+}
+
+/// Refuse an empty ladder, a rung outside `1..=MAX_DILATION`, a
+/// duplicate, or any step that does not descend.
+fn validate_ladder(ladder: &[u32]) -> Result<(), String> {
+    if ladder.is_empty() {
+        return Err(
+            "dilation policy ladder must not be empty — the loop has to start on a rung".into(),
+        );
+    }
+    let mut prev: Option<u32> = None;
+    for &rung in ladder {
+        if rung == 0 || rung > crate::vm::MAX_DILATION {
+            return Err(format!(
+                "dilation policy ladder rung {rung} is outside 1..={} — \
+                 the carried patch refuses a factor past that",
+                crate::vm::MAX_DILATION
+            ));
+        }
+        if let Some(earlier) = prev {
+            if rung >= earlier {
+                return Err(format!(
+                    "dilation policy ladder {ladder:?} must be strictly decreasing — \
+                     a duplicate or rising rung is refused"
+                ));
+            }
+        }
+        prev = Some(rung);
+    }
+    Ok(())
+}
+
+/// Index of `factor` on `ladder`, if it is one of the rungs.
+#[must_use]
+pub fn ladder_rung(ladder: &[u32], factor: u32) -> Option<usize> {
+    ladder.iter().position(|&rung| rung == factor)
+}
+
+/// `factor` is not a rung the adaptive loop can represent.
+#[must_use]
+pub fn ladder_factor_error(ladder: &[u32], factor: u32) -> String {
+    format!(
+        "dilation factor {factor} is not on the ladder {ladder:?} — \
+         the adaptive loop only moves between those rungs"
+    )
+}
 
 /// The rungs, highest first. The sweep's operating point is the first and its
 /// knee (N=12) is deliberately not here: this ladder is what the sweep
@@ -103,6 +341,9 @@ pub enum Verdict {
 /// property of the type rather than a rule a caller has to remember.
 #[derive(Debug, Clone)]
 pub struct DilationPolicy {
+    /// Rungs, highest first. The rung index walks this, not the module
+    /// [`LADDER`], so a tree can run `[4, 1]`.
+    ladder: Vec<u32>,
     rung: usize,
     window: usize,
     saturated: f64,
@@ -129,7 +370,14 @@ impl DilationPolicy {
     /// observations against a `saturated` fraction of awake vCPUs.
     #[must_use]
     pub fn new(window: usize, saturated: f64) -> Self {
+        Self::with_ladder(window, saturated, LADDER.to_vec())
+    }
+
+    /// [`Self::new`] on `ladder` instead of [`LADDER`]. Starts on the
+    /// top rung. The caller has already refused an empty ladder.
+    fn with_ladder(window: usize, saturated: f64, ladder: Vec<u32>) -> Self {
         Self {
+            ladder,
             rung: 0,
             window: window.max(1),
             saturated,
@@ -143,7 +391,22 @@ impl DilationPolicy {
     /// The factor the cluster should be running at now.
     #[must_use]
     pub fn factor(&self) -> u32 {
-        LADDER[self.rung]
+        self.ladder[self.rung]
+    }
+
+    /// Start on the rung whose factor is `factor`, instead of the top.
+    ///
+    /// The daemon loop calls this with the node's live factor so a tree
+    /// created at 8 stays there until a window says otherwise, and a
+    /// fork that inherited 2 does not immediately try to set 8. A factor
+    /// that is not on this policy's ladder is an error — the loop does
+    /// not snap to a neighbour.
+    pub fn align_to(&mut self, factor: u32) -> Result<(), String> {
+        let Some(rung) = ladder_rung(&self.ladder, factor) else {
+            return Err(ladder_factor_error(&self.ladder, factor));
+        };
+        self.rung = rung;
+        Ok(())
     }
 
     /// How many rungs this episode has spent.
@@ -198,7 +461,7 @@ impl DilationPolicy {
         if !saturated {
             return Verdict::Headroom;
         }
-        if self.rung + 1 >= LADDER.len() {
+        if self.rung + 1 >= self.ladder.len() {
             return Verdict::Floor;
         }
         self.rung += 1;
@@ -223,6 +486,8 @@ impl DilationPolicy {
 /// be a silent fallback.
 #[derive(Debug, Clone)]
 pub struct TrackingPolicy {
+    /// Rungs, highest first. The rung index walks this, not [`LADDER`].
+    ladder: Vec<u32>,
     rung: usize,
     window: usize,
     saturated: f64,
@@ -246,11 +511,17 @@ impl TrackingPolicy {
     /// fraction (raise).
     #[must_use]
     pub fn new(window: usize, saturated: f64, quiet: f64) -> Self {
+        Self::with_ladder(window, saturated, quiet, LADDER.to_vec())
+    }
+
+    /// [`Self::new`] on `ladder` instead of [`LADDER`].
+    fn with_ladder(window: usize, saturated: f64, quiet: f64, ladder: Vec<u32>) -> Self {
         assert!(
             quiet < saturated,
             "quiet ({quiet}) must be below saturated ({saturated}) — a missing deadband chatters"
         );
         Self {
+            ladder,
             rung: 0,
             window: window.max(1),
             saturated,
@@ -266,7 +537,17 @@ impl TrackingPolicy {
     /// The factor the cluster should be running at now.
     #[must_use]
     pub fn factor(&self) -> u32 {
-        LADDER[self.rung]
+        self.ladder[self.rung]
+    }
+
+    /// Start on the rung whose factor is `factor`. See
+    /// [`DilationPolicy::align_to`].
+    pub fn align_to(&mut self, factor: u32) -> Result<(), String> {
+        let Some(rung) = ladder_rung(&self.ladder, factor) else {
+            return Err(ladder_factor_error(&self.ladder, factor));
+        };
+        self.rung = rung;
+        Ok(())
     }
 
     /// How many rungs this episode has spent going down.
@@ -318,7 +599,7 @@ impl TrackingPolicy {
         self.samples = 0;
 
         if load >= self.saturated {
-            if self.rung + 1 >= LADDER.len() {
+            if self.rung + 1 >= self.ladder.len() {
                 return Verdict::Floor;
             }
             self.rung += 1;
@@ -355,7 +636,10 @@ fn awake_cpus(samples: &[TimeSample]) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DilationPolicy, TrackingPolicy, Verdict, LADDER, QUIET, SATURATED, WINDOW};
+    use super::{
+        DilationPolicy, DilationPolicyConfig, DilationPolicyMode, PolicyConfig, TrackingPolicy,
+        Verdict, LADDER, QUIET, SATURATED, WINDOW,
+    };
 
     /// The ladder is what the N sweep licensed, in descending order.
     #[test]
@@ -544,5 +828,189 @@ mod tests {
         assert_eq!(p.factor(), 8);
         assert_eq!(p.drops(), 0);
         assert_eq!(p.raises(), 0);
+    }
+
+    #[test]
+    fn builtin_config_is_the_module_constants() {
+        let cfg = PolicyConfig::default();
+        assert_eq!(cfg.window, WINDOW);
+        assert!((cfg.saturated - SATURATED).abs() < f64::EPSILON);
+        assert!((cfg.quiet - QUIET).abs() < f64::EPSILON);
+        assert_eq!(cfg.cadence, std::time::Duration::from_secs(1));
+        assert_eq!(cfg.ladder, LADDER);
+        let down = cfg.down_policy().expect("default config");
+        let mut track = cfg.track_policy().expect("default config");
+        assert_eq!(down.factor(), LADDER[0]);
+        track.align_to(1).expect("1 is the bottom rung");
+        assert_eq!(track.factor(), 1);
+        assert!(
+            track.align_to(12).is_err(),
+            "12 is the sweep's knee, not a rung"
+        );
+        assert!(track.align_to(3).is_err());
+    }
+
+    #[test]
+    fn a_missing_deadband_is_refused_before_the_constructor_asserts() {
+        let cfg = PolicyConfig {
+            quiet: SATURATED,
+            ..PolicyConfig::default()
+        };
+        let err = cfg.track_policy().expect_err("quiet == saturated chatters");
+        assert!(err.contains("deadband"), "{err}");
+    }
+
+    #[test]
+    fn omitted_request_config_is_the_module_constants() {
+        let cfg = PolicyConfig::from_request(None).expect("omitted config");
+        let builtin = PolicyConfig::default();
+        assert_eq!(cfg.window, builtin.window);
+        assert!((cfg.saturated - builtin.saturated).abs() < f64::EPSILON);
+        assert!((cfg.quiet - builtin.quiet).abs() < f64::EPSILON);
+        assert_eq!(cfg.cadence, builtin.cadence);
+        assert_eq!(cfg.ladder, builtin.ladder);
+        assert_eq!(cfg.window, WINDOW);
+        assert_eq!(cfg.ladder, LADDER);
+    }
+
+    #[test]
+    fn bad_request_knobs_are_refused() {
+        let refuse = |cfg: DilationPolicyConfig, needle: &str| {
+            let err = cfg.resolve().expect_err(needle);
+            assert!(err.contains(needle), "{err}");
+        };
+        refuse(
+            DilationPolicyConfig {
+                window: Some(0),
+                ..DilationPolicyConfig::default()
+            },
+            "window",
+        );
+        refuse(
+            DilationPolicyConfig {
+                cadence_ms: Some(0),
+                ..DilationPolicyConfig::default()
+            },
+            "cadence",
+        );
+        refuse(
+            DilationPolicyConfig {
+                quiet: Some(SATURATED),
+                ..DilationPolicyConfig::default()
+            },
+            "deadband",
+        );
+        refuse(
+            DilationPolicyConfig {
+                quiet: Some(0.9),
+                saturated: Some(0.4),
+                ..DilationPolicyConfig::default()
+            },
+            "deadband",
+        );
+        refuse(
+            DilationPolicyConfig {
+                ladder: Some(vec![]),
+                ..DilationPolicyConfig::default()
+            },
+            "empty",
+        );
+        refuse(
+            DilationPolicyConfig {
+                ladder: Some(vec![1, 4]),
+                ..DilationPolicyConfig::default()
+            },
+            "strictly decreasing",
+        );
+        refuse(
+            DilationPolicyConfig {
+                ladder: Some(vec![4, 4, 1]),
+                ..DilationPolicyConfig::default()
+            },
+            "strictly decreasing",
+        );
+        refuse(
+            DilationPolicyConfig {
+                ladder: Some(vec![4, 0]),
+                ..DilationPolicyConfig::default()
+            },
+            "outside",
+        );
+        refuse(
+            DilationPolicyConfig {
+                ladder: Some(vec![65, 1]),
+                ..DilationPolicyConfig::default()
+            },
+            "outside",
+        );
+    }
+
+    #[test]
+    fn window_one_drops_on_the_first_saturated_sample() {
+        let cfg = DilationPolicyConfig {
+            window: Some(1),
+            ladder: Some(vec![4, 1]),
+            ..DilationPolicyConfig::default()
+        }
+        .resolve()
+        .expect("window 1 on [4, 1]");
+        let mut policy = cfg.down_policy().expect("down policy");
+        assert_eq!(policy.factor(), 4);
+        assert_eq!(policy.observe(6, 6), Verdict::Drop(1));
+        assert_eq!(policy.factor(), 1);
+        assert_eq!(policy.observe(6, 6), Verdict::Floor);
+        assert!(
+            !matches!(policy.observe(0, 6), Verdict::Raise(_)),
+            "down never raises"
+        );
+    }
+
+    #[test]
+    fn a_fork_inherits_knobs_unless_it_sets_them() {
+        let parent = DilationPolicyConfig {
+            window: Some(1),
+            cadence_ms: Some(250),
+            ladder: Some(vec![4, 1]),
+            ..DilationPolicyConfig::default()
+        }
+        .resolve()
+        .expect("parent knobs");
+        let inherited = parent.for_fork(None).expect("inherit");
+        assert_eq!(inherited.window, 1);
+        assert_eq!(inherited.cadence, std::time::Duration::from_millis(250));
+        assert_eq!(inherited.ladder, vec![4, 1]);
+
+        let replaced = parent
+            .for_fork(Some(&DilationPolicyConfig {
+                window: Some(5),
+                ..DilationPolicyConfig::default()
+            }))
+            .expect("replace");
+        assert_eq!(replaced.window, 5);
+        assert_eq!(replaced.ladder, LADDER.to_vec());
+        assert_eq!(replaced.cadence, parent.cadence);
+
+        let err = parent
+            .for_fork(Some(&DilationPolicyConfig {
+                cadence_ms: Some(250),
+                ..DilationPolicyConfig::default()
+            }))
+            .expect_err("a fork cadence is refused");
+        assert!(err.contains("cadence"), "{err}");
+    }
+
+    #[test]
+    fn policy_mode_wire_names() {
+        assert_eq!(DilationPolicyMode::default(), DilationPolicyMode::Fixed);
+        for (mode, name) in [
+            (DilationPolicyMode::Fixed, "fixed"),
+            (DilationPolicyMode::Down, "down"),
+            (DilationPolicyMode::Track, "track"),
+        ] {
+            let wire = serde_json::to_string(&mode).unwrap();
+            assert_eq!(wire, format!("\"{name}\""));
+            let back: DilationPolicyMode = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, mode);
+        }
     }
 }

@@ -287,6 +287,19 @@ pub fn build_node_vm_sized(
     data_disks: &[DataDisk],
     size: NodeSize,
 ) -> Vm {
+    build_node_vm_tuned(image, disk, tap, extra, data_disks, size, |b| b)
+}
+
+/// [`build_node_vm_sized`], with `tune` applied to the builder last.
+pub fn build_node_vm_tuned(
+    image: &NodeImage,
+    disk: &VmDisk,
+    tap: TapDevice,
+    extra: NodeCmdlineExtra<'_>,
+    data_disks: &[DataDisk],
+    size: NodeSize,
+    tune: impl FnOnce(k7d::vm::VmBuilder) -> k7d::vm::VmBuilder,
+) -> Vm {
     let cmdline = node_cmdline_with(tap.guest_ip(), extra);
     let mut builder = Vm::builder()
         .kernel(image.kernel())
@@ -300,7 +313,7 @@ pub fn build_node_vm_sized(
     for dd in data_disks {
         builder = builder.data_disk(dd.clone());
     }
-    builder.build().expect("Ubuntu node VM should build")
+    tune(builder).build().expect("Ubuntu node VM should build")
 }
 
 /// A named persistent data disk owned by a test: same

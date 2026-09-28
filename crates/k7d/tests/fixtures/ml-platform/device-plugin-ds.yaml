@@ -1,7 +1,43 @@
-# Fake GPU device plugin. Registers nvidia.com/gpu
-# count=2 per node. Mount both kubelet device-plugin dirs: k3s v1.32.5
-# keeps kubelet.sock at the stock /var/lib/kubelet/device-plugins/
-# path (CHALLENGES #146). The plugin auto-detects which has kubelet.sock.
+# Fake GPU device plugin. Registers nvidia.com/gpu.
+# FAKE_GPU_COUNT defaults to 2 per node (the JobSet Capacity=2 contract).
+# FAKE_GPU_PRODUCT / FAKE_GPU_TOPOLOGY_BLOCK / FAKE_GPU_TOPOLOGY_RACK
+# are the homogeneous identity. A ConfigMap fake-gpu-identity (data key
+# = node name, value = product=,block=,rack=) overrides per node.
+# Mount both kubelet device-plugin dirs: k3s v1.32.5 keeps kubelet.sock
+# at the stock /var/lib/kubelet/device-plugins/ path (CHALLENGES #146).
+# The plugin auto-detects which has kubelet.sock.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fake-gpu-plugin
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fake-gpu-plugin
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
+  resourceNames: ["fake-gpu-identity"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fake-gpu-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fake-gpu-plugin
+subjects:
+- kind: ServiceAccount
+  name: fake-gpu-plugin
+  namespace: default
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -18,6 +54,7 @@ spec:
       labels:
         app: fake-gpu-plugin
     spec:
+      serviceAccountName: fake-gpu-plugin
       tolerations:
       - operator: Exists
       containers:
@@ -28,6 +65,18 @@ spec:
         env:
         - name: PLUGIN_SOCK_DIR
           value: /var/lib/kubelet/device-plugins
+        - name: FAKE_GPU_COUNT
+          value: "2"
+        - name: FAKE_GPU_PRODUCT
+          value: "Fake-A100"
+        - name: FAKE_GPU_TOPOLOGY_BLOCK
+          value: "block-0"
+        - name: FAKE_GPU_TOPOLOGY_RACK
+          value: "rack-0"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         securityContext:
           privileged: true
         volumeMounts:

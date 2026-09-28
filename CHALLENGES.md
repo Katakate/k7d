@@ -9870,6 +9870,609 @@ once, and jail hard-links stay on the XFS.
 
 ---
 
+## 264. Auto-warp on the Intel node, kernel 6.8: the same `lapic` one-shot as AMD, and a jump fires it anyway, because the VMX preemption timer keeps a guest-TSC copy of the expiry
+
+**Symptom:** after the Intel node went back to host kernel 6.8,
+`test_auto_warp_jump_compresses_a_crash_loop_backoff` failed at 151 s
+and then 159.3 s against the 150 s ceiling (312 s guest, 1.96×). The
+guest now reports `lapic`, the same as the AMD nodes: 6.8 does not
+advertise `CPUID.1:ECX[24]`, so #261's deadline path never runs, and the
+test picked the one-shot ceiling that was measured on AMD (132.3 s,
+2.34×). The AMD nodes still pass. The difference shows in the decline
+mix: 40% of cycles `vcpu_awake` against AMD's 18%.
+
+**Root cause:** the one-shot is host-anchored only on SVM. KVM stores
+a one-shot's expiry twice, `target_expiration` in host time (for the
+hrtimer and `TMCCT`) and `tscdeadline` in guest-TSC units (for the VMX
+preemption timer, `vmx_set_hv_timer`). `vcpu_block` switches a halting
+vCPU to the hrtimer, and switches it back to the preemption timer when
+anything wakes it, the policy's own pause signal included.
+`start_hv_timer` then compares the stale guest-TSC copy against the TSC
+the warp just advanced, finds it expired, and fires the timer. So on
+VMX a jumped one-shot fires at the next pause, and each jump deletes one
+idle gap. That is the exact semantics #261 measured for deadlines. It is
+not the suspend semantics that the 150 s number assumes. SVM has no
+`set_hv_timer`, so there the jumped timer only fires at its host
+instant.
+
+**Measured A/B on the same host:** turning the preemption timer off
+for just the cluster's VMs (`KVM_CAP_X86_DISABLE_EXITS` MWAIT, which
+makes `kvm_can_use_hv_timer` false without reloading `kvm_intel`
+under a co-tenant's VMs) gave host-anchored one-shots and **471 s guest
+in 57.2 s wall = 8.24×**, past the 3.76× idleness ceiling: 76% of
+cycles warped and 7% declined `vcpu_awake`. The loop re-jumped the same
+armed timer about 4 400 times a second. This also says how much of
+AMD's 2.34× is invented time: the invented share grows with the cycle
+rate, and AMD cycles about 7× slower than this host (627 vs ~4 400
+cycles/s).
+
+**Fix:** the wall ceiling is keyed on what a jump does to the armed
+timer, not only on the clockevent name.
+`common::warp::host_runs_lapic_timer_on_preemption_timer` reads
+`kvm_intel`'s `preemption_timer`. k7d never disables MWAIT or HLT
+exits, so that parameter decides it. A one-shot on the preemption timer
+gets its own ceiling of 200 s, 25% over the slower measurement, the
+same margin as the deadline's 240 s. The AMD 150 s is unchanged. No
+policy change: fabrication on SVM is bounded by the test's idleness
+ceiling assertion. Making the SVM one-shot fire on a jump would take a
+`KVM_SET_LAPIC` re-arm with `TMCCT` reduced by the jump. That is policy
+work, and it needs AMD measurements.
+
+**What this generalises to:** "which timer does the guest arm" and
+"does a jump fire it" are separate host facts. The first is CPUID. The
+second is the vendor module's timer backend. Two hosts can give the
+same `/proc/timer_list` and still behave differently under a warp.
+
+**Reference:** Linux v6.8 `arch/x86/kvm/lapic.c`
+(`set_target_expiration`, `start_hv_timer`, `start_sw_period`,
+`kvm_can_use_hv_timer`), `arch/x86/kvm/x86.c` (`vcpu_block`),
+`arch/x86/kvm/vmx/vmx.c` (`vmx_set_hv_timer`).
+
+**Time lost:** ~1 h, including one 10-minute A/B run.
+
+---
+
+## 265. The workspace lock let go the moment it was taken: a `status` file left by the last run of the same name
+
+**Symptom:** two agents on one node. Mine held the lock for a single
+`test_auto_warp` run, and a second agent's `make check` started and ran
+`test_auto_warp` alongside it. `bring_up_cluster` in one process tore
+down the other's bridge. Result: a flood of `TAP write … File descriptor
+in bad state (os error 77)`, and a compression measurement that means
+nothing. `workspace.lock.holder` named my run, and yet the other run was
+building in the same `/root/k7d`.
+
+**Root cause:** `remote-run.sh`'s node-side holder takes `flock` and
+then waits `while [ ! -f status ]`. `status` is only cleared later, by
+`start_run`, after the rsync. A run name that had finished before
+(`check`) still had its old `status`, so the holder's loop exited at
+once and released the lock. The new run then went ahead unlocked, and
+the next agent's holder took the lock and rsynced over the tree it was
+building.
+
+**Fix:** the holder removes the stale `status` right after `flock`
+succeeds, before it records `lock.pid`.
+
+**Reference:** none.
+
+**Time lost:** ~20 min, plus one invalidated 10-minute run on each side.
+
+---
+
+## 266. `test_fork_requeues_interrupted_injection` on the Intel node: VM-entry failure 0x80000021, #97's forced injection meeting VMX's entry checks
+
+**Symptom:** on the Intel node the test sometimes fails with `KVM fail
+entry on vCPU 0: reason=0x80000021 … after 1 exits`, and then the vsock
+probe times out. It looks like the CET/XSS restore trap (#260), but it
+is not.
+
+**Root cause:** 0x80000021 is VMX exit reason 33, "VM-entry failure due
+to invalid guest state". The test forces `interrupt.injected=1` onto a
+capture taken at an arbitrary pause point. SDM 26.3.1.5 refuses to
+inject an external interrupt when `RFLAGS.IF=0` or an STI/MOV-SS shadow
+is set, and KVM passes the staged event straight into the VMCS. SVM's
+`EVENTINJ` makes no such check, so on AMD the same input gets injected
+anyway. That is #97's intermittent "deaf vsock" flake. It is the same
+test-side cause (a state KVM never produces, because KVM stages an
+external interrupt only when the guest can take it), and each vendor
+fails it in its own way.
+
+**Fix:** the test captures again, up to 200 times, until vCPU 0 has
+`IF=1` and no interrupt shadow, and only then forces the injection. The
+restore path is unchanged. A real cancelled injection always satisfies
+those conditions.
+
+**Reference:** Intel SDM Vol. 3C §26.3.1.5 (checks on VM-entry event
+injection); #78, #97.
+
+**Time lost:** ~15 min (read off the exit reason).
+
+---
+
+## 267. `stop_vm` after `tree_adopt_cluster` looks like "already gone"
+
+**Symptom:** After `tree_adopt_cluster`, a client `StopVm` on the
+original ids gets `no such VM` and treats teardown as done. The
+guests keep running; caller `block_devices` stay open until
+`tree_drop` or daemon exit. `df` only moves after `docker restart k7d`.
+
+**Root cause:** Adopt removes the ids from `vms` on purpose (the tree
+owns the payloads). `stop_vm` on a miss always returned `no such VM`,
+the same string as a never-created id. The shim treats any non-Ok as
+best-effort; a lab client that assumes "error = already gone" leaks.
+
+**Fix:** The daemon remembers `vm_id → tree_id` at adopt. A `stop_vm`
+miss that maps to a tree returns `VM {id} was adopted into tree
+{tree_id}; use tree_prune / tree_drop`. Unknown ids stay `no such VM`.
+`tree_drop` still does not unlink caller images (broker `O_PATH` pins
+wait for the follow-up that calls `release_vm` on prune/drop).
+
+**Reference:** none (control-plane API).
+
+**Time lost:** reported by a training-tree lab; diagnosis from the
+code path, not a live repro.
+
+---
+
+## 268. Adopted disk pins must die with the tree, not at restore-swap
+
+**Symptom:** With `K7D_PRIVSEP=on`, `tree_drop` / `tree_prune` closed
+the guests but caller `block_devices` stayed allocated until the
+broker process exited (`df` moved only after `docker restart k7d`).
+Releasing those pins at adopt, or inside restore-swap, is the other
+failure: the next `disk.open` of the same root-owned image returns
+`EACCES` because uid `k7d` cannot open it directly.
+
+**Root cause:** `vm.register` pins each caller image as an `O_PATH` fd
+in the node broker, keyed by the `CreateVm` id. `tree_adopt_cluster`
+removes that id from `vms` and never called `release_vm`. Restore-swap
+does not take ownership of a new file: `open_pinned` reopens the same
+path through that pin (`vm.rs` restore-swap, `block.rs`
+`open_backing_file`). A child prune drops only the child's fds; the
+root is still live on the same pins. Tree-created `register_disk`
+auto-entries are a different id and a different lifetime.
+
+**Fix:** The cluster tree remembers the adopted ids. After the live
+payloads drop, `release_vm` runs for a prune whose subtree includes
+the root, for `tree_drop`, and for `Drop` (shutdown, or a tree that
+never made it into the registry). The daemon then forgets those ids,
+so a later `stop_vm` is `no such VM` again. A child prune leaves the
+pins and the adopted map alone.
+
+**Reference:** none (broker pin table).
+
+**Time lost:** named in the adopt issue before the patch. The wrong
+lifetime (release at restore-swap, or on a child prune) is the trap.
+
+---
+
+## 269. KubeRay injects `--num-gpus` from `nvidia.com/gpu`, so omitting `rayStartParams.num-gpus` still reports 1 GPU (G5 / 31a-inc4b)
+
+**Symptom:** on the fake-GPU Ubuntu mock, a RayJob whose worker
+requests `nvidia.com/gpu: 1` reaches SUCCEEDED with digest-pinned
+CPU `rayproject/ray:2.47.1-py311`. `ray status` prints `0.0/1.0 GPU`
+when `rayStartParams.num-gpus: "1"` is set. The same line appears
+when that param is stripped. The G5 plan expected **0** without
+`num-gpus` because there is no NVML.
+
+**Root cause:** KubeRay's pod builder copies the container's
+`nvidia.com/gpu` limit into `ray start --num-gpus=…` even when
+`rayStartParams` is empty. Ray therefore advertises a GPU from the
+start argument, not from NVML. There is still no device node and no
+CUDA; the count is a scheduler-shaped integer.
+
+**Fix:** record **1 GPU / `0.0/1.0 GPU`** for both variants in
+`test_ubuntu_ml_rayjob_gpu_succeeded` and the README. Assert the
+worker cmdline still contains `num-gpus` when the CR omits the
+param. Do not claim Ray placement-group *hardware* works.
+
+**Reference:** KubeRay v1.7.0 pod builder (`ray start` inject);
+CHALLENGES #157 (the busybox opt-out of that inject).
+
+**Time lost:** one isolated RayJob run (~3 min after image cache)
+plus rewriting the expected-0 assertion.
+
+---
+
+## 270. Resuming a suspended checkpoint restores keyframe RAM and drops later guest writes
+
+**Symptom:** An Ubuntu tree root — it is its own nearest checkpoint — writes a marker on `/dev/shm` after `new_cluster` has published `memory.bin`, then suspends and resumes. The marker is in guest RAM before suspend and absent from the keyframe file. After resume the new mapping does not contain it. `vm_state.json` is still the post-keyframe capture, so CPU and device state come back on older RAM. A fork child does not show this: its nearest checkpoint is an ancestor, and that pack is applied.
+
+**Root cause:** `SnapshotTree::resume` and `ClusterSnapshotTree::resume` skipped `apply_delta` when `base_node == node_id`. Suspend still writes that node's `delta.pack` as a diff against its own keyframe and does not refresh `memory.bin`. The skip treated the keyframe as the whole memory. LRU suspend can select the root: `lru_live_victim` does not exempt it unless the node is protected.
+
+**Fix:** Apply the node's pack onto the nearest checkpoint's `memory.bin` when the pack exists, including when they are the same node. The dirty-bitmap re-seed (CHALLENGES #143) then keeps those pages across a second suspend. A checkpoint with no pack is the crash path: `open` marks a killed live root Suspended without writing a delta, and resume uses the keyframe alone. `test_ubuntu_root_resume_keeps_post_keyframe_marker` writes the marker only after the keyframe, checks it is missing from `memory.bin`, and requires it in RAM after two suspend/resume cycles.
+
+**Reference:** none.
+
+**Time lost:** the skip was already suspected; one Ubuntu repro confirmed it.
+
+---
+
+## 271. A cluster keyframe cut must not resume members before their swap
+
+**Symptom:** `tree_adopt_cluster` / `tree_create_cluster` keyframed
+members one at a time. Each guest froze for its own full dump while
+its peers kept running, so the root keyframes were not one instant of
+the cluster. The obvious fix — pause all, dump all, resume all, then
+restore-swap each member — looks like a shorter pause but is wrong.
+
+**Root cause:** `restore_swap_onto_base` shuts the source down and
+restores it from the keyframe it just wrote. Whatever a guest does
+between a resume and its own swap is rewound. That includes packets
+it sent to peers that already swapped: a peer can ACK data that the
+rewound member no longer has sent, or keep data the member never
+received. The old per-member loop had the same window, only
+microseconds wide. With a serial swap after a resume-all, the last
+member ran for the whole length of everyone else's swap. The plan
+also kept swaps serial "for CID/TAP". A swap drops and re-claims only
+its own member's CID and moves only its own TAP, so on 3 × 1 GiB that
+serialization added ~280 ms per member to the last one's pause.
+
+**Fix:** `fork::prepare_cluster_fork_source` pauses every member,
+dumps them from scoped threads, then restore-swaps all of them in
+parallel **straight from the pause**. The restored copy's `start` is
+the resume. `ClusterCut` records per-member pause, dump and restart
+times; `is_consistent` checks that every dump ran while every member
+was paused. `TreeCreated.pause_ns` is that per-member pause. On AMD,
+3 × 1024 MB: max pause 1.19 s (parallel dumps ~0.80 s each) against
+2.23 s for the same dumps one at a time. Serial swaps gave 1.63 s.
+
+**Reference:** none (`fork_cluster_warm_batch` for the pause-all
+skeleton and for concurrent restores).
+
+**Time lost:** ~1 h, most of it spent getting the design right before
+writing code.
+
+---
+
+## 272. Two workers on one node: `make remote-check` can attach to the other's run, or test the other's binaries
+
+**Symptom:** A second full `make remote-check` on a node another
+worker was also using reported `test_cluster_tree` as `10 passed`. The
+branch has 11 tests there, and the new one was the reason for the run.
+The log said `Finished … in 0.06s` for every test binary. Nothing had
+been compiled.
+
+**Root cause:** There are two traps.
+
+1. `remote-run.sh` attaches to any in-flight run **with the same name**
+   and skips the rsync. `make remote-check` is always named `check`, so
+   while another worker's `check` holds the node, your `make
+   remote-check` streams their log and returns their exit code.
+2. The node's sources were byte-identical to the branch, but they
+   carried the branch's *local edit* mtimes (10:47 UTC). Another
+   worker's run had built `libk7d` and the test binaries later (14:27
+   UTC) from different sources. `rsync-to-node.sh` uses `--checksum`
+   and touches only files it transfers, so a content no-op left the old
+   mtimes in place. Cargo saw sources older than the artifacts and
+   reused them. It is the same trap as #64 and #142, carried here by a
+   second writer to `/root/k7d`.
+
+**Fix:** When the node is shared, run the suite under your own run
+name, and touch the sources before building:
+`bash utils/remote-run.sh <you>-check "find crates -name '*.rs' -exec
+touch {} + && make check"`. The tell is a test count that doesn't
+match the branch, or `Finished` in well under a second right after an
+rsync.
+
+**Reference:** CHALLENGES #64, #142.
+
+**Time lost:** ~2 h: one full suite that tested another worker's
+build, plus lock waits.
+
+---
+
+## 273. A parallel root keyframe made serial child keyframes look slower than a full dump
+
+**Symptom:** After #271 made the cluster root keyframe one parallel
+cut, `test_keyframe_cost_ubuntu_divergence_levels` failed on AMD:
+the kafka child's incremental keyframe took 2.607 s, and the root's
+full dump of the same 3 × 2 GiB cluster took 2.158 s ("the clone is
+not paying for itself"). The byte share was still 0.507, far under
+the 0.80 ceiling. The same test had passed on main on that node.
+
+**Root cause:** Only the root path changed. `ClusterSnapshotTree::
+prepare_fork_source` still prepared a child's members one after
+another, each with its own pause, dirty merge, clone, pwrite and
+swap. The baseline went from the sum of three full dumps to the max
+of three, while the kafka child still paid the sum of three
+incremental writes. A child keyframe was not one instant of the
+cluster either, which is the same bug #271 fixed for the root.
+
+**Fix:** The child path goes through `prepare_cluster_fork_source`
+too, with a per-member ancestor `memory.bin`.
+`Vm::write_keyframe_paused` holds the incremental-or-full choice and
+its loud fallbacks, and the single-VM
+`prepare_fork_source_incremental_in` now uses it as well. On AMD-0 the
+kafka child took 0.775 s against a 2.133 s root, and idle and k8s took
+0.50 s and 0.48 s. The budgets did not change.
+
+The Intel miss in the same round
+(`test_ubuntu_k3s_cluster_warm_fork_no_restart`, 2.022 s against 1 s,
+at the tail of a 100-minute suite) goes through per-VM
+`Vm::prepare_fork_source` and `fork_cluster_warm`, whose behaviour T3
+does not change. On the T3 head, run on its own on the same Intel
+node, it measured 160 ms, so there was no case for a main A/B run. It
+is the cold page cache described in #118.
+
+**Reference:** #271, #118.
+
+**Time lost:** one red AMD suite.
+
+---
+
+## 274. `advisor_mode` show string is not a legal write
+
+**Symptom:** a test that saved `/sys/kernel/mm/ksm/advisor_mode` with
+`cat` and wrote that byte string back on the way out failed with
+`Invalid argument`. The live file still read `[none] scan-time`.
+
+**Root cause:** that knob's show method prints every choice and
+brackets the active one. The store method accepts only the bare
+token (`none` or `scan-time`). Writing the display string is EINVAL,
+so a restore that uses the raw file leaves the last successful write
+in place.
+
+**Fix:** `KsmdGuard` in `test_ubuntu_ksm.rs` stores the bracketed
+token and writes that back.
+
+**Reference:** Linux `mm/ksm.c` `advisor_mode` sysfs (choice list).
+
+**Time lost:** one Intel suite tail, then a restore that did not
+match the saved display string.
+
+---
+
+## 275. Live dilation on the Intel node: a timer armed before the change keeps the old rate, because the VMX preemption timer path returned early
+
+**Symptom:** on the Intel node (Core Ultra 7 265, 6.8, `kvm_intel
+preemption_timer=Y`), the rate and `sleep 8` checks around a live
+`SetDilation` all pass. But a guest `sleep 0.25` that is already armed
+when the factor goes 4 → 8 overran by up to **249.3 ms** of guest time
+across 20 raise/drop pairs, against a quiet maximum of 29 ms. That is
+its whole remaining interval, doubled. The `sleep 8` checks never saw
+it, because they arm the sleep *after* the change.
+
+**Root cause:** `kvm_lapic_dilation_changed` returned early when
+`hv_timer_in_use`, on the theory that the preemption timer is armed in
+guest TSC cycles and the offset rewrite keeps those continuous. Two
+things in 6.8 make that false:
+
+1. `vmx_set_hv_timer` converts the guest deadline into a **host** TSC
+   deadline (`hv_deadline_tsc`) through the vCPU's current TSC ratio,
+   which is the old ratio. It is only redone when something calls
+   `restart_apic_timer`. `kvm_arch_vcpu_load` does that on a CPU
+   migration, which usually hides the bug, but not reliably.
+2. The one-shot's host-time `target_expiration` and `period` were left
+   alone too. At the vCPU's next `HLT`, `vcpu_block` calls
+   `kvm_lapic_switch_to_sw_timer`, and `start_sw_period` arms the
+   hrtimer at that stale host instant. An idle guest halts right after
+   resume, so this path is deterministic. A raise fires the timer
+   new/old times late; a drop fires it early, which the guest absorbs
+   by reprogramming.
+
+SVM has no `set_hv_timer`, so the AMD path always rescaled the
+hrtimer. The AMD numbers were right. The TSC-deadline hrtimer
+(`start_sw_tscdeadline`) was never re-armed on either vendor, because
+the old code's `!period` check skipped it.
+
+**Fix:** patch ABI 3. Rescale `.period`, plus `.target_expiration`
+whenever an hrtimer or the hv timer was armed. Then call
+`restart_apic_timer`, from `kvm_dilation_reload_vcpu` with the vCPU
+still loaded and after the new ratio is in place. Across the same 20
+pairs, the maximum overrun is now 33.5 ms (one-shot) and 36.3 ms
+(TSC-deadline). `VmBuilder::tsc_deadline_timer` advertises
+`CPUID.1:ECX[24]`, which 6.8 leaves out, so one host kernel covers both
+timer modes. `test_dilation_live_change_rearms_in_flight_timers` holds
+the 80 ms budget.
+
+**What this generalises to:** KVM keeps a LAPIC timer's expiry in three
+units: guest TSC (`tscdeadline`), host time (`target_expiration`), and,
+on VMX only, host TSC (`hv_deadline_tsc`). Changing the TSC ratio keeps
+only the first one continuous. A test that arms its timer after the
+change can't see the other two.
+
+**Reference:** Linux v6.8 `arch/x86/kvm/vmx/vmx.c` (`vmx_set_hv_timer`),
+`arch/x86/kvm/lapic.c` (`start_sw_period`, `restart_apic_timer`,
+`kvm_lapic_switch_to_sw_timer`), `arch/x86/kvm/x86.c` (`vcpu_block`,
+`kvm_arch_vcpu_load`); #264 (the same stale guest-TSC copy under a jump).
+
+**Time lost:** ~30 min reading source; one 10-minute A/B pair on Intel.
+
+---
+
+## 276. Cross-rate dilated fork "misses lockstep" by 15 s whenever the child's agent is slow to connect
+
+**Symptom:** `test_dilation_fork_child_at_one_from_source_at_eight`
+failed on AMD with the child 15.27 s of guest time behind the source,
+and `..._at_eight_from_source_at_one` failed once on Intel with the
+child +14.3 s ahead. Both read as the rest being handed back in the
+wrong guest time. On Intel this was written off as intermittent.
+
+**Root cause:** the test read the source's clock only after the child
+had started, its agent had connected (about 2 s on the AMD node) and
+its clocks had been read. Across that window the two VMs run at
+different rates, so they drift apart by `|N_child - N_source| x
+window`: 7 x 2.06 s is 14.4 s. The bound only allowed
+`N_source x fork_wall`, and `fork_wall` stops before `start()`. The
+handoff was exact the whole time. With a 17 ms connect the same test
+reads +0.62 s.
+
+**Fix:** time the child from `start()` to its first read, and widen
+the lockstep bound by the rate difference times that window, in the
+direction the faster clock moves. When both rates are equal, the bound
+is unchanged.
+
+**Reference:** none.
+
+**Time lost:** one failed Intel run written off as a flake, one failed AMD run.
+
+---
+
+## 277. Pre-copying a keyframe from a running guest: clear only what GET saw, drain the device bitmaps, and stop the pause clock before the husk's unmap
+
+**Symptom:** Two traps, one silent and one loud. The first large
+pre-copied cut (spec 44a, 30 GiB member) reported a **5.3 s** pause for
+a member whose paused write took 12 ms and whose restore took 10 ms.
+The silent one never fired in a test, because the old code only
+harvested paused guests.
+
+**Root cause:**
+
+1. `get_and_accumulate_dirty` re-armed write protection with an
+   **all-ones** `KVM_CLEAR_DIRTY_LOG` mask. On a paused VM that is
+   harmless. On a running one, a write that lands between `GET` and
+   `CLEAR` on a page `GET` reported clean has its bit cleared unseen.
+   The page stays stale in the keyframe, and no bitmap ever reports it.
+2. The virtio-blk / virtio-net device-DMA bitmaps were read and never
+   cleared: cumulative for the VM's lifetime. That is correct for a
+   union, but every live round would re-copy every page a device had
+   ever written.
+3. `restore_swap_onto_base` dropped the swapped-out husk before it
+   returned. Unmapping a 30 GiB memfd mapping and freeing its 22 GiB
+   of shmem takes ~5 s. The cut stopped its "running" clock after
+   that, though the restored copy had been running since `start()`.
+
+**Fix:**
+
+1. `Vm::harvest_dirty` clears with the `GET` bitmap as the mask.
+2. It drains the device bitmaps with `swap(0, AcqRel)`, and
+   `mark_dirty` is now `Release`. Every worker writes before it marks,
+   so a drained bit means the bytes are visible.
+3. `restore_swap_onto_base_keep_husk` hands the husk back, and the cut
+   drops it after recording `running_ns`.
+
+With those, the 30 GiB member's pause is 44 ms, against 48.9 s for its
+full paused dump. The swap also stopped hiding the husk's unmap in
+T3's 3 × 1 GiB test: 30–54 ms instead of 0.27–0.43 s.
+
+**Reference:** cloud-hypervisor `MemoryManager::dirty_log` drains its
+VMM-side bitmap (`get_and_reset`) every pre-copy round.
+
+**Time lost:** ~1 h (the pause mismeasurement, plus a guest fill that
+relied on `setsid`/`nohup`, which the busybox guest does not link).
+
+---
+
+## 278. Re-keyframing over `memory.bin` silently changes every child that re-opens that path
+
+**Symptom:** Refreshing an adopted root by writing a new keyframe onto
+`nodes/<id>/members/<i>/memory.bin` makes the next fork of a child that
+was mapped before the refresh — and a resume of one that was suspended
+against the old generation — come up with the refreshed memory. Nothing
+returns an error. The child's marker from before the refresh is gone
+and the root's post-refresh bytes are there instead.
+
+**Root cause:** A live child does not store a generation. It stores
+`fork_source_base_path`, and every later fork re-opens that path.
+`cow_base` recorded `(ancestor, identity)` only so resume could refuse
+when the ancestor's *current* `base_identity` had moved, which is the
+wrong way around once the old file is still the one the child maps.
+The adopted root has no `cow_base` of its own: its members are "the
+keyframe just swapped in, plus a dirty bitmap that swap zeroed", so
+the incremental ancestor is that file, not a parent the root does not
+have. A suspended pack has the same problem if resume opens the
+checkpoint's current generation instead of the identity in the pack
+header.
+
+**Fix:** `tree_prepare_fork_source` with `refresh: true` writes
+`nodes/<id>/gen-<identity>/members/<i>/memory.bin` and swaps the
+members onto that file. The previous inode stays at the path children
+already hold. `cow_base` and the pack header name the generation that
+was mapped; resume and a later fork open that file after the
+checkpoint's current identity has moved. Restore-swap allocates a fresh
+dirty bitmap, so the next fork copies only pages dirtied after the
+refresh.
+
+**Reference:** none.
+
+**Time lost:** named in the fork-memory assessment before the patch.
+The failure is silent, which is why the new file is the whole fix.
+
+---
+
+## 279. Fork-source teardown waits out the log bridge's dead vsock read
+
+**Symptom:** `test_kubectl_fork_source_teardown` fails about 2 of 5 times
+on the Intel node. The fork pod is gone in a couple of seconds. The
+source stays `Running` until the test's 30s deadline. Passing runs stop
+both in about 3s. kubelet does issue Kill for the source; `stop_vm`
+for the source VM never arrives.
+
+**Root cause:** containerd's `task.Delete` blocks in `io.Wait()` until
+the shim closes the container's stdout/stderr FIFO write ends
+(CHALLENGES #23), and only then stops the sandbox. The source's
+`OutputBridge` owns those FIFOs. `Drop` only set a flag; the thread
+closes the FIFOs when it leaves `container_output`. That call uses the
+connection opened at pod start. `prepare_fork_source` swaps the source's
+vsock backend and leaves the old connection silent — a native vsock
+read does not treat EOF as fatal, so `read_response_line` polls until
+the 30s request deadline. The flag is not looked at during that read.
+The fork's bridge was dialed after the swap, so its read returns at once
+and its sandbox `stop_vm` lands. When the kernel resets the old socket,
+the source read errors immediately and the test passes; when the socket
+just goes quiet, Delete is still in `io.Wait()` at 27s
+(`context deadline exceeded` on the source container, sandbox still up).
+
+**Fix:** `OutputBridge`'s `Drop` closes the FIFO write ends itself, so
+`io.Wait()` is not stuck behind the agent read. The bridge also bounds
+each `container_output` at 1s (`AgentClient::set_request_timeout`), so
+the thread notices the dead connection and redials the swapped backend
+instead of sitting out the 30s deadline. `Kill` was already dialing a
+fresh agent (CHALLENGES #60); this is the other holder of that
+pre-swap connection.
+
+**Reference:** containerd `client/task.go` (`io.Wait()` before Delete),
+CHALLENGES #23 and #60.
+
+**Time lost:** ~2 h, most of it in the containerd log: Kill(15) and
+Kill(9) for the source were on time, and the 27s gap was between the
+exit event and `task.Delete`.
+
+---
+
+## 280. Week-old Kata Firecracker VMs pin `kvm_amd`, so dilation-install will not swap modules
+
+**Symptom:** `make dilation-install` stops k7d, then `modprobe -r kvm_amd` returns "Module kvm_amd is in use" and the script restores the daemon without loading the patched modules. `utils/kvm-dilation/state.sh` still prints `stock`. The holders are `firecracker-v1.16.1` processes whose cwd and root are `(deleted)`, parent pid 1, cgroup `kata_overhead`, elapsed 7–8 days. `crictl pods` shows no Kata sandbox for them. `kubectl` only lists ordinary runc system pods (Cilium, Longhorn).
+
+**Root cause:** A Kata Containers sandbox exited and left the Firecracker VMM reparented to init, still holding `/dev/kvm`. Those processes are not a live worker's lease and not a k3s pod. `kvm_amd`'s use count stays non-zero, and the install script treats any external holder as a reason to refuse the swap (the same interlock as #197).
+
+**Fix:** On a node whose lease you hold, and after confirming no live worker holds it, `kill` those Firecracker pids. Their sandboxes are already gone. `kvm_amd` then shows zero users and `modprobe -r` succeeds. Do not delete the runc shims for Cilium or Longhorn; those pods are the node's k3s, not the pin.
+
+**Reference:** Kata Containers (Firecracker hypervisor, `kata_overhead` cgroup). Same refusal path as #197.
+
+**Time lost:** one failed install on each AMD node before the processes were identified as reparented leftovers.
+
+---
+
+## 281. RayJob `gpu-rayjob` fails on a GCS heartbeat miss while k3s nodes stay Ready
+
+**Symptom:** `test_ubuntu_ml_rayjob_gpu_succeeded` panics about 64s after apply: RayJob `gpu-rayjob` is `FAILED`, deployment `Failed`, message "The actor died unexpectedly before finishing this task" / "The actor died because its node has died" / "health check failed due to missing too many heartbeats" / "The actor never ran". The `ray-worker` container exits 1 after about 28s (`ExitCode:1`, `Reason:Error`) and the pod restarts because `restartPolicy` is `Always`. The head pod does not restart. `kubectl get nodes` still shows all three Ubuntu nodes `Ready`, and the RayCluster status is still `ready`. The `ray:2.47.1-py311` image pull (~894 MB) succeeded.
+
+**Root cause:** Ray's GCS marked the worker's Ray node dead because raylet heartbeats were late, then cancelled the JobSupervisor actor before it ran. Kubernetes never marked the node NotReady. The test brings the cluster up in-process at dilation 1 and does not set `dilation_policy`. It failed at the end of a multi-hour `make check` on stock KVM, after the dilation modules had already been reverted. That is a load flake on the existing RayJob path. The per-tree dilation loop does not run this test.
+
+**Fix:** `apply_and_wait_rayjob` deletes the RayJob and applies it once more when the status message contains `missing too many heartbeats`, or both "actor died unexpectedly" and "The actor never ran". Any other `FAILED`, `STOPPED`, or timeout still panics on the first sighting. That panic, and the retry log line, include the head and worker container logs (`--previous` as well). The first capture only had the KubeRay operator line `ExitCode: 1`.
+
+**Reference:** none.
+
+**Time lost:** one full AMD `make check` that died on this test after the dilation policy tests had already passed.
+
+---
+
+## 282. Window 1 spends its rung on the arm-time sample, before a fork exists
+
+**Symptom:** `test_dilation_policy_knobs_custom_ladder` created a minimal guest at factor 4 with `window: 1` and ladder `[4, 1]`, then forked. The root trajectory was `[4, 1]`. The child, forked with the knobs omitted, had trajectory `[1]`. The log shows `set_dilation_lockstep: x1` in the same second the policy thread starts, before `tree_fork`.
+
+**Root cause:** `dilation_loop` samples once before it sleeps. That sample runs as `TreeCreate` arms the thread, and the vCPU is still `RUNNING` after the snapshot resume that made the tree. `WINDOW` is 3 because one staggered wakeup looks saturated; a window of 1 spends the rung on it. The fork then copies the live factor, so the child never occupied 4. 1 is also on the default ladder, so a child that stayed at 1 does not prove it inherited `[4, 1]`.
+
+**Fix:** The `[4, 1]` tree still has to walk `4 → 1` and must not visit 8 or 2. Inherit is a second tree on `[4, 3]`. 3 is not a default rung, so a fork that omits the struct and comes up at 3 inherited the parent's ladder. A fork that replaces the ladder with `[4, 1]` is refused before it boots, because 3 is not on that ladder.
+
+**Reference:** none. The window of 3 is the comment on `WINDOW` in `crates/k7d/src/dilation.rs`.
+
+**Time lost:** one patched-host run of the new dilation test (~35 s of guest time, after the module rebuild).
+
+---
+
 ## Reference projects and what each taught us
 
 | Project | What we learned |

@@ -270,6 +270,8 @@ fn test_sweep_spares_marked_tree_with_live_vm() {
             config: k7d::control::VmConfig::default(),
             budget: None,
             tree_id: Some(tree_id.clone()),
+            dilation_policy: None,
+            dilation_config: None,
         })
         .expect("tree_create");
     let tree_id = match created {
