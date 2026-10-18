@@ -1,0 +1,24 @@
+# A bare agent-sandbox Sandbox in a k7d microVM (runtimeClassName k7).
+# k7d sizes the VM from the container limits. Versions: utils/agent-sandbox/pins.env.
+#   kubectl apply -f sandbox-k7.yaml
+#   kubectl wait sandbox/python-k7 --for=condition=Ready --timeout=180s
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: python-k7
+spec:
+  service: true
+  podTemplate:
+    metadata:
+      labels: {app: python-k7}
+    spec:
+      runtimeClassName: k7
+      automountServiceAccountToken: false
+      containers:
+      - name: python-runtime
+        image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v0.1.0@sha256:b6f0957f46c69543d874fdb8858b53b313cfc14cc6501bb7b0c6054707d96b64
+        ports: [{containerPort: 8888, name: http}]
+        readinessProbe: {httpGet: {path: /, port: 8888}, periodSeconds: 5, timeoutSeconds: 5}
+        resources:
+          limits: {cpu: "1", memory: 1Gi}
+          requests: {cpu: 250m, memory: 1Gi}

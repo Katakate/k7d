@@ -1060,6 +1060,15 @@ fn test_install_pod_nat_installs_rules() {
 
     let pod_ip = Ipv4Addr::new(10, 0, 99, 7);
     let netns_path = PathBuf::from(format!("/var/run/netns/{netns}"));
+    let localnet = |args: &[&str]| {
+        let out = Command::new(args[0])
+            .args(&args[1..])
+            .output()
+            .expect("sysctl");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let key = "net.ipv4.conf.all.route_localnet";
+    let host_localnet = localnet(&["sysctl", "-n", key]);
     net.install_pod_nat(0, pod_ip, &netns_path)
         .expect("install_pod_nat");
 
@@ -1079,6 +1088,21 @@ fn test_install_pod_nat_installs_rules() {
     let snat = format!("-A POSTROUTING -s {guest_ip}/32 -j SNAT --to-source {pod_ip}");
     assert!(s.contains(&dnat), "DNAT rule missing — got:\n{s}");
     assert!(s.contains(&snat), "SNAT rule missing — got:\n{s}");
+    // CRI port-forward dials loopback inside the pod netns.
+    let lo_dnat = format!("-A OUTPUT -d 127.0.0.1/32 -p tcp -j DNAT --to-destination {guest_ip}");
+    let lo_masq = format!("-A POSTROUTING -s 127.0.0.0/8 -d {guest_ip}/32 -j MASQUERADE");
+    assert!(s.contains(&lo_dnat), "loopback DNAT missing — got:\n{s}");
+    assert!(
+        s.contains(&lo_masq),
+        "loopback MASQUERADE missing — got:\n{s}"
+    );
+    let ns_arg = format!("--net={}", netns_path.display());
+    assert_eq!(localnet(&["nsenter", &ns_arg, "sysctl", "-n", key]), "1");
+    assert_eq!(
+        localnet(&["sysctl", "-n", key]),
+        host_localnet,
+        "route_localnet changed on the host"
+    );
 
     // The rules must NOT leak into the host's default netns.
     let host_listing = Command::new("iptables")

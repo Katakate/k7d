@@ -1279,6 +1279,7 @@ fn sandbox_create_fork_adopt(
     state: &mut SandboxState,
     sandbox_id: &str,
     ann: &ShimAnnotations,
+    pod_netns: Option<PathBuf>,
 ) -> Result<(), String> {
     let (src_sandbox, src_cluster) = match (&ann.fork_source_vm, &ann.fork_source_cluster) {
         (Some(v), Some(c)) => (v.clone(), c.clone()),
@@ -1320,6 +1321,13 @@ fn sandbox_create_fork_adopt(
     let (fork_vm_id, endpoint) = match daemon.call(&k7d::control::Request::ForkVm {
         vm_id: src_vm_id.clone(),
         sandbox_id: Some(sandbox_id.to_string()),
+        // Cluster-mode pods stay on the shared host bridge, exactly as
+        // at cold create.
+        pod_netns: if ann.cluster_id.is_some() {
+            None
+        } else {
+            pod_netns.map(|p| p.to_string_lossy().into_owned())
+        },
         dilation: None,
     })? {
         k7d::control::Response::VmForked {
@@ -1356,10 +1364,9 @@ fn sandbox_create_fork_adopt(
     state.state_dir = Some(state_dir);
     state.fork_of = Some(src_sandbox);
     state.pending_vm = None;
-    // The fork VM rides the source's (daemon-owned) bridge and keeps
-    // the inherited guest network identity; this pod's own CNI netns
-    // is left untouched (kubectl exec/logs go over vsock, not the pod
-    // IP).
+    // The daemon attached the fork's own bridge + TAP (inherited guest
+    // identity) into this pod's CNI netns; the guest's eth0 config
+    // came with its memory, so there is no `configure_guest_network`.
     state.cluster_id = None;
     state.cluster_mode = false;
     state.vm_index = None;
@@ -1787,7 +1794,8 @@ impl Task for K7Service {
                 // container already running inside it). Fail-loud:
                 // unknown source / half-specified annotations fail
                 // Create with an error naming the annotation keys.
-                sandbox_create_fork_adopt(&mut state, &req.id, &ann).map_err(|e| {
+                let pod_netns = pod_netns_from_spec(&req.bundle);
+                sandbox_create_fork_adopt(&mut state, &req.id, &ann, pod_netns).map_err(|e| {
                     debug_log_cni(&format!("Create: fork adopt for {} failed: {e}", req.id));
                     containerd_shim::Error::Other(format!("k7d fork-source annotations: {e}"))
                 })?;

@@ -286,8 +286,8 @@ pub fn node_pod_cidrs(kubeconfig: &Path) -> Vec<(String, String, String)> {
     out
 }
 
-/// Policy-table overlay routes so the k7 gateway forwards guest
-/// podCIDR / ClusterIP without `replace`ing host `cni0` (CHALLENGES.md #117).
+/// Overlay routes in the network's namespace so the k7 gateway forwards
+/// guest podCIDR / ClusterIP between guests (CHALLENGES.md #117).
 pub fn ensure_host_pod_routes(bridge: &str, cidrs: &[(String, String, String)]) {
     k7d::network::restore_host_cni_connected_route()
         .unwrap_or_else(|e| panic!("restore host cni0 before overlay routes: {e}"));
@@ -301,14 +301,10 @@ pub fn ensure_host_pod_routes(bridge: &str, cidrs: &[(String, String, String)]) 
         panic!("guest overlay routes on {bridge}: {e}");
     });
     for (name, cidr, via) in cidrs {
-        eprintln!(
-            "host table {}: {cidr} via {via} dev {bridge} ({name})",
-            k7d::network::GUEST_OVERLAY_TABLE
-        );
+        eprintln!("netns {bridge}: {cidr} via {via} ({name})");
     }
     eprintln!(
-        "host table {}: {} via {via0} dev {bridge} (ClusterIP)",
-        k7d::network::GUEST_OVERLAY_TABLE,
+        "netns {bridge}: {} via {via0} (ClusterIP)",
         k7d::network::GUEST_SERVICE_OVERLAY
     );
 }

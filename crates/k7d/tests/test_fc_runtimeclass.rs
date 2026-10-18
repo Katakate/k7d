@@ -706,4 +706,24 @@ spec:
         fork_info.vm_id, src_info.vm_id,
         "fork must be a distinct VM"
     );
+
+    // CHALLENGES #283: the child used to get a new-index TAP on the
+    // source's host bridge, whose anti-spoof pin dropped every frame
+    // of the inherited guest MAC.
+    let (_, src_index, _) = common::pod_vm_network(&src);
+    let (fork_cluster, fork_index, fork_in_pod) = common::pod_vm_network(&fork);
+    assert_eq!(
+        fork_cluster.as_deref(),
+        Some(common::pod_sandbox_id(&fork).as_str())
+    );
+    assert_eq!(
+        fork_index, src_index,
+        "fork TAP must carry the source's vm_index"
+    );
+    assert!(
+        fork_in_pod,
+        "fork TAP must be attached into the fork pod netns"
+    );
+    common::assert_pod_egress(&fork, "k7-fc fork");
+    common::assert_pod_egress(&src, "k7-fc source after fork");
 }

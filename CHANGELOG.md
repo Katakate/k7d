@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-07
+
+Warm-forked pod sandboxes keep their network. Every host-bridge
+network gets its own network namespace, so a fork and its live source
+have egress at the same time.
+
+### Fixed
+
+- Warm forks of pod-backed sandboxes (k7d and k7d-fc) lost their
+  network: the fork's NIC was missing (native) or sat outside the fork
+  pod's netns (Firecracker), which could also bypass the pod's network
+  policy. `fork_vm` takes the fork pod's netns from the shim and gives
+  the fork its own bridge with a TAP at the source's `vm_index`, attached
+  into the fork pod netns with NAT. A pod-backed fork with no netns
+  fails loudly (CHALLENGES #283).
+- A second `tree_suspend` on a parked node returns `BadState` instead of
+  "node not found" (CHALLENGES #286).
+- `set_dilation` matches the longest tree id, then the single guest of a
+  one-VM tree (CHALLENGES #287).
+- Per-VM CPU samples read the vCPU thread's own task stat instead of the
+  whole process, which clamped every node to 100% (CHALLENGES #293).
+
+### Changed
+
+- One network namespace per host-bridge network. Each
+  `k7-br-<id>` bridge moves into `/run/netns/k7-br-<id>` behind a `/30`
+  uplink veth from `198.18.0.0/15`; guests keep `10.200.0.0/24`. Two
+  networks with the same guest IP (a fork and its source) both have
+  egress. Pod-backed sandboxes never build the netns. Startup and the
+  orphan sweep reap stale `k7-br-*` netns (CHALLENGES #283, #284).
+
+### Added
+
+- `set_dilation_policy` and a per-VM CPU tick sample for the k7view
+  observer (fork N children, dilation ladder presets, live CPU).
+
 ## [0.8.0] — 2026-09-28
 
 Cluster keyframes pause for the residual, not the guest's RAM. A tree

@@ -900,10 +900,10 @@ fn test_tap_anti_spoof() {
     let mac_b = parse_mac(&mac_b_s);
     let ip: Ipv4Addr = dup_ip.parse().unwrap();
 
-    let jail_a = TapAntiSpoof::install(&topo.a.veth_host, mac_a, ip)
+    let jail_a = TapAntiSpoof::install(&topo.a.veth_host, mac_a, ip, None)
         .expect("install anti-spoof A")
         .expect("enforced");
-    let _jail_b = TapAntiSpoof::install(&topo.b.veth_host, mac_b, ip)
+    let _jail_b = TapAntiSpoof::install(&topo.b.veth_host, mac_b, ip, None)
         .expect("install anti-spoof B")
         .expect("enforced");
     assert!(tap_jail_installed(&topo.a.veth_host));

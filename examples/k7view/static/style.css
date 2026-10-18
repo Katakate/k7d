@@ -54,15 +54,21 @@ body {
 }
 .wordmark { font-weight: 700; font-size: 15px; letter-spacing: 0.06em; color: var(--text); }
 .wordmark em { font-style: normal; color: var(--accent); }
-.tree-tabs { display: flex; gap: 6px; margin-left: 14px; }
+.tree-tabs { display: flex; gap: 6px; margin-left: 14px; flex-wrap: wrap; }
 .tree-tabs button {
-  font: 11px/1 var(--mono); color: var(--muted);
+  font: 13px/1.2 var(--mono); color: var(--muted);
   background: transparent; border: 1px solid var(--line);
-  border-radius: 5px; padding: 5px 10px; cursor: pointer; white-space: nowrap;
+  border-radius: 5px; padding: 6px 10px; cursor: pointer; white-space: nowrap;
 }
 .tree-tabs button .n { color: var(--faint); margin-left: 6px; }
 .tree-tabs button.on { color: #0a0d13; background: var(--accent); border-color: var(--accent); font-weight: 700; }
 .tree-tabs button.on .n { color: #33430f; }
+#layout-split {
+  font: 13px/1.2 var(--mono); color: var(--muted);
+  background: transparent; border: 1px solid var(--line);
+  border-radius: 5px; padding: 6px 10px; cursor: pointer; white-space: nowrap;
+}
+#layout-split.on { color: #0a0d13; background: var(--accent); border-color: var(--accent); font-weight: 700; }
 
 .goal {
   flex: 1; min-width: 0; text-align: center;
@@ -128,7 +134,8 @@ main {
 :root { --rail-w: 348px; }
 
 .hero {
-  position: relative; overflow: auto; background:
+  position: relative; overflow: hidden; min-height: 0;
+  display: flex; flex-direction: column; background:
     radial-gradient(1100px 420px at 18% -10%, rgba(83, 216, 232, 0.05), transparent 60%),
     radial-gradient(900px 500px at 85% 110%, rgba(183, 240, 77, 0.04), transparent 55%),
     var(--bg-hero);
@@ -138,7 +145,38 @@ main {
   background-image: radial-gradient(rgba(120, 140, 170, 0.08) 1px, transparent 1.4px);
   background-size: 26px 26px;
 }
-#graph { display: block; min-width: 100%; min-height: 100%; }
+.panes { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.panes.split { flex-direction: row; }
+.pane {
+  position: relative; flex: 1 1 0; min-width: 0; min-height: 160px;
+  overflow: auto; display: flex; flex-direction: column;
+  /* One tree's CPU text must not restyle the other pane. */
+  contain: layout paint;
+}
+.pane.off { display: none; }
+.panes.split .pane + .pane { border-left: 1px solid var(--line); }
+.pane.focus { box-shadow: inset 0 0 0 1px rgba(183, 240, 77, 0.35); }
+.pane-tools {
+  position: sticky; top: 0; z-index: 2; align-self: flex-start;
+  display: flex; gap: 6px; margin: 8px 10px 0;
+}
+.pane-title {
+  font: 13px/1.2 var(--mono); color: var(--text);
+  background: rgba(10, 13, 19, 0.82); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 8px; cursor: pointer;
+}
+.pane-max {
+  font: 11px/1.2 var(--mono); color: var(--text);
+  background: rgba(10, 13, 19, 0.82); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 8px; cursor: pointer;
+}
+.pane-max[hidden] { display: none; }
+.pane.focus .pane-title { color: #0a0d13; background: var(--accent); border-color: var(--accent); }
+.pane svg { display: block; min-width: 100%; flex: 1; }
+.pane-hint {
+  position: absolute; inset: 28px 0 0; display: flex; align-items: center; justify-content: center;
+  color: var(--faint); font-size: 13px; pointer-events: none;
+}
 .hero-hint {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--faint); font-size: 13px; pointer-events: none;
@@ -179,6 +217,8 @@ main {
 .node .bar { rx: 2; }
 .node .lbl { fill: var(--text); font: 600 13px var(--mono); }
 .node .meta { fill: var(--muted); font: 9.5px var(--mono); }
+.node .cpu-bg { fill: #101820; stroke: #1a3d42; stroke-width: 1; }
+.node .cpu { fill: var(--cyan); font: 700 9px var(--mono); }
 .node .badge { font: 10px var(--mono); }
 
 .node.live .box { fill: #0e1a15; stroke: #2c8d63; }
@@ -322,8 +362,9 @@ main {
 .tiles {
   display: flex; gap: 10px; padding: 10px 20px 12px;
   border-top: 1px solid var(--line); background: #090c11;
-  overflow-x: auto; min-height: 138px; scrollbar-width: thin;
+  overflow-x: auto; scrollbar-width: thin;
 }
+.tiles:empty { display: none; }
 .tile {
   flex: 0 0 252px; min-width: 0;
   background: linear-gradient(180deg, var(--panel-2), var(--panel));
@@ -355,6 +396,7 @@ main {
   color: var(--cyan); border: 1px solid #1a3d42; background: rgba(83, 216, 232, 0.08);
   border-radius: 999px; padding: 1px 7px;
 }
+.tile .xn.cpu { color: var(--text); border-color: var(--line-2); background: #10151e; }
 .tile .verdict {
   font-size: 10.5px; font-weight: 700; border-radius: 4px; padding: 2px 7px;
   align-self: flex-start; letter-spacing: 0.03em;
@@ -412,12 +454,30 @@ main {
 .kv b { color: var(--faint); font-weight: 400; }
 .note { color: var(--prot); font-size: 11.5px; margin: 10px 0 0; }
 .note.err { color: var(--err); }
+.note.warn { color: #e0b15a; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .actions button {
   background: #0a0e15; color: var(--text); border: 1px solid var(--line);
   border-radius: 5px; padding: 5px 9px; font: 11px var(--mono); cursor: pointer;
 }
 .actions button:hover { border-color: var(--accent); color: var(--accent); }
+.actions button:disabled, .forkrow button:disabled, .dilate input:disabled, .dilate select:disabled {
+  opacity: 0.38; cursor: not-allowed;
+}
+.forkrow, .dilate {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-top: 10px; font-size: 12px;
+}
+.forkrow input[type="number"] { width: 52px; }
+.ladder { display: flex; gap: 4px; }
+.ladder i {
+  font-style: normal; font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px;
+  color: var(--muted);
+}
+.ladder i.on { background: var(--accent); color: #0a0d13; border-color: var(--accent); font-weight: 700; }
+.cpus { font-variant-numeric: tabular-nums; color: var(--muted); width: 100%; }
+.dilate input[type="range"] { width: 140px; }
 .vms { display: flex; flex-direction: column; gap: 5px; }
 .vm {
   background: #0a0e15; border: 1px solid var(--line); border-radius: 5px;

@@ -142,6 +142,28 @@ class K7dClient:
             req["budget"] = budget
         return self.call(req)
 
+    def set_dilation(self, cluster_id: str, factor: int) -> dict[str, Any]:
+        return self.call(
+            {"op": "set_dilation", "cluster_id": cluster_id, "factor": int(factor)}
+        )
+
+    def set_dilation_policy(
+        self,
+        tree_id: str,
+        mode: str,
+        ladder: list[int],
+        node_id: str | None = None,
+    ) -> dict[str, Any]:
+        req: dict[str, Any] = {
+            "op": "set_dilation_policy",
+            "tree_id": tree_id,
+            "mode": mode,
+            "config": {"ladder": [int(r) for r in ladder]},
+        }
+        if node_id:
+            req["node_id"] = node_id
+        return self.call(req)
+
     def tree_fork_batch(
         self,
         tree_id: str,

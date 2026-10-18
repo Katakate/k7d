@@ -612,6 +612,15 @@ fn test_cluster_tree_suspend_resume_preserves_topology() {
 
     let suspend_start = Instant::now();
     tree.suspend(&root_id).expect("suspend root");
+    let again = tree.suspend(&root_id).unwrap_err().to_string();
+    assert!(
+        again.contains("Suspended"),
+        "a second suspend must name the state, got {again}"
+    );
+    assert!(
+        !again.contains("not found"),
+        "a suspended node is still in the tree, got {again}"
+    );
     let suspend_elapsed = suspend_start.elapsed();
     eprintln!("2-VM cluster-tree suspend: {suspend_elapsed:?}");
     assert!(

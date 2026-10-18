@@ -945,6 +945,7 @@ fn test_fc_fork_vm_child_answers_on_uds() {
         &Request::ForkVm {
             vm_id: src_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         },
     ) {

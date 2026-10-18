@@ -1,0 +1,44 @@
+# Docker-in-VM under agent-sandbox: two k7d pod annotations start dockerd in
+# the guest on a per-VM ext4 graph disk. No privileged container, no sidecar,
+# no socket volume. The image needs /bin/sh. dockerd resolves via 1.1.1.1 /
+# 8.8.8.8, which the Managed default policy (public egress) allows.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: docker-k7
+spec:
+  networkPolicyManagement: Managed
+  podTemplate:
+    metadata:
+      annotations:
+        k7d.katakate.org/docker: "true"
+        k7d.katakate.org/docker-disk: "20Gi"
+    spec:
+      runtimeClassName: k7      # or k7-fc (recommended for multi-tenant docker)
+      automountServiceAccountToken: false
+      containers:
+      - name: workspace
+        image: docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+        command: ["sh", "-c", "sleep infinity"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: ["ALL"]}
+          seccompProfile: {type: RuntimeDefault}
+        resources:
+          limits: {cpu: "2", memory: 4Gi}
+          requests: {cpu: 500m, memory: 4Gi}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: docker-k7-pool
+spec:
+  replicas: 1
+  sandboxTemplateRef: {name: docker-k7}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: docker-k7-claim
+spec:
+  warmPoolRef: {name: docker-k7-pool}

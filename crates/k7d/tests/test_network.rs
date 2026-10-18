@@ -227,6 +227,12 @@ fn test_egress_policy_threading_and_input_drain() {
     let mut src = ClusterNetwork::create_with_egress("egrsrc", deny.clone()).expect("bridge");
     assert_eq!(src.egress(), &deny, "policy must be recorded");
     assert!(
+        !src.is_materialized() && !netjail::jail_installed(src.bridge_name()),
+        "nothing touches the host before a TAP is placed"
+    );
+    // The first placed TAP builds the namespace, the uplink and the jail.
+    let tap = src.add_tap().expect("tap");
+    assert!(
         netjail::jail_installed(src.bridge_name()),
         "jail table must exist"
     );
@@ -242,10 +248,10 @@ fn test_egress_policy_threading_and_input_drain() {
         "the INPUT -i <bridge> ACCEPT must be drained:\n{rules}"
     );
 
-    // Every TAP carries its per-TAP anti-spoof table.
-    let tap = src.add_tap().expect("tap");
+    // Every TAP carries its per-TAP anti-spoof table, in its namespace.
+    let ns = tap.netns_path().expect("a placed TAP has a namespace");
     assert!(
-        netjail::tap_jail_installed(tap.name()),
+        netjail::tap_jail_installed_in(tap.name(), &ns),
         "TAP {} must have its anti-spoof table",
         tap.name()
     );
@@ -275,10 +281,103 @@ fn test_egress_policy_threading_and_input_drain() {
     let tap_name = tap.name().to_string();
     drop(tap);
     assert!(
-        !netjail::tap_jail_installed(&tap_name),
+        !netjail::tap_jail_installed_in(&tap_name, &ns),
         "dropping the TAP must remove its anti-spoof table"
     );
     drop(src);
+}
+
+/// Boot a busybox guest on `net` at its next index with `ip` on eth0
+/// and the gateway as its default route.
+fn boot_on(net: &mut ClusterNetwork) -> (Vm, k7d::api::AgentClient) {
+    let tap = net.add_tap().expect("tap");
+    let ip = tap.guest_ip();
+    let mut vm = Vm::builder()
+        .kernel(&workspace_path("guest/kernel/vmlinux"))
+        .initrd(&workspace_path("guest/rootfs/initramfs.cpio.gz"))
+        .memory_mb(256)
+        .vsock(true)
+        .network(tap)
+        .build()
+        .expect("VM should create");
+    vm.start().expect("VM should start");
+    let mut agent = vm
+        .connect_agent(Duration::from_secs(90))
+        .expect("should connect to agent");
+    let up = agent
+        .exec(&[
+            "sh",
+            "-c",
+            &format!(
+                "ifconfig eth0 {ip} netmask 255.255.255.0 up && route add default gw 10.200.0.1"
+            ),
+        ])
+        .expect("configure eth0");
+    assert_eq!(up.exit_code, 0, "configure eth0: {}", up.stderr);
+    (vm, agent)
+}
+
+/// `ping` from the guest, retried while its link settles.
+fn guest_pings(agent: &mut k7d::api::AgentClient, target: &str) -> bool {
+    (0..10).any(|_| {
+        let ok = agent
+            .exec(&["ping", "-c", "1", "-W", "3", target])
+            .is_ok_and(|o| o.exit_code == 0);
+        if !ok {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        ok
+    })
+}
+
+/// Two networks whose guests hold the SAME address (10.200.0.2 — what a
+/// fork looks like) both reach the gateway and the internet at the same
+/// time: each network is its own namespace behind its own uplink
+/// (the per-network netns spec, CHALLENGES #283). Destroying one
+/// leaves nothing of it on the host and the other untouched.
+#[test]
+fn test_two_networks_same_guest_ip_egress_at_once() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = k7d::network::cleanup_stale_k7_bridges();
+
+    let mut net_a = ClusterNetwork::create("twin-a").expect("network a");
+    let mut net_b = ClusterNetwork::create("twin-b").expect("network b");
+    let (vm_a, mut agent_a) = boot_on(&mut net_a);
+    let (mut vm_b, mut agent_b) = boot_on(&mut net_b);
+    assert_eq!(
+        net_a.entry(0).map(|e| e.guest_ip),
+        net_b.entry(0).map(|e| e.guest_ip),
+        "both guests must hold the same address"
+    );
+
+    for (name, agent) in [("a", &mut agent_a), ("b", &mut agent_b)] {
+        assert!(guest_pings(agent, "10.200.0.1"), "guest {name}: gateway");
+        assert!(guest_pings(agent, "1.1.1.1"), "guest {name}: internet");
+    }
+
+    let a = net_a.bridge_name().to_string();
+    drop(agent_a);
+    drop(vm_a);
+    drop(net_a);
+    assert!(
+        !std::path::Path::new("/sys/class/net").join(&a).exists(),
+        "uplink {a} must be gone"
+    );
+    assert!(
+        !std::path::Path::new("/run/netns").join(&a).exists(),
+        "namespace {a} must be gone"
+    );
+    assert!(
+        !k7d::netjail::jail_installed(&a),
+        "jail of {a} must be gone"
+    );
+    assert!(
+        guest_pings(&mut agent_b, "1.1.1.1"),
+        "guest b after a is gone"
+    );
+
+    drop(agent_b);
+    vm_b.shutdown();
 }
 
 // --- Hostile virtqueue geometry ---

@@ -342,6 +342,10 @@ fn main() {
         if !reaped_tap_jails.is_empty() {
             log::warn!("reaped stale tap anti-spoof jails: {reaped_tap_jails:?}");
         }
+        let reaped_netns = k7d::network::reap_stale_netns_files();
+        if !reaped_netns.is_empty() {
+            log::warn!("reaped stale network namespace files: {reaped_netns:?}");
+        }
     }
     prepare_tree_root();
     prepare_fc_chroot_base();

@@ -468,6 +468,7 @@ fn test_data_disk_exclusive_while_live() {
     match call(&Request::ForkVm {
         vm_id: vm_id2.clone(),
         sandbox_id: None,
+        pod_netns: None,
         dilation: None,
     }) {
         Response::VmForked { vm_id: fork_id, .. } => {

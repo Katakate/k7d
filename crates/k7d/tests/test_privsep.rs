@@ -1550,6 +1550,7 @@ fn test_a_firecracker_vm_boots_and_forks_under_the_split() {
         &Request::ForkVm {
             vm_id: vm_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         },
     ) {

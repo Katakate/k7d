@@ -12,6 +12,7 @@
       <span class="mark"></span>
       <span class="wordmark">k7d<em>-view</em></span>
       <nav class="tree-tabs" id="trees"></nav>
+      <button type="button" id="layout-split" hidden title="show both trees at once">side by side</button>
     </div>
     <div class="goal" id="goal">waiting for a tree</div>
     <div class="status">
@@ -29,14 +30,8 @@
 
   <main>
     <section class="hero" id="hero">
-      <svg id="graph" xmlns="http://www.w3.org/2000/svg">
-        <g id="layer-edges"></g>
-        <g id="layer-chips"></g>
-        <g id="layer-ghosts"></g>
-        <g id="layer-nodes"></g>
-      </svg>
+      <div class="panes" id="panes"></div>
       <div class="toast" id="toast" hidden></div>
-      <div class="hero-hint" id="hero-hint">waiting for k7d snapshot tree</div>
     </section>
 
     <aside class="rail">
@@ -90,6 +85,27 @@
           <button data-act="resume">resume</button>
           <button data-act="prune">prune</button>
           <button data-act="auto_evict">auto-evict</button>
+        </div>
+        <div class="forkrow">
+          <label>fork <input id="fork-n" type="number" min="1" max="32" value="1"></label>
+          <button id="fork-btn" data-act="fork" type="button">fork</button>
+        </div>
+        <div class="dilate" id="dilate">
+          <div class="ladder" id="ladder"></div>
+          <span class="hint" id="ladder-hint"></span>
+          <label>policy
+            <select id="preset">
+              <option value="gentle">gentle 8·4·2·1</option>
+              <option value="aggressive">aggressive 8·4·1</option>
+            </select>
+          </label>
+          <label class="check"><input id="adaptive" type="checkbox"> adaptive</label>
+          <label class="rate">rate
+            <input id="rate" type="range" min="1" max="64" step="1" value="1">
+            <b id="rate-read">×1</b>
+          </label>
+          <div class="cpus" id="cpus" title="Host CPU of each VM's vCPU threads">cpu —</div>
+          <p class="note warn" id="rate-warn" hidden></p>
         </div>
         <h3>trace</h3>
         <div class="feed" id="drawer-trace"></div>

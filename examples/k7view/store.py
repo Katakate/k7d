@@ -41,6 +41,10 @@ def _new_slot(tree_id: str, kind: str, memory_mb: int) -> dict[str, Any]:
         "usage": None,
         "memory_mb": memory_mb,
         "live_dilation": {},
+        "live_cpu": {},
+        "dilation_ladder": {},
+        "dilation_policy": {},
+        "dilation_trajectory": {},
         "guest_clock": None,
     }
 
@@ -227,6 +231,10 @@ class ViewStore:
         budget: dict[str, Any] | None = None,
         live_guest_cids: dict[str, Any] | None = None,
         live_dilation: dict[str, Any] | None = None,
+        live_cpu: dict[str, Any] | None = None,
+        dilation_ladder: dict[str, Any] | None = None,
+        dilation_policy: dict[str, Any] | None = None,
+        dilation_trajectory: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         ts = now_ms()
         cur = {n["id"]: _norm_node(n) for n in nodes if "id" in n}
@@ -268,6 +276,22 @@ class ViewStore:
                         f"live_dilation[{nid!r}] is not an int: {factor!r}"
                     ) from exc
             slot["live_dilation"] = out
+        if live_cpu is not None:
+            slot["live_cpu"] = {
+                str(nid): list(rows or []) for nid, rows in live_cpu.items()
+            }
+        if dilation_ladder is not None:
+            slot["dilation_ladder"] = {
+                str(nid): [int(r) for r in (rungs or [])]
+                for nid, rungs in dilation_ladder.items()
+            }
+        if dilation_policy is not None:
+            slot["dilation_policy"] = {str(k): str(v) for k, v in dilation_policy.items()}
+        if dilation_trajectory is not None:
+            slot["dilation_trajectory"] = {
+                str(nid): [int(r) for r in (rungs or [])]
+                for nid, rungs in dilation_trajectory.items()
+            }
         emitted = [self._push(e) for e in derived]
         return emitted
 
@@ -492,15 +516,16 @@ class ViewStore:
             clock["cid"] = payload.get("cid")
             clock["ts_unix_ms"] = payload.get("ts_unix_ms") or now_ms()
             slot["guest_clock"] = clock
-            return self._push(
-                {
-                    "tree_id": tree_id,
-                    "op": "guest_clock",
-                    "node_id": node_id,
-                    "label": node_id or tree_id,
-                    "uptime_s": uptime_s,
-                }
-            )
+            # A sample every second must not enter the event log. That
+            # log rides along on full snapshots and would rebuild the
+            # tree while CPU and dilation are moving.
+            return {
+                "tree_id": tree_id,
+                "op": "guest_clock",
+                "node_id": node_id,
+                "label": node_id or tree_id,
+                "uptime_s": uptime_s,
+            }
         if kind == "tick":
             self.clock_ms = now_ms()
             self.bus_n += 1

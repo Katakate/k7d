@@ -101,6 +101,10 @@ pub struct JailerArgs<'a> {
     pub cpu_quota_us: Option<u64>,
     /// Pod CFS period in µs, paired with `cpu_quota_us`.
     pub cpu_period_us: Option<u64>,
+    /// Network namespace to run Firecracker in (`--netns`): the one its
+    /// TAP was placed in, since it opens the TAP by name (the
+    /// per-network netns spec).
+    pub netns: Option<&'a Path>,
 }
 
 /// Result of a successful spawn.
@@ -168,8 +172,11 @@ pub fn spawn(args: &JailerArgs<'_>, chroot: &super::stage::Chroot) -> Result<Spa
         .arg("--cgroup")
         .arg(format!("cpu.max={quota} {period}"))
         .arg("--cgroup")
-        .arg(format!("memory.max={memory_max}"))
-        .arg("--")
+        .arg(format!("memory.max={memory_max}"));
+    if let Some(ns) = args.netns {
+        cmd.arg("--netns").arg(ns);
+    }
+    cmd.arg("--")
         .arg("--api-sock")
         .arg(CHROOT_API_SOCKET)
         .stdin(Stdio::Null)

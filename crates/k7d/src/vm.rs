@@ -4358,6 +4358,18 @@ impl Vm {
         fork_ids: &[&str],
         dilation: Option<u32>,
     ) -> Result<Vec<Self>, crate::fork::ForkError> {
+        let forks = fork_ids.iter().map(|&id| (id, None)).collect();
+        self.fork_warm_batch_with_taps(forks, dilation)
+    }
+
+    /// [`Self::fork_warm_batch`] where each fork may take its own TAP
+    /// for the virtio-net slot. A snapshot with virtio-net and no TAP
+    /// yields a fork whose guest network is inactive.
+    pub fn fork_warm_batch_with_taps(
+        &mut self,
+        forks: Vec<(&str, Option<crate::network::TapDevice>)>,
+        dilation: Option<u32>,
+    ) -> Result<Vec<Self>, crate::fork::ForkError> {
         let base_path = self.fork_source_base_path.clone().ok_or_else(|| {
             crate::fork::ForkError::Reflink(
                 "VM not prepared as fork source — call prepare_fork_source() first".into(),
@@ -4382,19 +4394,32 @@ impl Vm {
         // to pages we're about to copy, making the fork's memory inconsistent
         // with its captured vCPU state. Per fork, memcpy time is
         // O(dirty_pages) — 0.5 µs/page, so ≤15 ms even at 100% dirty on 256 MB.
-        let mut forks = Vec::with_capacity(fork_ids.len());
+        let mut out = Vec::with_capacity(forks.len());
         let mut fork_err: Option<crate::fork::ForkError> = None;
-        for &id in fork_ids {
-            match crate::fork::restore_vm_from_state(
-                &base_path,
-                &dirty_bitmap,
-                source_mem_addr,
-                &state,
-                id,
-                dilation,
-                force_full_dump,
-            ) {
-                Ok(fork) => forks.push(fork),
+        for (id, tap) in forks {
+            let restored = match tap {
+                Some(tap) => crate::fork::restore_vm_from_state_with_tap(
+                    &base_path,
+                    &dirty_bitmap,
+                    source_mem_addr,
+                    &state,
+                    id,
+                    tap,
+                    dilation,
+                    force_full_dump,
+                ),
+                None => crate::fork::restore_vm_from_state(
+                    &base_path,
+                    &dirty_bitmap,
+                    source_mem_addr,
+                    &state,
+                    id,
+                    dilation,
+                    force_full_dump,
+                ),
+            };
+            match restored {
+                Ok(fork) => out.push(fork),
                 Err(e) => {
                     fork_err = Some(e);
                     break;
@@ -4409,7 +4434,7 @@ impl Vm {
         if let Some(e) = fork_err {
             return Err(e);
         }
-        Ok(forks)
+        Ok(out)
     }
 
     /// Fork this VM into an independent copy with `CoW` memory and reflinked disk.

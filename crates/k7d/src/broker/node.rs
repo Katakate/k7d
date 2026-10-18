@@ -680,7 +680,11 @@ fn dispatch(verb: Verb, fds: Vec<OwnedFd>) -> (Reply, Vec<OwnedFd>) {
 
         Verb::NetTreeCreate { tree_id, egress } => (tree_create(&tree_id, &egress), Vec::new()),
         Verb::NetTreeDestroy { tree_id } => (tree_destroy(&tree_id), Vec::new()),
-        Verb::NetTapCreate { tree_id, indices } => tap_create(&tree_id, &indices),
+        Verb::NetTapCreate {
+            tree_id,
+            indices,
+            place,
+        } => tap_create(&tree_id, &indices, place),
         Verb::NetTapDetach {
             tree_id,
             vm_index,
@@ -760,20 +764,28 @@ fn dispatch_fc(verb: Verb) -> (Reply, Vec<OwnedFd>) {
             memory_mb,
             cpu,
             tap,
+            tap_of,
             images,
             restore_from,
-        } => super::jail::spawn_jail(
-            &super::jail::SpawnRequest {
-                vm_id: &vm_id,
-                vcpus,
-                memory_mb,
-                cpu,
-                tap,
-                images: &images,
-                restore_from: restore_from.as_ref(),
-            },
-            &|idx| block_path(&vm_id, idx),
-        ),
+        } => {
+            let netns = match tap_of.map(|(tree, idx)| tap_netns(&tree, idx)).transpose() {
+                Ok(ns) => ns.flatten(),
+                Err(reply) => return (reply, Vec::new()),
+            };
+            super::jail::spawn_jail(
+                &super::jail::SpawnRequest {
+                    vm_id: &vm_id,
+                    vcpus,
+                    memory_mb,
+                    cpu,
+                    tap,
+                    netns: netns.as_deref(),
+                    images: &images,
+                    restore_from: restore_from.as_ref(),
+                },
+                &|idx| block_path(&vm_id, idx),
+            )
+        }
         Verb::FcConnect { vm_id, which } => super::jail::connect(&vm_id, which),
         Verb::FcUpdateDrive {
             vm_id,
@@ -1384,11 +1396,12 @@ fn tree_destroy(tree_id: &str) -> Reply {
     Reply::Ok
 }
 
-fn tap_create(tree_id: &str, indices: &[u32]) -> (Reply, Vec<OwnedFd>) {
+fn tap_create(tree_id: &str, indices: &[u32], place: bool) -> (Reply, Vec<OwnedFd>) {
     let created = trees(|t| {
         let Some(record) = t.get_mut(tree_id) else {
             return Err(unknown_tree(tree_id));
         };
+        record.net.set_place_taps(place);
         let taps = match record.net.add_taps_at(indices) {
             Ok(taps) => taps,
             Err(e) => {
@@ -1430,6 +1443,22 @@ fn tap_create(tree_id: &str, indices: &[u32]) -> (Reply, Vec<OwnedFd>) {
         Ok(out) => out,
         Err(reply) => (reply, Vec::new()),
     }
+}
+
+/// The network namespace the TAP at `tree_id[vm_index]` was placed in,
+/// `None` when it sits in the host waiting for a pod attach.
+fn tap_netns(tree_id: &str, vm_index: u32) -> Result<Option<std::path::PathBuf>, Reply> {
+    trees(|t| {
+        t.get(tree_id)
+            .and_then(|r| r.taps.get(&vm_index))
+            .map(crate::network::TapDevice::netns_path)
+            .ok_or_else(|| {
+                Reply::failed(
+                    libc::ENOENT,
+                    format!("tree {tree_id} has no TAP at index {vm_index}"),
+                )
+            })
+    })
 }
 
 fn dup_owned(fd: std::os::fd::RawFd) -> io::Result<OwnedFd> {
@@ -1743,6 +1772,10 @@ pub fn sweep_orphans() {
     let tap_jails = crate::netjail::clean_stale_tap_jails();
     if !tap_jails.is_empty() {
         log::warn!("node broker reaped stale tap anti-spoof jails: {tap_jails:?}");
+    }
+    let netns = crate::network::reap_stale_netns_files();
+    if !netns.is_empty() {
+        log::warn!("node broker reaped stale network namespace files: {netns:?}");
     }
 }
 
@@ -2189,6 +2222,7 @@ mod tests {
                 memory_mb: 256,
                 cpu: None,
                 tap: false,
+                tap_of: None,
                 images: vec![super::super::ImageRef::Kernel { device_idx: 0 }],
                 restore_from: None,
             },

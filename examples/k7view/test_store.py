@@ -398,6 +398,7 @@ def test_store_live_dilation_and_guest_clock() -> None:
     )
     slot = s.snapshot()["trees"]["t1"]
     assert slot["live_dilation"] == {"root": 8, "a": 8}
+    logged = len(s.events)
     s.ingest(
         {
             "type": "guest_clock",
@@ -410,6 +411,7 @@ def test_store_live_dilation_and_guest_clock() -> None:
     clock = s.snapshot()["trees"]["t1"]["guest_clock"]
     assert clock["base_uptime_s"] == 384.0
     assert clock["uptime_s"] == 384.0
+    assert len(s.events) == logged
     s.ingest(
         {
             "type": "guest_clock",
@@ -422,6 +424,7 @@ def test_store_live_dilation_and_guest_clock() -> None:
     clock = s.snapshot()["trees"]["t1"]["guest_clock"]
     assert clock["base_uptime_s"] == 384.0
     assert clock["uptime_s"] == 392.0
+    assert len(s.events) == logged
     try:
         s.ingest({"type": "guest_clock", "tree_id": "t1"})
         raise AssertionError("guest_clock without uptime_s must be loud")

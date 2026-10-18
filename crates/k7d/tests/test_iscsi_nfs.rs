@@ -12,7 +12,7 @@
 //!
 //! Host side, created and destroyed per test: a `tgt` (`tgtd`/`tgtadm`)
 //! file-backed LUN and an `exportfs -o` NFSv4 export, both scoped to
-//! the bridge gateway `10.200.0.1` and the `10.200.0.0/24` subnet. `tgt`
+//! the gateway `10.200.0.1` and the uplink range guests arrive from. `tgt`
 //! is a *userspace* target, so unlike LIO/configfs it needs nothing
 //! from the host kernel. Both are torn down by a `Drop` guard: a leaked
 //! target, export, or logged-in session outlives a panicking test and
@@ -51,9 +51,11 @@ const NODEUSR: &str = "/run/k7d/nodeusr";
 /// the only address a guest can reach a host-side service on.
 const GATEWAY: &str = "10.200.0.1";
 
-/// The bridge subnet, used to scope both the iSCSI initiator ACL and
-/// the NFS export. Never `0.0.0.0`: the node is shared.
-const SUBNET: &str = "10.200.0.0/24";
+/// Where guest connections to the gateway come from: each network SNATs
+/// its guests to its own uplink address (the per-network netns spec).
+/// Scopes both the iSCSI initiator ACL and the NFS export. Never
+/// `0.0.0.0`: the node is shared.
+const SUBNET: &str = k7d::network::UPLINK_RANGE;
 
 /// Standard iSCSI port. Free on the node because the packaged `tgt`
 /// service is disabled by `your node provisioning` — it binds
@@ -239,7 +241,7 @@ impl IscsiTarget {
             "-b",
             target.backing_file.to_str().expect("utf-8 backing path"),
         ]);
-        // Scope the initiator ACL to the bridge subnet, not ALL.
+        // Scope the initiator ACL to the uplink range, not ALL.
         target.tgtadm_ok(&[
             "--op", "bind", "--mode", "target", "--tid", "1", "-I", SUBNET,
         ]);
@@ -595,6 +597,8 @@ fn test_iscsi_and_nfs_round_trips() {
     // about guest *egress* and do nothing for a connection terminating
     // on the host itself.
     let mut net = ClusterNetwork::create("k7stor").expect("cluster bridge");
+    // tgtd binds the gateway, which exists once the network is built.
+    net.materialize().expect("network namespace and gateway");
     let target = IscsiTarget::create("lun0");
     let export = NfsExport::create();
     let export_path = export.path().to_path_buf();

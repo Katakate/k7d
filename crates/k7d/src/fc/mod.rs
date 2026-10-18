@@ -776,6 +776,10 @@ impl FcVm {
                 memory_mb: config.memory_mb,
                 cpu_quota_us: config.cpu_quota_us,
                 cpu_period_us: config.cpu_period_us,
+                netns: tap
+                    .as_ref()
+                    .and_then(crate::network::TapDevice::netns_path)
+                    .as_deref(),
             },
             &chroot,
         )?;
@@ -912,6 +916,7 @@ impl FcVm {
                 _ => None,
             },
             tap: config.net.is_some(),
+            tap_of: tap.as_ref().and_then(crate::network::TapDevice::broker_ref),
             images,
             restore_from,
         })

@@ -2896,16 +2896,6 @@ spec:
     ))
 }
 
-/// Number of ports attached to a Linux bridge (0 for a non-bridge or
-/// missing device). Disambiguates the 3-TAP fork bridge from the
-/// trigger pod's own single-TAP bridge among the bridges that appear
-/// during the trigger pod's Create.
-fn bridge_port_count(name: &str) -> usize {
-    std::fs::read_dir(format!("/sys/class/net/{name}/brif"))
-        .map(|d| d.count())
-        .unwrap_or(0)
-}
-
 /// The warm fork driven entirely by
 /// kubectl: a trigger pod's `k7d.katakate.org/tree-*` annotations make
 /// the shim call `TreeAdoptCluster` + `TreeFork`. No
@@ -3002,11 +2992,11 @@ fn test_inner_k3s_cluster_warm_fork_via_annotation() {
     }
 
     // The fork bridge is the new 3-port bridge (the trigger pod's own
-    // bridge also appeared, but it carries a single TAP).
+    // TAP goes into its pod and never builds a network namespace).
     let fork_bridge = list_k7_bridges()
         .into_iter()
         .filter(|b| !bridges_before.contains(b))
-        .find(|b| bridge_port_count(b) == 3);
+        .find(|b| common::k7_bridge_port_count(b) == 3);
     let Some(fork_bridge) = fork_bridge else {
         teardown();
         panic!("no new 3-port fork bridge appeared");

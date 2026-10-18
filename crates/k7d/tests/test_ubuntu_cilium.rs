@@ -800,16 +800,15 @@ fn test_ubuntu_cilium_datapath_fork() {
     let cidrs = node_pod_cidrs(&kube);
     assert_direct_node_routes(&mut cluster, &cidrs);
     ensure_host_pod_routes(cluster.bridge(), &cidrs);
-    let nf = std::fs::read_to_string(format!(
-        "/sys/class/net/{}/bridge/nf_call_iptables",
-        cluster.bridge()
-    ))
-    .unwrap_or_else(|e| panic!("read nf_call_iptables: {e}"));
-    assert_eq!(
-        nf.trim(),
-        "0",
-        "{} still calls iptables — host flannel would SNAT guest pod SYNs",
-        cluster.bridge()
+    let br = cluster.bridge();
+    let out = std::process::Command::new("ip")
+        .args(["-n", br, "-d", "link", "show", "dev", br])
+        .output()
+        .expect("ip -d link show");
+    let link = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && link.contains("nf_call_iptables 0"),
+        "{br} still calls iptables — bridged guest pod SYNs would hit netfilter:\n{link}"
     );
 
     let marker = format!("CIL_MARKER_{}", std::process::id());

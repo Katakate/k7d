@@ -1,0 +1,39 @@
+# SandboxTemplate + SandboxWarmPool + SandboxClaim on k7-fc (Firecracker +
+# jailer). The pool keeps 3 booted VMs; a claim adopts one without a restart.
+# networkPolicyManagement: Managed gives the upstream default policy:
+# ingress only from the sandbox-router, egress to public IPs only.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: python-k7-fc
+spec:
+  networkPolicyManagement: Managed
+  podTemplate:
+    metadata:
+      labels: {app: python-k7-fc}
+    spec:
+      runtimeClassName: k7-fc   # or k7 (native VMM; also supports virtiofs/hostPath)
+      automountServiceAccountToken: false
+      containers:
+      - name: python-runtime
+        image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v0.1.0@sha256:b6f0957f46c69543d874fdb8858b53b313cfc14cc6501bb7b0c6054707d96b64
+        ports: [{containerPort: 8888, name: http}]
+        readinessProbe: {httpGet: {path: /, port: 8888}, periodSeconds: 5, timeoutSeconds: 5}
+        resources:
+          limits: {cpu: "1", memory: 1Gi}
+          requests: {cpu: 250m, memory: 1Gi}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: python-k7-fc-pool
+spec:
+  replicas: 3
+  sandboxTemplateRef: {name: python-k7-fc}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: python-k7-fc-claim
+spec:
+  warmPoolRef: {name: python-k7-fc-pool}

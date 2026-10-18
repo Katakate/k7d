@@ -1316,6 +1316,20 @@ impl SnapshotTree {
     /// tracking, so `delta.pack` would silently miss device DMA and the
     /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        // A second suspend used to `live_vms.remove` and report
+        // `node not found` — the node is still in the tree, it is
+        // just not Live. Name the state, the same way `resume` does.
+        let info = self
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        if info.state != NodeState::Live {
+            return Err(TreeError::BadState(
+                node_id.clone(),
+                info.state,
+                "suspend (must be Live)",
+            ));
+        }
         if self.is_fc(node_id) {
             return self.suspend_fc(node_id);
         }

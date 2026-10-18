@@ -1305,6 +1305,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         })
         .expect("fork_vm");
@@ -1564,6 +1565,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         })
         .expect("fork_vm");
@@ -2597,6 +2599,7 @@ spec:
         .call(&k7d::control::Request::ForkVm {
             vm_id: src.vm_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         })
         .expect("fork_vm");
@@ -2935,6 +2938,85 @@ spec:
         src_alive.contains("src-alive"),
         "source must still exec after annotation ForkVm: {src_alive:?}"
     );
+
+    let _ = kubectl_delete("pod", &fork);
+    let _ = kubectl_delete("pod", &src);
+}
+
+/// A CNI (non-cluster-mode) pod's annotation fork keeps internet
+/// egress, through its own pod netns: own bridge at the source's
+/// `vm_index`, TAP attached into the fork pod's netns (CHALLENGES
+/// #283 — the fork used to come up with no virtio-net at all).
+#[test]
+fn test_kubectl_fork_keeps_pod_egress() {
+    let _leak_guard = ensure_shim_installed();
+    common::ensure_pod_annotations_forwarded();
+
+    let src = common::unique_name("test-k7d-fnet-a");
+    let fork = common::unique_name("test-k7d-fnet-b");
+    let _ = kubectl_delete("pod", &src);
+    let _ = kubectl_delete("pod", &fork);
+    std::thread::sleep(Duration::from_secs(2));
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {src}
+spec:
+  runtimeClassName: k7
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply source");
+    wait_for_pod_ready(&src, Duration::from_secs(120)).expect("source ready");
+    let (src_cluster, src_index, src_in_pod) = common::pod_vm_network(&src);
+    assert!(src_in_pod, "CNI source must be attached to its pod netns");
+    common::assert_pod_egress(&src, "source before fork");
+    let src_sandbox = common::pod_sandbox_id(&src);
+    let src_cluster = src_cluster.expect("networked source has a cluster id");
+
+    kubectl_apply(&common::pin_to_local_node(&format!(
+        r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {fork}
+  annotations:
+    k7d.katakate.org/fork-source-cluster: {src_cluster}
+    k7d.katakate.org/fork-source-vm: {src_sandbox}
+spec:
+  runtimeClassName: k7
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+"#
+    )))
+    .expect("apply fork");
+    wait_for_pod_ready(&fork, Duration::from_secs(180)).expect("fork pod Running");
+
+    let (fork_cluster, fork_index, fork_in_pod) = common::pod_vm_network(&fork);
+    assert_eq!(
+        fork_cluster.as_deref(),
+        Some(common::pod_sandbox_id(&fork).as_str()),
+        "fork must get its own bridge keyed by its sandbox id"
+    );
+    assert_eq!(
+        fork_index, src_index,
+        "fork TAP must carry the source's vm_index (inherited guest IP/MAC)"
+    );
+    assert!(
+        fork_in_pod,
+        "fork TAP must be attached into the fork pod netns"
+    );
+    common::assert_pod_egress(&fork, "fork");
+    common::assert_pod_egress(&src, "source after fork");
 
     let _ = kubectl_delete("pod", &fork);
     let _ = kubectl_delete("pod", &src);

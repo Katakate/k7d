@@ -417,6 +417,10 @@ pub enum Verb {
         tree_id: String,
         /// Indices inside the tree; each decides a name, MAC and IP.
         indices: Vec<u32>,
+        /// Place them on the bridge in the tree's network namespace
+        /// (the per-network netns spec), or leave them in the host
+        /// for a pod attach.
+        place: bool,
     },
     /// Hand one TAP to a jailed Firecracker: `TUNSETOWNER`,
     /// `TUNSETGROUP`, `TUNSETPERSIST`.
@@ -554,6 +558,10 @@ pub enum Verb {
         cpu: Option<(u64, u64)>,
         /// Whether the jail needs a persistent TAP.
         tap: bool,
+        /// `(tree id, index)` of that TAP. The node broker runs the
+        /// jailer in the namespace it placed the TAP in, which it looks
+        /// up itself rather than take a path from this side.
+        tap_of: Option<(String, u32)>,
         /// Every file that has to exist inside the jail before
         /// Firecracker is allowed to look for it.
         images: Vec<ImageRef>,
@@ -1440,6 +1448,7 @@ mod tests {
             Verb::NetTapCreate {
                 tree_id: "t".into(),
                 indices: vec![0, 3],
+                place: true,
             },
             Verb::NetTapDetach {
                 tree_id: "t".into(),
@@ -1511,6 +1520,7 @@ mod tests {
                 memory_mb: 2048,
                 cpu: Some((20_000, 100_000)),
                 tap: true,
+                tap_of: Some(("t".into(), 0)),
                 images: vec![
                     ImageRef::Kernel { device_idx: 0 },
                     ImageRef::Initrd { device_idx: 1 },
@@ -1538,6 +1548,7 @@ mod tests {
                 memory_mb: 512,
                 cpu: None,
                 tap: false,
+                tap_of: None,
                 images: Vec::new(),
                 restore_from: Some(FcRestore::Point {
                     source_vm_id: "vm-1".into(),

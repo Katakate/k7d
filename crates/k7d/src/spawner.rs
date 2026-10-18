@@ -151,6 +151,10 @@ enum Request {
     Reap {
         pid: u32,
     },
+    /// [`open_tun_in`]: needs `setns`, which the daemon's filter lacks.
+    OpenTun {
+        netns: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +165,8 @@ enum Reply {
     Exited { raw_status: i32 },
     /// `Reap` completed.
     Done,
+    /// `OpenTun`: the descriptor comes with this datagram.
+    Tun,
     /// The spawner refused or the syscall failed. `errno` is preserved so
     /// `io::Error::kind()` still says `NotFound` for a missing `mkfs.erofs`.
     Failed { errno: i32, message: String },
@@ -630,7 +636,71 @@ fn handle(
             }
             None => failed(format!("reap {pid}: not a helper of this spawner")),
         },
+        Request::OpenTun { netns } => match open_tun_local(OsStr::from_bytes(netns)) {
+            Ok(fd) => (Reply::Tun, vec![fd]),
+            Err(e) => (
+                Reply::Failed {
+                    errno: e.raw_os_error().unwrap_or(0),
+                    message: format!(
+                        "open /dev/net/tun in {}: {e}",
+                        Path::new(OsStr::from_bytes(netns)).display()
+                    ),
+                },
+                Vec::new(),
+            ),
+        },
     }
+}
+
+/// An unattached `/dev/net/tun` descriptor opened in the network
+/// namespace at `netns`. A TAP lives in its opener's namespace, so
+/// `TUNSETIFF` on this creates it there — moving one in afterwards
+/// costs an RCU grace period per device (~20 ms).
+pub fn open_tun_in(netns: &Path) -> io::Result<OwnedFd> {
+    if SPAWNER.get().is_none() {
+        return open_tun_local(netns.as_os_str());
+    }
+    let request = Request::OpenTun {
+        netns: netns.as_os_str().as_bytes().to_vec(),
+    };
+    let (reply, mut fds) = round_trip(&request, &[])?;
+    match reply {
+        Reply::Tun if fds.len() == 1 => Ok(fds.remove(0)),
+        Reply::Failed { errno, message } => Err(spawner_error(errno, message)),
+        other => protocol_abort(&format!(
+            "unexpected reply to OpenTun ({} fds): {other:?}",
+            fds.len()
+        )),
+    }
+}
+
+/// [`open_tun_in`] on a thread of this process that enters `netns` and
+/// exits, so no other thread's namespace changes.
+fn open_tun_local(netns: &OsStr) -> io::Result<OwnedFd> {
+    let ns = std::fs::File::open(netns)?;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // SAFETY: `ns` is an open file; setns only reads it, and
+            // changes this short-lived thread alone.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(last_error());
+            }
+            // SAFETY: NUL-terminated path, plain flags.
+            let fd = unsafe {
+                libc::open(
+                    c"/dev/net/tun".as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(last_error());
+            }
+            // SAFETY: `fd` was just opened and is owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        })
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("tun opener thread panicked")))
+    })
 }
 
 fn spawn_helper(

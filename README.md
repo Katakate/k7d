@@ -491,6 +491,8 @@ This is the outer layer: kubectl on the host schedules pods into k7d
 microVMs via `runtimeClassName: k7` (native) or `k7-fc` (Firecracker).
 Relevant if you also want single-VM sandboxes, not only whole-cluster
 forks.
+`examples/agent-sandbox/` runs
+[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) on top.
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -504,7 +506,9 @@ forks.
 | Warm fork of the pod VM | ✅ Today | Snapshot-tree fork of that sandbox. Whole-cluster fork is the daemon tree API (bare VMs), not a kubectl feature — [k7d vs k7d-fc](#two-backends-k7d-vs-k7d-fc) |
 | Init containers; natural exit / `restartPolicy` | ✅ Today | Multi-container pods |
 | Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | From pod CPU limits; fork/snapshot parity |
-| `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
+| NetworkPolicy on the pod IP | ✅ Today | k3s kube-router, same verdicts as runc for egress ipBlocks and ingress podSelector — `test_agent_sandbox` V6. Other CNIs not measured on the host RuntimeClass |
+| agent-sandbox `Sandbox` / warm pool / claim | ✅ Today | v1.0.5 on `k7` and `k7-fc`, incl. SDK, port-forward, Docker-in-VM — `examples/agent-sandbox/`, `test_agent_sandbox`. Kubelet volume updates (token rotation) do not reach the guest |
+| `hostNetwork`, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
 | Cross-node fork | 🔮 Later | Host-local trees today |
 
 ## Two backends: k7d vs k7d-fc

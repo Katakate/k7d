@@ -168,6 +168,8 @@ pub struct SpawnRequest<'a> {
     pub cpu: Option<(u64, u64)>,
     /// Whether the VM was given a TAP, for `fc.list` (§9.3).
     pub tap: bool,
+    /// Namespace the TAP was placed in, resolved by the node broker.
+    pub netns: Option<&'a Path>,
     /// Files to link into the jail, by registered index.
     pub images: &'a [ImageRef],
     /// Guest state to load, for a fork child or a resume.
@@ -227,6 +229,7 @@ fn spawn_jail_inner(
             memory_mb: req.memory_mb,
             cpu_quota_us: req.cpu.map(|(q, _)| q),
             cpu_period_us: req.cpu.map(|(_, p)| p),
+            netns: req.netns,
         },
         &chroot,
     )
@@ -1006,6 +1009,7 @@ mod tests {
                 memory_mb: 128,
                 cpu: None,
                 tap: false,
+                netns: None,
                 images: &[ImageRef::ReadOnly {
                     device_idx: 0,
                     name: "d0".into(),

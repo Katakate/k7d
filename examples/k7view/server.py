@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE.parent / "cluster-tree-search"))
 
 from k7d_client import K7dClient  # noqa: E402
 from probe import RealProbe  # noqa: E402
-from store import ViewStore  # noqa: E402
+from store import ViewStore, now_ms  # noqa: E402
 
 STATIC = HERE / "static"
 MAX_SERIAL = 48 * 1024
@@ -33,7 +33,202 @@ ACTIONS = (
     "resume",
     "prune",
     "auto_evict",
+    "fork",
+    "set_dilation",
+    "set_dilation_policy",
 )
+
+# Presets are a UI mapping onto DilationPolicyConfig.ladder. Other
+# knobs stay at the daemon defaults — a bad window refuses to boot.
+DILATION_PRESETS = {
+    "gentle": [8, 4, 2, 1],
+    "aggressive": [8, 4, 1],
+}
+
+
+def fork_labels(n: int) -> list[str]:
+    """Readable child labels. The daemon mints ids from these."""
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 32:
+        raise ValueError(f"fork count {n} is outside 1..=32")
+    return [f"child-{i:02d}" for i in range(1, n + 1)]
+
+
+def dilation_cluster_id(tree_id: str, node_id: str) -> str:
+    """Cluster id `set_dilation` expects. Root is the tree id."""
+    if node_id in ("", "root"):
+        return tree_id
+    return f"{tree_id}-{node_id}"
+
+
+def nearest_rung(ladder: list[int], factor: int) -> int:
+    """Closest rung. A tie picks the lower factor so a click does not jump up."""
+    if not ladder:
+        raise ValueError("dilation ladder is empty")
+    if factor in ladder:
+        return int(factor)
+    return int(min(ladder, key=lambda r: (abs(int(r) - int(factor)), int(r))))
+
+
+def topo_sig(store: ViewStore) -> tuple:
+    """Identity of the graph. CPU and dilation are not part of it."""
+    parts: list[Any] = [store.connected, tuple(sorted(store.trees))]
+    for tid, slot in sorted(store.trees.items()):
+        members = slot.get("members") or {}
+        lats = tuple(sorted((slot.get("latencies") or {}).keys()))
+        nodes = []
+        for nid, n in sorted((slot.get("nodes") or {}).items()):
+            nodes.append(
+                (
+                    nid,
+                    n.get("parent"),
+                    n.get("state"),
+                    bool(n.get("protected")),
+                    tuple(n.get("children") or []),
+                    tuple(members.get(nid) or []),
+                )
+            )
+        parts.append((tid, tuple(nodes), lats))
+    return tuple(parts)
+
+
+def metric_sig(store: ViewStore) -> tuple:
+    """Fields that move every poll and must not rebuild the DOM."""
+    parts: list[Any] = []
+    for tid, slot in sorted(store.trees.items()):
+        clock = slot.get("guest_clock") or {}
+        usage = slot.get("usage") or {}
+        dirty = tuple(
+            sorted(
+                (nid, n.get("dirty_page_count"))
+                for nid, n in (slot.get("nodes") or {}).items()
+            )
+        )
+        parts.append(
+            (
+                tid,
+                usage.get("live_vm_count"),
+                usage.get("live_ram_bytes"),
+                usage.get("disk_bytes"),
+                clock.get("uptime_s"),
+                tuple(sorted((slot.get("live_dilation") or {}).items())),
+                _frozen(slot.get("live_cpu") or {}),
+                _frozen(slot.get("dilation_ladder") or {}),
+                tuple(sorted((slot.get("dilation_policy") or {}).items())),
+                dirty,
+            )
+        )
+    return tuple(parts)
+
+
+def _frozen(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return tuple(sorted((str(k), _frozen(v)) for k, v in obj.items()))
+    if isinstance(obj, list):
+        return tuple(_frozen(v) for v in obj)
+    return obj
+
+
+def metrics_message(store: ViewStore) -> dict[str, Any]:
+    """Slim SSE body. No event log, no node records."""
+    trees: dict[str, Any] = {}
+    for tid, slot in store.trees.items():
+        dirty = {
+            nid: n.get("dirty_page_count") or 0
+            for nid, n in (slot.get("nodes") or {}).items()
+        }
+        trees[tid] = {
+            "usage": slot.get("usage"),
+            "live_dilation": slot.get("live_dilation") or {},
+            "live_cpu": slot.get("live_cpu") or {},
+            "dilation_ladder": slot.get("dilation_ladder") or {},
+            "dilation_policy": slot.get("dilation_policy") or {},
+            "guest_clock": slot.get("guest_clock"),
+            "dirty": dirty,
+        }
+    return {
+        "kind": "metrics",
+        "connected": store.connected,
+        "error": store.error,
+        "clock_ms": now_ms(),
+        "trees": trees,
+    }
+
+
+def perform_action(app: "App", payload: dict[str, Any]) -> dict[str, Any]:
+    """One operator verb. Errors raise; the handler turns them into 400s."""
+    op = str(payload.get("op") or "")
+    tree_id = str(payload.get("tree_id") or "")
+    node_id = str(payload.get("node_id") or "")
+    if op not in ACTIONS:
+        raise ValueError(f"unknown action: {op}")
+    if not tree_id:
+        raise ValueError("tree_id required")
+    if op not in ("auto_evict", "set_dilation_policy") and not node_id:
+        raise ValueError("node_id required")
+    client = app.client
+    if op == "protect":
+        resp = client.tree_protect(tree_id, node_id)
+    elif op == "unprotect":
+        resp = client.tree_unprotect(tree_id, node_id)
+    elif op == "suspend":
+        resp = client.tree_suspend(tree_id, node_id)
+    elif op == "resume":
+        resp = client.tree_resume(tree_id, node_id)
+    elif op == "prune":
+        resp = client.tree_prune(tree_id, node_id)
+    elif op == "auto_evict":
+        resp = client.tree_auto_evict(tree_id)
+    elif op == "fork":
+        n = int(payload.get("n") or 1)
+        labels = fork_labels(n)
+        resp = client.tree_fork_batch(tree_id, node_id, labels)
+        latency_ns = int(resp.get("latency_ns") or 0)
+        latency_ms = latency_ns / 1_000_000.0
+        for branch in resp.get("forks") or []:
+            bid = branch.get("node_id")
+            if not bid:
+                continue
+            app.store.ingest(
+                {
+                    "type": "latency",
+                    "tree_id": tree_id,
+                    "node_id": bid,
+                    "parent_id": node_id,
+                    "latency_ms": latency_ms,
+                    "cow": branch.get("fork_memory_full_copy") or [],
+                }
+            )
+    elif op == "set_dilation":
+        factor = int(payload.get("factor"))
+        if not 1 <= factor <= 64:
+            raise ValueError(f"dilation factor {factor} is outside 1..=64")
+        resp = client.set_dilation(dilation_cluster_id(tree_id, node_id), factor)
+    elif op == "set_dilation_policy":
+        preset = str(payload.get("preset") or "gentle")
+        if preset not in DILATION_PRESETS:
+            raise ValueError(f"unknown dilation preset: {preset}")
+        ladder = DILATION_PRESETS[preset]
+        mode = "track" if payload.get("adaptive") else "fixed"
+        if mode != "fixed":
+            slot = app.store.trees.get(tree_id) or {}
+            for nid, factor in list((slot.get("live_dilation") or {}).items()):
+                rung = nearest_rung(ladder, int(factor))
+                if rung != int(factor):
+                    client.set_dilation(dilation_cluster_id(tree_id, str(nid)), rung)
+        resp = client.set_dilation_policy(tree_id, mode, ladder, node_id or None)
+    else:
+        raise ValueError(f"unknown action: {op}")
+    app.store.ingest(
+        {
+            "type": "meta",
+            "tree_id": tree_id,
+            "node_id": node_id,
+            "action": op,
+            "text": f"operator {op} {node_id or tree_id}",
+        }
+    )
+    app.poll_once()
+    return {"ok": True, "op": op, "resp": resp}
 
 
 class Fanout:
@@ -75,36 +270,29 @@ class App:
         self.fanout = Fanout()
         self._stop = threading.Event()
         self.probe = RealProbe(self.store, self._ingest_probe)
-        self._last_sig: tuple | None = None
+        self._last_topo: tuple | None = None
+        self._last_metric: tuple | None = None
 
     def _ingest_probe(self, items: list[dict[str, Any]]) -> None:
         events: list[dict[str, Any]] = []
+        clock = False
         for item in items:
+            kind = item.get("type") or item.get("op")
             try:
-                events.append(self.store.ingest(item))
+                event = self.store.ingest(item)
             except ValueError:
                 continue
+            if kind == "guest_clock":
+                clock = True
+                continue
+            events.append(event)
         if events:
             self.emit(events)
-
-    def _view_sig(self) -> tuple:
-        parts: list[Any] = [self.store._seq, (self.store.run or {}).get("phase"), self.store.connected]
-        for tid, slot in sorted(self.store.trees.items()):
-            usage = slot.get("usage") or {}
-            clock = slot.get("guest_clock") or {}
-            parts.append(
-                (
-                    tid,
-                    usage.get("live_vm_count"),
-                    usage.get("disk_bytes"),
-                    usage.get("live_ram_bytes"),
-                    clock.get("uptime_s"),
-                    tuple(sorted((slot.get("live_dilation") or {}).items())),
-                )
-            )
-            for nid, n in sorted((slot.get("nodes") or {}).items()):
-                parts.append((nid, n.get("state"), n.get("protected"), n.get("dirty_page_count")))
-        return tuple(parts)
+        elif clock:
+            # Clock ticks are metrics. A full snapshot here repaints both
+            # trees (and the 200-event log) once a second.
+            self._last_metric = metric_sig(self.store)
+            self.fanout.publish(metrics_message(self.store))
 
     def emit(self, events: list[dict[str, Any]]) -> None:
         snap = self.store.snapshot()
@@ -136,15 +324,24 @@ class App:
                         budget=resp.get("budget") or t.get("budget"),
                         live_guest_cids=resp.get("live_guest_cids"),
                         live_dilation=resp.get("live_dilation"),
+                        live_cpu=resp.get("live_cpu") or {},
+                        dilation_ladder=resp.get("dilation_ladder") or {},
+                        dilation_policy=resp.get("dilation_policy") or {},
+                        dilation_trajectory=resp.get("dilation_trajectory") or {},
                     )
                 )
             for tid in list(self.store.trees):
                 if tid not in seen:
                     events.extend(self.store.drop_tree(tid))
-            sig = self._view_sig()
-            if events or sig != self._last_sig:
-                self._last_sig = sig
+            topo = topo_sig(self.store)
+            metric = metric_sig(self.store)
+            if events or topo != self._last_topo:
+                self._last_topo = topo
+                self._last_metric = metric
                 self.emit(events)
+            elif metric != self._last_metric:
+                self._last_metric = metric
+                self.fanout.publish(metrics_message(self.store))
         except Exception as exc:  # noqa: BLE001 — surface to the UI
             self.store.connected = False
             self.store.error = str(exc)
@@ -274,45 +471,10 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 self._json(200, {"ok": True, "n": len(events)})
                 return
             if path == "/api/action":
-                op = str(payload.get("op") or "")
-                tree_id = str(payload.get("tree_id") or "")
-                node_id = str(payload.get("node_id") or "")
-                if op not in ACTIONS:
-                    self._json(400, {"error": f"unknown action: {op}"})
-                    return
-                if not tree_id:
-                    self._json(400, {"error": "tree_id required"})
-                    return
-                if op != "auto_evict" and not node_id:
-                    self._json(400, {"error": "node_id required"})
-                    return
                 try:
-                    if op == "protect":
-                        resp = app.client.tree_protect(tree_id, node_id)
-                    elif op == "unprotect":
-                        resp = app.client.tree_unprotect(tree_id, node_id)
-                    elif op == "suspend":
-                        resp = app.client.tree_suspend(tree_id, node_id)
-                    elif op == "resume":
-                        resp = app.client.tree_resume(tree_id, node_id)
-                    elif op == "prune":
-                        resp = app.client.tree_prune(tree_id, node_id)
-                    else:
-                        resp = app.client.tree_auto_evict(tree_id)
+                    self._json(200, perform_action(app, payload))
                 except Exception as exc:  # noqa: BLE001
                     self._json(400, {"error": str(exc)})
-                    return
-                app.store.ingest(
-                    {
-                        "type": "meta",
-                        "tree_id": tree_id,
-                        "node_id": node_id,
-                        "action": op,
-                        "text": f"operator {op} {node_id or tree_id}",
-                    }
-                )
-                app.poll_once()
-                self._json(200, {"ok": True, "op": op, "resp": resp})
                 return
             self._send(404, b"not found", "text/plain")
 

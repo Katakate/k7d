@@ -10473,6 +10473,168 @@ exit event and `task.Delete`.
 
 ---
 
+## 283. Warm-forked pods have no internet on either backend, and no fork test sent a packet
+
+**Symptom:** A k7 fork of a k7d or k7d-fc sandbox runs and answers `exec`, but `wget http://1.1.1.1/` from the fork times out. The source's egress still works. On native, the daemon logs `snapshot has virtio-net but no TAP supplied — guest network will be inactive`. On k7d-fc, the fork's TAP sits on the source's host bridge as index N+1, and the `k7tapjail-*` anti-spoof counter increments for frames from `aa:bb:00:00:00:02`, the source's MAC. The fork pod's own netns has only `eth0`: no `k7-podbr0`, no NAT.
+
+**Root cause:** Two different bugs.
+- Native: `fork_vm_native` forked through `restore_vm_from_state`, which passes no TAP, so the fork had no virtio-net backend.
+- FC: `fork_vm_fc` asked `acquire_network` for the *next* index on the source's bridge. The guest keeps the source's `eth0` IP and MAC in memory, and the new TAP's anti-spoof pin only accepts the new index's MAC.
+
+On both backends the shim sent `ForkVm` without the fork pod's CNI netns. Even a working TAP would have left through the host bridge's MASQUERADE, outside the fork pod's NetworkPolicy. The fork tests (`test_kubectl_fork_source_annotation`, `test_k7_fc_fork_source_annotation_adopts_child`) only checked `exec`.
+
+**Fix:**
+- `ForkVm` carries `pod_netns`, which the shim fills from the fork pod's bundle. Cluster-mode pods keep the host bridge.
+- `acquire_fork_network` gives the fork its own bridge (`ClusterNetwork::fork_from`, keyed by the fork's sandbox id, egress inherited) with a TAP at the **source's** `vm_index`, and attaches it into the fork pod netns with NAT.
+  - Native: the fork is built through `Vm::fork_warm_batch_with_taps`.
+  - FC: the attach runs after `spawn_child`, for the same by-name TAP reason as create.
+- A pod-backed fork of a pod-attached source with no fork netns fails loud.
+- A `ForkBridgeRef` guard releases the bridge on every error before the registry insert.
+- Regression tests:
+  - `test_kubectl_fork_keeps_pod_egress` (native).
+  - The FC annotation test now asserts the fork's bridge, index, netns attach and egress, and that the source still has egress after the fork.
+
+**Limit (found by `test_daemon_fork_networked_vm_keeps_egress`):** a fork with no pod netns (cluster-mode pods, direct `ForkVm` calls) sits on its own host bridge. That bridge owns `10.200.0.1/24`, and so does the source's. While the source lives, the host FIB sends every reply to the shared guest IP out the source's bridge (the same root cause as #167). Such a fork gets its NIC and identity right but has no egress until the source is gone. Pod-backed forks (every k7 sandbox) are unaffected: each pod netns is its own routing realm. Lifting the limit needs per-bridge routing, such as a VRF or netns per host bridge, not a fork-path change.
+
+**Reference:** `fork_cluster_warm` already did this for cluster trees (`fork_from` + `add_tap_at` + `restore_vm_from_state_with_tap`). The single-VM path never used it.
+
+**Time lost:** a user report; reproduced on one node for both backends before reading the fork paths.
+
+---
+
+## 284. A netns per host network doubled warm cluster fork time — moving a TAP between namespaces costs ~20 ms
+
+**Symptom:** After spec 45a moved each host-bridge network into its own netns (the fix for #283's limit), `test_cluster_fork_warm_3vm_under_50ms` failed at ~150–175 ms on every sample. On `main` the same node measured 89–110 ms. The member restores took 3–4 ms each. Host-net setup took 100–130 ms.
+
+**Root cause:** Two costs, the second much larger.
+- Bring-up ran ~15 separate `ip`/`nsenter`/`nft` processes at ~3–4 ms each.
+- TAPs were created in the host netns (TUNSETIFF puts a TAP in its *opener's* netns) and then moved with `ip link set … netns`. That move waits for an RCU grace period: ~20 ms per device on this node, ~29 ms for two moves in one `ip -batch`, and a dummy link costs the same. Three TAPs added ~55 ms. Creating the TAP inside the netns costs ~3 ms.
+
+**Fix:**
+- `spawner::open_tun_in` opens `/dev/net/tun` on a short-lived thread that `setns`es into the network's netns, so `TUNSETIFF` creates the TAP in place. The daemon's seccomp filter has no `setns` (`daemon_filter_has_no_privilege_syscalls`), so the un-split daemon asks its spawner over a new `OpenTun` request, and the fd returns by `SCM_RIGHTS`. The node broker and tests have no spawner and do it in-process.
+- One `ip -n <ns> -batch` sets MAC + master + up for all of a cluster's TAPs.
+- Host-side bring-up (`netns add`, veth, addresses, host route) is one `ip -batch`, the inside is another, and sysctls + SNAT run in one `nsenter sh`. The uplink allocator uses `getifaddrs`.
+- Bridge names are now `ip -batch` tokens, so cluster ids with characters outside `[A-Za-z0-9._-]` are hashed.
+- Result: the warm 3-VM fork measured 86–101 ms best-of-5, back at `main`'s level.
+
+**Also:** the in-netns bridge lost `main`'s per-bridge `nf_call_iptables=0` (`test_ubuntu_cilium_datapath_fork` read it from host sysfs). It is now set on the `ip link add … type bridge` line.
+
+**Time lost:** one full-suite run, then two timing rounds with temporary `eprintln!` timers to find that it was the moves and not the process count.
+
+---
+
+## 286. A second suspend said "node not found" because the live map was already empty
+
+**Symptom:** In k7view, suspend worked once (the cluster root went suspended and the live-VM count dropped to zero). Clicking suspend again printed `tree_suspend: node not found: root` in the serial pane. Resume of a node that was already live correctly said `cannot resume (must be Suspended)`, so the two verbs did not match.
+
+**Root cause:** `SnapshotTree::suspend` and `ClusterSnapshotTree::suspend` (and their Firecracker twins, which share the same entry) take the payload out of `live_vms` / `live` and map a missing entry to `NodeNotFound`. After the first suspend the node is still in the tree, with state `Suspended`. `resume` checks that state first. Suspend did not.
+
+**Fix:** If the node exists and its state is not `Live`, return `BadState(..., "suspend (must be Live)")` before touching the live map. k7view shows that text in the drawer, disables suspend unless the node is live, and ignores a second click while the first request is in flight.
+
+**Reference:** none. `resume` in the same files was already the right shape.
+
+**Time lost:** one live click-through on a 2-VM cluster plus reading both suspend paths.
+
+---
+
+## 287. set_dilation could not see a single-VM tree, and a shorter tree id won the prefix match
+
+**Symptom:** `set_dilation` on a `tree_create` node (the miner demo is one VM, not a cluster) returned `no VM on cluster`. The registry lookup is empty because the tree owns the VM, and `tree_cluster_members_mut` only returns `ClusterSnapshotTree` members. The same helper also walked the tree map in hash order and returned the first id that was a prefix, so a tree named `a` could capture `a-b`.
+
+**Root cause:** CHALLENGES #193 fixed the cluster-payload half. Single-VM payloads go through `SnapshotTree::get_vm`, which that lookup never called. The prefix walk had no "longest id" rule.
+
+**Fix:** Resolve `cluster_id` to the longest matching tree id (`tree_id` is the root, `{tree_id}-{node_id}` is a child). Cluster members still come from the cluster payload. If that payload has no live members, `set_dilation` uses the single-VM guest. `set_dilation_policy` is a separate op: it stores the ladder and arms `fixed` / `down` / `track` without ioctling the TSC, so a UI preset can change the ladder while the VM stays at ×1 on a stock kernel.
+
+**Reference:** none. Same class of bug as #193.
+
+**Time lost:** tracing `set_dilation` from the registry miss into `tree_cluster_members_mut`.
+
+---
+
+## 291. k7view slider move during a policy POST never reaches the daemon
+
+**Symptom:** The dilation drawer readout flashed ×8 and then sat on ×1. The ladder never left the bottom rung. `k7view` logged three `POST /api/action` calls for a gesture that should have sent four: the `set_dilation` was missing. Host KVM was already the patched module.
+
+**Root cause:** `act()` returns immediately when another action is in flight. Changing the preset calls `set_dilation_policy`, and that handler then `poll_once()`s every cluster, which on an 11-node Ubuntu tree takes longer than the slider gesture. The `change` handler's `set_dilation` hit `acting` and was discarded. The next metrics snapshot painted the old factor back over the optimistic readout. A stale `track` snapshot could also re-check Adaptive before the slider event, and the change handler bails when that box is checked.
+
+**Fix:** Keep the latest `set_dilation` / `set_dilation_policy` and run it when the in-flight action finishes. Hold the readout and the Adaptive checkbox on what the operator just set until the snapshot echoes it.
+
+**Reference:** none.
+
+**Time lost:** ~40 minutes. The first demo take's "manual ×8" frames were the optimistic flash, already overwritten.
+
+---
+
+## 293. Every k7view node reads CPU 100% once the daemon has more than a few vCPUs
+
+**Symptom:** A 3-VM busybox cluster at idle reported about 2% per VM, matching `/proc/<tid>/task/<tid>/stat`. The same cluster with a userspace burner on each vCPU reported exactly 100% on every VM, while each vCPU thread had gained ~100 ticks in one second and `/proc/<tid>/stat` had gained ~600 (six threads). On a 33-VM tree (66 vCPU threads) every node sat at a constant 100% as soon as the forks existed. An idle guest's `/proc/stat` was all idle ticks.
+
+**Root cause:** `task_cpu_ticks` read `/proc/<tid>/stat`. That file is the thread-group aggregate, the same number `ps` prints for the process. Summing it once per vCPU multiplies the daemon's CPU by its vCPU-thread count. `cpu_percent` then clamps anything past 100, so a tree with N vCPU threads displays 100% for any VM busier than about `100/N` percent. Those 66 threads made roughly 1.5% of real host time look like 100%.
+
+**Fix:** Read `/proc/<tid>/task/<tid>/stat`, which is that one thread. The node badge is the vCPU-weighted average of those per-VM percents, and the hover lists each VM.
+
+**Reference:** `proc_pid_stat(5)` — `/proc/[pid]/task/[tid]/stat` versus `/proc/[pid]/stat`.
+
+**Time lost:** ~1 hour. The burner loops were real, and they hid the clamp: a genuinely pegged guest and a lightly loaded one both drew "CPU 100%".
+
+---
+
+## 300. A warm pool of `k7-fc` pods on a fresh node crash-looped in Firecracker staging
+
+**Symptom:** On a freshly installed node, an agent-sandbox `SandboxWarmPool` of three `k7-fc` pods plus one claim went Ready, but the claim's pod showed `RESTARTS 2`. The kubelet events carried `firecracker staging /var/lib/k7d/fc/.ro-cache/.<key>.tmp-<pid>: chmod 0444: No such file or directory`. A single `k7-fc` pod never hit it, and neither did a second pool once the cache was warm.
+
+**Root cause:** `cache_read_only` copies a guest artifact (kernel, initrd, erofs image) onto the jail filesystem under a temp name and then renames it into place. The temp name was `.<key>.tmp-<pid>`. The daemon stages concurrent VMs on threads of one process, so all of them got the same name. The second thread's `create_new` failed with EEXIST, and its error path called `remove_file(tmp)`. That unlinked the first thread's in-flight copy, whose `chmod` then failed with ENOENT. Four pods created at once on a cold cache is exactly what a warm pool does.
+
+**Fix:** Add a per-process atomic sequence to the temp name, the way `erofs::build_erofs_image` already does. The regression test `concurrent_cache_of_one_artifact_all_succeed` runs 16 threads on one artifact. It fails on the old name and passes with the fix.
+
+**Reference:** none.
+
+**Time lost:** ~20 minutes. The k3s journal named the path, and the `.tmp-<pid>` shape gave the cause away.
+
+---
+
+## 301. `kubectl port-forward` to a k7d pod returned connection refused
+
+**Symptom:** `kubectl port-forward pod/<sandbox> 8888` started, but every request through the tunnel failed with `connection refused`, on `k7` and on `k7-fc`. The same pod answered on its pod IP. The upstream agent-sandbox Python SDK's tunnel mode and its e2e helpers depend on port-forward.
+
+**Root cause:** containerd's CRI `PortForward` enters the pod netns and dials `127.0.0.1:<port>`. With runc the workload listens there. With k7d the workload is in the guest, and the pod netns only had PREROUTING DNAT for traffic arriving on the pod IP. Locally generated loopback traffic never passes PREROUTING, so nothing forwarded it.
+
+**Fix:** `install_pod_nat` adds, inside the pod netns only, an OUTPUT DNAT of TCP to `127.0.0.1` towards the guest, a MASQUERADE for `127.0.0.0/8 -> guest` so the reply has a route back, and `net.ipv4.conf.all.route_localnet=1`, which lets a loopback-sourced packet leave `lo`. Nothing in the pod netns listens on loopback, since every container runs in the guest. `test_install_pod_nat_installs_rules` asserts the rules and that the host sysctl is unchanged. `test_agent_sandbox` V3 checks HTTP 200 through a real port-forward on both backends.
+
+**Reference:** [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) v1.0.5 Python SDK tunnel mode.
+
+**Time lost:** ~30 minutes. Spec 46a predicted it, and the first assertion that `route_localnet` stayed `0` on the host was wrong: k3s already sets it to `1` there.
+
+---
+
+## 302. A rotated projected service-account token never reached the k7d guest
+
+**Symptom:** An agent-sandbox `Sandbox` mounted a projected `serviceAccountToken` with `expirationSeconds: 600`. kubelet rewrote the token on the host after about 9 minutes, but `cat` inside the pod kept returning the first token on both `k7` and `k7-fc`. After expiry, the workload would have been calling the API with a dead token.
+
+**Root cause:** On the block path, the shim packs every read-only kubelet volume (ConfigMap, Secret, downwardAPI, projected) into one erofs image at sandbox Create (`volumes_blk::BlockVolumes::prepare`). The image is immutable and nothing re-reads the host directories, so every later kubelet update is lost: token rotation, ConfigMap and Secret edits.
+
+**Fix:** Not fixed. The examples set `automountServiceAccountToken: false`. `test_agent_sandbox` V10 asserts the current behaviour: the host token rotates and the guest copy does not. A real fix needs a refresh path, such as the agent re-syncing changed RO trees over vsock. Spec 46a 1c sizes it.
+
+**Reference:** none.
+
+**Time lost:** ~25 minutes, mostly two 10-minute waits for kubelet to rotate the token.
+
+---
+
+## 303. `common::pod_sandbox_id` returned a warm-pool pod's sandbox
+
+**Symptom:** In `test_agent_sandbox`, after `python-k7` was suspended, the daemon kept answering `lookup_sandbox` for its sandbox id. The k7d journal showed the VM stopped two seconds after the patch.
+
+**Root cause:** `crictl pods --name` is a regex, not an exact name. `--name python-k7` also matched the `python-k7-fc-pool-*` warm-pool pods in the same namespace. The test was looking up a pool VM that was still alive.
+
+**Fix:** `pod_sandbox_id` anchors the pattern: `--name ^<pod>$`.
+
+**Reference:** none.
+
+**Time lost:** ~15 minutes.
+
+---
+
 ## Reference projects and what each taught us
 
 | Project | What we learned |

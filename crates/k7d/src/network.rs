@@ -62,13 +62,12 @@ const VIRTIO_NET_DEVICE_FEATURES: u64 =
 const GUEST_SUBNET_BASE: [u8; 4] = [10, 200, 0, 0];
 const GUEST_GATEWAY: [u8; 4] = [10, 200, 0, 1];
 
-/// Policy-routing table for guest overlay prefixes forwarded across a
-/// k7 bridge. Must not be the main table: an `ip route replace` there
-/// once stole host k3s `cni0`'s connected route, and deleting the
-/// bridge left the prefix unroutable — `CoreDNS` probes timed out
-/// (CHALLENGES.md #117). The guest CIDRs no longer overlap the host's
-/// (#121), but a scoped table stays self-cleaning and cannot regress.
-pub const GUEST_OVERLAY_TABLE: u32 = 200;
+/// Host policy-routing table guest overlay prefixes used before they
+/// moved into each network's namespace (the per-network netns spec);
+/// only drained now.
+/// It was never the main table: an `ip route replace` there once stole
+/// host k3s `cni0`'s connected route (CHALLENGES.md #117).
+const GUEST_OVERLAY_TABLE: u32 = 200;
 /// Guest k3s pod overlay. Keep in step with `POD_CIDR` in
 /// `tests/common/ubuntu_k3s.rs` and `guest/ubuntu/k7d-k3sconfig` —
 /// off k3s' default `10.42/16` because the host running these VMs is
@@ -108,21 +107,34 @@ pub struct TapDevice {
     /// lifetime — the `ip link delete`, the `TUNSETOWNER` hand-over —
     /// is a verb rather than a syscall here.
     tree_id: Option<String>,
+    /// The network namespace this TAP was placed in — its network's,
+    /// named like the bridge (the per-network netns spec). `None`
+    /// while it sits unplaced in the host namespace, waiting to be
+    /// moved into a pod's.
+    netns: Option<String>,
 }
 
 impl TapDevice {
-    /// Create a TAP device and attach it to the given bridge.
+    /// Create a TAP device and, with `netns`, place it on the bridge
+    /// inside that network namespace (the per-network netns spec).
+    /// Without, it stays unplaced in the host namespace for a pod
+    /// attach to move.
     ///
     /// The TAP device name is derived from `bridge_name` and `vm_index` so two
     /// bridges (e.g. source and fork) can each host a TAP for the same
     /// `vm_index` without colliding on the kernel-side interface name.
-    pub fn create(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
-        let mut tap = Self::create_unpinned(bridge_name, vm_index)?;
+    fn create(bridge_name: &str, vm_index: u32, netns: Option<&str>) -> Result<Self, String> {
+        let mut tap = Self::create_unpinned(bridge_name, vm_index, netns)?;
         // Per-TAP L2 anti-spoof: the MAC/IP identity is
         // assigned right here, so this is where the pin goes on. All
         // bridges share 10.200.0.0/24 and forks reuse guest IPs — the
         // pin must be per-TAP, never a global source-IP set.
-        tap.anti_spoof = crate::netjail::TapAntiSpoof::install(&tap.name, tap.mac, tap.guest_ip)?;
+        tap.anti_spoof = crate::netjail::TapAntiSpoof::install(
+            &tap.name,
+            tap.mac,
+            tap.guest_ip,
+            tap.netns_path().as_deref(),
+        )?;
         Ok(tap)
     }
 
@@ -132,15 +144,35 @@ impl TapDevice {
     /// instead of one process per TAP. Callers MUST attach the batch
     /// guards before any guest traffic can flow (the VMs don't exist
     /// yet at this point on the fork path).
-    fn create_unpinned(bridge_name: &str, vm_index: u32) -> Result<Self, String> {
+    fn create_unpinned(
+        bridge_name: &str,
+        vm_index: u32,
+        netns: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut taps = [Self::open(bridge_name, vm_index, netns)?];
+        Self::place(&mut taps, bridge_name)?;
+        let [tap] = taps;
+        Ok(tap)
+    }
+
+    /// The TAP device itself, down and off the bridge —
+    /// [`Self::place`] next. With `netns` it is created in that
+    /// namespace.
+    fn open(bridge_name: &str, vm_index: u32, netns: Option<&str>) -> Result<Self, String> {
+        use std::os::fd::IntoRawFd;
         let (tap_name, mac, guest_ip) = tap_identity(bridge_name, vm_index);
 
-        // SAFETY: valid C string path, valid flags.
-        let fd = unsafe {
-            libc::open(
-                c"/dev/net/tun".as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
+        let fd = match netns {
+            Some(ns) => crate::spawner::open_tun_in(&netns_path(ns))
+                .map_err(|e| format!("open /dev/net/tun in {ns}: {e}"))?
+                .into_raw_fd(),
+            // SAFETY: valid C string path, valid flags.
+            None => unsafe {
+                libc::open(
+                    c"/dev/net/tun".as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            },
         };
         if fd < 0 {
             return Err(format!(
@@ -194,26 +226,8 @@ impl TapDevice {
             return Err(format!("TUNSETOFFLOAD none: {err}"));
         }
 
-        // TAP MAC must differ from guest MAC to avoid bridge "own source address" drops.
-        let tap_mac_str = format!(
-            "fe:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
-
-        run_cmd(
-            "ip",
-            &["link", "set", "dev", &tap_name, "address", &tap_mac_str],
-        )?;
-        run_cmd(
-            "ip",
-            &["link", "set", "dev", &tap_name, "master", bridge_name],
-        )?;
-        run_cmd("ip", &["link", "set", "dev", &tap_name, "up"])?;
-
-        log::info!("TAP {tap_name} created: tap_mac={tap_mac_str} guest_ip={guest_ip}");
-
-        // Build the struct before pinning so its `Drop` (close fd,
-        // delete link) cleans up if a later anti-spoof install fails.
+        // Built before placing so its `Drop` (close fd, delete link)
+        // cleans up if placing or pinning fails.
         Ok(Self {
             fd,
             name: tap_name,
@@ -222,7 +236,60 @@ impl TapDevice {
             vm_index,
             anti_spoof: None,
             tree_id: None,
+            netns: netns.map(str::to_string),
         })
+    }
+
+    /// Give each of `taps` its host-side MAC and bring it up — on the
+    /// bridge, for TAPs opened in its namespace. One `ip -batch`
+    /// however many TAPs.
+    fn place(taps: &mut [Self], bridge_name: &str) -> Result<(), String> {
+        // TAP MAC must differ from guest MAC to avoid bridge "own source address" drops.
+        let tap_mac = |t: &Self| {
+            let m = t.mac;
+            format!(
+                "fe:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                m[1], m[2], m[3], m[4], m[5]
+            )
+        };
+        let netns = taps[0].netns.clone();
+        let lines: Vec<String> = taps
+            .iter()
+            .map(|t| match netns {
+                Some(_) => format!(
+                    "link set dev {} address {} master {bridge_name} up",
+                    t.name,
+                    tap_mac(t)
+                ),
+                None => format!("link set dev {} address {} up", t.name, tap_mac(t)),
+            })
+            .collect();
+        let file = format!("{}-{bridge_name}-t{}", std::process::id(), taps[0].vm_index);
+        ip_batch(netns.as_deref(), &file, &lines)?;
+        for t in taps.iter() {
+            log::info!(
+                "TAP {} created: tap_mac={} guest_ip={} netns={netns:?}",
+                t.name,
+                tap_mac(t),
+                t.guest_ip
+            );
+        }
+        Ok(())
+    }
+
+    /// Path of the network namespace this TAP was placed in, `None`
+    /// when it is in the host namespace (or is a node-broker mirror).
+    /// An external VMM must run there to open the TAP by name.
+    #[must_use]
+    pub fn netns_path(&self) -> Option<PathBuf> {
+        self.netns.as_deref().map(netns_path)
+    }
+
+    /// `(tree id, index)` of a TAP the node broker holds, which is how
+    /// `fc.spawn` names it — that side knows where it was placed.
+    #[must_use]
+    pub fn broker_ref(&self) -> Option<(String, u32)> {
+        self.tree_id.clone().map(|t| (t, self.vm_index))
     }
 
     /// Adopt a TAP the node broker created: the descriptor came over
@@ -244,6 +311,7 @@ impl TapDevice {
             vm_index: info.vm_index,
             anti_spoof: None,
             tree_id: Some(tree_id.to_string()),
+            netns: None,
         }
     }
 
@@ -265,6 +333,7 @@ impl TapDevice {
             vm_index,
             anti_spoof: None,
             tree_id: Some(tree_id.to_string()),
+            netns: None,
         }
     }
 
@@ -651,10 +720,13 @@ impl Drop for TapDevice {
             return;
         }
         // `ip link delete` removes the device whether or not it was
-        // marked persistent for an external VMM.
-        let _ = crate::spawner::command("ip")
-            .args(["link", "delete", &self.name])
-            .output();
+        // marked persistent for an external VMM. A namespace already
+        // deleted took the device with it.
+        let mut args = vec!["link", "delete", self.name.as_str()];
+        if let Some(ns) = &self.netns {
+            args.splice(0..0, ["-n", ns.as_str()]);
+        }
+        let _ = crate::spawner::command("ip").args(&args).output();
     }
 }
 
@@ -721,6 +793,215 @@ pub struct ClusterNetwork {
     /// `CAP_NET_ADMIN` — the `jail` guard and the `ip`/`nft`/`nsenter`
     /// calls, which are the other side's.
     tree_id: Option<String>,
+    /// This network's uplink slot once its namespace is built — the
+    /// first placed TAP builds it ([`Self::materialize`]). `None` for a
+    /// mirror and for a network only pod-attached TAPs ever used.
+    uplink: Option<Uplink>,
+    /// Whether new TAPs go onto the bridge in the network's namespace
+    /// (`true`) or stay unplaced in the host for a pod attach to move.
+    place_taps: bool,
+}
+
+/// Guest-facing range every network reuses; its gateway is the host.
+const GUEST_SUBNET: &str = "10.200.0.0/24";
+
+/// Where each network's uplink `/30` comes from (RFC 2544 benchmarking
+/// space: not used by k3s, flannel, Cilium or the nodes). One slot per
+/// live network; host end `.1`, namespace end `.2` of the slot.
+pub const UPLINK_RANGE: &str = "198.18.0.0/15";
+const UPLINK_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
+const UPLINK_SLOTS: u32 = 1 << 15;
+/// Namespace end of the uplink veth. The host end is named like the
+/// bridge, so everything on the host keyed on `k7-br-*` keeps working.
+const UPLINK_PEER: &str = "k7-up";
+/// Pinned bridge MAC: guests cache the gateway's MAC, and a fork's
+/// guest must find the same one on its new bridge.
+const BRIDGE_MAC: &str = "aa:bb:00:00:00:01";
+const NETNS_DIR: &str = "/run/netns";
+/// Serialises uplink allocation across processes (daemon, node broker,
+/// in-process tests).
+const NETNS_LOCK: &str = "/run/k7d-netns.lock";
+const NSFS_MAGIC: i64 = 0x6e73_6673;
+
+/// `/run/netns/<name>`.
+#[must_use]
+pub fn netns_path(name: &str) -> PathBuf {
+    Path::new(NETNS_DIR).join(name)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Uplink {
+    slot: u32,
+}
+
+impl Uplink {
+    fn host(self) -> Ipv4Addr {
+        Ipv4Addr::from(UPLINK_BASE + 4 * self.slot + 1)
+    }
+    fn peer(self) -> Ipv4Addr {
+        Ipv4Addr::from(UPLINK_BASE + 4 * self.slot + 2)
+    }
+}
+
+/// Lowest uplink slot no host address claims. Callers hold
+/// [`NETNS_LOCK`] until the slot's address is on a link.
+fn allocate_uplink() -> Result<Uplink, String> {
+    let mut used = std::collections::HashSet::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list freed below.
+    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+        return Err(format!("getifaddrs: {}", std::io::Error::last_os_error()));
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: a non-null ifa_addr points at a sockaddr.
+        let family = unsafe { (*ifa.ifa_addr).sa_family };
+        if i32::from(family) != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: as above; unaligned, only sockaddr's alignment is promised.
+        let sin = unsafe { ifa.ifa_addr.cast::<libc::sockaddr_in>().read_unaligned() };
+        let a = u32::from_be(sin.sin_addr.s_addr);
+        if a.wrapping_sub(UPLINK_BASE) < 4 * UPLINK_SLOTS {
+            used.insert((a - UPLINK_BASE) / 4);
+        }
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    (0..UPLINK_SLOTS)
+        .find(|s| !used.contains(s))
+        .map(|slot| Uplink { slot })
+        .ok_or_else(|| {
+            format!("every uplink /30 in {UPLINK_RANGE} is in use ({UPLINK_SLOTS} live networks)")
+        })
+}
+
+/// The inside of network `ns`'s namespace: bridge, uplink end, routes,
+/// proxy-ARP for the gateway and the SNAT to the uplink address.
+fn build_inside(ns: &str, uplink: Uplink) -> Result<(), String> {
+    let (u1, u2) = (uplink.host().to_string(), uplink.peer().to_string());
+    let gw = Ipv4Addr::from(GUEST_GATEWAY).to_string();
+    ip_batch(
+        Some(ns),
+        &format!("{ns}-in"),
+        &[
+            "link set dev lo up".into(),
+            // Bridged guest↔guest frames are pure L2: no conntrack or
+            // IP hooks in this namespace (CHALLENGES #117 was the host's
+            // flannel SNAT seeing them).
+            format!(
+                "link add {ns} address {BRIDGE_MAC} type bridge \
+                 nf_call_iptables 0 nf_call_ip6tables 0 nf_call_arptables 0"
+            ),
+            format!("link set dev {ns} up"),
+            format!("addr add {u2}/30 dev {UPLINK_PEER}"),
+            format!("link set dev {UPLINK_PEER} up"),
+            format!("route add {GUEST_SUBNET} dev {ns}"),
+            format!("route add {gw}/32 via {u1} dev {UPLINK_PEER}"),
+            format!("route add default via {u1} dev {UPLINK_PEER}"),
+        ],
+    )?;
+    let enter = format!("--net={}", netns_path(ns).display());
+    // One process for the sysctls and the SNAT (`/proc/sys/net` is the
+    // writer's namespace's). The bridge answers ARP for the gateway
+    // (routed up the uplink), at once.
+    let nat = format!(
+        "add table ip k7nat; \
+         add chain ip k7nat post {{ type nat hook postrouting priority srcnat; }}; \
+         add rule ip k7nat post oifname \"{UPLINK_PEER}\" ip saddr {GUEST_SUBNET} snat to {u2}"
+    );
+    run_cmd(
+        "nsenter",
+        &[
+            &enter,
+            "sh",
+            "-ec",
+            "s=/proc/sys/net/ipv4; echo 1 >$s/ip_forward; echo 0 >$s/conf/all/rp_filter; \
+             echo 0 >$s/conf/$1/rp_filter; echo 1 >$s/conf/$1/proxy_arp; \
+             echo 0 >$s/neigh/$1/proxy_delay; exec nft \"$2\"",
+            "sh",
+            ns,
+            &nat,
+        ],
+    )?;
+    Ok(())
+}
+
+struct NetnsLock {
+    _file: std::fs::File,
+}
+
+impl NetnsLock {
+    fn acquire() -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(NETNS_LOCK)
+            .map_err(|e| format!("open {NETNS_LOCK}: {e}"))?;
+        // SAFETY: `f` is an open file; flock takes no pointers.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "flock {NETNS_LOCK}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { _file: f })
+    }
+}
+
+/// Whether `path` is a mounted network namespace (not just the empty
+/// file `ip netns add` leaves behind once the mount is gone).
+#[must_use]
+pub fn is_mounted_netns(path: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: zeroed statfs is a valid out-buffer; `c` is NUL-terminated.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let rc = unsafe { libc::statfs(c.as_ptr(), &raw mut st) };
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as i64;
+    rc == 0 && magic == NSFS_MAGIC
+}
+
+/// Remove `/run/netns/k7-br-*` files that no longer name a namespace.
+///
+/// k7d runs in a private mount namespace (`ProtectSystem=strict`), so
+/// the bind mount behind each of its network namespaces dies with the
+/// process and the kernel frees the namespace — but the empty file
+/// stays in `/run/netns`, and `ip netns add` refuses that name until it
+/// is gone. A file whose host uplink still exists belongs to a live
+/// network in another mount namespace and is left alone. Returns the
+/// names removed.
+#[must_use]
+pub fn reap_stale_netns_files() -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(NETNS_DIR) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("k7-br-") || Path::new("/sys/class/net").join(&name).exists() {
+            continue;
+        }
+        if is_mounted_netns(&entry.path()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed.push(name),
+            Err(e) => log::error!("remove stale {}: {e}", entry.path().display()),
+        }
+    }
+    removed
 }
 
 impl ClusterNetwork {
@@ -760,117 +1041,194 @@ impl ClusterNetwork {
                 egress,
                 default_iface: String::new(),
                 tree_id: Some(cluster_id.to_string()),
+                uplink: None,
+                place_taps: true,
             });
         }
         // To keep distinct cluster IDs mapping to distinct bridges even
         // after truncation, mix in a short FNV-1a hash for IDs that
-        // exceed the budget.
-        let suffix = if cluster_id.len() <= MAX_SUFFIX {
+        // exceed the budget. The name is also a token in `ip -batch`
+        // lines, so anything outside `[A-Za-z0-9._-]` is hashed too.
+        let safe = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        let suffix = if cluster_id.len() <= MAX_SUFFIX && cluster_id.chars().all(safe) {
             cluster_id.to_string()
         } else {
             // 3-char prefix from the cluster_id + 5-char hash, joined by `-`.
             let h = bridge_short_tag(cluster_id);
-            format!("{}-{}", &cluster_id[..3], &h[..5])
+            let prefix: String = cluster_id
+                .chars()
+                .take(3)
+                .map(|c| if safe(c) { c } else { '-' })
+                .collect();
+            format!("{prefix}-{}", &h[..5])
         };
         let bridge_name = format!("k7-br-{suffix}");
+        // Nothing touches the host until a TAP is placed (the
+        // per-network netns spec): a network whose TAPs all go to pods
+        // never needs a namespace.
+        egress.validate()?;
+        Ok(Self {
+            bridge_name,
+            subnet_base: GUEST_SUBNET_BASE,
+            next_vm_index: 0,
+            entries: HashMap::new(),
+            jail: None,
+            egress,
+            default_iface: String::new(),
+            tree_id: None,
+            uplink: None,
+            place_taps: true,
+        })
+    }
 
-        // Idempotent attach without a TOCTOU race: just attempt `link add` and
-        // accept "File exists" (kernel returns EEXIST when the link is already
-        // there). Doing show-then-add would let two concurrent shim processes
-        // both observe "missing" and both try to create the bridge, with the
-        // loser failing loudly even though the post-condition is satisfied.
-        // pidfd-based wait — under sustained shim load Tokio's
-        // SIGCHLD reaper races `Command::output()`'s `waitpid(pid)`
-        // and surfaces as `ip link add: No child processes (os
-        // error 10)`. `run_capture` opens a `pidfd` immediately
-        // after spawn and waits on that instead, race-free.
-        let (add_status, _, add_stderr) = crate::netns::run_capture(
-            "ip",
-            &["link", "add", "name", &bridge_name, "type", "bridge"],
-        )
-        .map_err(|e| format!("ip link add: {e}"))?;
-        if !add_status.success() {
-            // `ip` prints `RTNETLINK answers: File exists` for EEXIST.
-            if !add_stderr.contains("File exists") {
+    /// Whether this network's namespace, uplink and jail exist yet.
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
+        self.uplink.is_some()
+    }
+
+    /// Choose whether TAPs created from now on are placed on the bridge
+    /// (the default) or left in the host for a pod attach to move.
+    pub fn set_place_taps(&mut self, place: bool) {
+        self.place_taps = place;
+    }
+
+    /// Build this network's namespace, if it does not exist yet:
+    ///
+    /// ```text
+    /// netns <bridge>:  bridge <bridge> (no address, proxy-ARP 10.200.0.1)
+    ///                  10.200.0.1/32 + default via U1, SNAT guests → U2
+    ///                  k7-up U2/30
+    ///                    │ veth
+    /// host:            <bridge> U1/30 + 10.200.0.1/32, jail, MASQUERADE
+    /// ```
+    ///
+    /// Every network reuses 10.200.0.0/24 (a fork's guests keep their
+    /// addresses), so it cannot be routed in the host namespace — two
+    /// live copies would share one FIB entry (CHALLENGES #283). Here the
+    /// host only ever sees each network's own uplink address.
+    ///
+    /// The first placed TAP calls this; call it directly to bring the
+    /// gateway address up before any guest exists (a host service that
+    /// binds `10.200.0.1`). Not on a node-broker mirror.
+    pub fn materialize(&mut self) -> Result<(), String> {
+        if self.uplink.is_some() {
+            return Ok(());
+        }
+        if let Some(tree_id) = &self.tree_id {
+            return Err(format!(
+                "materialize on tree {tree_id}: the node broker owns this network"
+            ));
+        }
+        let ns = self.bridge_name.clone();
+        let _lock = NetnsLock::acquire()?;
+        if Path::new("/sys/class/net").join(&ns).exists() {
+            return Err(format!(
+                "host link {ns} already exists — another live network has this name"
+            ));
+        }
+        let path = netns_path(&ns);
+        if path.exists() {
+            if is_mounted_netns(&path) {
                 return Err(format!(
-                    "ip link add name {bridge_name} type bridge failed: {}",
-                    add_stderr.trim()
+                    "{} is a live network namespace with no host uplink — a crashed                      user's leftover (cleanup_stale_k7_bridges removes it)",
+                    path.display()
                 ));
             }
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("remove stale {}: {e}", path.display()))?;
         }
-        let gw = format!(
-            "{}.{}.{}.{}",
-            GUEST_GATEWAY[0], GUEST_GATEWAY[1], GUEST_GATEWAY[2], GUEST_GATEWAY[3]
-        );
-        // `addr add` returns EEXIST when the address is already on the bridge —
-        // tolerate it to keep `create()` idempotent on shared bridges.
-        let _ = crate::netns::run_capture(
-            "ip",
-            &["addr", "add", &format!("{gw}/24"), "dev", &bridge_name],
-        );
-        run_cmd("ip", &["link", "set", "dev", &bridge_name, "up"])?;
+        let uplink = allocate_uplink()?;
+        self.uplink = Some(uplink);
+        if let Err(e) = self.build_namespace(uplink) {
+            self.teardown();
+            self.jail = None;
+            self.uplink = None;
+            return Err(format!("network {ns}: {e}"));
+        }
+        Ok(())
+    }
+
+    fn build_namespace(&mut self, uplink: Uplink) -> Result<(), String> {
+        let ns = self.bridge_name.clone();
+        let ns = ns.as_str();
+        let (u1, u2) = (uplink.host().to_string(), uplink.peer().to_string());
+        let gw = Ipv4Addr::from(GUEST_GATEWAY).to_string();
+        ip_batch(
+            None,
+            &format!("{ns}-host"),
+            &[
+                format!("netns add {ns}"),
+                format!("link add {ns} type veth peer name {UPLINK_PEER} netns {ns}"),
+                format!("addr add {u1}/30 dev {ns}"),
+                format!("addr add {gw}/32 dev {ns}"),
+                format!("link set dev {ns} up"),
+                // The host's own way in — `curl --interface <bridge>`
+                // and the like; guest traffic never uses it, it
+                // arrives SNATed to U2. `append`: every live network
+                // adds one for the same prefix.
+                format!("route append {GUEST_SUBNET} via {u2} dev {ns} src {gw}"),
+            ],
+        )?;
+        std::fs::write(format!("/proc/sys/net/ipv4/conf/{ns}/rp_filter"), "0")
+            .map_err(|e| format!("clear {ns} rp_filter: {e}"))?;
+
+        build_inside(ns, uplink)?;
 
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
             .map_err(|e| format!("enable ip_forward: {e}"))?;
-        // `net.bridge.bridge-nf-call-iptables` is GLOBAL. Host kube-proxy
-        // ClusterIP DNAT needs it 1 (writing 0 here broke every host
-        // Service). FORWARD ACCEPT on this bridge does **not** stop the
-        // host flannel `MASQUERADE 10.42.0.0/16` in nat POSTROUTING —
-        // bridged guest pod SYNs became `10.200.0.1` (world) and Cilium
-        // NetworkPolicy denied them (CHALLENGES.md #117). Keep the
-        // global sysctl 1; turn netfilter off on *this* bridge only.
-        std::fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "1")
-            .map_err(|e| format!("enable bridge-nf-call-iptables: {e}"))?;
-        std::fs::write("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "1")
-            .map_err(|e| format!("enable bridge-nf-call-ip6tables: {e}"))?;
-        disable_bridge_nf_call(&bridge_name)?;
-        let default_iface = default_route_iface()?;
-        assert_no_leftover_shaping(&default_iface)?;
-        install_bridge_forward_rules(&bridge_name)?;
-        // Disable reverse path filtering on bridge (strict rp_filter blocks responses)
-        std::fs::write(
-            format!("/proc/sys/net/ipv4/conf/{bridge_name}/rp_filter"),
-            "0",
-        )
-        .map_err(|e| format!("clear {bridge_name} rp_filter: {e}"))?;
         std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
             .map_err(|e| format!("clear all rp_filter: {e}"))?;
+        let default_iface = default_route_iface()?;
+        assert_no_leftover_shaping(&default_iface)?;
+        install_bridge_forward_rules(ns)?;
         ensure_iptables(
             Some("nat"),
             &[
                 "POSTROUTING",
                 "-s",
-                "10.200.0.0/24",
+                UPLINK_RANGE,
                 "-o",
                 &default_iface,
                 "-j",
                 "MASQUERADE",
             ],
         )?;
-
-        // The FORWARD ACCEPT rules above make this bridge reachable from
+        // The FORWARD ACCEPTs above make this uplink reachable from
         // every other `k7-br-*` on the node. The jail (evaluated one
         // priority ahead of them) is what stops one tree from routing
-        // into another's guests, and owns the egress and
-        // guest→host input decisions — see `crate::netjail`.
-        let jail = crate::netjail::TreeNetJail::install(
-            &bridge_name,
+        // into another's, and owns the egress and guest→host input
+        // decisions — see `crate::netjail`.
+        self.jail = crate::netjail::TreeNetJail::install(
+            ns,
             &crate::netjail::JailIfaces::detect(&default_iface),
-            &egress,
+            &self.egress,
         )?;
+        self.default_iface = default_iface;
+        log::info!(
+            "network {ns}: namespace up, uplink {u1}/30 <-> {u2}/30 via {}",
+            self.default_iface
+        );
+        Ok(())
+    }
 
-        log::info!("bridge {bridge_name} created with gateway {gw}/24 via {default_iface}");
-
-        Ok(Self {
-            bridge_name,
-            subnet_base: GUEST_SUBNET_BASE,
-            next_vm_index: 0,
-            entries: HashMap::new(),
-            jail,
-            egress,
-            default_iface,
-            tree_id: None,
-        })
+    /// Undo [`Self::materialize`], tolerating whatever part of it never
+    /// happened. The host end goes first: deleting it kills the pair at
+    /// once, so the name and the uplink slot are free even while a VMM
+    /// still pins the namespace.
+    fn teardown(&self) {
+        let ns = self.bridge_name.clone();
+        if let Some(jail) = &self.jail {
+            if let Err(e) = jail.remove() {
+                log::error!("remove net jail for {ns}: {e}");
+            }
+        }
+        remove_bridge_forward_rules(&ns);
+        let _ = crate::netns::run_capture("ip", &["link", "delete", &ns]);
+        let _ = crate::netns::run_capture("ip", &["netns", "delete", &ns]);
+        if !any_other_k7_bridge_exists(&ns) {
+            drop_shared_masquerade();
+        }
     }
 
     /// This tree's egress policy.
@@ -980,11 +1338,13 @@ impl ClusterNetwork {
     }
 
     fn create_tap_at_index(&mut self, vm_index: u32) -> Result<TapDevice, String> {
-        let tap = match self.tree_id.clone() {
-            Some(tree_id) => Self::taps_from_broker(&tree_id, &[vm_index])?
+        let tap = if let Some(tree_id) = self.tree_id.clone() {
+            Self::taps_from_broker(&tree_id, &[vm_index], self.place_taps)?
                 .pop()
-                .expect("one index asked for, one TAP checked back"),
-            None => TapDevice::create(&self.bridge_name, vm_index)?,
+                .expect("one index asked for, one TAP checked back")
+        } else {
+            let ns = self.placement()?;
+            TapDevice::create(&self.bridge_name, vm_index, ns.as_deref())?
         };
         self.register_tap_entry(&tap);
         Ok(tap)
@@ -997,13 +1357,27 @@ impl ClusterNetwork {
     /// node broker pins the whole batch in the single `nft` transaction
     /// [`Self::add_taps_at`] relies on, on the side that has the
     /// `CAP_NET_ADMIN` for it.
-    fn taps_from_broker(tree_id: &str, indices: &[u32]) -> Result<Vec<TapDevice>, String> {
-        let made = crate::broker::client::net_tap_create(tree_id, indices)
+    fn taps_from_broker(
+        tree_id: &str,
+        indices: &[u32],
+        place: bool,
+    ) -> Result<Vec<TapDevice>, String> {
+        let made = crate::broker::client::net_tap_create(tree_id, indices, place)
             .map_err(|e| format!("net.tap_create({tree_id}, {indices:?}): {e}"))?;
         Ok(made
             .into_iter()
             .map(|(info, fd)| TapDevice::adopt(tree_id, &info, fd))
             .collect())
+    }
+
+    /// The namespace new TAPs go into — built on first use — or `None`
+    /// when they stay in the host for a pod attach.
+    fn placement(&mut self) -> Result<Option<String>, String> {
+        if !self.place_taps {
+            return Ok(None);
+        }
+        self.materialize()?;
+        Ok(Some(self.bridge_name.clone()))
     }
 
     fn register_tap_entry(&mut self, tap: &TapDevice) {
@@ -1035,7 +1409,7 @@ impl ClusterNetwork {
             }
         }
         if let Some(tree_id) = self.tree_id.clone() {
-            let taps = Self::taps_from_broker(&tree_id, indices)?;
+            let taps = Self::taps_from_broker(&tree_id, indices, self.place_taps)?;
             for &idx in indices {
                 if idx >= self.next_vm_index {
                     self.next_vm_index = idx + 1;
@@ -1046,18 +1420,25 @@ impl ClusterNetwork {
             }
             return Ok(taps);
         }
+        let ns = self.placement()?;
         let mut taps = Vec::with_capacity(indices.len());
         for &idx in indices {
-            taps.push(TapDevice::create_unpinned(&self.bridge_name, idx)?);
+            taps.push(TapDevice::open(&self.bridge_name, idx, ns.as_deref())?);
             if idx >= self.next_vm_index {
                 self.next_vm_index = idx + 1;
             }
+        }
+        if !taps.is_empty() {
+            TapDevice::place(&mut taps, &self.bridge_name)?;
         }
         let specs: Vec<(String, [u8; 6], Ipv4Addr)> = taps
             .iter()
             .map(|t| (t.name().to_string(), t.mac(), t.guest_ip()))
             .collect();
-        if let Some(guards) = crate::netjail::TapAntiSpoof::install_batch(&specs)? {
+        let ns_path = ns.as_deref().map(netns_path);
+        if let Some(guards) =
+            crate::netjail::TapAntiSpoof::install_batch(&specs, ns_path.as_deref())?
+        {
             for (tap, guard) in taps.iter_mut().zip(guards) {
                 tap.anti_spoof = Some(guard);
             }
@@ -1190,6 +1571,58 @@ impl ClusterNetwork {
                 "SNAT",
                 "--to-source",
                 &pod_ip_s,
+            ],
+        )?;
+        // CRI port-forward (`kubectl port-forward`) dials 127.0.0.1:<port>
+        // from inside the pod netns, where nothing listens: the workload
+        // is in the guest. Send loopback TCP to the guest too. A
+        // 127.0.0.0/8 source may only leave `lo` with route_localnet
+        // (this netns only), and it is masqueraded so the guest's reply
+        // has a route back.
+        run_cmd(
+            "nsenter",
+            &[
+                &nsenter,
+                "sysctl",
+                "-q",
+                "-w",
+                "net.ipv4.conf.all.route_localnet=1",
+            ],
+        )?;
+        run_cmd(
+            "nsenter",
+            &[
+                &nsenter,
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "OUTPUT",
+                "-d",
+                "127.0.0.1",
+                "-p",
+                "tcp",
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &guest_ip,
+            ],
+        )?;
+        run_cmd(
+            "nsenter",
+            &[
+                &nsenter,
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                "127.0.0.0/8",
+                "-d",
+                &guest_ip,
+                "-j",
+                "MASQUERADE",
             ],
         )?;
         entry.pod_ip = Some(pod_ip);
@@ -1484,14 +1917,9 @@ impl ClusterNetwork {
         Ok(())
     }
 
-    /// Destroy the bridge and clean up.
-    ///
-    /// Removes the iptables rules added by `create()` (FORWARD/INPUT/OUTPUT
-    /// ACCEPTs scoped to the bridge, and one MASQUERADE on the subnet) before
-    /// deleting the bridge link. Without this cleanup, repeated test runs on
-    /// the same host accumulate stale rules; in particular, the gateway IP
-    /// `10.200.0.1` ends up bound to a stale bridge so a freshly-created
-    /// bridge can't claim it, breaking NAT for the new VMs.
+    /// Destroy the network: jail, host rules, uplink, namespace (with
+    /// the bridge, its TAPs and its NAT inside), and the shared
+    /// MASQUERADE once no other network is left. Idempotent.
     pub fn destroy(&self) -> Result<(), String> {
         if let Some(tree_id) = &self.tree_id {
             return crate::broker::client::ok(&crate::broker::Verb::NetTreeDestroy {
@@ -1499,47 +1927,9 @@ impl ClusterNetwork {
             })
             .map_err(|e| format!("net.tree_destroy({tree_id}): {e}"));
         }
-        // iptables rules first (best-effort: -D may fail if rule wasn't there).
-        let bridge = self.bridge_name.as_str();
-        // The jail names this device; a table left behind would filter
-        // the next bridge that reuses the name.
-        if let Some(jail) = &self.jail {
-            if let Err(e) = jail.remove() {
-                log::error!("remove net jail for {bridge}: {e}");
-            }
+        if self.uplink.is_some() {
+            self.teardown();
         }
-        remove_bridge_forward_rules(bridge);
-        // MASQUERADE is keyed on the subnet, not the bridge — only remove it
-        // when this is the last bridge using the subnet, i.e. when no other
-        // `k7-br-*` link still exists. Conservative: count siblings.
-        if !any_other_k7_bridge_exists(bridge) {
-            if let Ok(iface) = default_route_iface() {
-                let _ = delete_iptables(
-                    Some("nat"),
-                    &[
-                        "POSTROUTING",
-                        "-s",
-                        "10.200.0.0/24",
-                        "-o",
-                        &iface,
-                        "-j",
-                        "MASQUERADE",
-                    ],
-                );
-            }
-        }
-        // Overlay policy rules/routes first — they name this device.
-        remove_guest_overlay_routes(bridge);
-        // The bridge link last — kernel connected routes go with it.
-        // Guest overlay routes installed with `ip route replace` in
-        // the *main* table do not come back: they replaced host
-        // `cni0`'s `10.42.0.0/24`. Restore that explicitly.
-        let _ = crate::spawner::command("ip")
-            .args(["link", "set", "dev", bridge, "down"])
-            .output();
-        run_cmd("ip", &["link", "delete", bridge, "type", "bridge"])?;
-        purge_main_table_guest_via_routes();
-        restore_host_cni_connected_route()?;
         Ok(())
     }
 }
@@ -1563,6 +1953,22 @@ fn debug_log_cni(msg: &str) {
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         );
+    }
+}
+
+/// Remove the host MASQUERADE every network's uplink shares, and the
+/// pre-netns `10.200.0.0/24` one (looping drains duplicates).
+fn drop_shared_masquerade() {
+    let Ok(iface) = default_route_iface() else {
+        return;
+    };
+    for src in [UPLINK_RANGE, GUEST_SUBNET] {
+        while delete_iptables(
+            Some("nat"),
+            &["POSTROUTING", "-s", src, "-o", &iface, "-j", "MASQUERADE"],
+        )
+        .is_ok()
+        {}
     }
 }
 
@@ -1593,12 +1999,13 @@ fn list_k7_bridges() -> Vec<String> {
         .collect()
 }
 
-/// Install guest podCIDR / `ClusterIP` routes in [`GUEST_OVERLAY_TABLE`].
+/// Route guest podCIDR / `ClusterIP` prefixes between the guests of
+/// network `bridge`, inside its namespace (the per-network netns spec).
 ///
-/// Only packets arriving on `bridge` destined to [`GUEST_POD_OVERLAY`]
-/// or [`GUEST_SERVICE_OVERLAY`] look up this table. The host main
-/// table stays untouched, so host k3s (`cni0`, `10.42/16`) cannot be
-/// disturbed (CHALLENGES.md #117).
+/// The namespace holds nothing but that network, so the routes go in
+/// its main table; the host's tables — and host k3s (`cni0`,
+/// `10.42/16`, CHALLENGES.md #117) — are never touched. Fails loud when
+/// the network has no namespace yet (no TAP placed on it).
 ///
 /// `routes` is `(prefix, via)` — each guest node's podCIDR via its
 /// `InternalIP`, plus [`GUEST_SERVICE_OVERLAY`] via the first node.
@@ -1611,7 +2018,12 @@ pub fn install_guest_overlay_routes(bridge: &str, routes: &[(&str, &str)]) -> Re
     if routes.is_empty() {
         return Err("install_guest_overlay_routes: no overlay routes".into());
     }
-    let table = GUEST_OVERLAY_TABLE.to_string();
+    if !is_mounted_netns(&netns_path(bridge)) {
+        return Err(format!(
+            "install_guest_overlay_routes: network {bridge} has no namespace ({})",
+            netns_path(bridge).display()
+        ));
+    }
     for (prefix, via) in routes {
         if prefix.is_empty() || via.is_empty() {
             return Err(format!("empty overlay route prefix={prefix:?} via={via:?}"));
@@ -1619,25 +2031,18 @@ pub fn install_guest_overlay_routes(bridge: &str, routes: &[(&str, &str)]) -> Re
         run_cmd(
             "ip",
             &[
-                "route", "replace", prefix, "via", via, "dev", bridge, "table", &table,
+                "-n", bridge, "route", "replace", prefix, "via", via, "dev", bridge,
             ],
         )?;
     }
-    ensure_ip_rule(
-        GUEST_OVERLAY_POD_PREF,
-        &["iif", bridge, "to", GUEST_POD_OVERLAY, "lookup", &table],
-    )?;
-    ensure_ip_rule(
-        GUEST_OVERLAY_SVC_PREF,
-        &["iif", bridge, "to", GUEST_SERVICE_OVERLAY, "lookup", &table],
-    )?;
     Ok(())
 }
 
-/// Drop policy rules and table-200 routes that name `bridge`.
-/// Also drains rules for the pre-#121 overlay prefixes (`10.42/16`,
-/// `10.43/16`) so nodes provisioned before the CIDR split come clean.
-pub fn remove_guest_overlay_routes(bridge: &str) {
+/// Drop host policy rules and table-200 routes that name `bridge` —
+/// what overlay routes were before they moved into the network's
+/// namespace — including the pre-#121 prefixes (`10.42/16`,
+/// `10.43/16`), so long-lived nodes come clean.
+fn remove_guest_overlay_routes(bridge: &str) {
     let table = GUEST_OVERLAY_TABLE.to_string();
     for (pref, dest) in [
         (GUEST_OVERLAY_POD_PREF, GUEST_POD_OVERLAY),
@@ -1756,34 +2161,6 @@ fn ipv4_network(addr_slash: &str) -> Result<(String, String), String> {
     Ok((format!("{net}/{bits}"), ip.to_string()))
 }
 
-fn ensure_ip_rule(pref: u32, spec: &[&str]) -> Result<(), String> {
-    if ip_rule_present(pref, spec) {
-        return Ok(());
-    }
-    let pref_s = pref.to_string();
-    let mut args = Vec::with_capacity(spec.len() + 4);
-    args.extend_from_slice(&["rule", "add", "pref", pref_s.as_str()]);
-    args.extend_from_slice(spec);
-    let (status, _, stderr) =
-        crate::netns::run_capture("ip", &args).map_err(|e| format!("ip rule add: {e}"))?;
-    if status.success() || stderr.contains("File exists") {
-        return Ok(());
-    }
-    Err(format!("ip {} failed: {}", args.join(" "), stderr.trim()))
-}
-
-fn ip_rule_present(pref: u32, spec: &[&str]) -> bool {
-    let pref_s = pref.to_string();
-    let Ok((_, stdout, _)) =
-        crate::netns::run_capture("ip", &["-4", "rule", "show", "pref", &pref_s])
-    else {
-        return false;
-    };
-    stdout
-        .lines()
-        .any(|line| spec.iter().all(|tok| line.contains(tok)))
-}
-
 fn delete_ip_rule(pref: u32, spec: &[&str]) -> Result<(), String> {
     let pref_s = pref.to_string();
     let mut args = Vec::with_capacity(spec.len() + 4);
@@ -1792,20 +2169,17 @@ fn delete_ip_rule(pref: u32, spec: &[&str]) -> Result<(), String> {
     run_cmd("ip", &args)
 }
 
-/// Sweep every `k7-br-*` bridge and its iptables ACCEPT/MASQUERADE rules
-/// from the host kernel. Best-effort, idempotent.
+/// Sweep every `k7-br-*` network from the host: uplinks (and legacy
+/// host bridges), their namespaces, rules, jails and the shared
+/// MASQUERADE. Best-effort, idempotent.
 ///
 /// This is **test-setup hygiene** — production k7d never needs it because
 /// [`ClusterNetwork::Drop`] already runs `destroy()` on scope exit. The
 /// problem is integration tests that panic / are killed / segfault before
-/// `Drop` can run; they leave a stale bridge holding the `10.200.0.1/24`
-/// gateway address. A freshly-created bridge then can't claim the gateway
-/// (the kernel returns `EEXIST` on `ip addr add` and we tolerate it), but
-/// it routes through whichever bridge originally claimed the IP — usually
-/// a `NO-CARRIER` zombie with no live TAPs. Ping to the gateway fails,
-/// ARP doesn't resolve, and the next test that tries to use the bridge
-/// (e.g. `test_vm_has_network_interface`) flakes with a misleading
-/// "100% packet loss" assertion failure.
+/// `Drop` can run: their namespace stays mounted in the host's mount
+/// namespace (unlike the daemon's, which dies with it) and its uplink
+/// keeps its slot and its name, so the next network of that name fails
+/// to build.
 ///
 /// Calling this at the start of an integration test guarantees the test
 /// gets a clean L2/L3 substrate regardless of what prior tests left
@@ -1813,80 +2187,39 @@ fn delete_ip_rule(pref: u32, spec: &[&str]) -> Result<(), String> {
 /// it; tests that do should treat it as the equivalent of
 /// `ensure_shim_installed()` in `test_shim.rs` — call once, idempotent.
 ///
-/// Returns the names of the bridges that were swept (informational; the
-/// caller may want to log them). Not `#[must_use]` — tests typically
+/// Returns the names of the networks that were swept (informational;
+/// the caller may want to log them). Not `#[must_use]` — tests typically
 /// fire-and-forget with `let _ = cleanup_stale_k7_bridges();`.
 #[allow(clippy::must_use_candidate)]
 pub fn cleanup_stale_k7_bridges() -> Vec<String> {
-    let bridges = list_k7_bridges();
-    for bridge in &bridges {
-        // Remove the per-bridge ACCEPT / TCPMSS rules first; failure is
-        // fine (the rule may already be gone).
-        remove_bridge_forward_rules(bridge);
-        let _ = crate::spawner::command("ip")
-            .args(["link", "set", "dev", bridge, "down"])
-            .output();
-        remove_guest_overlay_routes(bridge);
-        let _ = crate::spawner::command("ip")
-            .args(["link", "delete", bridge, "type", "bridge"])
-            .output();
+    let mut swept = list_k7_bridges();
+    for link in &swept {
+        remove_bridge_forward_rules(link);
+        remove_guest_overlay_routes(link);
+        let _ = crate::netns::run_capture("ip", &["link", "delete", link]);
     }
-    purge_main_table_guest_via_routes();
-    let _ = restore_host_cni_connected_route();
-    // Once every `k7-br-*` is gone, the shared `10.200.0.0/24`
-    // MASQUERADE rule is safe to remove — there's no live bridge using
-    // the subnet anymore. Repeat the delete to drain duplicates that
-    // accumulated across test crashes.
-    if let Ok(iface) = default_route_iface() {
-        loop {
-            if delete_iptables(
-                Some("nat"),
-                &[
-                    "POSTROUTING",
-                    "-s",
-                    "10.200.0.0/24",
-                    "-o",
-                    &iface,
-                    "-j",
-                    "MASQUERADE",
-                ],
-            )
-            .is_err()
-            {
-                // `iptables -D` returns non-zero when the rule isn't there;
-                // that's our termination condition (no more duplicates).
-                break;
+    if let Ok(dir) = std::fs::read_dir(NETNS_DIR) {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("k7-br-") {
+                let _ = crate::netns::run_capture("ip", &["netns", "delete", &name]);
+                if !swept.contains(&name) {
+                    swept.push(name);
+                }
             }
         }
     }
-    bridges
+    purge_main_table_guest_via_routes();
+    let _ = restore_host_cni_connected_route();
+    drop_shared_masquerade();
+    let _ = crate::netjail::clean_stale_jails();
+    swept
 }
 
 impl Drop for ClusterNetwork {
     fn drop(&mut self) {
         let _ = self.destroy();
     }
-}
-
-/// Host `br_netfilter` + flannel `MASQUERADE 10.42.0.0/16` SNATs
-/// bridged guest pod SYNs to the k7 gateway (`10.200.0.1`). Cilium
-/// then classifies the source as `reserved:world` and a `NetworkPolicy`
-/// that allows only `role=cil-client` drops them. Per-bridge sysfs
-/// keeps the global `bridge-nf-call-iptables=1` the host kube-proxy
-/// needs.
-fn disable_bridge_nf_call(bridge: &str) -> Result<(), String> {
-    for name in ["nf_call_iptables", "nf_call_ip6tables", "nf_call_arptables"] {
-        let path = format!("/sys/class/net/{bridge}/bridge/{name}");
-        std::fs::write(&path, "0").map_err(|e| format!("write {path}: {e}"))?;
-        let got = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-        if got.trim() != "0" {
-            return Err(format!(
-                "{path} is {:?} after write 0 — host flannel would SNAT bridged guest pods to {bridge}",
-                got.trim()
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Fail loud if a previous experiment left IFB / tc shaping on the
@@ -2118,6 +2451,24 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Run `lines` as one `ip [-n netns] -batch` — one process instead of
+/// one per command, which is most of a network's bring-up time on the
+/// warm fork path. `file` names the batch under `/run/k7d` and must be
+/// unique among concurrent callers.
+fn ip_batch(netns: Option<&str>, file: &str, lines: &[String]) -> Result<(), String> {
+    let path = PathBuf::from("/run/k7d").join(format!("{file}.ip"));
+    std::fs::create_dir_all("/run/k7d").map_err(|e| format!("create /run/k7d: {e}"))?;
+    std::fs::write(&path, lines.join("\n") + "\n")
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    let p = path.to_string_lossy();
+    let result = match netns {
+        Some(ns) => run_cmd("ip", &["-n", ns, "-batch", &p]),
+        None => run_cmd("ip", &["-batch", &p]),
+    };
+    let _ = std::fs::remove_file(&path);
+    result.map_err(|e| format!("{e}\nbatch:\n{}", lines.join("\n")))
 }
 
 // --- Virtio-net config space ---

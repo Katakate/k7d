@@ -163,6 +163,7 @@ gym-test: k7d-mcp-test k7view-test
 k7view-test:
 	python3 examples/k7view/test_store.py
 	python3 examples/k7view/test_probe.py
+	python3 examples/k7view/test_actions.py
 
 check: lint build-agent gym-test test
 

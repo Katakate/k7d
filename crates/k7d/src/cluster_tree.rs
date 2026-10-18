@@ -1563,6 +1563,20 @@ impl ClusterSnapshotTree {
     /// tracking, so `delta.pack` would silently miss device DMA and the
     /// resumed guest would corrupt (limitation).
     pub fn suspend(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        // Same trap as the single-VM tree: `live.remove` on an
+        // already-suspended node is `NodeNotFound`, which the UI
+        // showed as "node not found: root" on a second click.
+        let info = self
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| TreeError::NodeNotFound(node_id.clone()))?;
+        if info.state != NodeState::Live {
+            return Err(TreeError::BadState(
+                node_id.clone(),
+                info.state,
+                "suspend (must be Live)",
+            ));
+        }
         if self.is_fc(node_id) {
             return self.suspend_fc(node_id);
         }

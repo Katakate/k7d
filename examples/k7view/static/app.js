@@ -22,12 +22,36 @@
   let armSeen = "";
   let serialTimer = null;
 
-  // keyed svg elements
-  const nodeEls = new Map();
-  const edgeEls = new Map();
-  const chipEls = new Map();
-  const positions = new Map(); // node_id -> {x, y, w, h}
-  let graphTree = null;        // tree_id the keyed maps belong to
+  // One SVG per tree. Node ids collide ("root"), so the maps live
+  // on the pane, not on the page. Metrics patches never rebuild them.
+  const panes = new Map();
+  // One tree fills the hero. Side-by-side is opt-in.
+  let splitMode = false;
+  let acting = false;
+  // A preset/policy round trip polls every cluster and can outlive the
+  // next slider gesture. Dropping that gesture left the drawer on ×1.
+  // Keep the latest dilation action and the factor the operator asked
+  // for until the snapshot echoes them.
+  let pendingAct = null;
+  let pendingFactor = null;
+  let pendingFactorUntil = 0;
+  let pendingAdaptive = null;
+  let pendingAdaptiveUntil = 0;
+  let drawerSig = "";
+  let tileSigCache = "";
+  let treeTabSig = "";
+  let gaugeSig = "";
+  let timelineSig = "";
+  let eventSig = "";
+  let metaSig = "";
+  let ladderSig = "";
+  let flashHot = 0;
+  let raf = 0;
+  const pending = [];
+  const TITLES = {
+    tetragon: "Tetragon — fork the cluster and watch the tree",
+    miner: "MCP agent — remove the miner",
+  };
 
   /* ---------- formatting ---------- */
 
@@ -162,11 +186,237 @@
 
   /* ---------- graph reconciler ---------- */
 
-  function clearGraph() {
-    for (const layer of ["layer-edges", "layer-chips", "layer-ghosts", "layer-nodes"]) {
-      $(layer).replaceChildren();
+  function cpuRows(tree, nodeId) {
+    return ((tree && tree.live_cpu) || {})[nodeId] || [];
+  }
+
+  // Mean of per-VM host-vCPU percents, weighted by vCPU count.
+  // Each VM's percent is already (utime+stime) / (wall × vCPUs).
+  function cpuAvg(tree, nodeId) {
+    let acc = 0;
+    let cpus = 0;
+    for (const r of cpuRows(tree, nodeId)) {
+      const pct = Number(r.cpu_percent);
+      const n = Number(r.vcpus) || 0;
+      if (!Number.isFinite(pct) || n <= 0) continue;
+      acc += pct * n;
+      cpus += n;
     }
-    nodeEls.clear(); edgeEls.clear(); chipEls.clear(); positions.clear();
+    if (!cpus) return null;
+    return acc / cpus;
+  }
+
+  function cpuText(tree, nodeId) {
+    const avg = cpuAvg(tree, nodeId);
+    if (avg == null) return "";
+    const n = cpuRows(tree, nodeId).filter((r) => r.cpu_percent != null).length;
+    return n > 1 ? `CPU avg ${avg.toFixed(0)}%` : `CPU ${avg.toFixed(0)}%`;
+  }
+
+  function cpuTip(tree, nodeId) {
+    const parts = cpuRows(tree, nodeId).map((r) => {
+      const pct = r.cpu_percent == null ? "…" : `${Number(r.cpu_percent).toFixed(0)}%`;
+      const n = Number(r.vcpus) || 0;
+      return `vm${r.member} ${pct} of ${n} vCPU${n === 1 ? "" : "s"}`;
+    });
+    const avg = cpuAvg(tree, nodeId);
+    const head = avg == null ? "no sample yet" : `avg ${avg.toFixed(0)}% across vCPUs`;
+    return `${head}. ${parts.join(" · ")}. ` +
+      "Host utime+stime of each vCPU thread over wall time, divided by that VM's vCPU count. " +
+      "Not guest /proc/stat, and not a share of the host.";
+  }
+
+  function labelRoom(m, cpuLabel) {
+    const reserve = cpuLabel ? Math.ceil(cpuLabel.length * 5.6 + 16) : 24;
+    return Math.max(4, Math.floor((m.boxW - reserve) / (6.6 * m.f + 0.4)));
+  }
+
+  function nodeBits(tree, n, maxChars) {
+    // Dilation stays on the status line. CPU is its own top-right label
+    // so a bare percent is not read as the rate.
+    const f = nodeFactor(tree, n.id);
+    const tail = [];
+    if (f !== 1) tail.push(`×${f}`);
+    const state = n.state || "live";
+    const vmc = n.vm_count || 1;
+    const vm = vmc === 1 ? "" : `${vmc} vm`;
+    const dirtyN = (n.dirty_page_count || 0) * 4096;
+    const dirty = dirtyN ? fmtBytes(dirtyN) : "";
+    const limit = (maxChars || 24) + 8;
+    const candidates = [
+      [state, vm, dirty, ...tail],
+      [state, vm, ...tail],
+      [state, ...tail],
+      tail.length ? tail : [state],
+    ];
+    for (const parts of candidates) {
+      const text = parts.filter(Boolean).join(" · ");
+      if (text.length <= limit) return text;
+    }
+    return (tail.length ? tail : [state]).join(" · ");
+  }
+
+  function topoKey(tree) {
+    const nodes = Object.values(tree.nodes || {});
+    return nodes.map((n) => [
+      n.id, n.parent || "", n.state || "", n.protected ? 1 : 0,
+      (n.children || []).join(","),
+      ((tree.latencies || {})[n.id] || {}).latency_ms,
+    ].join(":")).join("|");
+  }
+
+  function ensurePane(tree) {
+    let pane = panes.get(tree.tree_id);
+    if (pane) return pane;
+    const wrap = document.createElement("div");
+    wrap.className = "pane";
+    wrap.dataset.tree = tree.tree_id;
+    const bar = document.createElement("div");
+    bar.className = "pane-tools";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "pane-title";
+    const max = document.createElement("button");
+    max.type = "button";
+    max.className = "pane-max";
+    max.textContent = "fill view";
+    max.title = "show only this tree";
+    max.hidden = true;
+    const hint = document.createElement("div");
+    hint.className = "pane-hint";
+    hint.textContent = "waiting for nodes";
+    const svg = document.createElementNS(SVGNS, "svg");
+    const layers = {};
+    for (const name of ["edges", "chips", "ghosts", "nodes"]) {
+      const g = document.createElementNS(SVGNS, "g");
+      layers[name] = g;
+      svg.appendChild(g);
+    }
+    bar.append(head, max);
+    wrap.append(bar, svg, hint);
+    wrap.addEventListener("click", () => {
+      if (selectedTree === tree.tree_id) return;
+      focusTree(tree.tree_id, { clear: true });
+    });
+    $("panes").appendChild(wrap);
+    pane = {
+      treeId: tree.tree_id, wrap, svg, hint, head, max, layers,
+      nodeEls: new Map(), edgeEls: new Map(), chipEls: new Map(),
+      positions: new Map(), topo: "", nodeCount: 0,
+    };
+    panes.set(tree.tree_id, pane);
+    head.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (selectedTree === tree.tree_id) return;
+      focusTree(tree.tree_id, { clear: false });
+    });
+    max.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      focusTree(tree.tree_id, { fill: true, clear: false });
+    });
+    return pane;
+  }
+
+  function multiTree() {
+    return Object.keys(state.trees || {}).length >= 2;
+  }
+
+  function focusTree(id, opts) {
+    opts = opts || {};
+    if (opts.fill) {
+      splitMode = false;
+      for (const pane of panes.values()) pane.topo = "";
+    }
+    if (selectedTree !== id) {
+      selectedTree = id;
+      if (opts.clear) {
+        selected = null;
+        selectedCid = null;
+      }
+      drawerSig = "";
+      ladderSig = "";
+    }
+    showFocused();
+    const tree = (state.trees || {})[id];
+    if (tree) reconcileGraph(tree);
+  }
+
+  function markFocus() {
+    const focus = (currentTree() || {}).tree_id;
+    const split = splitMode && multiTree();
+    const box = $("panes");
+    if (box) box.classList.toggle("split", split);
+    const toggle = $("layout-split");
+    if (toggle) {
+      toggle.hidden = !multiTree();
+      toggle.classList.toggle("on", split);
+      toggle.title = split ? "show one tree" : "show both trees at once";
+    }
+    for (const [id, pane] of panes) {
+      const show = split || id === focus;
+      const wasOff = pane.wrap.classList.contains("off");
+      pane.wrap.classList.toggle("off", !show);
+      pane.wrap.classList.toggle("focus", split && id === focus);
+      if (pane.max) pane.max.hidden = !split;
+      if (wasOff && show) pane.topo = "";
+    }
+    for (const btn of document.querySelectorAll("#trees button")) {
+      btn.classList.toggle("on", btn.dataset.id === focus);
+    }
+  }
+
+  function flashKey(treeId, nodeId) {
+    return `${treeId}\n${nodeId}`;
+  }
+
+  function patchNodeTexts(pane, tree) {
+    // Metrics-only path. Do not touch transform, class, or layout —
+    // twenty-plus VMs repaint this several times a second.
+    const nodes = Object.values(tree.nodes || {});
+    const m = metrics(nodes.length);
+    for (const n of nodes) {
+      const g = pane.nodeEls.get(n.id);
+      if (!g) return false;
+      const cpu = cpuText(tree, n.id);
+      const meta = g._meta || (g._meta = g.querySelector(".meta"));
+      const text = nodeBits(tree, n, labelRoom(m, cpu));
+      if (meta.textContent !== text) meta.textContent = text;
+      placeCpu(g, m, cpu, cpuTip(tree, n.id), n.protected && n.state !== "pruned");
+    }
+    return true;
+  }
+
+  function setSvgLabel(el, text, tip) {
+    const shown = `${tip || ""}\n${text || ""}`;
+    if (el.dataset.shown === shown) return;
+    el.dataset.shown = shown;
+    el.replaceChildren();
+    if (tip) {
+      const title = document.createElementNS(SVGNS, "title");
+      title.textContent = tip;
+      el.appendChild(title);
+    }
+    if (text) el.appendChild(document.createTextNode(text));
+  }
+
+  function placeCpu(g, m, text, tip, shielded) {
+    const el = g._cpu || (g._cpu = g.querySelector(".cpu"));
+    const bg = g._cpuBg || (g._cpuBg = g.querySelector(".cpu-bg"));
+    if (!el || !bg) return;
+    setSvgLabel(el, text, tip);
+    if (!text) {
+      bg.setAttribute("width", "0");
+      return;
+    }
+    const w = Math.ceil(text.length * 5.4 + 8);
+    const x = m.boxW - w - (shielded ? 18 : 5);
+    bg.setAttribute("x", x);
+    bg.setAttribute("y", 3);
+    bg.setAttribute("width", w);
+    bg.setAttribute("height", 13);
+    bg.setAttribute("rx", 3);
+    el.setAttribute("x", x + w - 4);
+    el.setAttribute("y", 12.5);
   }
 
   function shieldPath(x, y, s) {
@@ -175,7 +425,7 @@
     return `M${x},${y} h${w} v${s * 0.45} q0,${s * 0.4} -${w / 2},${s * 0.55} q-${w / 2},-${s * 0.15} -${w / 2},-${s * 0.55} z`;
   }
 
-  function makeNodeEl(n, m) {
+  function makeNodeEl(n, m, treeId) {
     const g = document.createElementNS(SVGNS, "g");
     g.dataset.id = n.id;
     const box = document.createElementNS(SVGNS, "rect");
@@ -200,22 +450,53 @@
     const meta = document.createElementNS(SVGNS, "text");
     meta.setAttribute("class", "meta");
     meta.setAttribute("x", 11); meta.setAttribute("y", m.boxH * 0.78);
+    const cpuBg = document.createElementNS(SVGNS, "rect");
+    cpuBg.setAttribute("class", "cpu-bg");
+    cpuBg.setAttribute("width", 0);
+    cpuBg.setAttribute("height", 13);
+    cpuBg.setAttribute("rx", 3);
+    const cpu = document.createElementNS(SVGNS, "text");
+    cpu.setAttribute("class", "cpu");
+    cpu.setAttribute("text-anchor", "end");
+    cpu.setAttribute("x", m.boxW - 8);
+    cpu.setAttribute("y", 12);
     const shield = document.createElementNS(SVGNS, "path");
     shield.setAttribute("class", "shield");
     shield.setAttribute("d", shieldPath(m.boxW - 17, 6, 12));
     shield.setAttribute("fill", "var(--prot)");
     shield.setAttribute("visibility", "hidden");
-    g.append(box, ring, bar, lbl, meta, shield);
-    g.addEventListener("click", () => { selectNode(n.id); });
+    g.append(box, ring, bar, lbl, meta, cpuBg, cpu, shield);
+    g._meta = meta;
+    g._cpu = cpu;
+    g._cpuBg = cpuBg;
+    g.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      selectedTree = treeId;
+      selectNode(n.id);
+    });
     return g;
   }
 
   function reconcileGraph(tree) {
-    const svg = $("graph");
-    if (!tree) { clearGraph(); graphTree = null; return; }
-    if (graphTree !== tree.tree_id) { clearGraph(); graphTree = tree.tree_id; }
+    if (!tree) return;
+    const pane = ensurePane(tree);
+    if (pane.wrap.classList.contains("off")) {
+      if (pane.nodeEls.size && pane.topo === topoKey(tree)) patchNodeTexts(pane, tree);
+      return;
+    }
+    const key = topoKey(tree);
+    if (pane.topo === key && patchNodeTexts(pane, tree)) {
+      pane.head.textContent = `${tree.tree_id}  ×${treeFactor(tree)}`;
+      return;
+    }
+    const nodeEls = pane.nodeEls;
+    const edgeEls = pane.edgeEls;
+    const chipEls = pane.chipEls;
+    const positions = pane.positions;
+    const svg = pane.svg;
     const nodes = Object.values(tree.nodes || {});
-    const hint = $("hero-hint");
+    const grew = nodes.length > pane.nodeCount;
+    const hint = pane.hint;
     hint.style.display = nodes.length ? "none" : "flex";
     const { byId, laneOf, depth, maxD } = layout(nodes);
     const m = metrics(nodes.length);
@@ -261,7 +542,7 @@
     for (const [id, g] of [...nodeEls]) {
       if (cur.has(id)) continue;
       const pos = positions.get(id);
-      spawnGhost(id, pos, g.dataset.label || id);
+      spawnGhost(pane, id, pos, g.dataset.label || id);
       g.remove();
       nodeEls.delete(id);
       positions.delete(id);
@@ -278,9 +559,9 @@
       let g = nodeEls.get(n.id);
       const isNew = !g;
       if (isNew) {
-        g = makeNodeEl(n, m);
+        g = makeNodeEl(n, m, tree.tree_id);
         nodeEls.set(n.id, g);
-        $("layer-nodes").appendChild(g);
+        pane.layers.nodes.appendChild(g);
         const p = n.parent && positions.get(n.parent);
         g.style.transform = p
           ? `translate(${p.x + 14}px, ${p.y}px) scale(0.55)`
@@ -309,21 +590,18 @@
       g.setAttribute("class", [
         "node", stateName,
         err ? "err" : "",
-        selected === n.id ? "sel" : "",
-        Date.now() - (lastFlash[n.id] || 0) < 900 ? "flash" : "",
+        pane.treeId === selectedTree && selected === n.id ? "sel" : "",
+        Date.now() - (lastFlash[flashKey(tree.tree_id, n.id)] || 0) < 900 ? "flash" : "",
       ].join(" "));
       g.dataset.label = n.label || n.id;
+      const cpuShown = cpuText(tree, n.id);
       const lbl = g.querySelector(".lbl");
-      const maxChars = Math.floor((m.boxW - 24) / (6.6 * m.f + 0.4));
+      const maxChars = labelRoom(m, cpuShown);
       lbl.textContent = (n.state === "pruned" ? "✕ " : "")
         + (n.label || n.id).slice(0, maxChars);
-      const bits = [n.state || "live"];
-      const vmc = n.vm_count || 1;
-      bits.push(`${vmc} vm${vmc === 1 ? "" : "s"}`);
-      const dirty = (n.dirty_page_count || 0) * 4096;
-      if (dirty) bits.push(fmtBytes(dirty));
       const meta = g.querySelector(".meta");
-      meta.textContent = bits.join(" · ").slice(0, maxChars + 4);
+      meta.textContent = nodeBits(tree, n, maxChars);
+      placeCpu(g, m, cpuShown, cpuTip(tree, n.id), n.protected && n.state !== "pruned");
       g.querySelector(".shield").setAttribute(
         "visibility",
         n.protected && n.state !== "pruned" ? "visible" : "hidden");
@@ -343,7 +621,7 @@
       if (!e) {
         e = document.createElementNS(SVGNS, "path");
         edgeEls.set(n.id, e);
-        $("layer-edges").appendChild(e);
+        pane.layers.edges.appendChild(e);
         const len = Math.hypot(x2 - x1, y2 - y1) + 60;
         e.setAttribute("stroke-dasharray", len);
         e.style.setProperty("--len", len);
@@ -365,7 +643,7 @@
           t.setAttribute("text-anchor", "middle");
           c.append(r, t);
           chipEls.set(n.id, c);
-          $("layer-chips").appendChild(c);
+          pane.layers.chips.appendChild(c);
         }
         const text = fmtMs(lat.latency_ms);
         const w = text.length * 6.4 + 10;
@@ -391,13 +669,17 @@
       }
     }
 
-    // keep the newest column in view
-    if (wrap.scrollWidth > wrap.clientWidth + 24) {
-      wrap.scrollTo({ left: wrap.scrollWidth, behavior: "smooth" });
+    pane.topo = key;
+    pane.nodeCount = nodes.length;
+    pane.head.textContent = `${tree.tree_id}  ×${treeFactor(tree)}`;
+    // Instant jump when the tree grows. Smooth scroll on every metrics
+    // tick is what makes 20 VMs feel late.
+    if (grew && wrap.scrollWidth > wrap.clientWidth + 24) {
+      wrap.scrollLeft = wrap.scrollWidth;
     }
   }
 
-  function spawnGhost(id, pos, label) {
+  function spawnGhost(pane, id, pos, label) {
     if (!pos) return;
     const g = document.createElementNS(SVGNS, "g");
     g.setAttribute("class", "ghost prune");
@@ -410,7 +692,7 @@
     t.setAttribute("x", pos.x + 10); t.setAttribute("y", pos.y + pos.h / 2 + 4);
     t.textContent = `${label} ✕`;
     g.append(r, t);
-    $("layer-ghosts").appendChild(g);
+    pane.layers.ghosts.appendChild(g);
     setTimeout(() => g.remove(), 1150);
   }
 
@@ -452,6 +734,12 @@
     if (!tree) return;
     const u = tree.usage || {};
     const b = tree.budget || {};
+    const sig = [
+      tree.tree_id, u.live_vm_count, u.live_ram_bytes, u.disk_bytes,
+      b.max_live_vms, b.max_live_ram_bytes, b.max_disk_bytes,
+    ].join("|");
+    if (sig === gaugeSig) return;
+    gaugeSig = sig;
     const vms = u.live_vm_count || 0;
     const ram = u.live_ram_bytes || 0;
     const disk = u.disk_bytes || 0;
@@ -595,7 +883,10 @@
   function renderTimeline(tree) {
     const box = $("timeline");
     if (!tree) {
-      box.innerHTML = `<span class="timeline-empty">incident timeline — waiting for a run</span>`;
+      if (timelineSig !== "|none") {
+        timelineSig = "|none";
+        box.innerHTML = `<span class="timeline-empty">incident timeline — waiting for a run</span>`;
+      }
       return;
     }
     const explicit = (state.beats || []).filter((b) => b.tree_id === tree.tree_id);
@@ -608,11 +899,19 @@
     }
     beats.sort((a, b) => (a.ts_unix_ms || 0) - (b.ts_unix_ms || 0));
     if (!beats.length) {
-      box.innerHTML = `<span class="timeline-empty">incident timeline — waiting for a run</span>`;
+      const empty = `${tree.tree_id}|empty`;
+      if (timelineSig !== empty) {
+        timelineSig = empty;
+        box.innerHTML = `<span class="timeline-empty">incident timeline — waiting for a run</span>`;
+      }
       return;
     }
     beats = beats.slice(-12);
     const running = (state.run || {}).phase && state.run.phase !== "idle";
+    const sig = tree.tree_id + "|" + (running ? 1 : 0) + "|" +
+      beats.map((b) => `${b.name}:${b.ts_unix_ms}`).join(",");
+    if (sig === timelineSig) return;
+    timelineSig = sig;
     box.replaceChildren();
     beats.forEach((b, i) => {
       const el = document.createElement("div");
@@ -630,9 +929,67 @@
 
   /* ---------- branch tiles ---------- */
 
+  function tilesKey(tree) {
+    if (!tree) return "";
+    return tree.tree_id + "|" + Object.values(tree.nodes || {}).map((n) => {
+      const v = (tree.verdicts || {})[n.id];
+      return [
+        n.id, n.state, n.protected ? 1 : 0, n.label,
+        ((tree.latencies || {})[n.id] || {}).latency_ms,
+        (tree.notes || {})[n.id] || "",
+        (tree.errors || {})[n.id] || "",
+        v ? `${v.clean}:${v.branch_only}:${v.source_only}` : "",
+        ((tree.traces || {})[n.id] || []).length,
+      ].join(":");
+    }).join("|");
+  }
+
+  function syncTileBadges(el, tree, n) {
+    const header = el.querySelector("header");
+    if (!header) return;
+    const f = nodeFactor(tree, n.id);
+    let rate = el.querySelector(".xn.rate");
+    if (f === 1) {
+      if (rate) rate.remove();
+    } else if (rate) {
+      const text = `×${f}`;
+      if (rate.textContent !== text) rate.textContent = text;
+    } else {
+      rate = document.createElement("span");
+      rate.className = "xn rate";
+      rate.textContent = `×${f}`;
+      header.appendChild(rate);
+    }
+    const cpu = cpuText(tree, n.id);
+    const tip = cpuTip(tree, n.id);
+    let badge = el.querySelector(".xn.cpu");
+    if (!cpu) {
+      if (badge) badge.remove();
+    } else if (badge) {
+      if (badge.textContent !== cpu) badge.textContent = cpu;
+      if (badge.title !== tip) badge.title = tip;
+    } else {
+      badge = document.createElement("span");
+      badge.className = "xn cpu";
+      badge.textContent = cpu;
+      badge.title = tip;
+      header.appendChild(badge);
+    }
+  }
+
   function renderTiles(tree) {
     const box = $("tiles");
-    if (!tree) { box.replaceChildren(); return; }
+    if (!tree) { box.replaceChildren(); tileSigCache = ""; return; }
+    const key = tilesKey(tree);
+    if (key === tileSigCache) {
+      box.querySelectorAll(".tile").forEach((el) => {
+        const n = (tree.nodes || {})[el.dataset.id];
+        if (!n) return;
+        syncTileBadges(el, tree, n);
+      });
+      return;
+    }
+    tileSigCache = key;
     const nodes = Object.values(tree.nodes || {});
     const root = nodes.filter((n) => !n.parent);
     // stable camera order: creation order, root pinned first; newest kept
@@ -662,7 +1019,7 @@
         pruned ? "pruned" : "",
         n.protected && !pruned ? "prot" : "",
         err ? "errored" : "",
-        Date.now() - (lastFlash[n.id] || 0) < 900 ? "flash" : "",
+        Date.now() - (lastFlash[flashKey(tree.tree_id, n.id)] || 0) < 900 ? "flash" : "",
       ].join(" ");
       const lat = (tree.latencies || {})[n.id];
       const note = (tree.notes || {})[n.id] || "";
@@ -670,7 +1027,9 @@
       const verdict = (tree.verdicts || {})[n.id];
       const traces = (tree.traces || {})[n.id] || [];
       const lastTrace = traces[traces.length - 1];
-      let vHtml = `<span class="verdict none">tetragon — not scored</span>`;
+      // Tetragon diff vs the fork source. Ingest posts it; an unscored
+      // branch has nothing to show, so the card stays a node summary.
+      let vHtml = "";
       if (verdict) {
         if (verdict.clean) {
           vHtml = `<span class="verdict clean">✓ tetragon clean vs source</span>`;
@@ -680,10 +1039,13 @@
           vHtml = `<span class="verdict clean">✓ ${verdict.source_only} suspicious event${verdict.source_only === 1 ? "" : "s"} gone</span>`;
         }
       }
+      const rate = nodeFactor(tree, n.id);
+      const cpu = cpuText(tree, n.id);
       el.innerHTML =
         `<header><span class="dot ${stateName}"></span>` +
         `<h3>${pruned ? "✕ " : ""}${esc(n.label || n.id)}</h3>` +
-        (nodeFactor(tree, n.id) !== 1 ? `<span class="xn">×${nodeFactor(tree, n.id)}</span>` : "") +
+        (rate !== 1 ? `<span class="xn rate">×${rate}</span>` : "") +
+        (cpu ? `<span class="xn cpu" title="${esc(cpuTip(tree, n.id))}">${esc(cpu)}</span>` : "") +
         (lat && lat.latency_ms != null ? `<span class="ms">⑂ ${fmtMs(lat.latency_ms)}</span>` : "") +
         `</header>` +
         vHtml +
@@ -692,7 +1054,7 @@
         (err ? `<div class="cmd boom">${esc(err)}</div>` : "") +
         (lastTrace
           ? `<div class="trace${n.state === "live" ? " stream" : ""}">${esc(lastTrace.role)}: ${esc(lastTrace.text)}</div>`
-          : `<div class="trace">no trace yet</div>`);
+          : "");
       el.addEventListener("click", () => selectNode(n.id));
       box.appendChild(el);
     }
@@ -703,6 +1065,9 @@
   function renderMeta() {
     const box = $("meta-feed");
     const rows = (state.meta || []).slice(-14).reverse();
+    const sig = rows.map((r) => `${r.ts_unix_ms}:${r.action}:${r.text}`).join("|");
+    if (sig === metaSig && box.childElementCount) return;
+    metaSig = sig;
     if (!rows.length) {
       box.innerHTML = `<span class="empty">waiting for decisions</span>`;
       return;
@@ -719,6 +1084,9 @@
   function renderEvents() {
     const box = $("events");
     const evs = (state.events || []).filter((e) => !FEED_SKIP.has(e.op)).slice(-34).reverse();
+    const sig = evs.map((e) => e.seq).join(",");
+    if (sig === eventSig && box.childElementCount) return;
+    eventSig = sig;
     if (!evs.length) {
       box.innerHTML = `<span class="empty">waiting for events</span>`;
       return;
@@ -734,8 +1102,8 @@
   /* ---------- header ---------- */
 
   function renderHeader(tree) {
-    $("goal").textContent =
-      (state.run && state.run.goal) || (tree ? tree.tree_id : "waiting for a tree");
+    const titled = tree && (TITLES[tree.tree_id] || (state.run && state.run.tree_id === tree.tree_id && state.run.goal));
+    $("goal").textContent = titled || (tree ? tree.tree_id : "waiting for a tree");
     const phase = (state.run && state.run.phase) || "idle";
     const ph = $("phase");
     ph.textContent = phase;
@@ -762,22 +1130,28 @@
 
   function renderTrees() {
     const box = $("trees");
-    box.replaceChildren();
     const ids = Object.keys(state.trees || {});
     const active = currentTree();
-    if (ids.length < 2 && !ids.length) return;
+    const sig = ids.map((id) => {
+      const t = state.trees[id];
+      const nodes = Object.keys(t.nodes || {}).length;
+      const vms = (t.usage && t.usage.live_vm_count) || 0;
+      return `${id}:${nodes}:${vms}:${active && active.tree_id === id ? 1 : 0}`;
+    }).join("|");
+    if (sig === treeTabSig) return;
+    treeTabSig = sig;
+    box.replaceChildren();
     for (const id of ids) {
       const t = state.trees[id];
-      const nodes = Object.values(t.nodes || {});
+      const nodes = Object.keys(t.nodes || {}).length;
       const vms = (t.usage && t.usage.live_vm_count) || 0;
       const btn = document.createElement("button");
+      btn.dataset.id = id;
       btn.className = active && active.tree_id === id ? "on" : "";
+      btn.title = `show ${id}`;
       btn.innerHTML =
-        `${esc(id)}<span class="n">${nodes.length} nodes · ${vms} vms</span>`;
-      btn.addEventListener("click", () => {
-        selectedTree = id; selected = null; selectedCid = null;
-        render();
-      });
+        `${esc(id)}<span class="n">${nodes} nodes · ${vms} vms</span>`;
+      btn.addEventListener("click", () => focusTree(id, { clear: true }));
       box.appendChild(btn);
     }
   }
@@ -796,20 +1170,158 @@
 
   /* ---------- drawer ---------- */
 
+  function showFocused() {
+    const tree = currentTree();
+    markFocus();
+    renderHeader(tree);
+    renderGauges(tree);
+    renderTimeline(tree);
+    renderTiles(tree);
+    renderClock();
+    if (selected) renderDrawer();
+    else $("drawer").hidden = true;
+  }
+
   function selectNode(id) {
     selected = selected === id ? null : id;
     selectedCid = null;
-    renderDrawer();
-    const tree = currentTree();
-    if (tree) { reconcileGraph(tree); renderTiles(tree); }
+    drawerSig = "";
+    ladderSig = "";
+    for (const pane of panes.values()) {
+      for (const [nid, g] of pane.nodeEls) {
+        const on = pane.treeId === selectedTree && nid === selected;
+        if (g.classList.contains("sel") !== on) g.classList.toggle("sel", on);
+      }
+    }
+    showFocused();
   }
 
   function closeDrawer() {
     selected = null;
     selectedCid = null;
+    drawerSig = "";
     $("drawer").hidden = true;
-    const tree = currentTree();
-    if (tree) reconcileGraph(tree);
+    for (const pane of panes.values()) {
+      for (const g of pane.nodeEls.values()) g.classList.remove("sel");
+    }
+  }
+
+  function setAct(name, disabled, why) {
+    const btn = document.querySelector(`#actions button[data-act="${name}"]`);
+    if (!btn) return;
+    btn.disabled = disabled;
+    btn.title = disabled ? why : "";
+  }
+
+  function syncActions(node) {
+    if (!node) return;
+    const live = node.state === "live";
+    const sus = node.state === "suspended";
+    const dead = node.state === "pruned" || node.state === "evicted";
+    setAct("suspend", !live, "suspend needs a live node");
+    setAct("resume", !sus, "resume needs a suspended node");
+    setAct("fork", !live || dead, "fork needs a live node");
+    setAct("prune", dead, "already gone");
+    setAct("protect", !!node.protected || dead, node.protected ? "already protected" : "gone");
+    setAct("unprotect", !node.protected || dead, "not protected");
+    setAct("auto_evict", false, "");
+    const rate = $("rate");
+    const adaptive = $("adaptive");
+    if (rate && adaptive) rate.disabled = adaptive.checked || !live;
+  }
+
+  function ladderOf(tree, node) {
+    const stored = ((tree && tree.dilation_ladder) || {})[node.id];
+    if (stored && stored.length) return stored.map(Number);
+    return [8, 4, 2, 1];
+  }
+
+  function paintLadder(tree, node) {
+    const box = $("ladder");
+    if (!box || !node) return;
+    const ladder = ladderOf(tree, node);
+    const factor = nodeFactor(tree, node.id);
+    const onLadder = ladder.includes(factor);
+    const sig = `${tree.tree_id}|${node.id}|${ladder.join(",")}|${factor}|${onLadder ? 1 : 0}`;
+    if (sig === ladderSig) return;
+    ladderSig = sig;
+    box.replaceChildren();
+    for (const rung of ladder) {
+      const el = document.createElement("i");
+      el.textContent = `×${rung}`;
+      el.className = onLadder && rung === factor ? "on" : "";
+      box.appendChild(el);
+    }
+    const hint = $("ladder-hint");
+    if (hint) {
+      hint.textContent = onLadder ? "" : `live ×${factor} is off this ladder`;
+    }
+  }
+
+  function paintCpu(tree, node) {
+    const box = $("cpus");
+    if (!box || !node) return;
+    const avg = cpuAvg(tree, node.id);
+    const rows = cpuRows(tree, node);
+    const text = !rows.length
+      ? "CPU —"
+      : (avg == null ? "CPU —" : `avg ${avg.toFixed(0)}% of vCPUs`) + "  ·  " + rows.map((r) => {
+        const pct = r.cpu_percent == null ? "…" : `${Number(r.cpu_percent).toFixed(0)}%`;
+        const n = Number(r.vcpus) || 0;
+        return `vm${r.member} ${pct} / ${n} vCPU`;
+      }).join("  ·  ");
+    if (box.textContent !== text) box.textContent = text;
+    const tip = cpuTip(tree, node.id);
+    if (box.title !== tip) box.title = tip;
+  }
+
+  // Manual ×N does not back off. Adaptive does, from KVM awake-vCPU
+  // samples, not from this host-CPU number. Warn when the two disagree.
+  function paintHot(tree, node, factor) {
+    const el = $("rate-warn");
+    if (!el || !node) return;
+    const avg = cpuAvg(tree, node.id);
+    const hot = factor > 1 && avg != null && avg >= 80;
+    el.hidden = !hot;
+    if (!hot) return;
+    const share = Math.max(1, Math.round(100 / factor));
+    el.textContent =
+      `×${factor} while host vCPUs are ${avg.toFixed(0)}% busy. ` +
+      `Guest time runs ${factor}× wall time, so a saturated guest gets about ${share}% of a CPU per guest-second. ` +
+      "Timers and timeouts fire late. Adaptive steps down; a manual rate does not.";
+  }
+
+  function paintRate(tree, node) {
+    const factor = nodeFactor(tree, node.id);
+    if (pendingFactor != null && (factor === pendingFactor || Date.now() > pendingFactorUntil)) {
+      pendingFactor = null;
+    }
+    const shown = pendingFactor != null ? pendingFactor : factor;
+    const read = $("rate-read");
+    const rate = $("rate");
+    if (read) read.textContent = `×${shown}`;
+    if (rate && document.activeElement !== rate) rate.value = String(shown);
+    const mode = ((tree.dilation_policy || {})[node.id]) || "";
+    const adaptive = $("adaptive");
+    if (adaptive && document.activeElement !== adaptive) {
+      const tracked = mode === "track" || mode === "down";
+      if (pendingAdaptive != null && Date.now() > pendingAdaptiveUntil) pendingAdaptive = null;
+      if (pendingAdaptive == null) {
+        adaptive.checked = tracked;
+      } else if (pendingAdaptive === tracked || (pendingAdaptive && mode === "down")) {
+        pendingAdaptive = null;
+        adaptive.checked = tracked;
+      } else {
+        adaptive.checked = pendingAdaptive;
+      }
+    }
+    const preset = $("preset");
+    const ladder = ((tree.dilation_ladder || {})[node.id]) || [];
+    if (preset && document.activeElement !== preset && ladder.length && pendingAdaptive == null) {
+      const key = ladder.join(",");
+      if (key === "8,4,1") preset.value = "aggressive";
+      else if (key === "8,4,2,1") preset.value = "gentle";
+    }
   }
 
   function renderDrawer() {
@@ -818,6 +1330,25 @@
     const node = tree && selected && (tree.nodes || {})[selected];
     if (!node) { drawer.hidden = true; return; }
     drawer.hidden = false;
+    paintLadder(tree, node);
+    paintCpu(tree, node);
+    paintRate(tree, node);
+    paintHot(tree, node, pendingFactor != null ? pendingFactor : nodeFactor(tree, node.id));
+    syncActions(node);
+    const sig = [
+      tree.tree_id,
+      node.id, node.state, node.protected ? 1 : 0, node.parent || "",
+      ((tree.members || {})[node.id] || []).join(","),
+      ((tree.latencies || {})[node.id] || {}).latency_ms,
+      (tree.notes || {})[node.id] || "",
+      (tree.errors || {})[node.id] || "",
+      ((tree.traces || {})[node.id] || []).length,
+      ((tree.execs || {})[node.id] || []).length,
+    ].join("|");
+    const dil = $("kv-dil");
+    if (dil) dil.textContent = `×${nodeFactor(tree, node.id)}`;
+    if (sig === drawerSig) return;
+    drawerSig = sig;
     $("drawer-title").textContent = node.label || node.id;
     const lat = (tree.latencies || {})[node.id] || {};
     const cow = (lat.cow || []).length
@@ -830,7 +1361,7 @@
       <b>parent</b><span>${esc(node.parent || "—")}</span>
       <b>dirty</b><span>${node.dirty_page_count || 0} pages (${fmtBytes((node.dirty_page_count || 0) * 4096)})</span>
       <b>fork</b><span>${lat.latency_ms != null ? fmtMs(lat.latency_ms) : "—"} · ${cow}</span>
-      <b>dilation</b><span>×${nodeFactor(tree, node.id)}</span>
+      <b>dilation</b><span id="kv-dil">×${nodeFactor(tree, node.id)}</span>
       <b>cids</b><span>${cids.join(", ") || "—"}</span>`;
     const note = (tree.notes || {})[node.id] || "";
     const err = (tree.errors || {})[node.id] || "";
@@ -893,19 +1424,63 @@
     }
   }
 
-  async function act(op) {
+  function showErr(text) {
+    const el = $("drawer-err");
+    el.hidden = !text;
+    el.textContent = text || "";
+    if (text) toast(String(text).slice(0, 140), "evict");
+  }
+
+  async function act(op, extra) {
     const tree = currentTree();
     if (!tree) return;
+    if (acting) {
+      if (op === "set_dilation" || op === "set_dilation_policy") {
+        pendingAct = { op, extra };
+        if (op === "set_dilation" && extra && extra.factor != null) {
+          pendingFactor = Number(extra.factor);
+          pendingFactorUntil = Date.now() + 4000;
+        }
+      }
+      return;
+    }
+    acting = true;
+    document.querySelectorAll("#actions button, #fork-btn, #dilate button, #dilate select, #dilate input").forEach((el) => {
+      el.dataset.was = el.disabled ? "1" : "0";
+      el.disabled = true;
+    });
     try {
+      const body = Object.assign({
+        op,
+        tree_id: tree.tree_id,
+        node_id: selected || "",
+      }, extra || {});
+      if (op === "fork") body.n = Number(($("fork-n") || {}).value) || 1;
       const r = await fetch("/api/action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ op, tree_id: tree.tree_id, node_id: selected || "" }),
+        body: JSON.stringify(body),
       });
       const j = await r.json();
       if (j.error) throw new Error(j.error);
+      showErr("");
+      drawerSig = "";
+      tileSigCache = "";
+      treeTabSig = "";
     } catch (e) {
-      $("serial").textContent = String(e);
+      showErr(String(e.message || e));
+      if (op === "set_dilation") pendingFactor = null;
+      if (op === "set_dilation_policy") pendingAdaptive = null;
+    } finally {
+      acting = false;
+      document.querySelectorAll("#actions button, #fork-btn, #dilate button, #dilate select, #dilate input").forEach((el) => {
+        el.disabled = false;
+      });
+      const node = (currentTree() && currentTree().nodes || {})[selected];
+      if (node) syncActions(node);
+      const next = pendingAct;
+      pendingAct = null;
+      if (next) void act(next.op, next.extra);
     }
   }
 
@@ -917,7 +1492,10 @@
     const now = Date.now();
     for (const e of events || []) {
       noteBase(e);
-      if (e.node_id && TOPO_OPS.has(e.op)) lastFlash[e.node_id] = now;
+      if (e.node_id && e.tree_id && TOPO_OPS.has(e.op)) {
+        lastFlash[flashKey(e.tree_id, e.node_id)] = now;
+        flashHot = now + 900;
+      }
       if (e.op === "evict") toast(`evicted ${e.label || e.node_id} — over budget`, "evict");
       if (e.op === "protect") toast(`protected ${e.label || e.node_id}`, "protect");
       if (e.op === "prune") toast(`pruned ${e.label || e.node_id}`, "evict");
@@ -931,6 +1509,19 @@
 
   /* ---------- render root ---------- */
 
+  function renderPanes() {
+    const ids = new Set(Object.keys(state.trees || {}));
+    for (const id of ids) ensurePane(state.trees[id]);
+    for (const [id, pane] of [...panes]) {
+      if (!ids.has(id)) {
+        pane.wrap.remove();
+        panes.delete(id);
+      }
+    }
+    markFocus();
+    for (const id of ids) reconcileGraph(state.trees[id]);
+  }
+
   function render() {
     const tree = currentTree();
     renderHeader(tree);
@@ -939,22 +1530,72 @@
     renderMeta();
     renderEvents();
     renderGauges(tree);
-    reconcileGraph(tree);
+    renderPanes();
     renderTiles(tree);
     if (selected) renderDrawer();
     renderClock();
   }
 
-  function apply(msg) {
+  function applyMetrics(msg) {
+    state.connected = msg.connected !== false;
+    if (msg.error) state.error = msg.error;
+    for (const [tid, patch] of Object.entries(msg.trees || {})) {
+      const slot = (state.trees || {})[tid];
+      if (!slot) continue;
+      if (patch.usage) slot.usage = patch.usage;
+      if (patch.live_dilation) slot.live_dilation = patch.live_dilation;
+      if (patch.live_cpu) slot.live_cpu = patch.live_cpu;
+      if (patch.dilation_ladder) slot.dilation_ladder = patch.dilation_ladder;
+      if (patch.dilation_policy) slot.dilation_policy = patch.dilation_policy;
+      if (patch.dilation_trajectory) slot.dilation_trajectory = patch.dilation_trajectory;
+      if (patch.guest_clock) slot.guest_clock = patch.guest_clock;
+      const nodes = slot.nodes || {};
+      for (const [nid, dirty] of Object.entries(patch.dirty || {})) {
+        if (nodes[nid]) nodes[nid].dirty_page_count = dirty;
+      }
+    }
+    markFocus();
+    for (const id of Object.keys(state.trees || {})) reconcileGraph(state.trees[id]);
+    const tree = currentTree();
+    renderTrees();
+    renderGauges(tree);
+    renderTiles(tree);
+    renderClock();
+    renderHeader(tree);
+    if (selected) renderDrawer();
+  }
+
+  function applyState(msg) {
     const evs = msg.events || [];
     if (msg.state) {
       state = msg.state;
       for (const e of state.events || []) noteBase(e);
     }
     reactToEvents(evs);
-    sampleHistory();
+    if (evs.some((e) => TOPO_OPS.has(e.op) || e.op === "appear" || e.op === "drop" || e.op === "latency")) {
+      tileSigCache = "";
+      treeTabSig = "";
+      drawerSig = "";
+    }
     render();
-    drawChart();
+  }
+
+  function apply(msg) {
+    pending.push(msg);
+    if (!raf) raf = requestAnimationFrame(flushPending);
+  }
+
+  function flushPending() {
+    raf = 0;
+    const batch = pending.splice(0, pending.length);
+    let full = null;
+    let metric = null;
+    for (const msg of batch) {
+      if (msg.kind === "metrics") metric = msg;
+      else full = msg;
+    }
+    if (full) applyState(full);
+    else if (metric) applyMetrics(metric);
   }
 
   /* ---------- wiring ---------- */
@@ -962,12 +1603,47 @@
   document.querySelectorAll("#actions button[data-act]").forEach((btn) => {
     btn.addEventListener("click", () => act(btn.dataset.act));
   });
+  const forkBtn = $("fork-btn");
+  if (forkBtn) forkBtn.addEventListener("click", () => act("fork"));
+  const preset = $("preset");
+  const adaptive = $("adaptive");
+  const sendPolicy = () => {
+    pendingAdaptive = !!(adaptive && adaptive.checked);
+    pendingAdaptiveUntil = Date.now() + 4000;
+    act("set_dilation_policy", {
+      preset: preset ? preset.value : "gentle",
+      adaptive: pendingAdaptive,
+    });
+  };
+  if (preset) preset.addEventListener("change", sendPolicy);
+  if (adaptive) adaptive.addEventListener("change", sendPolicy);
+  const rate = $("rate");
+  if (rate) {
+    rate.addEventListener("input", () => {
+      if (adaptive && adaptive.checked) return;
+      pendingFactor = Number(rate.value);
+      pendingFactorUntil = Date.now() + 4000;
+      const read = $("rate-read");
+      if (read) read.textContent = `×${rate.value}`;
+    });
+    rate.addEventListener("change", () => {
+      if (adaptive && adaptive.checked) return;
+      pendingFactor = Number(rate.value);
+      pendingFactorUntil = Date.now() + 4000;
+      act("set_dilation", { factor: pendingFactor });
+    });
+  }
+  const layoutSplit = $("layout-split");
+  if (layoutSplit) {
+    layoutSplit.addEventListener("click", () => {
+      splitMode = !splitMode;
+      for (const pane of panes.values()) pane.topo = "";
+      renderPanes();
+    });
+  }
   $("drawer-close").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeDrawer();
-  });
-  $("graph").addEventListener("click", (e) => {
-    if (e.target === $("graph")) closeDrawer();
   });
 
   fetch("/api/state")
@@ -994,17 +1670,20 @@
 
   setInterval(() => {
     renderClock();
-    // flash decay + caret upkeep without a full re-render
+    const now = Date.now();
+    if (now > flashHot) return;
     const tree = currentTree();
-    if (tree) {
-      const now = Date.now();
-      for (const [id, g] of nodeEls) {
-        g.classList.toggle("flash", now - (lastFlash[id] || 0) < 900);
+    for (const [treeId, pane] of panes) {
+      for (const [id, g] of pane.nodeEls) {
+        const on = now - (lastFlash[flashKey(treeId, id)] || 0) < 900;
+        if (g.classList.contains("flash") !== on) g.classList.toggle("flash", on);
       }
-      document.querySelectorAll("#tiles .tile").forEach((el) => {
-        el.classList.toggle("flash", now - (lastFlash[el.dataset.id] || 0) < 900);
-      });
     }
+    if (!tree) return;
+    document.querySelectorAll("#tiles .tile").forEach((el) => {
+      const on = now - (lastFlash[flashKey(tree.tree_id, el.dataset.id)] || 0) < 900;
+      if (el.classList.contains("flash") !== on) el.classList.toggle("flash", on);
+    });
   }, 250);
 
   setInterval(() => {

@@ -905,7 +905,8 @@ pub struct PodVmState {
 /// embedded crictl. Fails loudly when the pod has no sandbox.
 pub fn pod_sandbox_id(pod: &str) -> String {
     let out = Command::new("k3s")
-        .args(["crictl", "pods", "-q", "--name", pod])
+        // `--name` is a regex: unanchored, `foo` also matches `foo-pool-x`.
+        .args(["crictl", "pods", "-q", "--name", &format!("^{pod}$")])
         .output()
         .expect("k3s crictl pods should run");
     let sandbox_id = String::from_utf8_lossy(&out.stdout)
@@ -935,6 +936,52 @@ pub fn pod_vm_id(pod: &str) -> String {
         k7d::control::Response::SandboxFound { vm_id, .. } => vm_id,
         other => panic!("daemon has no VM for pod {pod} (sandbox {sandbox_id}): {other:?}"),
     }
+}
+
+/// The daemon's network view of kubectl pod `pod`:
+/// `(cluster_id, vm_index, pod_netns_attached)`.
+pub fn pod_vm_network(pod: &str) -> (Option<String>, Option<u32>, bool) {
+    let sandbox_id = pod_sandbox_id(pod);
+    let mut client = k7d::control::Client::connect_env().expect("connect k7d daemon");
+    match client
+        .call(&k7d::control::Request::LookupSandbox {
+            sandbox_id: sandbox_id.clone(),
+        })
+        .expect("lookup_sandbox")
+    {
+        k7d::control::Response::SandboxFound {
+            cluster_id,
+            vm_index,
+            pod_netns_attached,
+            ..
+        } => (cluster_id, vm_index, pod_netns_attached),
+        other => panic!("daemon has no VM for pod {pod} (sandbox {sandbox_id}): {other:?}"),
+    }
+}
+
+/// Assert kubectl pod `pod` reaches the internet by raw IP (no DNS in
+/// the way). Busybox `wget` in the pod's first container; the verdict
+/// is an echoed sentinel, not the exec exit code. Three tries absorb a
+/// cold neighbour table, nothing more.
+pub fn assert_pod_egress(pod: &str, what: &str) {
+    let probe = "wget -q -T 5 -O /dev/null http://1.1.1.1/ && echo EGRESS_OK || echo EGRESS_FAIL";
+    let mut last = String::new();
+    for _ in 0..3 {
+        let out = Command::new("kubectl")
+            .args(["exec", pod, "--", "sh", "-c", probe])
+            .output()
+            .expect("kubectl exec should run");
+        last = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if last.contains("EGRESS_OK") {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    panic!("{what}: pod {pod} has no internet egress (http://1.1.1.1/): {last}");
 }
 
 /// Query the daemon's `vm_status` for the VM backing kubectl pod
@@ -1299,6 +1346,39 @@ pub fn mark_if_tree_created(resp: &k7d::control::Response) {
     if let k7d::control::Response::TreeCreated { tree_id, .. } = resp {
         mark_test_tree(tree_id);
     }
+}
+
+/// Network `name`'s namespace (the per-network netns spec), as a path
+/// this process can enter: `/run/netns/<name>` when this process or a
+/// daemon it spawned made it, else through the root of the k7d process
+/// that did — under systemd k7d mounts its namespaces in a private
+/// mount namespace.
+pub fn k7_netns(name: &str) -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/run/netns").join(name)];
+    if let Ok(procs) = std::fs::read_dir("/proc") {
+        for p in procs.flatten() {
+            let comm = std::fs::read_to_string(p.path().join("comm")).unwrap_or_default();
+            if comm.starts_with("k7d") {
+                candidates.push(p.path().join("root/run/netns").join(name));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|c| k7d::network::is_mounted_netns(c))
+}
+
+/// Ports on network `name`'s bridge (0 when it has no namespace).
+pub fn k7_bridge_port_count(name: &str) -> usize {
+    let Some(ns) = k7_netns(name) else {
+        return 0;
+    };
+    Command::new("nsenter")
+        .arg(format!("--net={}", ns.display()))
+        .args(["ip", "-o", "link", "show", "master", name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0)
 }
 
 /// Loud stranded-resource sweep. Cleans and prints one line per

@@ -531,23 +531,37 @@ fn ruleset(
 /// Per-TAP by necessity: all bridges share `10.200.0.0/24` and forks
 /// reuse guest IPs, so a global source-IP set cannot distinguish the
 /// legitimate owner of an address from a spoofer in another tree.
+///
+/// A netdev hook belongs to one device in one network namespace, so a
+/// TAP placed in its network's namespace (the per-network netns spec)
+/// carries its table there: `netns` is that namespace's path, `None`
+/// for the host.
 #[derive(Debug)]
 pub struct TapAntiSpoof {
     table: String,
+    netns: Option<PathBuf>,
 }
 
 impl TapAntiSpoof {
-    /// Install the anti-spoof chain on `tap` (which must exist),
-    /// pinning it to `mac`/`ip`. Returns `Ok(None)` when
-    /// `K7D_NET_JAIL=off`.
-    pub fn install(tap: &str, mac: [u8; 6], ip: Ipv4Addr) -> Result<Option<Self>, String> {
+    /// Install the anti-spoof chain on `tap` (which must exist in
+    /// `netns`, the host when `None`), pinning it to `mac`/`ip`.
+    /// Returns `Ok(None)` when `K7D_NET_JAIL=off`.
+    pub fn install(
+        tap: &str,
+        mac: [u8; 6],
+        ip: Ipv4Addr,
+        netns: Option<&Path>,
+    ) -> Result<Option<Self>, String> {
         if !enforced()? {
             return Ok(None);
         }
         let table = tap_table_name(tap);
         let ruleset = tap_ruleset(tap, &table, mac, ip);
-        apply_ruleset(&table, &ruleset)?;
-        Ok(Some(Self { table }))
+        apply_ruleset_in(&table, &ruleset, netns)?;
+        Ok(Some(Self {
+            table,
+            netns: netns.map(Path::to_path_buf),
+        }))
     }
 
     /// Install anti-spoof chains for a whole set of TAPs in **one**
@@ -561,6 +575,7 @@ impl TapAntiSpoof {
     /// `Ok(None)` when `K7D_NET_JAIL=off`.
     pub fn install_batch(
         specs: &[(String, [u8; 6], Ipv4Addr)],
+        netns: Option<&Path>,
     ) -> Result<Option<Vec<Self>>, String> {
         if !enforced()? {
             return Ok(None);
@@ -573,12 +588,15 @@ impl TapAntiSpoof {
         for (tap, mac, ip) in specs {
             let table = tap_table_name(tap);
             ruleset.push_str(&tap_ruleset(tap, &table, *mac, *ip));
-            guards.push(Self { table });
+            guards.push(Self {
+                table,
+                netns: netns.map(Path::to_path_buf),
+            });
         }
         // If nft rejects the transaction nothing was installed; drop
         // the guards without their Drop deleting tables that never
         // existed (delete tolerates that anyway, but don't spam).
-        match apply_ruleset(&tap_table_name(&specs[0].0), &ruleset) {
+        match apply_ruleset_in(&tap_table_name(&specs[0].0), &ruleset, netns) {
             Ok(()) => Ok(Some(guards)),
             Err(e) => {
                 guards.into_iter().for_each(std::mem::forget);
@@ -588,8 +606,12 @@ impl TapAntiSpoof {
     }
 
     /// Delete this TAP's table. Idempotent.
+    /// A table in a namespace that is already gone went with it.
     pub fn remove(&self) -> Result<(), String> {
-        delete_table("netdev", &self.table)
+        match &self.netns {
+            Some(ns) if !ns.exists() => Ok(()),
+            ns => delete_table_in("netdev", &self.table, ns.as_deref()),
+        }
     }
 
     /// This jail's nftables table name.
@@ -647,12 +669,32 @@ fn tap_ruleset(tap: &str, table: &str, mac: [u8; 6], ip: Ipv4Addr) -> String {
 /// than stdin so the child needs no pipe plumbing on the daemon's hot
 /// paths; the file lives in `/run` and is removed either way.
 fn apply_ruleset(table: &str, ruleset: &str) -> Result<(), String> {
+    apply_ruleset_in(table, ruleset, None)
+}
+
+/// `nft args`, inside `netns` when given.
+fn nft_in(
+    netns: Option<&Path>,
+    args: &[&str],
+) -> Result<(std::process::ExitStatus, String, String), crate::netns::NetnsError> {
+    match netns {
+        None => run_capture("nft", args),
+        Some(ns) => {
+            let enter = format!("--net={}", ns.display());
+            let mut full = vec![enter.as_str(), "nft"];
+            full.extend_from_slice(args);
+            run_capture("nsenter", &full)
+        }
+    }
+}
+
+fn apply_ruleset_in(table: &str, ruleset: &str, netns: Option<&Path>) -> Result<(), String> {
     let path = ruleset_path(table);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
     std::fs::write(&path, ruleset).map_err(|e| format!("write {}: {e}", path.display()))?;
-    let result = run_capture("nft", &["-f", &path.to_string_lossy()]);
+    let result = nft_in(netns, &["-f", &path.to_string_lossy()]);
     let _ = std::fs::remove_file(&path);
     let (status, _out, stderr) = result.map_err(|e| format!("nft -f: {e}"))?;
     if !status.success() {
@@ -670,8 +712,12 @@ fn ruleset_path(table: &str) -> PathBuf {
 
 /// Delete one table in `family`, tolerating "does not exist".
 fn delete_table(family: &str, table: &str) -> Result<(), String> {
+    delete_table_in(family, table, None)
+}
+
+fn delete_table_in(family: &str, table: &str, netns: Option<&Path>) -> Result<(), String> {
     let (status, _out, stderr) =
-        run_capture("nft", &["delete", "table", family, table]).map_err(|e| format!("nft: {e}"))?;
+        nft_in(netns, &["delete", "table", family, table]).map_err(|e| format!("nft: {e}"))?;
     if status.success() || stderr.contains("No such file or directory") {
         return Ok(());
     }
@@ -751,6 +797,17 @@ pub fn jail_installed(bridge: &str) -> bool {
 pub fn tap_jail_installed(tap: &str) -> bool {
     list_tables("netdev", TAP_TABLE_PREFIX)
         .is_ok_and(|tables| tables.contains(&tap_table_name(tap)))
+}
+
+/// [`tap_jail_installed`] for a TAP placed in the namespace at `netns`.
+#[must_use]
+pub fn tap_jail_installed_in(tap: &str, netns: &Path) -> bool {
+    nft_in(Some(netns), &["list", "tables", "netdev"]).is_ok_and(|(status, out, _)| {
+        status.success()
+            && out
+                .lines()
+                .any(|l| l.split_whitespace().nth(2) == Some(tap_table_name(tap).as_str()))
+    })
 }
 
 #[cfg(test)]
@@ -1084,19 +1141,27 @@ mod tests {
         let (st, _, err) =
             run_capture("ip", &["link", "add", dev, "type", "dummy"]).expect("ip link add");
         assert!(st.success(), "add dummy: {err}");
-        let jail =
-            TapAntiSpoof::install(dev, [0xaa, 0xbb, 0, 0, 0, 2], Ipv4Addr::new(10, 200, 0, 2))
-                .expect("install tap anti-spoof")
-                .expect("enforced");
+        let jail = TapAntiSpoof::install(
+            dev,
+            [0xaa, 0xbb, 0, 0, 0, 2],
+            Ipv4Addr::new(10, 200, 0, 2),
+            None,
+        )
+        .expect("install tap anti-spoof")
+        .expect("enforced");
         assert!(tap_jail_installed(dev));
         drop(jail);
         assert!(!tap_jail_installed(dev), "Drop must delete the table");
 
         // Stale reap: table outlives its device.
-        let jail =
-            TapAntiSpoof::install(dev, [0xaa, 0xbb, 0, 0, 0, 2], Ipv4Addr::new(10, 200, 0, 2))
-                .expect("install")
-                .expect("enforced");
+        let jail = TapAntiSpoof::install(
+            dev,
+            [0xaa, 0xbb, 0, 0, 0, 2],
+            Ipv4Addr::new(10, 200, 0, 2),
+            None,
+        )
+        .expect("install")
+        .expect("enforced");
         std::mem::forget(jail); // simulate a daemon that died without Drops
         let _ = run_capture("ip", &["link", "delete", dev]);
         let removed = clean_stale_tap_jails();

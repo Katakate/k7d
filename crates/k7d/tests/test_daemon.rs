@@ -791,6 +791,7 @@ fn test_daemon_fork_vm() {
         &Request::ForkVm {
             vm_id: src_id.clone(),
             sandbox_id: None,
+            pod_netns: None,
             dilation: None,
         },
     ) {
@@ -829,6 +830,196 @@ fn test_daemon_fork_vm() {
         Response::Ok
     ));
 
+    drop(guard);
+}
+
+/// Host `k7-br-*` link names — each network's uplink (the per-network
+/// netns spec).
+fn k7_bridges() -> std::collections::HashSet<String> {
+    let out = Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .expect("ip link show");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| {
+            n.trim_end_matches(':')
+                .split('@')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|n| n.starts_with("k7-br-"))
+        .collect()
+}
+
+/// Whether the guest at `cid` reaches the internet (1.1.1.1 by raw
+/// IP), with retries for a guest still bringing its link up.
+fn guest_egress(cid: u64) -> String {
+    let probe = "ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && echo EGRESS_OK || echo EGRESS_FAIL";
+    let mut last = String::new();
+    for _ in 0..15 {
+        last = guest_exec(cid, &["sh", "-c", probe]);
+        if last.contains("EGRESS_OK") {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    last
+}
+
+/// A fork of a networked (host-bridge) VM gets its own network with a
+/// TAP at the SOURCE's `vm_index`, so the guest identity it inherited
+/// in memory still passes the anti-spoof pin (CHALLENGES #283 — native
+/// forks used to have no NIC at all). Fork and source share every
+/// guest address, and both reach the internet **at the same time**:
+/// each network lives in its own namespace behind its own uplink
+/// (the per-network netns spec). Each network — uplink and namespace —
+/// dies with its own VM. A pod netns on a fork of an unnetworked VM
+/// is refused.
+#[test]
+fn test_daemon_fork_networked_vm_keeps_egress() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("forknet");
+    let cluster_id = format!("fn{}", std::process::id() % 1_000_000);
+    let src_bridge = format!("k7-br-{cluster_id}");
+
+    let mut config = default_config();
+    config.network = Some(NetConfig {
+        cluster_id: cluster_id.clone(),
+        vm_index: Some(3),
+        pod_netns: None,
+    });
+    let (src_id, cid, idx) = create_vm(&guard, config);
+    assert_eq!(idx, Some(3));
+    guest_exec(
+        cid,
+        &[
+            "sh",
+            "-c",
+            "ifconfig eth0 10.200.0.5 netmask 255.255.255.0 up && \
+             route add default gw 10.200.0.1",
+        ],
+    );
+    let src_before = guest_egress(cid);
+    assert!(
+        src_before.contains("EGRESS_OK"),
+        "source egress: {src_before}"
+    );
+
+    let bridges_before = k7_bridges();
+    let (fork_id, fork_cid) = match call(
+        &guard,
+        &Request::ForkVm {
+            vm_id: src_id.clone(),
+            sandbox_id: None,
+            pod_netns: None,
+            dilation: None,
+        },
+    ) {
+        Response::VmForked {
+            vm_id, guest_cid, ..
+        } => (vm_id, guest_cid),
+        other => panic!("unexpected fork_vm response: {other:?}"),
+    };
+    let new: Vec<String> = k7_bridges().difference(&bridges_before).cloned().collect();
+    assert_eq!(
+        new.len(),
+        1,
+        "fork must get exactly one new network: {new:?}"
+    );
+    let fork_bridge = &new[0];
+    assert_ne!(fork_bridge, &src_bridge);
+    let enslaved = Command::new("ip")
+        .args([
+            "-n",
+            fork_bridge,
+            "-o",
+            "link",
+            "show",
+            "master",
+            fork_bridge,
+        ])
+        .output()
+        .expect("ip link show master");
+    let enslaved = String::from_utf8_lossy(&enslaved.stdout);
+    assert_eq!(
+        enslaved.lines().count(),
+        1,
+        "fork bridge must carry exactly the fork's TAP: {enslaved}"
+    );
+
+    let fork_out = guest_egress(fork_cid);
+    assert!(
+        fork_out.contains("EGRESS_OK"),
+        "fork egress next to its running source: {fork_out}"
+    );
+    let src_after = guest_egress(cid);
+    assert!(
+        src_after.contains("EGRESS_OK"),
+        "source egress next to its running fork: {src_after}"
+    );
+
+    assert!(matches!(
+        call(&guard, &Request::StopVm { vm_id: src_id }),
+        Response::Ok
+    ));
+    assert!(
+        !bridge_exists(&src_bridge),
+        "source uplink must die with the source"
+    );
+    assert!(
+        !std::path::Path::new("/run/netns")
+            .join(&src_bridge)
+            .exists(),
+        "source namespace must die with the source"
+    );
+    assert!(
+        bridge_exists(fork_bridge),
+        "fork network must outlive the source"
+    );
+    let fork_alone = guest_egress(fork_cid);
+    assert!(
+        fork_alone.contains("EGRESS_OK"),
+        "fork egress: {fork_alone}"
+    );
+    assert!(matches!(
+        call(&guard, &Request::StopVm { vm_id: fork_id }),
+        Response::Ok
+    ));
+    assert!(
+        !bridge_exists(fork_bridge),
+        "{fork_bridge} must die with the fork"
+    );
+    assert!(
+        !std::path::Path::new("/run/netns")
+            .join(fork_bridge)
+            .exists(),
+        "fork namespace must die with the fork"
+    );
+
+    let (lone_id, lone_cid, _) = create_vm(&guard, default_config());
+    guest_exec(lone_cid, &["echo", "ready"]);
+    match call(
+        &guard,
+        &Request::ForkVm {
+            vm_id: lone_id.clone(),
+            sandbox_id: None,
+            pod_netns: Some("/var/run/netns/whatever".to_string()),
+            dilation: None,
+        },
+    ) {
+        Response::Error { message } => assert!(
+            message.contains("no network"),
+            "refusal must say the source has no network: {message}"
+        ),
+        other => panic!("pod netns on an unnetworked fork must be refused: {other:?}"),
+    }
+    assert!(matches!(
+        call(&guard, &Request::StopVm { vm_id: lone_id }),
+        Response::Ok
+    ));
     drop(guard);
 }
 
@@ -2463,6 +2654,159 @@ fn test_daemon_dilation_config_refuses_before_boot() {
             );
         }
         other => panic!("unexpected tree_nodes: {other:?}"),
+    }
+
+    assert!(matches!(
+        call(&guard, &Request::TreeDrop { tree_id }),
+        Response::Ok
+    ));
+}
+
+/// `set_dilation_policy` stores a ladder without ioctling (factor 1 is
+/// already the bottom rung), `tree_nodes` reports that ladder and a
+/// CPU sample, and a second suspend names Suspended instead of
+/// "not found".
+#[test]
+fn test_daemon_dilation_policy_and_cpu_sample() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let guard = spawn_daemon("dilpol");
+    let tree_id = "dilpol".to_string();
+
+    match call(
+        &guard,
+        &Request::TreeCreate {
+            config: default_config(),
+            budget: None,
+            tree_id: Some(tree_id.clone()),
+            dilation_policy: None,
+            dilation_config: None,
+        },
+    ) {
+        Response::TreeCreated { .. } => {}
+        other => panic!("tree_create: {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::SetDilationPolicy {
+            tree_id: tree_id.clone(),
+            node_id: None,
+            mode: k7d::dilation::DilationPolicyMode::Down,
+            config: Some(k7d::dilation::DilationPolicyConfig {
+                ladder: Some(vec![8, 4, 1]),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::DilationPolicySet {
+            mode,
+            ladder,
+            nodes,
+            ..
+        } => {
+            assert_eq!(mode, k7d::dilation::DilationPolicyMode::Down);
+            assert_eq!(ladder, vec![8, 4, 1]);
+            assert!(nodes.iter().any(|id| id == "root"), "{nodes:?}");
+        }
+        other => panic!("set_dilation_policy: {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::TreeNodes {
+            tree_id: tree_id.clone(),
+        },
+    ) {
+        Response::TreeNodeList {
+            dilation_policy,
+            dilation_ladder,
+            dilation_trajectory,
+            live_cpu,
+            ..
+        } => {
+            assert_eq!(
+                dilation_policy.get("root"),
+                Some(&k7d::dilation::DilationPolicyMode::Down)
+            );
+            assert_eq!(
+                dilation_ladder.get("root").map(Vec::as_slice),
+                Some([8, 4, 1].as_slice())
+            );
+            assert_eq!(
+                dilation_trajectory.get("root").map(Vec::as_slice),
+                Some([1].as_slice())
+            );
+            assert!(
+                live_cpu.contains_key("root"),
+                "live_cpu missing root: {live_cpu:?}"
+            );
+        }
+        other => panic!("tree_nodes: {other:?}"),
+    }
+
+    std::thread::sleep(Duration::from_millis(350));
+    match call(
+        &guard,
+        &Request::TreeNodes {
+            tree_id: tree_id.clone(),
+        },
+    ) {
+        Response::TreeNodeList { live_cpu, .. } => {
+            let members = live_cpu.get("root").expect("root cpu");
+            assert!(!members.is_empty(), "{live_cpu:?}");
+            let pct = members[0].cpu_percent.expect("second sample has a percent");
+            assert!((0.0..=100.0).contains(&pct), "{pct}");
+        }
+        other => panic!("tree_nodes cpu: {other:?}"),
+    }
+
+    match call(
+        &guard,
+        &Request::SetDilationPolicy {
+            tree_id: tree_id.clone(),
+            node_id: Some("root".to_string()),
+            mode: k7d::dilation::DilationPolicyMode::Fixed,
+            config: Some(k7d::dilation::DilationPolicyConfig {
+                ladder: Some(vec![8, 4, 2, 1]),
+                ..k7d::dilation::DilationPolicyConfig::default()
+            }),
+        },
+    ) {
+        Response::DilationPolicySet { mode, ladder, .. } => {
+            assert_eq!(mode, k7d::dilation::DilationPolicyMode::Fixed);
+            assert_eq!(ladder, vec![8, 4, 2, 1]);
+        }
+        other => panic!("set fixed: {other:?}"),
+    }
+
+    assert!(matches!(
+        call(
+            &guard,
+            &Request::TreeSuspend {
+                tree_id: tree_id.clone(),
+                node_id: "root".to_string(),
+            },
+        ),
+        Response::Ok
+    ));
+    match call(
+        &guard,
+        &Request::TreeSuspend {
+            tree_id: tree_id.clone(),
+            node_id: "root".to_string(),
+        },
+    ) {
+        Response::Error { message } => {
+            assert!(
+                message.contains("Suspended"),
+                "second suspend must name the state, got {message}"
+            );
+            assert!(
+                !message.contains("not found"),
+                "suspended root is still in the tree, got {message}"
+            );
+        }
+        other => panic!("second suspend should fail loud, got {other:?}"),
     }
 
     assert!(matches!(

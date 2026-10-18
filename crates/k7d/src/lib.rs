@@ -33,6 +33,8 @@ pub mod config;
 #[cfg(not(feature = "verif"))]
 pub mod control;
 #[cfg(not(feature = "verif"))]
+pub mod cpu_sample;
+#[cfg(not(feature = "verif"))]
 pub mod devices;
 #[cfg(not(feature = "verif"))]
 pub mod dilation;

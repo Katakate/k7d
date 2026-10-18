@@ -301,25 +301,26 @@ fn host_clk_tck() -> u64 {
     100
 }
 
-/// Host CPU time of a kernel thread, in clock ticks, from
-/// `/proc/<tid>/stat` (utime + stime).
+/// Host CPU time of one kernel thread, in clock ticks, from
+/// `/proc/<tid>/task/<tid>/stat` (utime + stime). `/proc/<tid>/stat`
+/// is the whole process, which made a single idle vCPU look busy.
 fn thread_cpu_ticks(tid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"))
-        .unwrap_or_else(|e| panic!("read /proc/{tid}/stat: {e}"));
+    let path = format!("/proc/{tid}/task/{tid}/stat");
+    let stat = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let rest = stat
         .rsplit_once(')')
-        .unwrap_or_else(|| panic!("malformed /proc/{tid}/stat: {stat}"))
+        .unwrap_or_else(|| panic!("malformed {path}: {stat}"))
         .1;
     let mut fields = rest.split_whitespace();
     // After `)`: state ppid … utime(index 11) stime(index 12).
     let utime: u64 = fields
         .nth(11)
-        .unwrap_or_else(|| panic!("utime missing in /proc/{tid}/stat: {stat}"))
+        .unwrap_or_else(|| panic!("utime missing in {path}: {stat}"))
         .parse()
         .unwrap_or_else(|e| panic!("utime parse: {e}"));
     let stime: u64 = fields
         .next()
-        .unwrap_or_else(|| panic!("stime missing in /proc/{tid}/stat: {stat}"))
+        .unwrap_or_else(|| panic!("stime missing in {path}: {stat}"))
         .parse()
         .unwrap_or_else(|e| panic!("stime parse: {e}"));
     utime + stime

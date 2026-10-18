@@ -618,6 +618,14 @@ pub enum Request {
         /// `reattach_sandbox` (and `k7 pause` on the fork) work.
         #[serde(default)]
         sandbox_id: Option<String>,
+        /// CNI netns of the FORK pod. A networked source's fork gets
+        /// its own bridge at the source's `vm_index` (the guest kept
+        /// that IP/MAC in memory); with this set, the fork's TAP is
+        /// attached into this netns with pod NAT, so the fork pod's
+        /// `NetworkPolicy` governs its traffic. A pod-backed fork
+        /// (`sandbox_id` set) of a pod-attached source must name it.
+        #[serde(default)]
+        pod_netns: Option<String>,
         /// Child dilation factor. `None` inherits the
         /// source's. `0` is a loud error.
         #[serde(default)]
@@ -988,6 +996,27 @@ pub enum Request {
     /// Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`,
     /// cgroup v2. Same checks as `k7d doctor`. Does not create VMs.
     Doctor,
+    /// Replace the dilation loop mode on one node, or on every live
+    /// node when `node_id` is omitted (`fixed` covers every listed
+    /// node, so a ladder can be stored before anything is sampled).
+    ///
+    /// `config` is the same knob struct as tree create. Omitted fields
+    /// stay at the module defaults. This does not ioctl the TSC
+    /// multiplier — the caller sets the rate with [`Request::SetDilation`].
+    /// `fixed` stores the ladder and starts no thread.
+    SetDilationPolicy {
+        /// Tree whose loop to arm.
+        tree_id: String,
+        /// One node. `None` is every live node, or every node when
+        /// `mode` is `fixed`.
+        #[serde(default)]
+        node_id: Option<String>,
+        /// `fixed`, `down`, or `track`.
+        mode: crate::dilation::DilationPolicyMode,
+        /// Ladder and the other #305 knobs. `None` is the module default.
+        #[serde(default)]
+        config: Option<crate::dilation::DilationPolicyConfig>,
+    },
 }
 
 impl Request {
@@ -1032,6 +1061,7 @@ impl Request {
             Self::TreeOpen { .. } => "tree_open",
             Self::PoolStatus => "pool_status",
             Self::Doctor => "doctor",
+            Self::SetDilationPolicy { .. } => "set_dilation_policy",
         }
     }
 
@@ -1114,6 +1144,18 @@ pub struct JailInfo {
     pub uid: u32,
     /// Host path of the directory it sees as `/`.
     pub chroot: String,
+}
+
+/// One native member's CPU sample, as reported by `tree_nodes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuMember {
+    /// Member index, 0 for a single-VM node.
+    pub member: u32,
+    /// vCPUs the VM was built with. The percent is of this count.
+    pub vcpus: u32,
+    /// 0..=100. `None` until a second sample 200 ms later.
+    #[serde(default)]
+    pub cpu_percent: Option<f64>,
 }
 
 /// A control-plane response.
@@ -1463,6 +1505,16 @@ pub enum Response {
         /// observed.
         #[serde(default)]
         live_ksm: Box<HashMap<String, Vec<crate::ksm::KsmMember>>>,
+        /// Per live node, one entry per native member, in member
+        /// order. `cpu_percent` is absent until two samples at least
+        /// 200 ms apart exist. Firecracker members are omitted.
+        #[serde(default)]
+        live_cpu: Box<HashMap<String, Vec<CpuMember>>>,
+        /// Ladder currently stored for each node the loop knows,
+        /// highest rung first. Empty when this daemon never armed the
+        /// node. The UI highlights the rung equal to `live_dilation`.
+        #[serde(default)]
+        dilation_ladder: Box<HashMap<String, Vec<u32>>>,
     },
     /// Reply to `tree_list`.
     TreeList {
@@ -1491,6 +1543,18 @@ pub enum Response {
         /// Firecracker cluster-fork pause skew, when measured.
         #[serde(default)]
         pause_skew_ns: Option<u64>,
+    },
+    /// Reply to `set_dilation_policy`.
+    DilationPolicySet {
+        /// Tree that was armed.
+        tree_id: String,
+        /// Mode now stored on each listed node.
+        mode: crate::dilation::DilationPolicyMode,
+        /// Node ids the call armed, in list order.
+        nodes: Vec<String>,
+        /// Ladder stored with the call (module default when the
+        /// request omitted `config.ladder`).
+        ladder: Vec<u32>,
     },
     /// Reply to `pool_status`.
     PoolStatus {
@@ -1603,6 +1667,27 @@ struct NetAttachment {
     vm_index: u32,
     /// Set only when the pod-netns attach succeeded.
     pod_netns: Option<PathBuf>,
+}
+
+/// A fork's bridge reference, released on drop unless the fork reached
+/// the registry (whose `teardown_entry` owns it from then on).
+struct ForkBridgeRef<'a> {
+    daemon: &'a Daemon,
+    cluster_id: String,
+    vm_index: u32,
+    armed: bool,
+}
+
+impl Drop for ForkBridgeRef<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            Daemon::release_bridge_locked(
+                &mut self.daemon.bridges.lock().unwrap(),
+                &self.cluster_id,
+                Some(self.vm_index),
+            );
+        }
+    }
 }
 
 /// What `build_and_start` hands back for the `vm_created` response.
@@ -1838,6 +1923,40 @@ impl TreePayload {
         }
     }
 
+    /// `(node_id, member, vcpus, utime+stime ticks)` for live native
+    /// members. Firecracker has no in-process vCPU thread to sample.
+    /// `ticks` is `None` until every published TID has a readable
+    /// `/proc/<tid>/task/<tid>/stat` (one thread, not the process sum).
+    /// The wait is zero: a 50 ms poll must not
+    /// sleep for a thread that has not published its TID yet.
+    fn cpu_probes(&self) -> Vec<(String, u32, u32, Option<u64>)> {
+        let mut out = Vec::new();
+        for n in self.list_nodes() {
+            if n.state != crate::tree::NodeState::Live {
+                continue;
+            }
+            for (i, guest) in self.node_guests(&n.id).into_iter().enumerate() {
+                let Ok(vm) = guest.as_native() else {
+                    continue;
+                };
+                let vcpus = vm.vcpu_count();
+                let ticks = vm.vcpu_kernel_tids(Duration::ZERO).and_then(|tids| {
+                    if tids.is_empty() {
+                        return None;
+                    }
+                    let mut sum = 0u64;
+                    for tid in tids {
+                        sum = sum.saturating_add(crate::cpu_sample::task_cpu_ticks(tid)?);
+                    }
+                    Some(sum)
+                });
+                let member = u32::try_from(i).unwrap_or(u32::MAX);
+                out.push((n.id.clone(), member, vcpus, ticks));
+            }
+        }
+        out
+    }
+
     /// Whether `node_id`'s live payload is a native VM. Firecracker has
     /// no dilation ioctl, so an adaptive loop on one is refused.
     fn node_is_native(&self, node_id: &str) -> bool {
@@ -1926,6 +2045,8 @@ impl TreePayload {
             dilation_policy: HashMap::new(),
             dilation_trajectory: Box::new(HashMap::new()),
             live_ksm: Box::new(live_ksm),
+            live_cpu: Box::new(HashMap::new()),
+            dilation_ladder: Box::new(HashMap::new()),
         }
     }
 
@@ -2059,6 +2180,17 @@ pub struct Daemon {
     /// not reported as `no such VM`.
     adopted: Mutex<HashMap<String, String>>,
     counter: AtomicU64,
+    /// Last `/proc` tick sample per `(tree, node, member)`. Recomputed
+    /// only after 200 ms so a 50 ms `tree_nodes` poll does not hammer
+    /// `/proc` or report a percent over a few milliseconds.
+    cpu_ticks: Mutex<HashMap<(String, String, u32), CpuTickSample>>,
+}
+
+/// One cached vCPU-tick sample.
+struct CpuTickSample {
+    ticks: u64,
+    at: Instant,
+    percent: Option<f64>,
 }
 
 /// One cluster's running auto-warp policy loop.
@@ -2167,30 +2299,64 @@ impl Drop for TreeDilationLoop {
     }
 }
 
-/// Live tree-owned members of `cluster_id`.
+/// Node id inside `tree_id` that `cluster_id` names.
+///
+/// The root's cluster id is the tree id. A child is
+/// `{tree_id}-{node_id}` (CHALLENGES #193). The longest tree id wins
+/// so a tree named `a-b` is not captured by a tree named `a`.
+fn cluster_node_id<'a>(tree_id: &'a str, cluster_id: &'a str) -> Option<&'a str> {
+    if cluster_id == tree_id {
+        return Some("root");
+    }
+    let rest = cluster_id.strip_prefix(tree_id)?;
+    let node = rest.strip_prefix('-')?;
+    if node.is_empty() {
+        None
+    } else {
+        Some(node)
+    }
+}
+
+/// `(tree_id, node_id)` of the longest tree id that `cluster_id` names.
+fn best_tree_node(
+    trees: &HashMap<String, TreePayload>,
+    cluster_id: &str,
+) -> Option<(String, String)> {
+    let mut best: Option<(usize, String, String)> = None;
+    for tid in trees.keys() {
+        let Some(node) = cluster_node_id(tid, cluster_id) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(len, _, _)| tid.len() > *len) {
+            best = Some((tid.len(), tid.clone(), node.to_string()));
+        }
+    }
+    best.map(|(_, tid, node)| (tid, node))
+}
+
+/// Live tree-owned cluster members of `cluster_id`.
 ///
 /// Gym / `tree_create_cluster` children are `{tree_id}-{node_id}`.
 /// Reset / source clusters use `cluster_id == tree_id` (the live root).
+/// A single-VM tree is not a cluster; [`tree_single_guest_mut`] covers it.
 fn tree_cluster_members_mut<'a>(
     trees: &'a mut HashMap<String, TreePayload>,
     cluster_id: &str,
 ) -> Option<&'a mut [Guest]> {
-    for (tid, tree) in trees.iter_mut() {
-        let node_id = if cluster_id == tid.as_str() {
-            "root"
-        } else if let Some(rest) = cluster_id.strip_prefix(tid.as_str()) {
-            match rest.strip_prefix('-') {
-                Some(n) => n,
-                None => continue,
-            }
-        } else {
-            continue;
-        };
-        if let Some(members) = tree.live_cluster_members_mut(node_id) {
-            return Some(members);
-        }
+    let (tid, node) = best_tree_node(trees, cluster_id)?;
+    trees.get_mut(&tid)?.live_cluster_members_mut(&node)
+}
+
+/// The one live guest of a single-VM tree node named by `cluster_id`.
+fn tree_single_guest_mut<'a>(
+    trees: &'a mut HashMap<String, TreePayload>,
+    cluster_id: &str,
+) -> Option<&'a mut Guest> {
+    let (tid, node) = best_tree_node(trees, cluster_id)?;
+    match trees.get_mut(&tid)? {
+        TreePayload::Single(tree) => tree.get_vm_mut(&node),
+        TreePayload::Cluster(_) => None,
     }
-    None
 }
 
 /// What a tree payload VM may not carry, on either backend: it is
@@ -2616,6 +2782,7 @@ impl Daemon {
             auto_warp_holds: Arc::new(Mutex::new(HashMap::new())),
             adopted: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
+            cpu_ticks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3009,9 +3176,10 @@ impl Daemon {
             Request::ForkVm {
                 vm_id,
                 sandbox_id,
+                pod_netns,
                 dilation,
             } => match validate_fork_dilation(dilation) {
-                Ok(d) => self.fork_vm(&vm_id, sandbox_id, d),
+                Ok(d) => self.fork_vm(&vm_id, sandbox_id, pod_netns, d),
                 Err(message) => Response::Error { message },
             },
             Request::PauseVm { vm_id } => self.pause_vm(&vm_id),
@@ -3381,6 +3549,12 @@ impl Daemon {
                 resp
             }
             Request::PoolStatus => self.pool_status(),
+            Request::SetDilationPolicy {
+                tree_id,
+                node_id,
+                mode,
+                config,
+            } => self.set_dilation_policy(&tree_id, node_id.as_deref(), mode, config.as_ref()),
             Request::Doctor => {
                 let report = crate::doctor::run();
                 Response::Doctor {
@@ -3712,6 +3886,9 @@ impl Daemon {
             let entry = bridges
                 .get_mut(&cfg.cluster_id)
                 .expect("bridge entry just ensured");
+            // A pod-backed TAP goes from the host straight into its
+            // pod's namespace; it never needs the network's own.
+            entry.net.set_place_taps(cfg.pod_netns.is_none());
             match cfg.vm_index {
                 Some(idx) => entry
                     .net
@@ -3850,6 +4027,69 @@ impl Daemon {
         } else {
             entry.refcount -= 1;
         }
+    }
+
+    /// Network for a fork of `vm_id`. `None` when the source is
+    /// unnetworked. Otherwise a fresh bridge keyed by `fork_key`
+    /// inheriting the source bridge's egress, with a TAP at the
+    /// source's `vm_index`: the fork's guest kept that index's IP and
+    /// MAC from memory, and a TAP at any other index drops its frames
+    /// at the anti-spoof pin (CHALLENGES #283). Sharing the source's
+    /// bridge is not an option — that identity is already on it.
+    fn acquire_fork_network(
+        &self,
+        vm_id: &str,
+        fork_key: &str,
+        pod_backed: bool,
+        pod_netns: Option<String>,
+        defer_pod_netns: bool,
+    ) -> Result<Option<NetAttachment>, String> {
+        let (src_cluster, src_index, src_in_pod) = {
+            let vms = self.vms.lock().unwrap();
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| format!("no such VM: {vm_id}"))?;
+            (
+                entry.cluster_id.clone(),
+                entry.vm_index,
+                entry.pod_netns.is_some(),
+            )
+        };
+        let (Some(src_cluster), Some(vm_index)) = (src_cluster, src_index) else {
+            return match pod_netns {
+                Some(p) => Err(format!(
+                    "fork of {vm_id}: source has no network, cannot attach fork to pod netns {p}"
+                )),
+                None => Ok(None),
+            };
+        };
+        if pod_backed && src_in_pod && pod_netns.is_none() {
+            return Err(format!(
+                "fork of {vm_id}: source is attached to its pod netns but the fork pod names \
+                 none — the fork would bypass its pod's network policy"
+            ));
+        }
+        {
+            let mut bridges = self.bridges.lock().unwrap();
+            if bridges.contains_key(fork_key) {
+                return Err(format!("fork of {vm_id}: bridge {fork_key} already exists"));
+            }
+            let src = bridges
+                .get(&src_cluster)
+                .ok_or_else(|| format!("fork of {vm_id}: no bridge for cluster {src_cluster}"))?;
+            let net = ClusterNetwork::fork_from(&src.net, fork_key)
+                .map_err(|e| format!("fork of {vm_id}: fork bridge {fork_key}: {e}"))?;
+            bridges.insert(fork_key.to_string(), BridgeEntry { net, refcount: 0 });
+        }
+        self.acquire_network(
+            &NetConfig {
+                cluster_id: fork_key.to_string(),
+                vm_index: Some(vm_index),
+                pod_netns,
+            },
+            defer_pod_netns,
+        )
+        .map(Some)
     }
 
     /// Build and boot the VM *without* holding the registry lock, then
@@ -4190,6 +4430,7 @@ impl Daemon {
         &self,
         vm_id: &str,
         fork_sandbox_id: Option<String>,
+        pod_netns: Option<String>,
         dilation: Option<u32>,
     ) -> Response {
         let backend = {
@@ -4204,9 +4445,18 @@ impl Daemon {
             }
         };
         match backend {
-            Backend::Firecracker => self.fork_vm_fc(vm_id, fork_sandbox_id, dilation),
-            Backend::Native => self.fork_vm_native(vm_id, fork_sandbox_id, dilation),
+            Backend::Firecracker => {
+                self.fork_vm_fc(vm_id, fork_sandbox_id, pod_netns.as_deref(), dilation)
+            }
+            Backend::Native => self.fork_vm_native(vm_id, fork_sandbox_id, pod_netns, dilation),
         }
+    }
+
+    /// The fork's bridge id: the fork pod's sandbox id (the same
+    /// `cluster_id == sandbox_id` rule a single-VM pod's create uses),
+    /// else the fork's VM id.
+    fn fork_bridge_key<'a>(fork_sandbox_id: Option<&'a String>, fork_id: &'a str) -> &'a str {
+        fork_sandbox_id.map_or(fork_id, String::as_str)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4214,9 +4464,33 @@ impl Daemon {
         &self,
         vm_id: &str,
         fork_sandbox_id: Option<String>,
+        pod_netns: Option<String>,
         dilation: Option<u32>,
     ) -> Response {
         let fork_id = self.mint_vm_id();
+        let fork_key = Self::fork_bridge_key(fork_sandbox_id.as_ref(), &fork_id).to_string();
+        // The native VMM holds the TAP fd from creation, so the pod
+        // netns move can happen before the fork is built.
+        let attachment = match self.acquire_fork_network(
+            vm_id,
+            &fork_key,
+            fork_sandbox_id.is_some(),
+            pod_netns,
+            false,
+        ) {
+            Ok(a) => a,
+            Err(message) => return Response::Error { message },
+        };
+        let (tap, fork_net) = match attachment {
+            Some(att) => (Some(att.tap), Some((att.vm_index, att.pod_netns))),
+            None => (None, None),
+        };
+        let mut bridge_ref = fork_net.as_ref().map(|(idx, _)| ForkBridgeRef {
+            daemon: self,
+            cluster_id: fork_key.clone(),
+            vm_index: *idx,
+            armed: true,
+        });
 
         let mut vms = self.vms.lock().unwrap();
         let forked = {
@@ -4274,14 +4548,19 @@ impl Daemon {
                     );
                 }
             }
-            let mut fork = match entry.vm.fork_batch(&[&fork_id], dilation) {
-                Ok(mut forks) => forks.pop().expect("single fork"),
-                Err(e) => {
-                    return Response::Error {
-                        message: format!("fork_warm({vm_id}): {e}"),
-                    }
-                }
+            let native = match native_mut(&mut entry.vm) {
+                Ok(v) => v,
+                Err(message) => return Response::Error { message },
             };
+            let mut fork =
+                match native.fork_warm_batch_with_taps(vec![(fork_id.as_str(), tap)], dilation) {
+                    Ok(mut forks) => Guest::from(forks.pop().expect("single fork")),
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("fork_warm({vm_id}): {e}"),
+                        }
+                    }
+                };
             // fork_warm hands the fork back paused; it runs from here.
             if let Err(e) = fork.start() {
                 return Response::Error {
@@ -4335,11 +4614,14 @@ impl Daemon {
                 cpu_period,
                 guest_cid,
                 sandbox_id: fork_sandbox_id.clone(),
-                cluster_id: None,
-                vm_index: None,
-                pod_netns: None,
+                cluster_id: fork_net.as_ref().map(|_| fork_key.clone()),
+                vm_index: fork_net.as_ref().map(|(idx, _)| *idx),
+                pod_netns: fork_net.as_ref().and_then(|(_, p)| p.clone()),
             },
         );
+        if let Some(r) = bridge_ref.as_mut() {
+            r.armed = false;
+        }
         // A fork that backs a kubectl pod is a first-class
         // sandbox VM — persist its reattach record and index it so
         // `lookup_sandbox` / `reattach_sandbox` (and `k7 pause` on the
@@ -4352,9 +4634,12 @@ impl Daemon {
                 vcpus,
                 cpu_quota,
                 cpu_period,
-                vm_index: None,
-                cluster_id: None,
-                pod_netns: None,
+                vm_index: fork_net.as_ref().map(|(idx, _)| *idx),
+                cluster_id: fork_net.as_ref().map(|_| fork_key.clone()),
+                pod_netns: fork_net
+                    .as_ref()
+                    .and_then(|(_, p)| p.as_ref())
+                    .map(|p| p.to_string_lossy().into_owned()),
                 agent_endpoint: Some(AgentEndpoint::Vsock { cid: guest_cid }),
                 backend: Backend::Native,
                 created_at_unix: std::time::SystemTime::now()
@@ -4376,7 +4661,10 @@ impl Daemon {
                 .unwrap()
                 .insert(sandbox_id, fork_id.clone());
         }
-        log::info!("forked {vm_id} -> {fork_id} (guest_cid={guest_cid})");
+        log::info!(
+            "forked {vm_id} -> {fork_id} (guest_cid={guest_cid}, net={:?})",
+            fork_net.as_ref().map(|(idx, p)| (&fork_key, idx, p))
+        );
         Response::VmForked {
             vm_id: fork_id,
             guest_cid,
@@ -4387,13 +4675,15 @@ impl Daemon {
     }
 
     /// Firecracker `fork_vm`: snapshot point + `LoadSnapshot` child,
-    /// with a new TAP on the source's cluster bridge when the source
-    /// is networked. Children are already running (`resume_vm: true`).
+    /// with its own bridge + TAP at the source's `vm_index` when the
+    /// source is networked ([`Self::acquire_fork_network`]). Children
+    /// are already running (`resume_vm: true`).
     #[allow(clippy::too_many_lines)]
     fn fork_vm_fc(
         &self,
         vm_id: &str,
         fork_sandbox_id: Option<String>,
+        pod_netns: Option<&str>,
         dilation: Option<u32>,
     ) -> Response {
         if dilation.is_some() {
@@ -4406,84 +4696,71 @@ impl Daemon {
             };
         }
         let fork_id = self.mint_vm_id();
-        let (cluster_id, cpu_quota, cpu_period, source_guest_cid) = {
-            let vms = self.vms.lock().unwrap();
-            let Some(entry) = vms.get(vm_id) else {
-                return Response::Error {
-                    message: format!("no such VM: {vm_id}"),
-                };
-            };
-            (
-                entry.cluster_id.clone(),
-                entry.cpu_quota,
-                entry.cpu_period,
-                entry.guest_cid,
-            )
-        };
-
-        let attachment = match cluster_id.as_deref() {
-            Some(cid) => match self.acquire_network(
-                &NetConfig {
-                    cluster_id: cid.to_string(),
-                    vm_index: None,
-                    pod_netns: None,
-                },
-                true,
-            ) {
-                Ok(a) => Some(a),
-                Err(message) => return Response::Error { message },
-            },
-            None => None,
+        let fork_key = Self::fork_bridge_key(fork_sandbox_id.as_ref(), &fork_id).to_string();
+        // Deferred pod-netns attach: Firecracker opens the TAP by name
+        // in the root netns (see `acquire_network`).
+        let attachment = match self.acquire_fork_network(
+            vm_id,
+            &fork_key,
+            fork_sandbox_id.is_some(),
+            pod_netns.map(str::to_string),
+            true,
+        ) {
+            Ok(a) => a,
+            Err(message) => return Response::Error { message },
         };
         let child_vm_index = attachment.as_ref().map(|a| a.vm_index);
         let tap = attachment.map(|a| a.tap);
+        let mut bridge_ref = child_vm_index.map(|idx| ForkBridgeRef {
+            daemon: self,
+            cluster_id: fork_key.clone(),
+            vm_index: idx,
+            armed: true,
+        });
 
-        let release_tap = |tap: Option<crate::network::TapDevice>| {
-            drop(tap);
-            if let Some(cid) = cluster_id.as_deref() {
-                Self::release_bridge_locked(&mut self.bridges.lock().unwrap(), cid, child_vm_index);
-            }
-        };
-
-        let child = {
+        let (child, cpu_quota, cpu_period, source_guest_cid) = {
             let mut vms = self.vms.lock().unwrap();
             let Some(entry) = vms.get_mut(vm_id) else {
-                release_tap(tap);
                 return Response::Error {
                     message: format!("no such VM: {vm_id}"),
                 };
             };
+            let (cpu_quota, cpu_period, source_guest_cid) =
+                (entry.cpu_quota, entry.cpu_period, entry.guest_cid);
             let fc = match entry.vm.as_fc_mut() {
                 Ok(fc) => fc,
                 Err(e) => {
-                    release_tap(tap);
                     return Response::Error {
                         message: e.to_string(),
                     };
                 }
             };
             if let Err(e) = fc.prepare_fork_source() {
-                release_tap(tap);
                 return Response::Error {
                     message: format!("prepare_fork_source({vm_id}): {e}"),
                 };
             }
             match fc.spawn_child(tap) {
-                Ok(child) => child,
+                Ok(child) => (child, cpu_quota, cpu_period, source_guest_cid),
                 Err(e) => {
-                    if let Some(cid) = cluster_id.as_deref() {
-                        Self::release_bridge_locked(
-                            &mut self.bridges.lock().unwrap(),
-                            cid,
-                            child_vm_index,
-                        );
-                    }
                     return Response::Error {
                         message: format!("fork_vm({vm_id}): {e}"),
                     };
                 }
             }
         };
+
+        let child_pod_netns = match child_vm_index {
+            Some(idx) => match self.attach_pod_netns(&fork_key, idx, pod_netns) {
+                Ok(p) => p,
+                Err(message) => {
+                    drop(child);
+                    return Response::Error { message };
+                }
+            },
+            None => None,
+        };
+        let child_cluster_id = child_vm_index.map(|_| fork_key.clone());
 
         let guest = Guest::from(child);
         let agent_endpoint = guest.agent_endpoint();
@@ -4500,11 +4777,14 @@ impl Daemon {
                     cpu_period,
                     guest_cid,
                     sandbox_id: fork_sandbox_id.clone(),
-                    cluster_id: cluster_id.clone(),
+                    cluster_id: child_cluster_id.clone(),
                     vm_index: child_vm_index,
-                    pod_netns: None,
+                    pod_netns: child_pod_netns.clone(),
                 },
             );
+        }
+        if let Some(r) = bridge_ref.as_mut() {
+            r.armed = false;
         }
         if let Some(sandbox_id) = fork_sandbox_id {
             let record = SandboxRecord {
@@ -4515,8 +4795,10 @@ impl Daemon {
                 cpu_quota,
                 cpu_period,
                 vm_index: child_vm_index,
-                cluster_id: cluster_id.clone(),
-                pod_netns: None,
+                cluster_id: child_cluster_id.clone(),
+                pod_netns: child_pod_netns
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 agent_endpoint: Some(agent_endpoint.clone()),
                 backend: Backend::Firecracker,
                 created_at_unix: std::time::SystemTime::now()
@@ -4539,7 +4821,10 @@ impl Daemon {
                 .unwrap()
                 .insert(sandbox_id, fork_id.clone());
         }
-        log::info!("forked {vm_id} -> {fork_id} (firecracker, guest_cid={guest_cid})");
+        log::info!(
+            "forked {vm_id} -> {fork_id} (firecracker, guest_cid={guest_cid}, net={:?})",
+            child_vm_index.map(|idx| (&fork_key, idx, &child_pod_netns))
+        );
         Response::VmForked {
             vm_id: fork_id,
             guest_cid,
@@ -4734,9 +5019,7 @@ impl Daemon {
             drop(vms);
             let mut trees = self.trees.lock().unwrap();
             let Some(tree_members) = tree_cluster_members_mut(&mut trees, cluster_id) else {
-                return Response::Error {
-                    message: format!("set_dilation: no VM on cluster {cluster_id}"),
-                };
+                return Self::set_dilation_single(&mut trees, cluster_id, factor);
             };
             // Tree-owned VMs have no registry id, so they are reported
             // positionally rather than under a name nothing can look up.
@@ -4799,6 +5082,40 @@ impl Daemon {
             }
         }
         Self::dilation_set(cluster_id, vm_ids, factor, latency)
+    }
+
+    /// `set_dilation` for a single-VM tree node. Cluster members are
+    /// handled by [`Self::set_dilation`] before this runs. A registry
+    /// miss used to stop here with "no VM on cluster" even when the
+    /// id was `{tree_id}` or `{tree_id}-{node_id}` of a `SnapshotTree`
+    /// (the miner demo is one of those).
+    fn set_dilation_single(
+        trees: &mut HashMap<String, TreePayload>,
+        cluster_id: &str,
+        factor: u32,
+    ) -> Response {
+        let Some(guest) = tree_single_guest_mut(trees, cluster_id) else {
+            return Response::Error {
+                message: format!("set_dilation: no VM on cluster {cluster_id}"),
+            };
+        };
+        let vm = match guest.as_native_mut() {
+            Ok(vm) => vm,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("set_dilation({cluster_id}, x{factor}): {e}"),
+                };
+            }
+        };
+        let mut natives = [vm];
+        match crate::vm::set_dilation_lockstep(&mut natives, factor) {
+            Ok(latency) => {
+                Self::dilation_set(cluster_id, vec![format!("{cluster_id}#0")], factor, latency)
+            }
+            Err(e) => Response::Error {
+                message: format!("set_dilation({cluster_id}, x{factor}): {e}"),
+            },
+        }
     }
 
     fn dilation_set(
@@ -6207,10 +6524,16 @@ impl Daemon {
     }
 
     fn tree_nodes(&self, tree_id: &str) -> Response {
-        let mut resp = self.with_tree(tree_id, |t| t.node_list_response());
+        let mut probes = Vec::new();
+        let mut resp = self.with_tree(tree_id, |t| {
+            probes = t.cpu_probes();
+            t.node_list_response()
+        });
         if let Response::TreeNodeList {
             dilation_policy,
             dilation_trajectory,
+            dilation_ladder,
+            live_cpu,
             ..
         } = &mut resp
         {
@@ -6223,9 +6546,170 @@ impl Daemon {
                     .iter()
                     .map(|(id, node)| (id.clone(), node.trajectory.clone()))
                     .collect();
+                **dilation_ladder = loop_
+                    .configs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, cfg)| (id.clone(), cfg.ladder.clone()))
+                    .collect();
             }
+            **live_cpu = self.cpu_members(tree_id, &probes);
         }
         resp
+    }
+
+    /// Percent per probe. A sample closer than 200 ms reuses the
+    /// previous percent and does not move the baseline.
+    fn cpu_members(
+        &self,
+        tree_id: &str,
+        probes: &[(String, u32, u32, Option<u64>)],
+    ) -> HashMap<String, Vec<CpuMember>> {
+        let mut out: HashMap<String, Vec<CpuMember>> = HashMap::new();
+        for (node_id, member, vcpus, ticks) in probes {
+            let percent = match ticks {
+                Some(ticks) => self.cpu_percent_cached(tree_id, node_id, *member, *ticks, *vcpus),
+                None => None,
+            };
+            out.entry(node_id.clone()).or_default().push(CpuMember {
+                member: *member,
+                vcpus: *vcpus,
+                cpu_percent: percent,
+            });
+        }
+        out
+    }
+
+    fn cpu_percent_cached(
+        &self,
+        tree_id: &str,
+        node_id: &str,
+        member: u32,
+        ticks: u64,
+        ncpus: u32,
+    ) -> Option<f64> {
+        let key = (tree_id.to_string(), node_id.to_string(), member);
+        let mut cache = self.cpu_ticks.lock().unwrap();
+        let now = Instant::now();
+        let hz = crate::cpu_sample::clk_tck();
+        if let Some(prev) = cache.get_mut(&key) {
+            let elapsed = now.saturating_duration_since(prev.at);
+            if elapsed < Duration::from_millis(200) {
+                return prev.percent;
+            }
+            let pct = crate::cpu_sample::cpu_percent(prev.ticks, ticks, elapsed, ncpus, hz);
+            prev.ticks = ticks;
+            prev.at = now;
+            prev.percent = pct;
+            return pct;
+        }
+        cache.insert(
+            key,
+            CpuTickSample {
+                ticks,
+                at: now,
+                percent: None,
+            },
+        );
+        None
+    }
+
+    /// Arm `mode` on the requested nodes. Validates every node before
+    /// arming any, and does not hold the trees lock across
+    /// [`Self::arm_dilation`] (that lock and the loop's nodes lock are
+    /// taken in the other order by the sample thread).
+    fn set_dilation_policy(
+        &self,
+        tree_id: &str,
+        node_id: Option<&str>,
+        mode: crate::dilation::DilationPolicyMode,
+        config: Option<&crate::dilation::DilationPolicyConfig>,
+    ) -> Response {
+        use crate::dilation::DilationPolicyMode;
+
+        let knobs = match crate::dilation::PolicyConfig::from_request(config) {
+            Ok(k) => k,
+            Err(message) => return Response::Error { message },
+        };
+        let set_cadence = config.is_some_and(|c| c.cadence_ms.is_some());
+        let targets = {
+            let trees = self.trees.lock().unwrap();
+            let Some(tree) = trees.get(tree_id) else {
+                return Response::Error {
+                    message: format!("set_dilation_policy: no such tree {tree_id}"),
+                };
+            };
+            let listed = tree.list_nodes();
+            let chosen: Vec<NodeInfo> = if let Some(id) = node_id {
+                match listed.into_iter().find(|n| n.id == id) {
+                    Some(n) => vec![n],
+                    None => {
+                        return Response::Error {
+                            message: format!("set_dilation_policy: no such node {id}"),
+                        };
+                    }
+                }
+            } else if mode == DilationPolicyMode::Fixed {
+                listed
+            } else {
+                listed
+                    .into_iter()
+                    .filter(|n| n.state == crate::tree::NodeState::Live)
+                    .collect()
+            };
+            if chosen.is_empty() {
+                return Response::Error {
+                    message: format!("set_dilation_policy({tree_id}): no node to arm"),
+                };
+            }
+            chosen
+                .into_iter()
+                .map(|n| {
+                    let factor = tree.node_dilation(&n.id).unwrap_or(1);
+                    let native = tree.node_is_native(&n.id);
+                    (n.id, factor, native, n.state)
+                })
+                .collect::<Vec<_>>()
+        };
+        if mode != DilationPolicyMode::Fixed {
+            for (id, factor, native, state) in &targets {
+                if *state != crate::tree::NodeState::Live {
+                    return Response::Error {
+                        message: format!(
+                            "set_dilation_policy: node {id} is {state:?}, adaptive needs Live"
+                        ),
+                    };
+                }
+                if !native {
+                    return Response::Error {
+                        message: format!(
+                            "dilation_policy {} needs the native backend — node {id}",
+                            mode.as_str()
+                        ),
+                    };
+                }
+                if crate::dilation::ladder_rung(&knobs.ladder, *factor).is_none() {
+                    return Response::Error {
+                        message: crate::dilation::ladder_factor_error(&knobs.ladder, *factor),
+                    };
+                }
+            }
+        }
+        let mut armed = Vec::with_capacity(targets.len());
+        for (id, factor, _, _) in &targets {
+            let cadence = set_cadence && (id == "root" || targets.len() == 1);
+            if let Err(message) = self.arm_dilation(tree_id, id, mode, &knobs, *factor, cadence) {
+                return Response::Error { message };
+            }
+            armed.push(id.clone());
+        }
+        Response::DilationPolicySet {
+            tree_id: tree_id.to_string(),
+            mode,
+            nodes: armed,
+            ladder: knobs.ladder,
+        }
     }
 
     /// Refuse an adaptive mode the live factor or the backend cannot honour.

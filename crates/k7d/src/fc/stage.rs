@@ -34,9 +34,12 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::FcError;
+
+static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// First uid/gid handed to a Firecracker VM. Override with
 /// `K7D_FC_UID_BASE`.
@@ -547,7 +550,14 @@ fn cache_read_only(
     if entry.exists() {
         return Ok(entry);
     }
-    let tmp = dir.join(format!(".{key}.tmp-{}", std::process::id()));
+    // Unique per call, not per process: the daemon stages concurrent VMs
+    // on threads, and a shared name let one copy's EEXIST cleanup unlink
+    // another's in-flight temp file (a warm pool filling on a cold cache).
+    let tmp = dir.join(format!(
+        ".{key}.tmp-{}-{}",
+        std::process::id(),
+        CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let copy = copy_sparse(src, &tmp, src_meta.size()).map_err(|e| FcError::Stage {
         path: tmp.clone(),
         message: format!("copy {} onto the jail's filesystem: {e}", src.display()),
@@ -779,6 +789,30 @@ mod tests {
         assert!(!orphan.exists(), "an unlinked entry must be collected");
         assert!(held.exists(), "an entry a jail links must survive");
         assert!(tmp.exists(), "a copy in flight must not be collected");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A warm pool boots several Firecracker pods at once on a cold
+    /// cache, so the same artifact is cached by concurrent threads.
+    #[test]
+    fn concurrent_cache_of_one_artifact_all_succeed() {
+        let base = std::env::temp_dir().join(format!("k7d-fc-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let src = base.join("artifact");
+        std::fs::write(&src, vec![7u8; 8 << 20]).expect("artifact");
+        let meta = std::fs::metadata(&src).expect("stat");
+        let entries: Vec<PathBuf> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| cache_read_only(&base, &src, &meta)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread").expect("cache_read_only"))
+                .collect()
+        });
+        assert!(entries.windows(2).all(|w| w[0] == w[1]), "{entries:?}");
+        assert_eq!(std::fs::read(&entries[0]).expect("entry").len(), 8 << 20);
         let _ = std::fs::remove_dir_all(&base);
     }
 

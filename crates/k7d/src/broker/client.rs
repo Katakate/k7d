@@ -468,10 +468,12 @@ pub fn net_tree_create(tree_id: &str, egress: &crate::netjail::EgressPolicy) -> 
 pub fn net_tap_create(
     tree_id: &str,
     indices: &[u32],
+    place: bool,
 ) -> io::Result<Vec<(super::TapInfo, OwnedFd)>> {
     let verb = Verb::NetTapCreate {
         tree_id: tree_id.to_string(),
         indices: indices.to_vec(),
+        place,
     };
     let (reply, fds) = call(&verb, &[])?;
     match reply {
