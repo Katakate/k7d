@@ -1,15 +1,23 @@
-//! Virtio-MMIO transport layer.
+//! Virtio transport layer: the device status machine, queue validation
+//! and the virtio-MMIO register decode (virtio 1.x, non-legacy).
 //!
-//! Implements the virtio-MMIO register interface (virtio 1.x, non-legacy)
-//! so the guest kernel can discover and configure virtio devices.
+//! [`MmioDevice`] is the transport-neutral core every backend sits
+//! behind. It decodes virtio-mmio itself; a device placed on the PCI
+//! bus ([`Transport::Pci`]) carries a [`VirtioPciFunction`] and is
+//! decoded by the virtio-pci methods in [`crate::pci`] against the same
+//! core.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use vm_memory::{Address, GuestAddress};
 use vmm_sys_util::eventfd::EventFd;
+
+pub use crate::pci::Transport;
+use crate::pci::{PciBus, PciFunctionState, VirtioPciFunction};
 
 // Virtio-MMIO register offsets (all 32-bit, little-endian)
 const MMIO_MAGIC: u64 = 0x000;
@@ -46,7 +54,7 @@ const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_FAILED: u32 = 128;
 
 // Interrupt status bits
-const INT_VRING: u32 = 0x01;
+pub(crate) const INT_VRING: u32 = 0x01;
 const INT_CONFIG: u32 = 0x02;
 
 /// `VIRTIO_F_VERSION_1` — bit 32 in the feature bitmap (word 1, bit 0).
@@ -686,6 +694,9 @@ pub struct MmioDevice {
     activated: bool,
     /// For vhost devices, always report `INT_VRING` (Firecracker pattern).
     is_vhost: bool,
+    /// The PCI function this device is, when it sits on the PCI bus.
+    /// `None` is a virtio-mmio device at `base_addr`.
+    pci: Option<VirtioPciFunction>,
 }
 
 impl MmioDevice {
@@ -721,12 +732,193 @@ impl MmioDevice {
             config_generation: 0,
             activated: false,
             is_vhost: false,
+            pci: None,
         }
     }
 
     /// Mark this device as a vhost device (`interrupt_status` always shows `INT_VRING`).
     pub fn set_vhost(&mut self, is_vhost: bool) {
         self.is_vhost = is_vhost;
+    }
+
+    /// Whether this is a vhost device (see [`Self::set_vhost`]).
+    #[must_use]
+    pub fn is_vhost(&self) -> bool {
+        self.is_vhost
+    }
+
+    /// Put this device on the PCI bus in `slot`, with its BAR at
+    /// `base_addr` and INTA# on `irq`. After this the device answers at
+    /// the BAR the guest programs, not at `base_addr`.
+    pub fn attach_pci(&mut self, slot: u8) -> Result<(), String> {
+        let f = VirtioPciFunction::new(slot, self.backend.device_type(), self.base_addr, self.irq)?;
+        self.pci = Some(f);
+        Ok(())
+    }
+
+    /// Which bus this device sits on.
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        if self.pci.is_some() {
+            Transport::Pci
+        } else {
+            Transport::Mmio
+        }
+    }
+
+    /// The PCI function, when this device is on the PCI bus.
+    #[must_use]
+    pub fn pci_function(&self) -> Option<&VirtioPciFunction> {
+        self.pci.as_ref()
+    }
+
+    pub(crate) fn pci_function_mut(&mut self) -> Option<&mut VirtioPciFunction> {
+        self.pci.as_mut()
+    }
+
+    /// The guest-physical window this device currently decodes:
+    /// the fixed 4 KiB virtio-mmio window, or the BAR the guest
+    /// programmed (`None` while PCI memory decoding is disabled).
+    #[must_use]
+    pub fn window(&self) -> Option<(u64, u64)> {
+        match &self.pci {
+            None => Some((self.base_addr, MMIO_DEVICE_SIZE)),
+            Some(f) => f.bar_window(),
+        }
+    }
+
+    /// Dispatch a read inside [`Self::window`] to the right decode.
+    pub fn window_read(&self, offset: u64, data: &mut [u8]) {
+        match self.transport() {
+            Transport::Mmio => self.mmio_read(offset, data),
+            Transport::Pci => self.pci_bar_read(offset, data),
+        }
+    }
+
+    /// Dispatch a write inside [`Self::window`] to the right decode.
+    pub fn window_write(&mut self, offset: u64, data: &[u8]) {
+        match self.transport() {
+            Transport::Mmio => self.mmio_write(offset, data),
+            Transport::Pci => self.pci_bar_write(offset, data),
+        }
+    }
+
+    // --- transport-neutral register primitives -------------------------
+    //
+    // Both decoders (`mmio_read`/`mmio_write` here, `pci_bar_read`/
+    // `pci_bar_write` in `pci.rs`) go through these, so the gates on
+    // feature and queue writes are stated once.
+
+    pub(crate) fn features_sel(&self) -> u32 {
+        self.features_sel
+    }
+
+    pub(crate) fn set_features_sel(&mut self, sel: u32) {
+        self.features_sel = sel;
+    }
+
+    pub(crate) fn driver_features_sel(&self) -> u32 {
+        self.driver_features_sel
+    }
+
+    pub(crate) fn set_driver_features_sel(&mut self, sel: u32) {
+        self.driver_features_sel = sel;
+    }
+
+    /// The device-feature word `features_sel` selects, with
+    /// `VIRTIO_F_VERSION_1` always set.
+    pub(crate) fn device_features_word(&self) -> u32 {
+        let features = self.backend.device_features() | VIRTIO_F_VERSION_1;
+        if self.features_sel == 0 {
+            features as u32
+        } else {
+            (features >> 32) as u32
+        }
+    }
+
+    /// The acked-feature word `driver_features_sel` selects.
+    pub(crate) fn driver_features_word(&self) -> u32 {
+        if self.driver_features_sel == 0 {
+            self.acked_features as u32
+        } else {
+            (self.acked_features >> 32) as u32
+        }
+    }
+
+    /// Driver writes one feature word; accepted only once the driver
+    /// has announced itself (`DRIVER`) and before `DRIVER_OK`.
+    pub(crate) fn write_driver_features_word(&mut self, val: u32) {
+        if self.features_ok() || self.device_status & STATUS_DRIVER != 0 {
+            let word = if self.driver_features_sel == 0 {
+                u64::from(val)
+            } else {
+                u64::from(val) << 32
+            };
+            self.acked_features |= word;
+        }
+    }
+
+    pub(crate) fn queue_sel(&self) -> u32 {
+        self.queue_sel
+    }
+
+    /// Select a queue. Out of range is still *stored*: the virtio spec
+    /// makes a driver read the queue maximum after selecting, and 0
+    /// tells it the queue does not exist, which is how Linux probes.
+    /// What must not happen is what used to: every subsequent `QUEUE_*`
+    /// write silently dropped on the floor, leaving a device the driver
+    /// believes it configured (`docs/bug-candidates.md` #41).
+    pub(crate) fn select_queue(&mut self, val: u32) {
+        if val as usize >= self.queues.len() {
+            log::error!(
+                "virtio (type={}): driver selected queue {val} of {} — \
+                 its QUEUE_NUM/DESC/AVAIL/USED writes will be discarded",
+                self.backend.device_type(),
+                self.queues.len()
+            );
+        }
+        self.queue_sel = val;
+    }
+
+    pub(crate) fn write_queue_size(&mut self, val: u32) {
+        if self.features_ok() || self.device_status & STATUS_DRIVER != 0 {
+            if let Some(q) = self.selected_queue_mut() {
+                q.size = (val & 0xffff) as u16;
+            }
+        }
+    }
+
+    pub(crate) fn write_queue_ready(&mut self, ready: bool) {
+        if let Some(q) = self.selected_queue_mut() {
+            q.ready = ready;
+        }
+    }
+
+    /// Guest kick of queue `queue`; ignored until the device is live.
+    pub(crate) fn notify(&self, queue: u32) {
+        if self.activated {
+            self.backend.queue_notify(queue);
+        }
+    }
+
+    pub(crate) fn status(&self) -> u32 {
+        self.device_status
+    }
+
+    pub(crate) fn write_status(&mut self, val: u32) {
+        self.handle_status_write(val);
+    }
+
+    pub(crate) fn config_generation(&self) -> u32 {
+        self.config_generation
+    }
+
+    pub(crate) fn backend_read_config(&self, offset: u64, data: &mut [u8]) {
+        self.backend.read_config(offset, data);
+    }
+
+    pub(crate) fn backend_write_config(&mut self, offset: u64, data: &[u8]) {
+        self.backend.write_config(offset, data);
     }
 
     /// Get the interrupt status (for injection from backend).
@@ -753,11 +945,11 @@ impl MmioDevice {
         Arc::clone(&self.irq_evt)
     }
 
-    fn selected_queue(&self) -> Option<&VirtqueueState> {
+    pub(crate) fn selected_queue(&self) -> Option<&VirtqueueState> {
         self.queues.get(self.queue_sel as usize)
     }
 
-    fn selected_queue_mut(&mut self) -> Option<&mut VirtqueueState> {
+    pub(crate) fn selected_queue_mut(&mut self) -> Option<&mut VirtqueueState> {
         self.queues.get_mut(self.queue_sel as usize)
     }
 
@@ -782,15 +974,7 @@ impl MmioDevice {
             MMIO_MAGIC => MAGIC_VALUE,
             MMIO_VERSION => MMIO_VERSION_2,
             MMIO_DEVICE_ID => self.backend.device_type(),
-            MMIO_DEVICE_FEATURES => {
-                let mut features = self.backend.device_features();
-                features |= VIRTIO_F_VERSION_1;
-                if self.features_sel == 0 {
-                    features as u32
-                } else {
-                    (features >> 32) as u32
-                }
-            }
+            MMIO_DEVICE_FEATURES => self.device_features_word(),
             MMIO_QUEUE_NUM_MAX => self.selected_queue().map_or(0, |q| q.max_size as u32),
             MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| u32::from(q.ready)),
             MMIO_INTERRUPT_STATUS => {
@@ -827,53 +1011,13 @@ impl MmioDevice {
         let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
 
         match offset {
-            MMIO_DEVICE_FEATURES_SEL => self.features_sel = val,
-            MMIO_DRIVER_FEATURES => {
-                if self.features_ok() || self.device_status & STATUS_DRIVER != 0 {
-                    let word = if self.driver_features_sel == 0 {
-                        val as u64
-                    } else {
-                        (val as u64) << 32
-                    };
-                    self.acked_features |= word;
-                }
-            }
-            MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
-            MMIO_QUEUE_SEL => {
-                // Out of range is still *stored*: the virtio spec makes a
-                // driver read `QUEUE_NUM_MAX` after selecting, and 0 tells
-                // it the queue does not exist, which is how Linux probes.
-                // What must not happen is what used to: every subsequent
-                // `QUEUE_*` write silently dropped on the floor, leaving a
-                // device the driver believes it configured
-                // (`docs/bug-candidates.md` #41).
-                if val as usize >= self.queues.len() {
-                    log::error!(
-                        "virtio-mmio (type={}): driver selected queue {val} of {} — \
-                         its QUEUE_NUM/DESC/AVAIL/USED writes will be discarded",
-                        self.backend.device_type(),
-                        self.queues.len()
-                    );
-                }
-                self.queue_sel = val;
-            }
-            MMIO_QUEUE_NUM => {
-                if self.features_ok() || self.device_status & STATUS_DRIVER != 0 {
-                    if let Some(q) = self.selected_queue_mut() {
-                        q.size = (val & 0xffff) as u16;
-                    }
-                }
-            }
-            MMIO_QUEUE_READY => {
-                if let Some(q) = self.selected_queue_mut() {
-                    q.ready = val == 1;
-                }
-            }
-            MMIO_QUEUE_NOTIFY => {
-                if self.activated {
-                    self.backend.queue_notify(val);
-                }
-            }
+            MMIO_DEVICE_FEATURES_SEL => self.set_features_sel(val),
+            MMIO_DRIVER_FEATURES => self.write_driver_features_word(val),
+            MMIO_DRIVER_FEATURES_SEL => self.set_driver_features_sel(val),
+            MMIO_QUEUE_SEL => self.select_queue(val),
+            MMIO_QUEUE_NUM => self.write_queue_size(val),
+            MMIO_QUEUE_READY => self.write_queue_ready(val == 1),
+            MMIO_QUEUE_NOTIFY => self.notify(val),
             MMIO_INTERRUPT_ACK => {
                 if self.device_status & STATUS_DRIVER_OK != 0 {
                     self.interrupt_status.fetch_and(!val, Ordering::SeqCst);
@@ -998,10 +1142,13 @@ impl MmioDevice {
     /// with correct vring base indices. This sets the MMIO device status,
     /// features, and queue addresses so the guest kernel's MMIO reads return
     /// the expected values.
-    pub fn restore_state(&mut self, state: &MmioDeviceState) {
+    pub fn restore_state(&mut self, state: &MmioDeviceState) -> Result<(), String> {
         self.device_status = state.device_status;
         self.acked_features = state.acked_features;
         self.activated = state.activated;
+        self.features_sel = state.features_sel;
+        self.driver_features_sel = state.driver_features_sel;
+        self.queue_sel = state.queue_sel;
 
         for (i, qs) in state.queues.iter().enumerate() {
             if i < self.queues.len() {
@@ -1011,6 +1158,22 @@ impl MmioDevice {
                 self.queues[i].avail_addr = GuestAddress(qs.avail_addr);
                 self.queues[i].used_addr = GuestAddress(qs.used_addr);
             }
+        }
+
+        // The guest's memory assumes the BAR and command bits it
+        // programmed; a child rebuilt with the boot-time defaults would
+        // have a device at an address the driver no longer uses.
+        match (&mut self.pci, &state.pci) {
+            (None, None) => Ok(()),
+            (Some(f), Some(s)) => f.restore(s),
+            (Some(_), None) => Err(format!(
+                "device type {} was rebuilt on the PCI bus but its snapshot carries no PCI state",
+                state.device_type
+            )),
+            (None, Some(_)) => Err(format!(
+                "device type {} snapshot carries PCI state but the device was rebuilt on virtio-mmio",
+                state.device_type
+            )),
         }
     }
 
@@ -1186,9 +1349,12 @@ fn mark_gpa_range_dirty(acc: &mut [u64], gpa: u64, len: u64) {
     }
 }
 
-/// Registry of MMIO devices for the vCPU run loop dispatcher.
+/// Registry of virtio devices for the vCPU run loop dispatcher: every
+/// virtio-mmio window and every PCI BAR, plus the PCI bus itself once a
+/// PCI device is registered.
 pub struct MmioDeviceRegistry {
     devices: Vec<Arc<Mutex<MmioDevice>>>,
+    pci_bus: Option<PciBus>,
 }
 
 impl MmioDeviceRegistry {
@@ -1197,42 +1363,119 @@ impl MmioDeviceRegistry {
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
+            pci_bus: None,
         }
     }
 
-    /// Register a device.
+    /// Register a device. The first PCI function brings the bus (host
+    /// bridge + config-space latch) with it.
     pub fn add(&mut self, device: Arc<Mutex<MmioDevice>>) {
+        if device.lock().unwrap().transport() == Transport::Pci {
+            self.pci_bus.get_or_insert_with(PciBus::new);
+        }
         self.devices.push(device);
     }
 
-    /// Dispatch an MMIO read to the appropriate device.
+    /// Whether this VM has a PCI bus (at least one PCI device).
+    #[must_use]
+    pub fn has_pci_bus(&self) -> bool {
+        self.pci_bus.is_some()
+    }
+
+    /// Dispatch an MMIO read to the device whose window holds `addr`.
     #[must_use]
     pub fn handle_read(&self, addr: u64, data: &mut [u8]) -> bool {
         for dev in &self.devices {
             let dev = dev.lock().unwrap();
-            if addr >= dev.base_addr && addr < dev.base_addr + MMIO_DEVICE_SIZE {
-                let offset = addr - dev.base_addr;
-                dev.mmio_read(offset, data);
-                log::trace!("mmio read addr={addr:#x} offset={offset:#x}");
-                return true;
+            if let Some((base, size)) = dev.window() {
+                if addr >= base && addr < base + size {
+                    let offset = addr - base;
+                    dev.window_read(offset, data);
+                    log::trace!("mmio read addr={addr:#x} offset={offset:#x}");
+                    return true;
+                }
             }
         }
         false
     }
 
-    /// Dispatch an MMIO write to the appropriate device.
+    /// Dispatch an MMIO write to the device whose window holds `addr`.
     #[must_use]
     pub fn handle_write(&self, addr: u64, data: &[u8]) -> bool {
         for dev in &self.devices {
             let mut dev = dev.lock().unwrap();
-            if addr >= dev.base_addr && addr < dev.base_addr + MMIO_DEVICE_SIZE {
-                let offset = addr - dev.base_addr;
-                log::trace!("mmio write addr={addr:#x} offset={offset:#x}");
-                dev.mmio_write(offset, data);
-                return true;
+            if let Some((base, size)) = dev.window() {
+                if addr >= base && addr < base + size {
+                    let offset = addr - base;
+                    log::trace!("mmio write addr={addr:#x} offset={offset:#x}");
+                    dev.window_write(offset, data);
+                    return true;
+                }
             }
         }
         false
+    }
+
+    /// Whether `port` is a PCI configuration port this VM answers.
+    #[must_use]
+    pub fn handles_pio(&self, port: u16) -> bool {
+        self.pci_bus.is_some() && PciBus::handles_port(port)
+    }
+
+    /// Guest `in` from a PCI configuration port. Returns `false` (data
+    /// untouched) when this VM has no PCI bus.
+    #[must_use]
+    pub fn pio_read(&self, port: u16, data: &mut [u8]) -> bool {
+        let Some(bus) = &self.pci_bus else {
+            return false;
+        };
+        if port < crate::pci::PCI_CONFIG_DATA_PORT {
+            bus.read_address(port, data);
+            return true;
+        }
+        let Some(target) = bus.target() else {
+            data.fill(0xff);
+            return true;
+        };
+        let offset = usize::from(target.offset) + PciBus::data_byte_offset(port);
+        if target.slot == 0 {
+            bus.host_bridge().read(offset, data);
+        } else {
+            match self.pci_slot(target.slot) {
+                Some(dev) => dev.lock().unwrap().pci_cfg_read(offset, data),
+                None => data.fill(0xff),
+            }
+        }
+        true
+    }
+
+    /// Guest `out` to a PCI configuration port.
+    pub fn pio_write(&mut self, port: u16, data: &[u8]) {
+        let Some(bus) = &mut self.pci_bus else {
+            return;
+        };
+        if port < crate::pci::PCI_CONFIG_DATA_PORT {
+            bus.write_address(port, data);
+            return;
+        }
+        let Some(target) = bus.target() else {
+            return;
+        };
+        let offset = usize::from(target.offset) + PciBus::data_byte_offset(port);
+        if target.slot == 0 {
+            bus.host_bridge_mut().write(offset, data);
+        } else if let Some(dev) = self.pci_slot(target.slot) {
+            dev.lock().unwrap().pci_cfg_write(offset, data);
+        }
+    }
+
+    fn pci_slot(&self, slot: u8) -> Option<&Arc<Mutex<MmioDevice>>> {
+        self.devices.iter().find(|d| {
+            d.lock()
+                .unwrap()
+                .pci_function()
+                .is_some_and(|f| f.slot() == slot)
+        })
     }
 }
 
@@ -1405,6 +1648,23 @@ pub struct MmioDeviceState {
     pub queues: Vec<VirtqueueSnapshot>,
     /// Interrupt status.
     pub interrupt_status: u32,
+    /// Which bus the device was on. Absent in snapshots written before
+    /// the PCI bus existed, which were all virtio-mmio.
+    #[serde(default)]
+    pub transport: Transport,
+    /// The guest-programmed PCI registers; present iff `transport` is
+    /// [`Transport::Pci`].
+    #[serde(default)]
+    pub pci: Option<PciFunctionState>,
+    /// `device_feature_select` / `DeviceFeaturesSel`.
+    #[serde(default)]
+    pub features_sel: u32,
+    /// `driver_feature_select` / `DriverFeaturesSel`.
+    #[serde(default)]
+    pub driver_features_sel: u32,
+    /// `queue_select` / `QueueSel`.
+    #[serde(default)]
+    pub queue_sel: u32,
 }
 
 impl MmioDevice {
@@ -1419,6 +1679,11 @@ impl MmioDevice {
             acked_features: self.acked_features,
             activated: self.activated,
             is_vhost: self.is_vhost,
+            transport: self.transport(),
+            pci: self.pci.as_ref().map(VirtioPciFunction::state),
+            features_sel: self.features_sel,
+            driver_features_sel: self.driver_features_sel,
+            queue_sel: self.queue_sel,
             queues: self
                 .queues
                 .iter()
@@ -1448,6 +1713,118 @@ impl MmioDeviceRegistry {
 
 /// Shared MMIO device registry.
 pub type SharedMmioRegistry = Arc<Mutex<MmioDeviceRegistry>>;
+
+/// First PIC line handed to virtio devices (COM1 = 4, COM2 = 3). Device
+/// `idx` takes `VIRTIO_IRQ_BASE + idx` on either transport.
+pub const VIRTIO_IRQ_BASE: u32 = 5;
+
+/// Where one virtio device sits: its virtio-mmio window or boot-time
+/// BAR base, its PIC line, and — on the PCI bus — its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// virtio-mmio window base, or the BAR base the device boots with.
+    pub base_addr: u64,
+    /// PIC line (`PCI_INTERRUPT_LINE` on the PCI bus).
+    pub irq: u32,
+    /// Slot on PCI bus 0; `None` for virtio-mmio.
+    pub pci_slot: Option<u8>,
+}
+
+impl Placement {
+    /// The `idx`-th device (0-based, creation order) of a fresh VM on
+    /// `transport`. Slot and IRQ budgets are the caller's to check.
+    #[must_use]
+    pub fn for_index(transport: Transport, idx: u32) -> Self {
+        let irq = VIRTIO_IRQ_BASE + idx;
+        match transport {
+            Transport::Mmio => Self {
+                base_addr: crate::mem_layout::MMIO_HOLE_START + u64::from(idx) * MMIO_DEVICE_SIZE,
+                irq,
+                pci_slot: None,
+            },
+            Transport::Pci => Self {
+                base_addr: crate::pci::PCI_BAR_BASE + u64::from(idx) * crate::pci::PCI_BAR_STRIDE,
+                irq,
+                pci_slot: Some((idx + 1) as u8),
+            },
+        }
+    }
+
+    /// Where a snapshotted device sat. A `transport` tag that
+    /// disagrees with the presence of PCI state is a corrupt snapshot.
+    pub fn of_state(state: &MmioDeviceState) -> Result<Self, String> {
+        let pci_slot = match (state.transport, &state.pci) {
+            (Transport::Mmio, None) => None,
+            (Transport::Pci, Some(p)) => Some(p.slot),
+            (t, p) => {
+                return Err(format!(
+                    "device type {} snapshot says transport {t} but pci state is {}",
+                    state.device_type,
+                    if p.is_some() { "present" } else { "absent" }
+                ))
+            }
+        };
+        Ok(Self {
+            base_addr: state.base_addr,
+            irq: state.irq,
+            pci_slot,
+        })
+    }
+
+    /// Which bus this placement is on.
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        if self.pci_slot.is_some() {
+            Transport::Pci
+        } else {
+            Transport::Mmio
+        }
+    }
+}
+
+/// Wire one backend into a VM: irqfd on `placement.irq`, the device
+/// object on the right bus, optional snapshot state, registry entry.
+///
+/// The one place a device is attached — the builder and both fork
+/// rebuild paths go through it, so the PCI/MMIO choice is made here
+/// and nowhere else. `make_backend` receives the irqfd because a
+/// rebuilt backend activates against it *before* the device object
+/// exists (the snapshot's queues, the seeded worker counters).
+///
+/// Every device is marked vhost: in-process workers signal the irqfd
+/// themselves, so `INTERRUPT_STATUS` / ISR must always report
+/// `INT_VRING`.
+pub fn attach_device<B: VirtioBackend + 'static>(
+    vm_fd: &VmFd,
+    registry: &SharedMmioRegistry,
+    placement: Placement,
+    restore: Option<&MmioDeviceState>,
+    make_backend: impl FnOnce(&Arc<EventFd>) -> Result<B, String>,
+) -> Result<Arc<Mutex<MmioDevice>>, String> {
+    let irq_evt =
+        crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(|e| format!("eventfd: {e}"))?;
+    vm_fd
+        .register_irqfd(&irq_evt, placement.irq)
+        .map_err(|e| format!("register irqfd for IRQ {}: {e}", placement.irq))?;
+    let irq_evt = Arc::new(irq_evt);
+    let backend = make_backend(&irq_evt)?;
+    let mut dev = MmioDevice::new(
+        placement.base_addr,
+        placement.irq,
+        irq_evt,
+        Box::new(backend),
+    );
+    dev.set_vhost(true);
+    if let Some(slot) = placement.pci_slot {
+        dev.attach_pci(slot)?;
+    }
+    if let Some(state) = restore {
+        dev.restore_state(state)?;
+    }
+    let dev = Arc::new(Mutex::new(dev));
+    registry.lock().unwrap().add(Arc::clone(&dev));
+    Ok(dev)
+}
 
 #[cfg(test)]
 mod tests {

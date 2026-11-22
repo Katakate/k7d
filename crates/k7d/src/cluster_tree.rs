@@ -1709,8 +1709,24 @@ impl ClusterSnapshotTree {
     /// per-VM identity tuples, every member restored from
     /// `members/{i}/delta.pack` + the nearest checkpoint ancestor's
     /// `members/{i}/memory.bin`.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The guest clock is rebased to real now ([`crate::fork::ClockMode::Wall`]).
     pub fn resume(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        self.resume_with_clock(node_id, crate::fork::ClockMode::Wall)
+            .map(|_| ())
+    }
+
+    /// [`Self::resume`] with an explicit kvmclock rebase.
+    ///
+    /// Returns the guest-time milliseconds the snapshot spent at rest
+    /// (the longest member). [`crate::fork::ClockMode::Frozen`] reports
+    /// the gap and does not add it.
+    #[allow(clippy::too_many_lines)]
+    pub fn resume_with_clock(
+        &mut self,
+        node_id: &NodeId,
+        clock: crate::fork::ClockMode,
+    ) -> Result<u64, TreeError> {
         let info = self
             .nodes
             .get(node_id)
@@ -1730,7 +1746,7 @@ impl ClusterSnapshotTree {
             .join(crate::fc::SUSPEND_META)
             .is_file()
         {
-            return self.resume_fc(node_id, vm_count_for_node);
+            return self.resume_fc(node_id, vm_count_for_node, clock);
         }
 
         // One delta.pack per member onto the nearest checkpoint. In-tree
@@ -1776,6 +1792,7 @@ impl ClusterSnapshotTree {
 
         let n = topology.members.len();
         let mut members: Vec<Guest> = Vec::with_capacity(n);
+        let mut at_rest_ms = 0u64;
         for (i, member_topo) in topology.members.iter().enumerate() {
             let _tap = net.add_tap_at(member_topo.vm_index).map_err(|e| {
                 TreeError::Fork(crate::fork::ForkError::Reflink(format!(
@@ -1809,11 +1826,13 @@ impl ClusterSnapshotTree {
                 apply_delta(&pack, fork_mem_addr, mem_span, mapped_identity)?
             };
 
-            let mut vm = crate::fork::build_vm_from_state_and_mem(
+            let mut vm = crate::fork::build_vm_from_state_and_mem_with_clock(
                 &state,
                 fork_mem_addr,
                 &format!("resume:{node_id}/{i}"),
+                clock,
             )?;
+            at_rest_ms = at_rest_ms.max(vm.clock_at_rest_ms());
             vm.start()?;
             vm.enable_dirty_tracking()?;
             // The pack's pages are this member's divergence from its
@@ -1854,10 +1873,22 @@ impl ClusterSnapshotTree {
         }
         self.save_metadata()?;
         log::info!("cluster_tree: resumed '{node_id}'");
-        Ok(())
+        Ok(at_rest_ms)
     }
 
-    fn resume_fc(&mut self, node_id: &NodeId, vm_count: u32) -> Result<(), TreeError> {
+    fn resume_fc(
+        &mut self,
+        node_id: &NodeId,
+        vm_count: u32,
+        clock: crate::fork::ClockMode,
+    ) -> Result<u64, TreeError> {
+        if clock == crate::fork::ClockMode::Frozen {
+            return Err(TreeError::Firecracker(
+                "clock \"frozen\" is not implemented for a Firecracker resume; \
+                 this path does not rebase kvmclock"
+                    .into(),
+            ));
+        }
         self.evict_for_incoming_no_exempt(vm_count as usize)?;
         let node_dir = self.node_dir(node_id);
         let topology = read_cluster_topology(&node_dir.join("cluster.json"))?;
@@ -1895,7 +1926,7 @@ impl ClusterSnapshotTree {
         }
         self.save_metadata()?;
         log::info!("cluster_tree: resumed Firecracker '{node_id}'");
-        Ok(())
+        Ok(0)
     }
 
     /// Permanently delete a node and all its descendants.

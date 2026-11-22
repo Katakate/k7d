@@ -612,6 +612,7 @@ fn test_fc_cluster_suspend_resume() {
         &Request::TreeResume {
             tree_id: tree_id.clone(),
             node_id: "root".into(),
+            clock: k7d::fork::ClockMode::Wall,
         },
     ) {
         Response::TreeResumed {

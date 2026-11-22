@@ -26,14 +26,23 @@ use serde::{Deserialize, Serialize};
 use crate::api::AgentClient;
 use crate::block::BlockBackend;
 use crate::devices::{
-    PipeSerialDevice, SerialTrigger, SharedPipeSerialDevice, SharedSerialDevice, SERIAL2_PORT_BASE,
-    SERIAL_PORT_BASE, SERIAL_PORT_SIZE,
+    PipeSerialDevice, SerialTrigger, SharedPipeSerialDevice, SharedSerialDevice,
+    I8042_COMMAND_PORT, I8042_RESET_PULSE, SERIAL2_PORT_BASE, SERIAL_PORT_BASE, SERIAL_PORT_SIZE,
 };
-use crate::mem_layout::{MemLayout, MMIO_HOLE_START};
+use crate::mem_layout::MemLayout;
 use crate::network::{TapDevice, TapNetBackend};
-use crate::virtio_mmio::{MmioDevice, MmioDeviceRegistry, NotQuiescent, SharedMmioRegistry};
+use crate::virtio_mmio::{
+    attach_device, MmioDeviceRegistry, NotQuiescent, Placement, SharedMmioRegistry, Transport,
+};
 use crate::virtiofs::{VirtioFsBackend, VirtiofsdProcess};
 use crate::vsock::{allocate_cid, VhostVsockBackend};
+
+// The clock owner and the live-fork engine are `impl Vm` blocks in child
+// modules: they see this module's private fields and helpers unchanged,
+// and `crate::vm::*` paths keep resolving through the re-export.
+mod clock;
+mod fork_ops;
+pub use clock::*;
 
 /// Errors from VM operations.
 #[derive(Debug, thiserror::Error)]
@@ -231,25 +240,6 @@ pub enum VmError {
     },
 }
 
-/// APIC register offsets inside the 1 KiB page `KVM_GET_LAPIC` returns.
-/// `KVM_GET_LAPIC` recomputes `TMCCT` from the backing host hrtimer as
-/// it copies the page out, so the value read here is live and not the
-/// stale one the guest last saw.
-const APIC_LVTT: usize = 0x320;
-const APIC_TMICT: usize = 0x380;
-const APIC_TMCCT: usize = 0x390;
-const APIC_TDCR: usize = 0x3E0;
-
-/// LVT mask bit — a masked timer counts down and delivers nothing.
-const APIC_LVT_MASKED: u32 = 1 << 16;
-/// LVT timer bits 18:17.
-const APIC_LVT_TIMER_MODE_SHIFT: u32 = 17;
-const APIC_LVT_TIMER_MODE_MASK: u32 = 3 << APIC_LVT_TIMER_MODE_SHIFT;
-
-/// i8254 input frequency. The PIT counts down at this rate regardless
-/// of anything the host or the guest can change.
-const PIT_FREQ_HZ: u64 = 1_193_182;
-
 /// Where one [`Vm::pause`] spent its wall time. All host time.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PauseCost {
@@ -291,546 +281,6 @@ const VCPU_STOP_RETRY_MAX: Duration = Duration::from_millis(20);
 /// after this is not slow, it is stuck, and a `pause` that returns
 /// anyway hands its caller a VM whose state nothing may read.
 const VCPU_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Femtoseconds in a nanosecond. The APIC bus cycle is ~1 ns on this
-/// host, so it is carried in femtoseconds: nanosecond units would round
-/// the very ratio the calibration exists to measure down to nothing.
-const FS_PER_NS: u64 = 1_000_000;
-
-/// What the LAPIC timer of one vCPU is programmed to do (LVT bits 18:17).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LapicTimerMode {
-    /// Counts `TMICT` down once and fires. What a NOHZ Linux guest arms
-    /// for every wakeup, and the only mode that yields a jump target.
-    OneShot,
-    /// Reloads `TMICT` and fires forever — a tick rate, not a deadline.
-    Periodic,
-    /// Fires when `IA32_TSC` passes `IA32_TSC_DEADLINE`. Needs
-    /// `CPUID.1:ECX[24]`: not reported by host kernel 6.8, reported by
-    /// 7.0, so Ubuntu guests on 7.0
-    /// register `lapic-deadline` and this is the mode they run in.
-    TscDeadline,
-    /// Bits 18:17 = 3, reserved by the SDM.
-    Reserved,
-}
-
-/// One vCPU's LAPIC timer programming, read via `KVM_GET_LAPIC`.
-#[derive(Debug, Clone, Copy)]
-pub struct LapicTimerState {
-    /// LVT timer mode.
-    pub mode: LapicTimerMode,
-    /// LVT mask bit: the countdown runs but nothing is delivered.
-    pub masked: bool,
-    /// Initial count the guest programmed (0 = never armed).
-    pub tmict: u32,
-    /// Live current count. **Zero means unarmed or already expired** —
-    /// KVM returns 0 both when `TMICT` is 0 and when the backing
-    /// hrtimer's expiry is already in the past.
-    pub tmcct: u32,
-    /// `TDCR` decoded to its divisor (1, 2, 4, … 128).
-    pub divide: u32,
-}
-
-impl LapicTimerState {
-    /// APIC bus cycles until this vCPU's one-shot timer fires, or `None`
-    /// when nothing is armed that can wake this vCPU.
-    ///
-    /// Periodic is deliberately not a target: it is a rate the guest
-    /// asked for, and a forward jump changes how many of its ticks fall
-    /// in a guest second exactly the way suspend/resume does — which is
-    /// what `KVM_KVMCLOCK_CTRL` tells the guest happened. A deadline is
-    /// a promise about *when*; a tick is not.
-    #[must_use]
-    pub fn armed_bus_cycles(&self) -> Option<u64> {
-        if self.mode != LapicTimerMode::OneShot || self.masked || self.tmcct == 0 {
-            return None;
-        }
-        Some(u64::from(self.tmcct) * u64::from(self.divide))
-    }
-
-    /// Period of a free-running periodic timer, in APIC bus cycles.
-    /// Measurement only — see [`Self::armed_bus_cycles`].
-    #[must_use]
-    pub fn periodic_bus_cycles(&self) -> Option<u64> {
-        if self.mode != LapicTimerMode::Periodic || self.masked || self.tmict == 0 {
-            return None;
-        }
-        Some(u64::from(self.tmict) * u64::from(self.divide))
-    }
-}
-
-/// Read a 32-bit APIC register out of the page `KVM_GET_LAPIC` filled.
-fn lapic_reg(regs: &[::std::os::raw::c_char; 1024], offset: usize) -> u32 {
-    let mut bytes = [0u8; 4];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = regs[offset + i] as u8;
-    }
-    u32::from_le_bytes(bytes)
-}
-
-/// `TDCR` → divisor, the same decode KVM's `update_divide_count` does.
-fn decode_divide(tdcr: u32) -> u32 {
-    let low = tdcr & 0xf;
-    let exp = ((low & 0x3) | ((low & 0x8) >> 1)) + 1;
-    1u32 << (exp & 0x7)
-}
-
-/// What Linux has left PIT channel 0 — the guest's `tick_broadcast`
-/// device (measured as the PIT) — programmed to do.
-///
-/// Read from the mode byte, because that is the only thing about the
-/// broadcast device `KVM_GET_PIT2` actually tells the truth about:
-/// channel 0's live count comes from `hrtimer_get_remaining` inside
-/// KVM (`kpit_elapsed`), and `count_load_time` is written only at reset
-/// and on a gate rising edge — never by the count writes Linux uses to
-/// arm the thing. So "when does the PIT next fire" is **not** readable,
-/// and the mode is what decides whether a jump may proceed at all.
-///
-/// The classification is Linux's own state machine
-/// (`arch/x86/kernel/i8253.c`), not the i8254 datasheet's: `pit_shutdown`
-/// writes mode 0, `pit_set_periodic` mode 2, `pit_set_oneshot` mode 4,
-/// and `pit_next_event` re-arms by writing the count with the mode left
-/// at 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PitClass {
-    /// Mode 0 — Linux's `pit_shutdown`. The broadcast device is off.
-    ///
-    /// KVM does arm one hrtimer for the count that write carries (its
-    /// mode-0 case goes to `create_pit_timer`), so for at most one
-    /// 54.9 ms span after a shutdown there is a stray pending IRQ0 this
-    /// class does not account for. Bounded by the counter's 16 bits.
-    ShutDown,
-    /// Mode 2 or 3 — a rate generator is running.
-    Periodic,
-    /// Mode 1, 4 or 5 — a one-shot is in service (`pit_set_oneshot`
-    /// plus `pit_next_event`). When it fires is not exported.
-    OneShotOpaque,
-    /// Any other mode byte, including the 0xff KVM leaves at reset:
-    /// `pit_load_count` destroys the hrtimer, so nothing is armed.
-    NoTimer,
-}
-
-/// PIT channel 0 as read by [`Vm::pit_channel0`].
-#[derive(Debug, Clone, Copy)]
-pub struct PitChannel0 {
-    /// Raw mode byte (0xff before the guest programs it).
-    pub mode: u8,
-    /// Programmed initial count; 0 means 65536 on the i8254.
-    pub count: u32,
-    /// `count / 1_193_182` — the full span of the current program, and
-    /// so the longest a PIT program can ever be (54.9 ms).
-    pub span: Duration,
-    /// What that means for a clock jump.
-    pub class: PitClass,
-}
-
-/// Where an armed timer that a forward jump must not leap over was read
-/// from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimerSource {
-    /// A vCPU's LAPIC one-shot timer (`TMCCT`).
-    LapicOneShot,
-    /// A vCPU's `IA32_TSC_DEADLINE`.
-    TscDeadline,
-    /// PIT channel 0 in one-shot mode — the broadcast device.
-    PitOneShot,
-}
-
-impl TimerSource {
-    /// Short name for counters and log lines.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimerSource::LapicOneShot => "lapic_one_shot",
-            TimerSource::TscDeadline => "tsc_deadline",
-            TimerSource::PitOneShot => "pit_one_shot",
-        }
-    }
-}
-
-/// One armed timer and how long it has left, in host time.
-#[derive(Debug, Clone, Copy)]
-pub struct ArmedTimer {
-    /// Which of the three sources reported it.
-    pub source: TimerSource,
-    /// vCPU it belongs to; `None` for the VM-scoped PIT.
-    pub cpu: Option<usize>,
-    /// Host wall time until it fires.
-    pub expires_in: Duration,
-}
-
-/// Every timer of one paused VM, read without writing anything.
-///
-/// Produced by [`Vm::sample_timers`]. The three lists are deliberately
-/// separate: only `armed` bounds a jump, `periodic` is measurement, and
-/// a non-empty `unmodelled` means the caller has no business jumping at
-/// all.
-#[derive(Debug, Clone, Default)]
-pub struct TimerSurvey {
-    /// Deadlines. A forward jump must land before the earliest of them.
-    pub armed: Vec<ArmedTimer>,
-    /// Free-running periodic timers, described and with their period.
-    pub periodic: Vec<(String, Duration)>,
-    /// Timer programming whose expiry this reader cannot read. A
-    /// non-empty list means the caller must decline: an opaque timer is
-    /// a timer that could be about to fire.
-    pub unmodelled: Vec<String>,
-    /// PIT channel 0 as it was read, kept for the measurement tables.
-    /// `None` only on a survey that never reached the PIT.
-    pub pit: Option<PitChannel0>,
-}
-
-impl TimerSurvey {
-    /// Earliest armed deadline, or `None` when nothing is armed —
-    /// which is never a licence to invent one.
-    #[must_use]
-    pub fn earliest(&self) -> Option<Duration> {
-        self.armed.iter().map(|t| t.expires_in).min()
-    }
-
-    /// Fold another member's survey in, so a cluster-wide minimum is
-    /// the minimum over every member.
-    pub fn absorb(&mut self, other: Self) {
-        self.armed.extend(other.armed);
-        self.periodic.extend(other.periodic);
-        self.unmodelled.extend(other.unmodelled);
-        self.pit = self.pit.or(other.pit);
-    }
-}
-
-/// `IA32_TSC` — the vCPU's timestamp counter.
-const MSR_IA32_TSC: u32 = 0x0000_0010;
-/// `IA32_TSC_DEADLINE` — the armed one-shot LAPIC deadline, in TSC
-/// units. Zero means *unarmed*, not "a deadline at TSC zero".
-const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
-
-/// One vCPU's timekeeping state at a single instant, read while the VM
-/// is paused. See [`Vm::sample_time_state`].
-#[derive(Debug, Clone, Copy)]
-pub struct CpuTimeSample {
-    /// `KVM_GET_MP_STATE`. See [`Self::is_halted`].
-    pub mp_state: u32,
-    /// `IA32_TSC`.
-    pub tsc: u64,
-    /// `IA32_TSC_DEADLINE`. **Zero means unarmed**, so a gap must never
-    /// be computed from a zero here.
-    pub tsc_deadline: u64,
-}
-
-impl CpuTimeSample {
-    /// Whether this vCPU was in `HLT` — the state an idle guest CPU
-    /// parks in once the haltpoll window expires.
-    #[must_use]
-    pub fn is_halted(&self) -> bool {
-        self.mp_state == kvm_bindings::KVM_MP_STATE_HALTED
-    }
-
-    /// TSC ticks until this vCPU's armed deadline; `None` when the
-    /// deadline timer is unarmed, and `Some(0)` when it is armed but
-    /// already past (the timer is about to fire).
-    ///
-    /// Divide by [`TimeSample::tsc_khz`] to get milliseconds — TSC
-    /// units and `kvmclock_ns` are different clocks and must never be
-    /// mixed.
-    #[must_use]
-    pub fn ticks_to_deadline(&self) -> Option<u64> {
-        if self.tsc_deadline == 0 {
-            return None;
-        }
-        Some(self.tsc_deadline.saturating_sub(self.tsc))
-    }
-}
-
-/// A paused VM's clocks and per-vCPU timer state. Read-only; produced
-/// by [`Vm::sample_time_state`].
-#[derive(Debug, Clone)]
-pub struct TimeSample {
-    /// `KVM_GET_CLOCK` — the kvmclock nanoseconds the guest reads.
-    pub kvmclock_ns: u64,
-    /// vCPU 0's TSC frequency: the only legal divisor for TSC deltas.
-    pub tsc_khz: u32,
-    /// Per-vCPU state, in vCPU-index order.
-    pub cpus: Vec<CpuTimeSample>,
-}
-
-/// Read one MSR off a paused vCPU.
-fn read_msr(vcpu_fd: &VcpuFd, cpu: usize, index: u32) -> Result<u64, VmError> {
-    let entries = [kvm_bindings::kvm_msr_entry {
-        index,
-        reserved: 0,
-        data: 0,
-    }];
-    let mut msrs = kvm_bindings::Msrs::from_entries(&entries).map_err(|e| VmError::GetMsr {
-        index,
-        cpu,
-        reason: format!("building the MSR list failed: {e:?}"),
-    })?;
-    match vcpu_fd.get_msrs(&mut msrs) {
-        Ok(1) => Ok(msrs.as_slice()[0].data),
-        Ok(n) => Err(VmError::GetMsr {
-            index,
-            cpu,
-            reason: format!("KVM_GET_MSRS returned {n} entries, wanted 1"),
-        }),
-        Err(e) => Err(VmError::GetMsr {
-            index,
-            cpu,
-            reason: format!("KVM_GET_MSRS: {e}"),
-        }),
-    }
-}
-
-/// Write one MSR on a paused vCPU. `Err` carries the reason only — the
-/// caller knows which vCPU and which step it was on.
-fn write_msr(vcpu_fd: &VcpuFd, index: u32, data: u64) -> Result<(), String> {
-    let entries = [kvm_bindings::kvm_msr_entry {
-        index,
-        reserved: 0,
-        data,
-    }];
-    let msrs = kvm_bindings::Msrs::from_entries(&entries)
-        .map_err(|e| format!("building the MSR list failed: {e:?}"))?;
-    match vcpu_fd.set_msrs(&msrs) {
-        Ok(1) => Ok(()),
-        Ok(n) => Err(format!("KVM_SET_MSRS wrote {n} entries, wanted 1")),
-        Err(e) => Err(format!("KVM_SET_MSRS: {e}")),
-    }
-}
-
-/// The `KVM_VCPU_TSC_CTRL` / `KVM_VCPU_TSC_OFFSET` vCPU device
-/// attribute, reading from (set) or writing to (get) `addr`.
-fn tsc_offset_attr(addr: u64) -> kvm_bindings::kvm_device_attr {
-    kvm_bindings::kvm_device_attr {
-        flags: 0,
-        group: kvm_bindings::KVM_VCPU_TSC_CTRL,
-        attr: u64::from(kvm_bindings::KVM_VCPU_TSC_OFFSET),
-        addr,
-    }
-}
-
-/// `_IOW(KVMIO, nr, struct kvm_device_attr)`. kvm-ioctls 0.19 wraps the
-/// vCPU device-attribute ioctls for aarch64 only, so on `x86_64` all
-/// three are raw calls — same style as `fork.rs`'s `KVM_KVMCLOCK_CTRL`.
-const fn kvm_device_attr_ioctl(nr: libc::c_ulong) -> libc::c_ulong {
-    0x4000_0000
-        | ((std::mem::size_of::<kvm_bindings::kvm_device_attr>() as libc::c_ulong) << 16)
-        | (0xAE << 8)
-        | nr
-}
-const KVM_SET_DEVICE_ATTR: libc::c_ulong = kvm_device_attr_ioctl(0xE1);
-const KVM_GET_DEVICE_ATTR: libc::c_ulong = kvm_device_attr_ioctl(0xE2);
-const KVM_HAS_DEVICE_ATTR: libc::c_ulong = kvm_device_attr_ioctl(0xE3);
-
-/// Issue one device-attribute ioctl on a **paused** vCPU.
-fn device_attr_ioctl(
-    vcpu_fd: &VcpuFd,
-    request: libc::c_ulong,
-    attr: &kvm_bindings::kvm_device_attr,
-    what: &str,
-) -> Result<(), String> {
-    // SAFETY: `vcpu_fd` is a live vCPU fd of a paused VM, so no
-    // `KVM_RUN` is in flight on it. `attr` outlives the call and — for
-    // the requests that use it — `attr.addr` points at a live `u64`
-    // KVM reads or writes exactly 8 bytes of.
-    if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), request, attr) } < 0 {
-        return Err(format!("{what}: {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// The VM-scoped device-attribute group the carried KVM patch in
-/// `utils/kvm-dilation` adds (`'dila'`), and its attributes: the `u32`
-/// dilation factor, and the patch's own read-only ABI generation. No
-/// mainline kernel answers device attributes on a VM fd at all, so a
-/// stock host fails the `KVM_HAS_DEVICE_ATTR` probe with `ENOTTY` and
-/// can never be mistaken for a patched one.
-const KVM_VM_DILATION: u32 = 0x6469_6c61;
-const KVM_VM_DILATION_FACTOR: u64 = 0;
-const KVM_VM_DILATION_ABI: u64 = 1;
-
-/// The patch generation that added a live factor change.
-/// Generation 1 answers `EBUSY` once any vCPU exists.
-pub const DILATION_ABI_LIVE_SET: u32 = 2;
-
-/// Largest factor the carried patch accepts (`KVM_MAX_DILATION`). The
-/// hardware TSC multiplier bounds it further, per vCPU frequency, and
-/// the kernel refuses out-of-range ratios rather than clamping them.
-pub const MAX_DILATION: u32 = 64;
-
-fn dilation_attr(addr: u64) -> kvm_bindings::kvm_device_attr {
-    kvm_bindings::kvm_device_attr {
-        flags: 0,
-        group: KVM_VM_DILATION,
-        attr: KVM_VM_DILATION_FACTOR,
-        addr,
-    }
-}
-
-/// Generation of the carried patch the loaded modules were built from.
-///
-/// The modules are built from a file in this tree and swapped in and out
-/// around a test suite, so "is this host patched" is not a sharp enough
-/// question: an edited patch whose rebuild was skipped presents as a
-/// patched host missing the behaviour the edit added, which reads as a
-/// bug in the caller rather than a stale install. Generation 1 predates
-/// the attribute and is inferred from its absence.
-///
-/// # Errors
-/// `/dev/kvm` is unusable, or the loaded modules are stock.
-pub fn host_dilation_abi() -> Result<u32, String> {
-    let kvm = Kvm::new().map_err(|e| format!("open /dev/kvm: {e}"))?;
-    let vm_fd = kvm.create_vm().map_err(|e| format!("KVM_CREATE_VM: {e}"))?;
-    vm_supports_dilation(&vm_fd)?;
-    let mut abi: u32 = 0;
-    let attr = kvm_bindings::kvm_device_attr {
-        attr: KVM_VM_DILATION_ABI,
-        ..dilation_attr(std::ptr::from_mut(&mut abi) as u64)
-    };
-    match vm_device_attr_ioctl(
-        &vm_fd,
-        KVM_GET_DEVICE_ATTR,
-        &attr,
-        "KVM_GET_DEVICE_ATTR(KVM_VM_DILATION_ABI)",
-    ) {
-        Ok(()) => Ok(abi),
-        Err(_) => Ok(1),
-    }
-}
-
-/// Issue one device-attribute ioctl on a VM fd.
-fn vm_device_attr_ioctl(
-    vm_fd: &VmFd,
-    request: libc::c_ulong,
-    attr: &kvm_bindings::kvm_device_attr,
-    what: &str,
-) -> Result<(), String> {
-    // SAFETY: `vm_fd` is a live VM fd, `attr` outlives the call, and
-    // `attr.addr` — where the request uses it — points at a live `u32`
-    // KVM reads or writes exactly 4 bytes of.
-    if unsafe { libc::ioctl(vm_fd.as_raw_fd(), request, attr) } < 0 {
-        return Err(format!("{what}: {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Whether this host runs the carried time-dilation patch.
-fn vm_supports_dilation(vm_fd: &VmFd) -> Result<(), String> {
-    vm_device_attr_ioctl(
-        vm_fd,
-        KVM_HAS_DEVICE_ATTR,
-        &dilation_attr(0),
-        "KVM_HAS_DEVICE_ATTR(KVM_VM_DILATION)",
-    )
-}
-
-/// Whether this host runs the carried time-dilation patch
-/// (`utils/kvm-dilation`), asked of a throwaway VM fd.
-///
-/// The answer comes from KVM, not from a module version string, so a
-/// stock host can never be mistaken for a dilating one.
-///
-/// # Errors
-/// The reason the host cannot dilate: either `/dev/kvm` is unusable or
-/// the loaded modules are stock.
-pub fn host_supports_dilation() -> Result<(), String> {
-    let kvm = Kvm::new().map_err(|e| format!("open /dev/kvm: {e}"))?;
-    let vm_fd = kvm.create_vm().map_err(|e| format!("KVM_CREATE_VM: {e}"))?;
-    vm_supports_dilation(&vm_fd)
-}
-
-/// Set this VM's dilation factor.
-///
-/// Legal before any vCPU exists and also on a live VM whose every
-/// vCPU is paused. The kernel is the
-/// one that decides: a runnable vCPU is `EBUSY`, because the factor
-/// rides on each vCPU's hardware TSC multiplier and half a cluster at
-/// the new rate is worse than a refusal. `pub(crate)` so restore
-/// can apply a snapshot's factor before the first vCPU
-/// exists.
-pub(crate) fn set_dilation(vm_fd: &VmFd, factor: u32) -> Result<(), String> {
-    vm_supports_dilation(vm_fd).map_err(|e| {
-        format!("this host does not expose per-VM time dilation ({e}) — install utils/kvm-dilation")
-    })?;
-    let attr = dilation_attr(std::ptr::from_ref(&factor) as u64);
-    vm_device_attr_ioctl(
-        vm_fd,
-        KVM_SET_DEVICE_ATTR,
-        &attr,
-        &format!("KVM_SET_DEVICE_ATTR(KVM_VM_DILATION) = {factor}"),
-    )?;
-    let mut got: u32 = 0;
-    let attr = dilation_attr(std::ptr::from_mut(&mut got) as u64);
-    vm_device_attr_ioctl(
-        vm_fd,
-        KVM_GET_DEVICE_ATTR,
-        &attr,
-        "KVM_GET_DEVICE_ATTR(KVM_VM_DILATION)",
-    )?;
-    if got != factor {
-        return Err(format!(
-            "the kernel kept dilation at {got} after being asked for {factor}"
-        ));
-    }
-    Ok(())
-}
-
-/// Whether this vCPU's kernel knows the TSC-offset attribute at all
-/// (`KVM_CAP_VCPU_ATTRIBUTES`, Linux 5.18+). `addr` is ignored.
-fn has_tsc_offset_attr(vcpu_fd: &VcpuFd) -> Result<(), String> {
-    device_attr_ioctl(
-        vcpu_fd,
-        KVM_HAS_DEVICE_ATTR,
-        &tsc_offset_attr(0),
-        "KVM_HAS_DEVICE_ATTR(KVM_VCPU_TSC_CTRL/KVM_VCPU_TSC_OFFSET)",
-    )
-}
-
-/// `KVM_KVMCLOCK_CTRL` — `_IO(KVMIO, 0xad)`. Tells the guest its
-/// pvclock page was "guest stopped", so a forward jump is a suspend it
-/// touches its watchdogs for instead of a stall it reports.
-const KVM_KVMCLOCK_CTRL: libc::c_ulong = (0xAE << 8) | 0xAD;
-
-/// Mark one paused vCPU's pvclock page "guest stopped".
-///
-/// `EINVAL` means this vCPU never registered a pvclock page
-/// (`MSR_KVM_SYSTEM_TIME_NEW`), so there is nowhere to record the
-/// suspend — the honest answer for a guest that has no kvmclock.
-pub(crate) fn kvmclock_ctrl(vcpu_fd: &VcpuFd) -> Result<(), String> {
-    // SAFETY: `vcpu_fd` is a live vCPU fd of a stopped/paused VM;
-    // KVM_KVMCLOCK_CTRL takes no argument.
-    if unsafe { libc::ioctl(vcpu_fd.as_raw_fd(), KVM_KVMCLOCK_CTRL) } < 0 {
-        return Err(format!(
-            "KVM_KVMCLOCK_CTRL: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-/// Read one paused vCPU's TSC offset (guest TSC − host TSC, in that
-/// vCPU's own ticks).
-fn read_tsc_offset(vcpu_fd: &VcpuFd) -> Result<u64, String> {
-    let mut offset: u64 = 0;
-    let attr = tsc_offset_attr(std::ptr::from_mut(&mut offset) as u64);
-    device_attr_ioctl(
-        vcpu_fd,
-        KVM_GET_DEVICE_ATTR,
-        &attr,
-        "KVM_GET_DEVICE_ATTR(KVM_VCPU_TSC_OFFSET)",
-    )?;
-    Ok(offset)
-}
-
-/// Write one paused vCPU's TSC offset.
-fn write_tsc_offset(vcpu_fd: &VcpuFd, offset: u64) -> Result<(), String> {
-    let attr = tsc_offset_attr(std::ptr::from_ref(&offset) as u64);
-    device_attr_ioctl(
-        vcpu_fd,
-        KVM_SET_DEVICE_ATTR,
-        &attr,
-        &format!("KVM_SET_DEVICE_ATTR(KVM_VCPU_TSC_OFFSET) = {offset:#x}"),
-    )
-}
 
 // x86_64 memory layout constants
 const ZERO_PAGE_START: u64 = 0x7000;
@@ -877,11 +327,12 @@ const E820_RESERVED: u32 = 2;
 // MMIO device addresses — placed in the 32-bit MMIO hole, so
 // they never overlap guest RAM regardless of how much RAM the guest has
 // and always stay addressable in 32 bits.
-const MMIO_IRQ_BASE: u32 = 5; // IRQ 5+ for virtio devices (COM1=4, COM2=3)
-/// Guest boots `noapic` (8259 PIC, IRQs 0..=15). Each virtio-mmio
-/// device takes `MMIO_IRQ_BASE + idx`; IRQ 16+ makes `request_irq`
-/// return `-EINVAL` and the device never appears (`virtio_net`
-/// probe -22). IOAPIC has 24 pins but this guest does not use it.
+const MMIO_IRQ_BASE: u32 = crate::virtio_mmio::VIRTIO_IRQ_BASE; // IRQ 5+ for virtio devices (COM1=4, COM2=3)
+/// Guest boots `noapic` (8259 PIC, IRQs 0..=15). Each virtio device
+/// (mmio window or PCI `INTx`) takes `MMIO_IRQ_BASE + idx`; IRQ 16+ makes
+/// `request_irq` return `-EINVAL` and the device never appears
+/// (`virtio_net` probe -22). IOAPIC has 24 pins but this guest does not
+/// use it.
 const PIC_IRQ_MAX: u32 = 15;
 const MMIO_DEVICE_BUDGET: usize = (PIC_IRQ_MAX - MMIO_IRQ_BASE + 1) as usize;
 
@@ -1042,6 +493,8 @@ pub struct VmBuilder {
     /// Advertise `CPUID.1:ECX[24]` so the guest arms the TSC-deadline
     /// timer. See [`Self::tsc_deadline_timer`].
     tsc_deadline: bool,
+    /// Which bus the virtio devices sit on. See [`Self::transport`].
+    transport: Transport,
 }
 
 impl Default for VmBuilder {
@@ -1244,7 +697,21 @@ impl VmBuilder {
             docker: false,
             dilation: 1,
             tsc_deadline: false,
+            transport: Transport::Mmio,
         }
+    }
+
+    /// Which bus the virtio devices sit on. [`Transport::Mmio`] is the
+    /// default and what every k7d guest so far boots. [`Transport::Pci`]
+    /// puts every device behind a legacy PCI bus (`crate::pci`): no
+    /// `virtio_mmio.device=` tokens are emitted, the cmdline must not
+    /// carry `pci=off`, and it must keep `noapic` — `INTx` rides the 8259
+    /// lines, and a multi-vCPU guest that enables its IOAPIC would look
+    /// for `MPTable` PCI routing entries this VMM does not write.
+    #[must_use]
+    pub fn transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Set the path to the kernel image (vmlinux ELF).
@@ -1259,6 +726,18 @@ impl VmBuilder {
     pub fn initrd(mut self, path: impl AsRef<Path>) -> Self {
         self.initrd_path = Some(path.as_ref().to_path_buf());
         self
+    }
+
+    /// Boot what the installed disk's bootloader entries say: kernel,
+    /// initrd and command line from a [`crate::bls::DiskBoot`]. The
+    /// disk itself still has to be attached with
+    /// [`Self::block_device`]; this only replaces the external
+    /// kernel/initrd pair and the base command line.
+    #[must_use]
+    pub fn boot_from(self, boot: &crate::bls::DiskBoot) -> Self {
+        self.kernel(&boot.kernel)
+            .initrd(&boot.initrd)
+            .cmdline(&boot.cmdline)
     }
 
     /// Set both kernel and initrd from [`default_guest_paths`], which
@@ -1681,52 +1160,63 @@ impl VmBuilder {
         let mut full_cmdline = self.cmdline.clone();
         let mmio_registry = Arc::new(std::sync::Mutex::new(MmioDeviceRegistry::new()));
 
-        // Every virtio-mmio device consumes one PIC IRQ
-        // (`MMIO_IRQ_BASE + idx`). The guest boots `noapic`, so IRQ 16+
-        // is not requestable and the device probe fails (-EINVAL).
+        // Every virtio device consumes one PIC IRQ (`MMIO_IRQ_BASE +
+        // idx`) on either transport. The guest boots `noapic`, so IRQ
+        // 16+ is not requestable and the device probe fails (-EINVAL).
         let mmio_devices = usize::from(self.vsock_enabled)
             + self.virtiofs_shares.len()
             + self.block_devices.len()
             + usize::from(self.network.is_some());
         if mmio_devices > MMIO_DEVICE_BUDGET {
             return Err(VmError::Pipe(std::io::Error::other(format!(
-                "{mmio_devices} virtio-mmio devices exceed the PIC IRQ budget \
+                "{mmio_devices} virtio devices exceed the PIC IRQ budget \
                  (IRQs {MMIO_IRQ_BASE}..={PIC_IRQ_MAX}, at most {MMIO_DEVICE_BUDGET} devices) — reduce \
                  block devices / virtiofs shares / image slots"
             ))));
         }
 
+        // A PCI guest discovers its devices by probing the bus, so the
+        // cmdline carries no `virtio_mmio.device=` tokens — and must not
+        // turn the bus off or route its interrupts through an IOAPIC
+        // this VMM gives no PCI routing for (see `VmBuilder::transport`).
+        let transport = self.transport;
+        if transport == Transport::Pci {
+            let tokens: Vec<&str> = self.cmdline.split_whitespace().collect();
+            if tokens.contains(&"pci=off") {
+                return Err(VmError::Pipe(std::io::Error::other(
+                    "transport=pci but the kernel cmdline carries `pci=off` — the guest \
+                     would never probe the bus and see no devices; drop the token",
+                )));
+            }
+            if !tokens.contains(&"noapic") {
+                return Err(VmError::Pipe(std::io::Error::other(
+                    "transport=pci requires `noapic` on the kernel cmdline: INTx is \
+                     delivered on 8259 lines and no MPTable PCI routing is written",
+                )));
+            }
+        }
+
         let mut next_slot: u32 = 0;
-        let mmio_slot = |idx: u32| -> (u64, u32) {
-            (
-                MMIO_HOLE_START + u64::from(idx) * 0x1000,
-                MMIO_IRQ_BASE + idx,
-            )
+        let placement = |idx: u32| Placement::for_index(transport, idx);
+        let device_token = |p: &Placement| match transport {
+            Transport::Mmio => format!(" virtio_mmio.device=4K@0x{:x}:{}", p.base_addr, p.irq),
+            Transport::Pci => String::new(),
         };
+        let attach_err = |e: String| VmError::Pipe(std::io::Error::other(e));
 
         if self.vsock_enabled {
-            let (base, irq) = mmio_slot(next_slot);
+            let p = placement(next_slot);
             next_slot += 1;
-
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-            let irq_evt = Arc::new(irq_evt);
-
-            let vsock_backend = VhostVsockBackend::new(self.guest_cid, mem_host_addr, mem_span)
-                .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(vsock_backend));
-            dev.set_vhost(true);
-            let mmio_dev = Arc::new(std::sync::Mutex::new(dev));
-
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
-
-            // Add virtio_mmio.device= to kernel cmdline
-            full_cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{base:x}:{irq}"));
-            log::info!("virtio-mmio vsock at {base:#x} irq {irq}");
+            attach_device(&vm_fd, &mmio_registry, p, None, |_| {
+                VhostVsockBackend::new(self.guest_cid, mem_host_addr, mem_span)
+            })
+            .map_err(attach_err)?;
+            full_cmdline.push_str(&device_token(&p));
+            log::info!(
+                "virtio-{transport} vsock at {:#x} irq {}",
+                p.base_addr,
+                p.irq
+            );
         }
 
         // Spawn one virtiofsd per share, register one virtio-fs MMIO
@@ -1757,7 +1247,7 @@ impl VmBuilder {
             let _ = std::fs::create_dir_all(&socket_dir);
 
             for (idx, share) in self.virtiofs_shares.iter().enumerate() {
-                let (base, irq) = mmio_slot(next_slot);
+                let p = placement(next_slot);
                 next_slot += 1;
 
                 let tag = if idx == 0 {
@@ -1775,31 +1265,23 @@ impl VmBuilder {
                 )
                 .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
 
-                let irq_evt =
-                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
-                vm_fd
-                    .register_irqfd(&irq_evt, irq)
-                    .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-                let irq_evt = Arc::new(irq_evt);
+                attach_device(&vm_fd, &mmio_registry, p, None, |_| {
+                    VirtioFsBackend::new(
+                        &socket_path,
+                        &tag,
+                        mem_host_addr,
+                        mem_span,
+                        mem_fd_for_virtiofs,
+                    )
+                })
+                .map_err(attach_err)?;
 
-                let fs_backend = VirtioFsBackend::new(
-                    &socket_path,
-                    &tag,
-                    mem_host_addr,
-                    mem_span,
-                    mem_fd_for_virtiofs,
-                )
-                .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-
-                let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(fs_backend));
-                dev.set_vhost(true);
-                let mmio_dev = Arc::new(std::sync::Mutex::new(dev));
-                mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
-
-                full_cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{base:x}:{irq}"));
+                full_cmdline.push_str(&device_token(&p));
                 log::info!(
-                    "virtio-mmio virtiofs[{idx}] tag={tag} ro={} at {base:#x} irq {irq}",
-                    share.readonly
+                    "virtio-{transport} virtiofs[{idx}] tag={tag} ro={} at {:#x} irq {}",
+                    share.readonly,
+                    p.base_addr,
+                    p.irq
                 );
 
                 virtiofsd_processes.push(vfsd);
@@ -1844,33 +1326,22 @@ impl VmBuilder {
                     if blk.readonly { "ro" } else { "rw" }
                 ));
             }
-            let (base, irq) = mmio_slot(next_slot);
+            let p = placement(next_slot);
             next_slot += 1;
 
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-            let irq_evt = Arc::new(irq_evt);
-
-            let blk_backend =
+            attach_device(&vm_fd, &mmio_registry, p, None, |_| {
                 BlockBackend::new(&blk.host_path, blk.readonly, mem_host_addr, mem_span)
-                    .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
+            })
+            .map_err(attach_err)?;
 
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(blk_backend));
-            // The worker signals the irqfd directly (like TapNetBackend), so
-            // INTERRUPT_STATUS must always report INT_VRING.
-            dev.set_vhost(true);
-            let mmio_dev = Arc::new(std::sync::Mutex::new(dev));
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
-
-            full_cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{base:x}:{irq}"));
+            full_cmdline.push_str(&device_token(&p));
             log::info!(
-                "virtio-mmio blk[{idx}] file={} ro={} mount={:?} at {base:#x} irq {irq}",
+                "virtio-{transport} blk[{idx}] file={} ro={} mount={:?} at {:#x} irq {}",
                 blk.host_path.display(),
                 blk.readonly,
-                blk.mount
+                blk.mount,
+                p.base_addr,
+                p.irq
             );
         }
         if !blk_mount_specs.is_empty() {
@@ -1902,29 +1373,20 @@ impl VmBuilder {
             // we don't bump `next_slot` after consuming it. If you
             // add another device family after net here, reinstate
             // `next_slot += 1;` to keep the counter honest.
-            let (base, irq) = mmio_slot(next_slot);
+            let p = placement(next_slot);
 
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(VmError::Pipe)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| VmError::Pipe(std::io::Error::other(e)))?;
-            let irq_evt = Arc::new(irq_evt);
+            attach_device(&vm_fd, &mmio_registry, p, None, |_| {
+                Ok(TapNetBackend::new(
+                    net_config.tap.mac(),
+                    net_config.tap.fd(),
+                    mem_host_addr,
+                    mem_span,
+                ))
+            })
+            .map_err(attach_err)?;
 
-            let net_backend = TapNetBackend::new(
-                net_config.tap.mac(),
-                net_config.tap.fd(),
-                mem_host_addr,
-                mem_span,
-            );
-
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(net_backend));
-            dev.set_vhost(true);
-            let mmio_dev = Arc::new(std::sync::Mutex::new(dev));
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
-
-            full_cmdline.push_str(&format!(" virtio_mmio.device=4K@0x{base:x}:{irq}"));
-            log::info!("virtio-mmio net at {base:#x} irq {irq}");
+            full_cmdline.push_str(&device_token(&p));
+            log::info!("virtio-{transport} net at {:#x} irq {}", p.base_addr, p.irq);
 
             guest_ip = Some(net_config.tap.guest_ip());
             tap_device = Some(net_config.tap);
@@ -2115,6 +1577,7 @@ impl VmBuilder {
             docker_disk: self.docker_disk,
             dilation: self.dilation,
             dilation_peak: self.dilation,
+            clock_at_rest_ms: 0,
         })
     }
 }
@@ -2265,6 +1728,11 @@ pub struct Vm {
     /// snapshot refusal asks, because dropping the factor back to 1 does
     /// not bring the guest's clock back out of the host's future.
     dilation_peak: u32,
+    /// Guest-time milliseconds the snapshot this VM was restored from
+    /// spent at rest (`(now − capture) × dilation`). `0` for a cold
+    /// boot, a snapshot with no kvmclock reading, and a [`crate::fork::ClockMode::Frozen`]
+    /// restore still reports the gap — frozen only skips adding it.
+    clock_at_rest_ms: u64,
 }
 
 /// Outcome of preparing a VM as a fork source.
@@ -2308,8 +1776,21 @@ impl Vm {
     ///
     /// The restored VM gets a new vsock CID. Memory is mapped copy-on-write
     /// from the snapshot's `memory.bin` — no upfront copy, O(1) time.
+    /// The guest clock is rebased to real now ([`crate::fork::ClockMode::Wall`]).
+    /// [`Self::restore_with_clock`] selects `frozen` instead.
     pub fn restore(snapshot_dir: &std::path::Path) -> Result<Self, crate::fork::RestoreError> {
         crate::fork::restore_vm(snapshot_dir)
+    }
+
+    /// [`Self::restore`] with an explicit kvmclock rebase.
+    ///
+    /// [`crate::fork::ClockMode::Wall`] matches [`Self::restore`].
+    /// [`crate::fork::ClockMode::Frozen`] does not add the at-rest gap.
+    pub fn restore_with_clock(
+        snapshot_dir: &std::path::Path,
+        clock: crate::fork::ClockMode,
+    ) -> Result<Self, crate::fork::RestoreError> {
+        crate::fork::restore_vm_with_clock(snapshot_dir, clock)
     }
 
     /// Internal constructor for a VM restored from snapshot with proper `GuestMemoryMmap`.
@@ -2390,29 +1871,20 @@ impl Vm {
             docker_disk: None,
             dilation,
             dilation_peak: dilation,
+            clock_at_rest_ms: 0,
         }
     }
 
-    /// This VM's time dilation factor **now**: guest time runs this many
-    /// times faster than wall time. 1 unless [`VmBuilder::dilation`]
-    /// asked for more, the snapshot it was restored from
-    /// was taken at more, or [`Self::set_dilation_live`]
-    /// changed it since.
+    /// Guest-time milliseconds this VM's snapshot spent at rest.
+    ///
+    /// Written when the VM is restored. `0` until then.
     #[must_use]
-    pub fn dilation(&self) -> u32 {
-        self.dilation
+    pub fn clock_at_rest_ms(&self) -> u64 {
+        self.clock_at_rest_ms
     }
 
-    /// The highest factor this VM has ever run at.
-    ///
-    /// Not the same question as [`Self::dilation`]: a VM whose factor
-    /// has been dropped back to 1 has a stock *rate* but a guest clock
-    /// still sitting in the host's future (CHALLENGES #191). Capture
-    /// records the *current* factor; the peak is for
-    /// observers, not a fork refusal.
-    #[must_use]
-    pub fn dilation_peak(&self) -> u32 {
-        self.dilation_peak
+    pub(crate) fn set_clock_at_rest_ms(&mut self, ms: u64) {
+        self.clock_at_rest_ms = ms;
     }
 
     /// Host path of this VM's scratch image, when it has one.
@@ -2968,317 +2440,6 @@ impl Vm {
         self.vcpus
     }
 
-    /// Read this VM's clocks and per-vCPU timer state without writing
-    /// anything (the clock survey).
-    ///
-    /// **Paused-only.** Between [`Self::start`] and [`Self::pause`] the
-    /// `VcpuFd`s live inside the run threads, so any vCPU ioctl issued
-    /// here would race `KVM_RUN`. This returns [`VmError::NotPaused`]
-    /// rather than sampling whatever subset of fds happens to be back.
-    ///
-    /// Nothing in this path writes a clock, an MSR, or a TSC offset.
-    pub fn sample_time_state(&self) -> Result<TimeSample, VmError> {
-        let want = self.require_paused("sample_time_state")?;
-        let clock = self.vm_fd.get_clock().map_err(VmError::GetClock)?;
-        let tsc_khz = self.vcpu_fds[0].get_tsc_khz().map_err(VmError::GetTscKhz)?;
-        let mut cpus = Vec::with_capacity(want);
-        for (cpu, vcpu_fd) in self.vcpu_fds.iter().enumerate() {
-            let mp_state = vcpu_fd.get_mp_state().map_err(VmError::GetMpState)?;
-            cpus.push(CpuTimeSample {
-                mp_state: mp_state.mp_state,
-                tsc: read_msr(vcpu_fd, cpu, MSR_IA32_TSC)?,
-                tsc_deadline: read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)?,
-            });
-        }
-        Ok(TimeSample {
-            kvmclock_ns: clock.clock,
-            tsc_khz,
-            cpus,
-        })
-    }
-
-    /// One paused vCPU's LAPIC timer programming.
-    ///
-    /// On a host whose `KVM_GET_SUPPORTED_CPUID` does not report
-    /// `CPUID.1:ECX[24]` (AMD, kernel 6.8) `IA32_TSC_DEADLINE` reads
-    /// zero on every vCPU and this — the LAPIC one-shot counter — is the
-    /// timer an auto-warp policy has to read. Where the bit is reported
-    /// (Intel, kernel 7.0) the mode here is [`LapicTimerMode::TscDeadline`],
-    /// `TMCCT` is meaningless, and the deadline MSR is the target.
-    pub fn lapic_timer(&self, cpu: usize) -> Result<LapicTimerState, VmError> {
-        self.require_paused("lapic_timer")?;
-        let regs = self.vcpu_fds[cpu]
-            .get_lapic()
-            .map_err(|e| VmError::GetLapic {
-                cpu,
-                reason: format!("KVM_GET_LAPIC: {e}"),
-            })?
-            .regs;
-        let lvtt = lapic_reg(&regs, APIC_LVTT);
-        let mode = match (lvtt & APIC_LVT_TIMER_MODE_MASK) >> APIC_LVT_TIMER_MODE_SHIFT {
-            0 => LapicTimerMode::OneShot,
-            1 => LapicTimerMode::Periodic,
-            2 => LapicTimerMode::TscDeadline,
-            _ => LapicTimerMode::Reserved,
-        };
-        Ok(LapicTimerState {
-            mode,
-            masked: lvtt & APIC_LVT_MASKED != 0,
-            tmict: lapic_reg(&regs, APIC_TMICT),
-            tmcct: lapic_reg(&regs, APIC_TMCCT),
-            divide: decode_divide(lapic_reg(&regs, APIC_TDCR)),
-        })
-    }
-
-    /// PIT channel 0 — the guest's `tick_broadcast` device. See
-    /// [`PitClass`] for why this reports a classification and not a
-    /// time to expiry.
-    pub fn pit_channel0(&self) -> Result<PitChannel0, VmError> {
-        let pit = self
-            .vm_fd
-            .get_pit2()
-            .map_err(|e| VmError::GetPit(e.to_string()))?;
-        let ch = &pit.channels[0];
-        // Count 0 means 65536 on the i8254, never "no timer".
-        let count = if ch.count == 0 { 65_536 } else { ch.count };
-        let class = if ch.gate == 0 {
-            PitClass::NoTimer
-        } else {
-            match ch.mode {
-                0 => PitClass::ShutDown,
-                2 | 3 => PitClass::Periodic,
-                1 | 4 | 5 => PitClass::OneShotOpaque,
-                _ => PitClass::NoTimer,
-            }
-        };
-        Ok(PitChannel0 {
-            mode: ch.mode,
-            count,
-            span: Duration::from_nanos(u64::from(count) * 1_000_000_000 / PIT_FREQ_HZ),
-            class,
-        })
-    }
-
-    /// Every timer of this paused VM that a forward clock jump must not
-    /// leap over.
-    ///
-    /// `bus_cycle_fs` is the measured length of one APIC bus cycle in
-    /// **femtoseconds** — [`Self::calibrate_apic_bus_cycle_fs`]
-    /// produces it. Passing a guessed one turns every `TMCCT` reading
-    /// into a wrong deadline, which is why it is a parameter and not a
-    /// constant; femtoseconds because a cycle is ~1 ns here, so
-    /// nanosecond units would round the ratio to nothing. `None` is
-    /// "not calibrated": legitimate for a guest whose vCPUs all run the
-    /// TSC-deadline timer (there is no count to convert), and any
-    /// one-shot or periodic count met without it is reported as
-    /// unmodelled rather than converted by a guess.
-    pub fn sample_timers(&self, bus_cycle_fs: Option<u64>) -> Result<TimerSurvey, VmError> {
-        let want = self.require_paused("sample_timers")?;
-        let mut survey = TimerSurvey::default();
-        // A 32-bit count at divisor 128 is 5.5e11 cycles, so the
-        // product stays inside a u64 for any bus cycle under ~30 µs.
-        let bus = |cycles: u64| {
-            bus_cycle_fs.map(|fs| Duration::from_nanos(cycles.saturating_mul(fs) / FS_PER_NS))
-        };
-
-        for cpu in 0..want {
-            let vcpu_fd = &self.vcpu_fds[cpu];
-            let lapic = self.lapic_timer(cpu)?;
-            if let Some(cycles) = lapic.armed_bus_cycles() {
-                match bus(cycles) {
-                    Some(expires_in) => survey.armed.push(ArmedTimer {
-                        source: TimerSource::LapicOneShot,
-                        cpu: Some(cpu),
-                        expires_in,
-                    }),
-                    None => survey.unmodelled.push(format!(
-                        "vCPU {cpu} LAPIC one-shot armed ({cycles} bus cycles) with the APIC \
-                         bus cycle uncalibrated"
-                    )),
-                }
-            }
-            if let Some(cycles) = lapic.periodic_bus_cycles() {
-                match bus(cycles) {
-                    Some(period) => survey
-                        .periodic
-                        .push((format!("vCPU {cpu} LAPIC periodic"), period)),
-                    None => survey.unmodelled.push(format!(
-                        "vCPU {cpu} LAPIC periodic ({cycles} bus cycles) with the APIC bus \
-                         cycle uncalibrated"
-                    )),
-                }
-            }
-            if lapic.mode == LapicTimerMode::Reserved && !lapic.masked {
-                survey
-                    .unmodelled
-                    .push(format!("vCPU {cpu} LVT timer mode 3 (reserved)"));
-            }
-
-            // Zero is unarmed, never "a deadline at TSC zero". Never
-            // armed where the host kernel does not advertise
-            // CPUID.1:ECX[24] (6.8); the live timer of every Ubuntu
-            // vCPU where it does (7.0).
-            let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)?;
-            if deadline != 0 {
-                let tsc = read_msr(vcpu_fd, cpu, MSR_IA32_TSC)?;
-                let tsc_khz = vcpu_fd.get_tsc_khz().map_err(VmError::GetTscKhz)?;
-                let ticks = deadline.saturating_sub(tsc);
-                survey.armed.push(ArmedTimer {
-                    source: TimerSource::TscDeadline,
-                    cpu: Some(cpu),
-                    expires_in: Duration::from_nanos(
-                        ticks.saturating_mul(1_000_000) / u64::from(tsc_khz).max(1),
-                    ),
-                });
-            }
-        }
-
-        let pit = self.pit_channel0()?;
-        survey.pit = Some(pit);
-        match pit.class {
-            PitClass::ShutDown | PitClass::NoTimer => {}
-            PitClass::Periodic => survey
-                .periodic
-                .push(("PIT channel 0 rate generator".to_string(), pit.span)),
-            // The broadcast device is in service and KVM exports no
-            // remaining time for it. This is the one case the spec
-            // singles out — the wakeup of the *most* idle CPU — so it
-            // is a decline, not a bound invented from `count`.
-            PitClass::OneShotOpaque => survey.unmodelled.push(format!(
-                "PIT channel 0 one-shot in service (mode {}, span {:?}); \
-                 KVM_GET_PIT2 exports no remaining time for channel 0",
-                pit.mode, pit.span
-            )),
-        }
-        Ok(survey)
-    }
-
-    /// Whether any vCPU of this paused VM has a one-shot LAPIC count
-    /// running — the only thing [`Self::calibrate_apic_bus_cycle_fs`]
-    /// can measure against, and the only reading that needs its result.
-    /// `false` on a guest whose vCPUs all arm the TSC-deadline timer
-    /// (Intel hosts that advertise `CPUID.1:ECX[24]`): there, a
-    /// calibration attempt would fail every cycle, forever, for a
-    /// number nothing would consume.
-    pub fn has_armed_lapic_one_shot(&self) -> Result<bool, VmError> {
-        let want = self.require_paused("has_armed_lapic_one_shot")?;
-        for cpu in 0..want {
-            if self.lapic_timer(cpu)?.armed_bus_cycles().is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Measure how long one APIC bus cycle is, in femtoseconds, on this
-    /// host.
-    ///
-    /// KVM computes `TMCCT` as `(target_expiration − now) / (bus cycle ×
-    /// divisor)`, and `now` is host time that keeps running while the
-    /// guest is paused. So two reads of one armed one-shot timer,
-    /// `window` apart, give the bus cycle directly — no constant lifted
-    /// out of a kernel header that a later kernel made a module
-    /// parameter.
-    ///
-    /// **Paused-only**, and it costs `window` of pause: call it once and
-    /// keep the answer. Fails loudly when no vCPU has an armed one-shot
-    /// timer far enough out to measure against, because a policy with
-    /// no calibration must decline rather than guess.
-    pub fn calibrate_apic_bus_cycle_fs(&self, window: Duration) -> Result<u64, VmError> {
-        let want = self.require_paused("calibrate_apic_bus_cycle_fs")?;
-        // The vCPU whose one-shot timer is furthest out: it is the one
-        // most likely to still be counting after the window.
-        let mut best: Option<(usize, LapicTimerState)> = None;
-        for cpu in 0..want {
-            let st = self.lapic_timer(cpu)?;
-            if st.armed_bus_cycles().is_some()
-                && best.is_none_or(|(_, b)| st.armed_bus_cycles() > b.armed_bus_cycles())
-            {
-                best = Some((cpu, st));
-            }
-        }
-        let (cpu, before) = best.ok_or_else(|| VmError::ApicUncalibrated {
-            reason: "no vCPU has an armed one-shot LAPIC timer to measure against".to_string(),
-        })?;
-
-        let started = Instant::now();
-        std::thread::sleep(window);
-        let elapsed_ns = started.elapsed().as_nanos();
-        let after = self.lapic_timer(cpu)?;
-
-        if after.mode != before.mode || after.divide != before.divide {
-            return Err(VmError::ApicUncalibrated {
-                reason: format!(
-                    "vCPU {cpu}'s timer was reprogrammed mid-window \
-                     ({:?}/{} → {:?}/{})",
-                    before.mode, before.divide, after.mode, after.divide
-                ),
-            });
-        }
-        let dropped = before.tmcct.checked_sub(after.tmcct).filter(|d| *d > 0);
-        let Some(dropped) = dropped.filter(|_| after.tmcct > 0) else {
-            return Err(VmError::ApicUncalibrated {
-                reason: format!(
-                    "vCPU {cpu}'s count went {} → {} over {elapsed_ns}ns — \
-                     the timer expired inside the window",
-                    before.tmcct, after.tmcct
-                ),
-            });
-        };
-        let cycles = u128::from(dropped) * u128::from(before.divide);
-        // The window is wall time; the count drained in guest time, which
-        // under dilation runs `dilation` times faster. Reporting the guest
-        // figure is what keeps every consumer of this number — ε, the
-        // minimum jump, the 30 s cap, the deadline a jump targets — in the
-        // one unit the guest's own timers are in. At 1x it
-        // is the identity.
-        let guest_ns = elapsed_ns * u128::from(self.dilation);
-        let bus_cycle_fs = u64::try_from(guest_ns * u128::from(FS_PER_NS) / cycles).unwrap_or(0);
-        // The SDM fixes no bus frequency, and KVM's is a compile-time
-        // 1 ns on this kernel (a module parameter from 6.12). Anything
-        // outside 0.1–100 ns is a misread, not a host with an unusual
-        // APIC.
-        if !(100_000..=100_000_000).contains(&bus_cycle_fs) {
-            return Err(VmError::ApicUncalibrated {
-                reason: format!(
-                    "measured {bus_cycle_fs}fs per bus cycle from a {dropped}-count drop \
-                     over {elapsed_ns}ns at divisor {} — outside any plausible band",
-                    before.divide
-                ),
-            });
-        }
-        log::info!(
-            "auto-warp: APIC bus cycle measured at {bus_cycle_fs}fs \
-             (vCPU {cpu}, divisor {}, {dropped} counts over {elapsed_ns}ns)",
-            before.divide
-        );
-        Ok(bus_cycle_fs)
-    }
-
-    /// vCPUs whose `KVM_RUN` was cancelled between KVM staging an event
-    /// injection and the VM entry that would have delivered it
-    /// (CHALLENGES #78's check).
-    ///
-    /// The fork path re-queues such an event on restore; a warp has
-    /// nowhere to put it, so the only correct move is to decline and
-    /// let the next sample find the vCPU clean.
-    pub fn vcpus_mid_injection(&self) -> Result<Vec<usize>, VmError> {
-        let want = self.require_paused("vcpus_mid_injection")?;
-        let mut out = Vec::new();
-        for cpu in 0..want {
-            let ev = self.vcpu_fds[cpu]
-                .get_vcpu_events()
-                .map_err(|e| VmError::GetLapic {
-                    cpu,
-                    reason: format!("KVM_GET_VCPU_EVENTS: {e}"),
-                })?;
-            if ev.interrupt.injected != 0 || ev.nmi.injected != 0 || ev.nmi.pending != 0 {
-                out.push(cpu);
-            }
-        }
-        Ok(out)
-    }
-
     /// Device-bound virtqueues with work the guest has handed over and
     /// not yet had completed — one description per queue, empty when
     /// every device is idle (CHALLENGES #79's `avail`/`used` handshake).
@@ -3325,236 +2486,6 @@ impl Vm {
             });
         }
         Ok(want)
-    }
-
-    /// Change this **paused** VM's dilation factor in place: guest
-    /// time runs `factor` nanoseconds per wall
-    /// nanosecond from here on.
-    ///
-    /// **Paused-only, slope-only.** The kernel re-pins the affine map
-    /// at the instant of the change, so the guest's `CLOCK_MONOTONIC`
-    /// changes *slope* and does not jump, and it reprograms every
-    /// vCPU's hardware TSC multiplier with a matching offset so the
-    /// guest's own counter is continuous too. A runnable vCPU is
-    /// `EBUSY` — the whole cluster is paused first, exactly as it is
-    /// for [`Self::warp_clock`].
-    ///
-    /// Lowering the factor does not rewind anything: the guest keeps
-    /// every nanosecond it has already been given (CHALLENGES #191),
-    /// it just stops accumulating them so fast. Which is also why
-    /// dropping back to 1 does **not** make this VM forkable again —
-    /// see [`Self::dilation_peak`].
-    pub fn set_dilation_live(&mut self, factor: u32) -> Result<(), VmError> {
-        self.require_paused("set_dilation_live")?;
-        self.set_dilation_raw(factor)?;
-        self.dilation = factor;
-        self.dilation_peak = self.dilation_peak.max(factor);
-        Ok(())
-    }
-
-    /// `KVM_SET_DEVICE_ATTR(KVM_VM_DILATION)` on this VM's fd, with no
-    /// host-side pause check.
-    ///
-    /// [`Self::set_dilation_live`] is the one to call — it refuses before
-    /// the ioctl and keeps `dilation` in step with what the kernel
-    /// believes. This is here because the kernel's own refusal (`EBUSY`
-    /// while any vCPU is runnable) is the invariant the whole mechanism
-    /// rests on, and an invariant only ever reached through a Rust guard
-    /// that fires first is an untested one.
-    pub fn set_dilation_raw(&self, factor: u32) -> Result<(), VmError> {
-        if factor == 0 || factor > MAX_DILATION {
-            return Err(VmError::DilationFactor(factor));
-        }
-        set_dilation(&self.vm_fd, factor).map_err(|reason| VmError::SetDilation { factor, reason })
-    }
-
-    /// Advance this paused VM's guest-visible clock by `delta`, so
-    /// the guest's backoffs, probe periods and
-    /// lease TTLs behave as if that much time had passed.
-    ///
-    /// **Paused-only, forward-only, all-or-nothing.** The clock the
-    /// guest reads (`KVM_SET_CLOCK`) and the counter its armed timers
-    /// compare against (the per-vCPU TSC offset) move by the same
-    /// amount: moving one without the other either does nothing or
-    /// fires timers wrong. `KVM_KVMCLOCK_CTRL` then tells each vCPU
-    /// the jump was a suspend, which is what stops the guest reporting
-    /// it as a stalled CPU.
-    ///
-    /// An error mid-warp restores the original TSC offsets and puts
-    /// the kvmclock back (never behind where it started — the rollback
-    /// adds the wall time the failed attempt took), and names the vCPU
-    /// it died on.
-    ///
-    /// Caller contract: no guest work may be in flight. The cluster is
-    /// paused, so an agent `exec` waiting on a reply sees its guest
-    /// jump forward mid-syscall.
-    pub fn warp_clock(&self, delta: Duration) -> Result<(), VmError> {
-        let delta_ns = u64::try_from(delta.as_nanos())
-            .ok()
-            .filter(|ns| *ns > 0)
-            .ok_or(VmError::WarpDelta(delta))?;
-        self.require_paused("warp_clock")?;
-        // Probe before the first write: a kernel without the attribute
-        // must fail the whole warp, not the tail of it. `addr` is
-        // ignored by KVM_HAS_DEVICE_ATTR.
-        has_tsc_offset_attr(&self.vcpu_fds[0]).map_err(VmError::WarpNoTscOffsetAttr)?;
-
-        // Everything the rollback needs, read before anything moves.
-        let read_at = Instant::now();
-        let clock_before = self.vm_fd.get_clock().map_err(VmError::GetClock)?.clock;
-        let mut offsets = Vec::with_capacity(self.vcpu_fds.len());
-        for (cpu, vcpu_fd) in self.vcpu_fds.iter().enumerate() {
-            offsets.push(
-                read_tsc_offset(vcpu_fd).map_err(|reason| VmError::WarpVcpu {
-                    cpu,
-                    what: "reading the TSC offset",
-                    reason,
-                    rollback: "nothing had been written yet".to_string(),
-                })?,
-            );
-        }
-
-        // 1. The clock the guest reads. Flags are an input only for
-        //    KVM_CLOCK_REALTIME (see `fork::restore_kvmclock`).
-        let data = kvm_bindings::kvm_clock_data {
-            clock: clock_before.saturating_add(delta_ns),
-            flags: 0,
-            ..Default::default()
-        };
-        self.vm_fd
-            .set_clock(&data)
-            .map_err(|e| VmError::WarpSetClock {
-                delta_ns,
-                reason: e.to_string(),
-            })?;
-
-        match self.warp_vcpus(delta_ns, &offsets) {
-            Ok(()) => {
-                // `debug`, not `info`: the auto-warp policy loop calls
-                // this up to 20 times a second per member, and a
-                // per-VM info line at that rate buries
-                // every other line in the daemon's journal.
-                log::debug!(
-                    "warp_clock: +{}ms on {} vCPUs (kvmclock {clock_before} → {})",
-                    delta_ns / 1_000_000,
-                    self.vcpu_fds.len(),
-                    data.clock
-                );
-                Ok(())
-            }
-            Err((cpu, what, reason)) => Err(VmError::WarpVcpu {
-                cpu,
-                what,
-                reason,
-                rollback: self.unwarp(clock_before, read_at, &offsets),
-            }),
-        }
-    }
-
-    /// Per-vCPU half of [`Self::warp_clock`]. `Err` names the vCPU, the
-    /// step, and the reason; the caller rolls back.
-    fn warp_vcpus(
-        &self,
-        delta_ns: u64,
-        offsets: &[u64],
-    ) -> Result<(), (usize, &'static str, String)> {
-        for ((cpu, vcpu_fd), before) in self.vcpu_fds.iter().enumerate().zip(offsets) {
-            // 2. What this vCPU's armed timers compare against, in
-            //    *this* vCPU's tick units — never a constant frequency.
-            let tsc_khz = vcpu_fd
-                .get_tsc_khz()
-                .map_err(|e| (cpu, "reading tsc_khz", e.to_string()))?;
-            let ticks = u64::try_from(u128::from(delta_ns) * u128::from(tsc_khz) / 1_000_000)
-                .map_err(|_| {
-                    (
-                        cpu,
-                        "converting the delta to TSC ticks",
-                        format!("{delta_ns}ns at {tsc_khz}kHz overflows a u64"),
-                    )
-                })?;
-            write_tsc_offset(vcpu_fd, before.wrapping_add(ticks))
-                .map_err(|reason| (cpu, "writing the TSC offset", reason))?;
-
-            // 3. A deadline armed before the warp holds a guest-TSC
-            //    value that the advanced offset has just put in the
-            //    past; rewriting it *unchanged* makes KVM recompute the
-            //    host-side hrtimer (or VMX preemption timer) against the
-            //    new offset, so the timer fires on the next entry — the
-            //    jump lands ε before it, and it goes off. That is the
-            //    semantics `autowarp::EPSILON` is written for.
-            //
-            //    Never armed under host kernel 6.8, which does not
-            //    advertise CPUID.1:ECX[24]: the guest runs the LAPIC
-            //    one-shot, not touched here. Its KVM hrtimer is
-            //    host-anchored, but on VMX the preemption timer re-reads
-            //    a guest-TSC copy of the expiry whenever a pause wakes
-            //    the vCPU, so there a jumped one-shot fires at the next
-            //    pause and on SVM it never does (CHALLENGES #264). The
-            //    live timer of every Ubuntu vCPU under kernel 7.0
-            //    (`lapic-deadline`). It is
-            //    not shifted along with the offset to mirror the
-            //    one-shot's host expiry: measured, that makes every idle
-            //    cycle re-jump the same still-armed deadline, fabricating
-            //    guest time at up to R²/cycle per host wait — a 160 s
-            //    kubelet backoff stamped as 245 s, 5.00× "compression"
-            //    past the 3.76× idleness ceiling (CHALLENGES #261).
-            let deadline = read_msr(vcpu_fd, cpu, MSR_IA32_TSC_DEADLINE)
-                .map_err(|e| (cpu, "reading IA32_TSC_DEADLINE", e.to_string()))?;
-            if deadline != 0 {
-                write_msr(vcpu_fd, MSR_IA32_TSC_DEADLINE, deadline)
-                    .map_err(|reason| (cpu, "rewriting IA32_TSC_DEADLINE", reason))?;
-            }
-
-            // 4. Tell the guest it was suspended, not stalled.
-            kvmclock_ctrl(vcpu_fd).map_err(|reason| {
-                (
-                    cpu,
-                    "KVM_KVMCLOCK_CTRL",
-                    format!(
-                        "{reason} — this guest has no kvmclock page registered, so it \
-                         cannot be told the jump was a suspend"
-                    ),
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Undo a failed warp: original TSC offsets back, kvmclock back to
-    /// where it was plus the wall time the attempt took (forward-only
-    /// holds even on the error path). Returns what was restored, for
-    /// the error message.
-    fn unwarp(&self, clock_before: u64, read_at: Instant, offsets: &[u64]) -> String {
-        let mut failures = Vec::new();
-        // Forward-only holds on the error path too: put the clock back
-        // where it was *plus* what the attempt cost, so a failed warp is
-        // a few microseconds of stall and never a step backwards.
-        // `read_at` is microseconds old, so the conversion cannot fail
-        // short of 584 years of elapsed time — and 0 would cost only
-        // those microseconds, which is why it is not worth a second
-        // failure mode inside a rollback.
-        let elapsed_ns = u64::try_from(read_at.elapsed().as_nanos()).unwrap_or(0);
-        let data = kvm_bindings::kvm_clock_data {
-            clock: clock_before.saturating_add(elapsed_ns),
-            flags: 0,
-            ..Default::default()
-        };
-        if let Err(e) = self.vm_fd.set_clock(&data) {
-            failures.push(format!("kvmclock: {e}"));
-        }
-        for ((cpu, vcpu_fd), before) in self.vcpu_fds.iter().enumerate().zip(offsets) {
-            if let Err(e) = write_tsc_offset(vcpu_fd, *before) {
-                failures.push(format!("vCPU {cpu} TSC offset: {e}"));
-            }
-        }
-        if failures.is_empty() {
-            "the original TSC offsets and kvmclock were restored".to_string()
-        } else {
-            format!(
-                "ROLLBACK INCOMPLETE, this VM's clock is now inconsistent: {}",
-                failures.join("; ")
-            )
-        }
     }
 
     /// Kernel TID of the running BSP (vCPU 0) thread, waiting up to
@@ -3699,6 +2630,17 @@ impl Vm {
         &self.mmio_registry
     }
 
+    /// Which bus this VM's virtio devices sit on. A VM with no devices
+    /// at all reports [`Transport::Mmio`].
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        if self.mmio_registry.lock().unwrap().has_pci_bus() {
+            Transport::Pci
+        } else {
+            Transport::Mmio
+        }
+    }
+
     /// Get the guest vsock CID.
     #[must_use]
     pub fn guest_cid(&self) -> u64 {
@@ -3712,6 +2654,20 @@ impl Vm {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst) && !self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Whether a vCPU left its run loop on its own: the guest asked
+    /// for a reset (`reboot=k`'s i8042 pulse), triple-faulted, or KVM
+    /// refused to run it. One is enough — the kernel parks the other
+    /// CPUs in `HLT` first, and with the in-kernel LAPIC those never
+    /// exit `KVM_RUN`. The guest is gone; only [`Self::shutdown`] (or
+    /// drop) follows. False for a VM that was never started or is
+    /// paused.
+    #[must_use]
+    pub fn guest_exited(&self) -> bool {
+        self.vcpu_telemetry
+            .iter()
+            .any(|t| t.phase.load(Ordering::Relaxed) == vcpu_phase::EXITED)
     }
 
     /// Whether the vCPU threads are parked after [`Self::pause`].
@@ -3759,710 +2715,6 @@ impl Vm {
         self.tap.take()
     }
 
-    /// Prepare this VM as a fork source.
-    ///
-    /// Performs the **one-time** cold snapshot + restore + dirty-tracking-enable
-    /// sequence described in part 1. After this call, the VM is "fork-ready":
-    /// subsequent `fork_warm()` calls only copy the pages dirtied since this point.
-    ///
-    /// Returns the path to the `base.mem` file that all future warm forks will use
-    /// as their `MAP_PRIVATE` backing. The directory is owned by this `Vm` and
-    /// cleaned up on Drop.
-    ///
-    /// Note: the caller **must** reconnect the agent after this call because the
-    /// source VM is replaced by a restored one (fresh vsock backend; existing
-    /// connections die). The CID itself is **preserved** so
-    /// cached-CID clients — the pod's shim — keep working by redialing.
-    pub fn prepare_fork_source(&mut self) -> Result<PathBuf, crate::fork::ForkError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static FORK_SRC_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = FORK_SRC_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let base_dir =
-            std::env::temp_dir().join(format!("k7d-fork-src-{}-{seq}", std::process::id()));
-        std::fs::create_dir_all(&base_dir)?;
-        let base_mem = self.prepare_fork_source_in(&base_dir)?;
-        // The tempdir is owned by this VM — clean up on Drop.
-        self.fork_source_dir = Some(base_dir);
-        Ok(base_mem)
-    }
-
-    /// Explicitly allow this virtiofs-backed VM to be prepared as a
-    /// **slow** fork source.
-    ///
-    /// VMs with virtiofs shares cannot take the `CoW`
-    /// (`MAP_PRIVATE(base.mem)` + dirty-delta) fast-fork path — every
-    /// fork is a full memfd copy of guest RAM. `prepare_fork_source*`
-    /// refuses such VMs loudly by default so nothing degrades
-    /// silently; callers that knowingly accept full-copy forks (the
-    /// daemon's virtiofs sandbox pods, the cluster-adopt path)
-    /// call this first. No-op for share-less VMs.
-    pub fn allow_slow_fork(&mut self) {
-        if !self.virtiofs_shares.is_empty() {
-            log::warn!(
-                "allow_slow_fork: VM (cid {}) has {} virtiofs share(s) — forks will be \
-                 full-memfd copies, not CoW (slow path, explicitly opted in)",
-                self.guest_cid,
-                self.virtiofs_shares.len()
-            );
-        }
-        self.slow_fork_allowed = true;
-    }
-
-    /// Like `prepare_fork_source`, but writes the base snapshot into
-    /// `base_dir` (caller owns the directory) instead of a private tempdir.
-    /// Used by the snapshot tree, which manages per-node directories itself.
-    pub fn prepare_fork_source_in(
-        &mut self,
-        base_dir: &Path,
-    ) -> Result<PathBuf, crate::fork::ForkError> {
-        self.check_fork_source_allowed()?;
-        std::fs::create_dir_all(base_dir)?;
-
-        self.snapshot(base_dir)
-            .map_err(crate::fork::ForkError::Snapshot)?;
-        // `snapshot` already wrote every page. Count a miss so the 200 ms
-        // question has data; do not refuse — a full dump is what ran.
-        let _ = self.take_full_dump_if_not_quiescent();
-        self.restore_swap_onto_base(base_dir)
-    }
-
-    /// Forkability validation: virtiofs shares force every fork onto the
-    /// slow full-memfd path (vhost-user needs fd-backed shared memory).
-    /// That trade must be taken knowingly ([`Self::allow_slow_fork`]),
-    /// never inherited silently.
-    pub(crate) fn check_fork_source_allowed(&self) -> Result<(), crate::fork::ForkError> {
-        if !self.virtiofs_shares.is_empty() && !self.slow_fork_allowed {
-            return Err(crate::fork::ForkError::VirtiofsSlowForkNotAllowed {
-                shares: self.virtiofs_shares.len(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Like [`Self::prepare_fork_source_in`], but write the keyframe
-    /// **incrementally** against `ancestor_mem`: `FICLONE`
-    /// the ancestor's `memory.bin` and overwrite only the pages this VM
-    /// has dirtied since it was materialized from that very file, so a
-    /// fork point down the tree costs O(divergence) instead of O(guest
-    /// RAM).
-    ///
-    /// The caller must guarantee that this VM's memory *is* `ancestor_mem`
-    /// plus its accumulated dirty set — true for a warm-fork child of the
-    /// node that owns `ancestor_mem`, and for a resumed node whose applied
-    /// `delta.pack` was re-seeded into the bitmap (CHALLENGES #143). The
-    /// snapshot tree is the only caller and derives `ancestor_mem` from
-    /// `nearest_checkpoint`.
-    ///
-    /// Falls back to a full dump — loudly, never silently — when the VM
-    /// has virtiofs shares, when dirty tracking is off, or when the two
-    /// paths are not on one reflink filesystem (`EXDEV` / `EOPNOTSUPP`).
-    /// [`PreparedBase::incremental`] says which path ran.
-    pub fn prepare_fork_source_incremental_in(
-        &mut self,
-        base_dir: &Path,
-        ancestor_mem: &Path,
-    ) -> Result<PreparedBase, crate::fork::ForkError> {
-        std::fs::create_dir_all(base_dir)?;
-        let was_running = self.is_running();
-        if was_running {
-            self.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
-        }
-        let (incremental, disk_bytes) =
-            match self.write_keyframe_paused(base_dir, Some(ancestor_mem)) {
-                Ok(written) => written,
-                Err(e) => {
-                    if was_running {
-                        self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
-                    }
-                    return Err(e);
-                }
-            };
-        let t_swap = std::time::Instant::now();
-        let base_mem = self.restore_swap_onto_base(base_dir)?;
-        if was_running && self.paused() {
-            self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
-        }
-        log::info!(
-            "prepare_fork_source_incremental_in: restore-swap took {:?}",
-            t_swap.elapsed()
-        );
-        Ok(PreparedBase {
-            base_mem,
-            incremental,
-            disk_bytes,
-        })
-    }
-
-    /// Write this **paused** VM's keyframe into `base_dir` without
-    /// swapping onto it: incrementally against `ancestor_mem` when given
-    /// (see [`Self::prepare_fork_source_incremental_in`] for the
-    /// contract), else as a full dump. Returns `(incremental,
-    /// disk_bytes)`. Every fallback to a full dump is logged and runs
-    /// under the same pause.
-    pub(crate) fn write_keyframe_paused(
-        &mut self,
-        base_dir: &Path,
-        ancestor_mem: Option<&Path>,
-    ) -> Result<(bool, u64), crate::fork::ForkError> {
-        let missed_park = self.take_full_dump_if_not_quiescent();
-        let Some(ancestor_mem) = ancestor_mem else {
-            return self.write_full_keyframe_paused(base_dir);
-        };
-        if !self.virtiofs_shares.is_empty() {
-            // Keep-live sources never take the CoW fork path at all
-            // (CHALLENGES #39) and virtiofsd's FUSE DMA is invisible to
-            // the bitmap, so an incremental keyframe would be incomplete.
-            log::warn!(
-                "write_keyframe_paused: VM (cid {}) has {} virtiofs share(s) — \
-                 writing a full keyframe instead",
-                self.guest_cid,
-                self.virtiofs_shares.len()
-            );
-            return self.write_full_keyframe_paused(base_dir);
-        }
-        if !self.dirty_tracking_enabled {
-            log::warn!(
-                "write_keyframe_paused: VM (cid {}) has no dirty tracking — \
-                 the divergence from {} is unknown, writing a full keyframe instead",
-                self.guest_cid,
-                ancestor_mem.display()
-            );
-            return self.write_full_keyframe_paused(base_dir);
-        }
-        if missed_park {
-            log::warn!(
-                "write_keyframe_paused: VM (cid {}) missed the 200ms park \
-                 — writing a full keyframe instead of an incremental dirty-delta",
-                self.guest_cid
-            );
-            return self.write_full_keyframe_paused(base_dir);
-        }
-        // The complete dirty set vs the ancestor keyframe: KVM's log ∪
-        // the device-DMA bitmaps ∪ the vhost-vsock rings (#101). The
-        // pages the TRANSPORT_RESET injection writes are merged inside
-        // `snapshot_vm_incremental`, which does the injection.
-        let mut dirty = self
-            .get_and_accumulate_dirty()
-            .map_err(crate::snapshot::SnapshotError::Vm)?
-            .to_vec();
-        match crate::snapshot::snapshot_vm_incremental(self, base_dir, ancestor_mem, &mut dirty) {
-            Ok(dirty_bytes) => Ok((true, dirty_bytes)),
-            Err(crate::snapshot::SnapshotError::ReflinkUnsupported {
-                ancestor,
-                dest,
-                detail,
-            }) => {
-                // Loud, never silent: the deploy is supposed to keep the
-                // whole tree root on the reflink XFS, so landing here
-                // means the node is misconfigured and every keyframe is
-                // about to cost a full dump.
-                log::warn!(
-                    "write_keyframe_paused: FICLONE {} -> {} failed ({detail}); \
-                     falling back to a FULL keyframe dump — put the tree root on a \
-                     reflink-capable filesystem to get O(divergence) fork points",
-                    ancestor.display(),
-                    dest.display(),
-                );
-                self.write_full_keyframe_paused(base_dir)
-            }
-            Err(e) => Err(crate::fork::ForkError::Snapshot(e)),
-        }
-    }
-
-    pub(crate) fn write_full_keyframe_paused(
-        &mut self,
-        base_dir: &Path,
-    ) -> Result<(bool, u64), crate::fork::ForkError> {
-        self.check_fork_source_allowed()?;
-        crate::snapshot::snapshot_vm(self, base_dir).map_err(crate::fork::ForkError::Snapshot)?;
-        Ok((false, self.mem_span()))
-    }
-
-    /// The half of `prepare_fork_source_in` that runs **after** the
-    /// keyframe is on disk: hand virtiofs sources back live, otherwise
-    /// shut the source down and restore it onto its own new
-    /// `memory.bin` (preserving the vsock CID) so later warm forks share
-    /// that file's page cache.
-    ///
-    /// A virtiofs source is left in whatever run state it arrived in; a
-    /// swapped source comes back running.
-    pub(crate) fn restore_swap_onto_base(
-        &mut self,
-        base_dir: &Path,
-    ) -> Result<PathBuf, crate::fork::ForkError> {
-        let (base_mem, husk) = self.restore_swap_onto_base_keep_husk(base_dir)?;
-        drop(husk);
-        Ok(base_mem)
-    }
-
-    /// [`Self::restore_swap_onto_base`], but hand back the swapped-out
-    /// husk instead of dropping it. The restored copy already runs;
-    /// unmapping the husk's RAM takes seconds for a guest of tens of
-    /// GiB, so a caller timing the pause stops its clock first.
-    pub(crate) fn restore_swap_onto_base_keep_husk(
-        &mut self,
-        base_dir: &Path,
-    ) -> Result<(PathBuf, Option<Self>), crate::fork::ForkError> {
-        let base_mem = base_dir.join("memory.bin");
-
-        // VMs with virtiofs shares keep running as-is: vhost-user needs
-        // an fd-backed shared mapping, which the restored copy's
-        // MAP_PRIVATE CoW memory cannot provide — a swap would leave
-        // every FUSE mount dead (runc, container rootfs — CHALLENGES.md
-        // #39). Forks of such sources are full memfd copies instead of
-        // base.mem CoW (see `fork::restore_vm_from_state`), so the
-        // source does not need to run on the base.mem mapping. Bonus:
-        // the vsock CID is unchanged, so shim-held agent connections
-        // survive prepare.
-        if !self.virtiofs_shares.is_empty() {
-            self.enable_dirty_tracking()?;
-            self.fork_source_base_path = Some(base_mem.clone());
-            log::info!(
-                "prepare_fork_source: keeping source live ({} virtiofs shares, cid {})",
-                self.virtiofs_shares.len(),
-                self.guest_cid
-            );
-            return Ok((base_mem, None));
-        }
-
-        // Move the source's TAP into the restored VM so the host bridge link
-        // survives the swap below. Without this, dropping the original `Vm`
-        // would tear down the kernel-side TAP interface and break networking
-        // for every subsequent warm fork.
-        let tap = self.take_tap();
-
-        // The restored copy must keep the source's vsock
-        // CID. The pod's shim caches the CID at Create and has no refresh
-        // channel once the daemon drops the sandbox records at adopt
-        // (CHALLENGES.md #39/#47 territory) — restoring on a fresh CID
-        // breaks every later exec/log against the source. The kernel
-        // holds a CID until the vhost-vsock fd that claimed it closes,
-        // so stop the source's vCPU and drop its devices (which closes
-        // that fd) BEFORE the restored VM re-claims the same CID. The
-        // guest is frozen-in-snapshot either way; if the restore below
-        // fails, the source is dead and the error propagates loudly
-        // (same blast radius as a failed swap had before).
-        let source_cid = self.guest_cid;
-        self.shutdown();
-        self.mmio_registry.lock().unwrap().shutdown_all();
-        let mut restored = crate::fork::restore_vm_preserving_cid(base_dir, tap, source_cid)?;
-        // Enable dirty tracking BEFORE starting the vCPU. Any page the restored
-        // guest writes must show up in the bitmap so the warm fork can copy it.
-        // If we started the vCPU first, pages dirtied before enable would drift
-        // silently from base.mem and corrupt every future fork's memory.
-        restored.enable_dirty_tracking()?;
-        restored.start()?;
-
-        // Hand the scratch image to the restored copy, for the
-        // same reason as the TAP above — the restored VM's block backend
-        // is already reading and writing that file, and dropping the
-        // husk's handle would unlink it out from under the live guest
-        // (and out from under every later fork's FICLONE).
-        restored.scratch_disk = self.scratch_disk.take();
-        // Same for the reflinked RW images a *forked* VM was built with:
-        // the husk owns their directory (`fork_state_dir`, removed on
-        // Drop) but the restored copy's block backends reopened those
-        // exact files. Without this transfer the husk's Drop deletes the
-        // live guest's disk (silently — the open fd keeps working) and
-        // every later fork's FICLONE fails ENOENT, which broke
-        // fork-of-fork for any VM with a RW block device
-        // (CHALLENGES.md #130).
-        restored.fork_state_dir = self.fork_state_dir.take();
-        // The per-container images are the same class of
-        // resource — the live guest is reading and writing them too.
-        restored.container_scratch_disks = std::mem::take(&mut self.container_scratch_disks);
-        // Data-disk handles move across too, but for a different reason:
-        // they own no cleanup, and the restored copy is now the live
-        // source, so it is the VM that must be able to report which
-        // persistent disks it was created with.
-        restored.data_disks = std::mem::take(&mut self.data_disks);
-        restored.docker_disk = self.docker_disk.take();
-
-        // The old source was already shut down above (CID release);
-        // dropping the swapped-out husk just unmaps its memory.
-        std::mem::swap(self, &mut restored);
-
-        self.fork_source_base_path = Some(base_mem.clone());
-        Ok((base_mem, Some(restored)))
-    }
-
-    /// Number of pages marked dirty in the accumulated bitmap since dirty
-    /// tracking was enabled. Returns `None` if tracking is not enabled.
-    ///
-    /// Used by the snapshot tree to estimate per-VM non-reclaimable RAM.
-    #[must_use]
-    pub fn accumulated_dirty_pages(&self) -> Option<u64> {
-        self.accumulated_dirty
-            .as_ref()
-            .map(|b| b.iter().map(|w| u64::from(w.count_ones())).sum())
-    }
-
-    /// Return a copy of the accumulated dirty bitmap (if tracking is enabled).
-    #[must_use]
-    pub fn accumulated_dirty_bitmap(&self) -> Option<Vec<u64>> {
-        self.accumulated_dirty.clone()
-    }
-
-    /// Seed the accumulated dirty bitmap with pre-existing dirty page marks.
-    ///
-    /// Used by the snapshot tree when forking a child: the child's delta
-    /// against the parent's `memory.bin` must include every page the parent
-    /// had marked dirty at fork time (those pages were memcpy'd into the
-    /// child's `CoW` mapping). ORs `preseed` into the accumulated bitmap;
-    /// tracking must already be enabled.
-    pub fn seed_accumulated_dirty(&mut self, preseed: &[u64]) -> Result<(), VmError> {
-        let acc = self.accumulated_dirty.as_mut().ok_or_else(|| {
-            VmError::Pipe(std::io::Error::other(
-                "dirty tracking not enabled — cannot seed bitmap",
-            ))
-        })?;
-        for (i, &w) in preseed.iter().enumerate() {
-            if i < acc.len() {
-                acc[i] |= w;
-            }
-        }
-        Ok(())
-    }
-
-    /// Enable KVM dirty page tracking on the VM's memory slot.
-    ///
-    /// Re-registers every RAM slot with `KVM_MEM_LOG_DIRTY_PAGES`. Allocates
-    /// the `accumulated_dirty` bitmap. Idempotent: no-op if already enabled.
-    ///
-    /// Also enables `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` (Linux 5.0+) so we can
-    /// re-arm write protection between `KVM_GET_DIRTY_LOG` calls without
-    /// dropping the memory region.
-    pub fn enable_dirty_tracking(&mut self) -> Result<(), VmError> {
-        if self.dirty_tracking_enabled {
-            return Ok(());
-        }
-
-        // Enable MANUAL_DIRTY_LOG_PROTECT2 (cap 168) before re-registering the
-        // memory region, so that KVM_GET_DIRTY_LOG does NOT auto-clear and we
-        // can re-arm write protection via KVM_CLEAR_DIRTY_LOG instead.
-        // args[0] = KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE (bit 0).
-        let cap = kvm_bindings::kvm_enable_cap {
-            cap: kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
-            args: [1, 0, 0, 0],
-            ..Default::default()
-        };
-        if let Err(e) = self.vm_fd.enable_cap(&cap) {
-            log::warn!("KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 not available: {e}");
-        }
-
-        // Briefly pause the vCPU while we re-register the memory region.
-        let was_running = self.is_running();
-        if was_running {
-            self.pause()?;
-        }
-
-        let mem_host_addr = self.mem_host_addr();
-        for (slot, gpa, size) in self.mem_layout().slots() {
-            let mem_region = kvm_bindings::kvm_userspace_memory_region {
-                slot,
-                guest_phys_addr: gpa,
-                memory_size: size,
-                userspace_addr: mem_host_addr + gpa,
-                flags: kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES,
-            };
-            // SAFETY: userspace_addr points into the VM's existing memory
-            // mapping, kept alive by self.guest_memory / self.cow_mmap_addr.
-            unsafe {
-                self.vm_fd
-                    .set_user_memory_region(mem_region)
-                    .map_err(VmError::SetUserMemoryRegion)?;
-            }
-        }
-
-        if was_running {
-            self.resume()?;
-        }
-
-        // Bitmap: one bit per 4 KiB page of the GPA span (so page index ==
-        // `memory.bin` offset / 4096, hole included and never dirty).
-        // 256 MB / 4 KiB = 65 536 pages = 1024 u64s.
-        let pages = self.mem_span().div_ceil(4096);
-        let words = (pages as usize).div_ceil(64);
-        self.accumulated_dirty = Some(vec![0u64; words]);
-        self.dirty_tracking_enabled = true;
-        log::info!("dirty tracking enabled ({pages} pages, {words} words)");
-        Ok(())
-    }
-
-    /// Harvest the dirty log, OR it into the accumulated bitmap, and
-    /// return the accumulated bitmap (union of all pages dirtied since
-    /// dirty tracking was enabled).
-    pub fn get_and_accumulate_dirty(&mut self) -> Result<&[u64], VmError> {
-        self.harvest_dirty()?;
-        Ok(self
-            .accumulated_dirty
-            .as_deref()
-            .expect("harvest checked tracking"))
-    }
-
-    /// Pages dirtied since the previous harvest — KVM's log ∪ the
-    /// device-DMA bitmaps ∪ the vhost-vsock rings — as a span-indexed
-    /// bitmap, also OR'd into the accumulated bitmap. Safe on a
-    /// **running** VM: a page written at any point after its bit is
-    /// cleared here is reported by a later harvest, which is what the
-    /// live keyframe (`snapshot::LiveKeyframe`) relies on.
-    pub fn harvest_dirty(&mut self) -> Result<Vec<u64>, VmError> {
-        if !self.dirty_tracking_enabled {
-            return Err(VmError::Pipe(std::io::Error::other(
-                "dirty tracking not enabled",
-            )));
-        }
-        let mem_host_addr = self.mem_host_addr();
-        let mem_span = self.mem_span();
-        let mut round = vec![0u64; self.accumulated_dirty.as_ref().map_or(0, Vec::len)];
-        let round_words = round.len();
-
-        // One KVM bitmap per RAM slot. Both region boundaries are whole
-        // bitmap words (see
-        // `mem_layout::tests::region_boundaries_are_bitmap_word_aligned`),
-        // so a slot's bits land at a word offset with no shifting.
-        for (slot, gpa, size) in self.mem_layout().slots() {
-            let bitmap = self.vm_fd.get_dirty_log(slot, size as usize).map_err(|e| {
-                VmError::Pipe(std::io::Error::other(format!(
-                    "KVM_GET_DIRTY_LOG slot {slot}: {e}"
-                )))
-            })?;
-            // Re-arm write protection for exactly the pages GET reported.
-            // With MANUAL_DIRTY_LOG_PROTECT2 GET no longer clears; an
-            // all-ones clear on a running guest would also drop a write
-            // that landed after GET on a page GET saw clean.
-            clear_dirty_log(&self.vm_fd, slot, size, &bitmap)?;
-            let word_offset = (gpa / 4096 / 64) as usize;
-            // Dropping words here would silently lose dirty pages and hand
-            // forks a stale copy of them, so a short bitmap is an error.
-            let dst = round
-                .get_mut(word_offset..word_offset + bitmap.len())
-                .ok_or_else(|| {
-                    VmError::Pipe(std::io::Error::other(format!(
-                        "dirty bitmap of the slot at {gpa:#x} ({} words at word {word_offset}) \
-                         does not fit the {round_words}-word span bitmap",
-                        bitmap.len(),
-                    )))
-                })?;
-            for (d, w) in dst.iter_mut().zip(bitmap) {
-                *d |= w;
-            }
-        }
-
-        // Device-DMA dirty pages: KVM's log only sees vCPU writes, so
-        // in-process device workers that write guest memory through k7d's
-        // own mapping report (and here drain) their pages. Without this,
-        // warm forks on the base.mem + dirty-delta path would silently miss
-        // read completions and used-ring updates (host-side #27 class).
-        // vhost-vsock has no userspace worker to report anything, so its
-        // virtqueue rings and buffers are marked from the queue state.
-        self.mmio_registry.lock().unwrap().merge_dirty_pages_all(
-            &mut round,
-            mem_host_addr,
-            mem_span,
-        );
-
-        let acc = self.accumulated_dirty.as_mut().expect("bitmap allocated");
-        for (a, r) in acc.iter_mut().zip(&round) {
-            *a |= r;
-        }
-        Ok(round)
-    }
-
-    /// Guest-physical `[start, end)` extents of RAM that may hold data:
-    /// for a memfd-backed guest, the memfd's `SEEK_DATA` extents clipped
-    /// to the RAM slots (never-touched pages are holes and read as zero);
-    /// for a restored guest, its whole RAM slots. Never the MMIO hole.
-    pub fn ram_data_extents(&self) -> Result<Vec<(u64, u64)>, VmError> {
-        use vm_memory::GuestMemoryRegion;
-        let slots = self.mem_layout().slots();
-        // The memfd only describes guest RAM when the guest runs on it.
-        let memfd = if self.restored || self.cow_mmap_addr.is_some() {
-            None
-        } else {
-            self.guest_memory
-                .iter()
-                .next()
-                .and_then(|r| r.file_offset().map(|f| f.file().as_raw_fd()))
-        };
-        let Some(fd) = memfd else {
-            return Ok(slots
-                .iter()
-                .map(|&(_, gpa, size)| (gpa, gpa + size))
-                .collect());
-        };
-        let mut out = Vec::new();
-        for (_, gpa, size) in slots {
-            let end = gpa + size;
-            let mut pos = gpa;
-            while pos < end {
-                let Some(data) = seek_memfd(fd, pos, libc::SEEK_DATA)? else {
-                    break;
-                };
-                if data >= end {
-                    break;
-                }
-                let hole = seek_memfd(fd, data, libc::SEEK_HOLE)?.unwrap_or(end);
-                if let Some(ext) = clip_extent(data, hole, gpa, end) {
-                    out.push(ext);
-                }
-                pos = hole;
-            }
-        }
-        Ok(out)
-    }
-
-    /// Path to the `base.mem` file this VM is fork-ready against, if any.
-    #[must_use]
-    pub fn fork_source_base_path(&self) -> Option<&Path> {
-        self.fork_source_base_path.as_deref()
-    }
-
-    /// Declare that this VM's memory is a `MAP_PRIVATE` mapping of
-    /// `base_mem`, so warm forks can use it without a fresh prepare.
-    ///
-    /// Point this VM at a `memory.bin` for `fork_warm` without writing
-    /// a new keyframe. Used for (1) a resumed checkpoint and (2) an
-    /// in-tree child that maps its ancestor's file plus a dirty bitmap.
-    pub fn set_fork_source_base_path(&mut self, base_mem: PathBuf) {
-        self.fork_source_base_path = Some(base_mem);
-    }
-
-    /// Warm fork: create a new VM from this source's `base.mem` plus the current
-    /// dirty delta (memory-to-memory copy). No disk I/O during the hot path.
-    ///
-    /// The source must have `fork_source_base_path` set (own keyframe
-    /// or an inherited ancestor file).
-    ///
-    /// Steps (part 1, §Warm fork):
-    /// 1. Pause source.
-    /// 2. Read dirty bitmap, accumulate, save CPU+devices+IRQ state in memory.
-    /// 3. Resume source immediately (steps 5–11 run while source is live).
-    /// 4. mmap `base.mem` with `MAP_PRIVATE`, memcpy dirty pages from source.
-    /// 5. Build a new KVM VM from the in-memory state.
-    /// 6. Inject `TRANSPORT_RESET` into the **fork's** memory only.
-    pub fn fork_warm(&mut self, fork_id: &str) -> Result<Self, crate::fork::ForkError> {
-        let mut out = self.fork_warm_batch(&[fork_id], None)?;
-        Ok(out.pop().expect("single fork"))
-    }
-
-    /// Batched warm fork: create N forks from the same paused moment.
-    ///
-    /// The source is paused once, the dirty bitmap captured once, CPU state
-    /// saved once — then each fork is materialized independently.
-    ///
-    /// `dilation` names the child's factor; `None`
-    /// inherits the source's.
-    pub fn fork_warm_batch(
-        &mut self,
-        fork_ids: &[&str],
-        dilation: Option<u32>,
-    ) -> Result<Vec<Self>, crate::fork::ForkError> {
-        let forks = fork_ids.iter().map(|&id| (id, None)).collect();
-        self.fork_warm_batch_with_taps(forks, dilation)
-    }
-
-    /// [`Self::fork_warm_batch`] where each fork may take its own TAP
-    /// for the virtio-net slot. A snapshot with virtio-net and no TAP
-    /// yields a fork whose guest network is inactive.
-    pub fn fork_warm_batch_with_taps(
-        &mut self,
-        forks: Vec<(&str, Option<crate::network::TapDevice>)>,
-        dilation: Option<u32>,
-    ) -> Result<Vec<Self>, crate::fork::ForkError> {
-        let base_path = self.fork_source_base_path.clone().ok_or_else(|| {
-            crate::fork::ForkError::Reflink(
-                "VM not prepared as fork source — call prepare_fork_source() first".into(),
-            )
-        })?;
-
-        let was_running = self.is_running();
-        if was_running {
-            self.pause().map_err(crate::snapshot::SnapshotError::Vm)?;
-        }
-        let force_full_dump = self.take_full_dump_if_not_quiescent();
-
-        // Capture dirty bitmap + CPU + device + IRQ state (all in-memory).
-        let dirty_bitmap = self
-            .get_and_accumulate_dirty()
-            .map_err(crate::snapshot::SnapshotError::Vm)?
-            .to_vec();
-        let state = crate::snapshot::capture_vm_state(self)?;
-        let source_mem_addr = self.mem_host_addr();
-
-        // The source must stay paused during memcpy: if it resumes, it may write
-        // to pages we're about to copy, making the fork's memory inconsistent
-        // with its captured vCPU state. Per fork, memcpy time is
-        // O(dirty_pages) — 0.5 µs/page, so ≤15 ms even at 100% dirty on 256 MB.
-        let mut out = Vec::with_capacity(forks.len());
-        let mut fork_err: Option<crate::fork::ForkError> = None;
-        for (id, tap) in forks {
-            let restored = match tap {
-                Some(tap) => crate::fork::restore_vm_from_state_with_tap(
-                    &base_path,
-                    &dirty_bitmap,
-                    source_mem_addr,
-                    &state,
-                    id,
-                    tap,
-                    dilation,
-                    force_full_dump,
-                ),
-                None => crate::fork::restore_vm_from_state(
-                    &base_path,
-                    &dirty_bitmap,
-                    source_mem_addr,
-                    &state,
-                    id,
-                    dilation,
-                    force_full_dump,
-                ),
-            };
-            match restored {
-                Ok(fork) => out.push(fork),
-                Err(e) => {
-                    fork_err = Some(e);
-                    break;
-                }
-            }
-        }
-
-        if was_running {
-            self.resume().map_err(crate::snapshot::SnapshotError::Vm)?;
-        }
-
-        if let Some(e) = fork_err {
-            return Err(e);
-        }
-        Ok(out)
-    }
-
-    /// Fork this VM into an independent copy with `CoW` memory and reflinked disk.
-    ///
-    /// The source VM is paused during the snapshot phase, then resumed.
-    /// The returned VM has its own vsock CID and `CoW` memory mapping.
-    /// If virtiofs is configured, the state directory is reflink-copied.
-    ///
-    /// `fork_id` is used to name the fork's working directories.
-    pub fn fork(&mut self, fork_id: &str) -> Result<Self, crate::fork::ForkError> {
-        let fork_base = std::env::temp_dir().join(format!("k7d-fork-{}", std::process::id()));
-        std::fs::create_dir_all(&fork_base)?;
-        crate::fork::fork_vm(self, fork_id, &fork_base)
-    }
-
-    /// Set the fork state directory path (used internally after fork).
-    pub(crate) fn set_fork_state_dir(&mut self, path: PathBuf) {
-        self.fork_state_dir = Some(path);
-    }
-
-    /// Take ownership of the fork state directory away from this VM, so
-    /// Drop no longer removes it. Used by tree suspend: the reflinked RW
-    /// images inside it ARE the node's disk state and must outlive the
-    /// `Vm` — resume reflinks fresh copies from them (CHALLENGES.md #130).
-    pub(crate) fn take_fork_state_dir(&mut self) -> Option<PathBuf> {
-        self.fork_state_dir.take()
-    }
-
     /// Take a snapshot of the VM to the given directory.
     ///
     /// The VM is paused, state is saved, and then optionally resumed.
@@ -4508,113 +2760,6 @@ impl Vm {
         self.vcpu_return_rxs.clear();
         self.vcpu_telemetry.clear();
     }
-}
-
-/// Advance the guest-visible clock of every VM in `vms` by the same
-/// `delta`, with all of them paused for the whole write,
-/// and hand back the host wall time the pause → warp → resume cycle
-/// took.
-///
-/// Lockstep or nothing: etcd heartbeats, lease TTLs and TLS skew checks
-/// tolerate a uniform jump across a cluster, not a skewed one, so the
-/// clocks only move while every member is stopped.
-///
-/// Every VM is resumed on every path — a warp that failed on member 2
-/// still hands members 0 and 1 back running, and a resume that itself
-/// fails is an error, not a log line.
-pub fn warp_clock_lockstep(vms: &mut [&mut Vm], delta: Duration) -> Result<Duration, VmError> {
-    if vms.is_empty() {
-        return Err(VmError::WarpNoVms);
-    }
-    let started = Instant::now();
-    let count = vms.len();
-    let resume_failures = std::cell::RefCell::new(Vec::<String>::new());
-    let mut guard = scopeguard::guard(vms, |vms| {
-        for (i, vm) in vms.iter_mut().enumerate() {
-            if let Err(e) = vm.resume() {
-                log::error!("warp_clock_lockstep: VM {i} did not resume: {e}");
-                resume_failures.borrow_mut().push(format!("VM {i} ({e})"));
-            }
-        }
-    });
-    for vm in guard.iter_mut() {
-        vm.pause()?;
-    }
-    for vm in guard.iter() {
-        vm.warp_clock(delta)?;
-    }
-    drop(guard);
-
-    let elapsed = started.elapsed();
-    let failures = resume_failures.into_inner();
-    if !failures.is_empty() {
-        return Err(VmError::WarpResume(failures.join(", ")));
-    }
-    log::info!(
-        "warp_clock_lockstep: +{}ms on {count} VMs in {elapsed:?}",
-        delta.as_millis()
-    );
-    Ok(elapsed)
-}
-
-/// Change the dilation factor of every VM in `vms` to `factor`, with all
-/// of them paused for the whole write, and hand back the
-/// host wall time the pause → set → resume cycle took.
-///
-/// One factor for the cluster, for the same reason a warp is lockstep:
-/// members whose clocks run at *different* rates diverge without bound,
-/// which is worse than the bounded offset skew a jump risks. Every VM is
-/// resumed on every path, and a resume that fails is an error.
-pub fn set_dilation_lockstep(vms: &mut [&mut Vm], factor: u32) -> Result<Duration, VmError> {
-    if vms.is_empty() {
-        return Err(VmError::DilationNoVms);
-    }
-    let started = Instant::now();
-    let count = vms.len();
-    let resume_failures = std::cell::RefCell::new(Vec::<String>::new());
-    let mut guard = scopeguard::guard(vms, |vms| {
-        for (i, vm) in vms.iter_mut().enumerate() {
-            if let Err(e) = vm.resume() {
-                log::error!("set_dilation_lockstep: VM {i} did not resume: {e}");
-                resume_failures.borrow_mut().push(format!("VM {i} ({e})"));
-            }
-        }
-    });
-    let before: Vec<u32> = guard.iter().map(|vm| vm.dilation()).collect();
-    for vm in guard.iter_mut() {
-        vm.pause()?;
-    }
-    for i in 0..count {
-        if let Err(e) = guard[i].set_dilation_live(factor) {
-            // Members already switched are at a rate the rest are not.
-            // Rates diverge without bound, so put them back before
-            // returning — and say so if even that fails.
-            let mut undone = Vec::new();
-            for j in 0..i {
-                if let Err(e) = guard[j].set_dilation_live(before[j]) {
-                    undone.push(format!("VM {j} stuck at x{factor} ({e})"));
-                }
-            }
-            drop(guard);
-            return Err(if undone.is_empty() {
-                e
-            } else {
-                VmError::SetDilation {
-                    factor,
-                    reason: format!("{e}; rolling the cluster back left {}", undone.join(", ")),
-                }
-            });
-        }
-    }
-    drop(guard);
-
-    let elapsed = started.elapsed();
-    let failures = resume_failures.into_inner();
-    if !failures.is_empty() {
-        return Err(VmError::DilationResume(failures.join(", ")));
-    }
-    log::info!("set_dilation_lockstep: x{factor} on {count} VMs in {elapsed:?}");
-    Ok(elapsed)
 }
 
 impl Drop for Vm {
@@ -4803,6 +2948,12 @@ fn vcpu_run_loop(
                             let offset = (addr - SERIAL2_PORT_BASE) as u8;
                             let mut dev = agent_serial.lock().unwrap();
                             data[0] = dev.read(offset);
+                        } else if crate::pci::PciBus::handles_port(addr) {
+                            // 0xCF8/0xCFC: PCI configuration space. A VM
+                            // without a PCI bus reads zero, as before.
+                            if !mmio_registry.lock().unwrap().pio_read(addr, data) {
+                                data.fill(0);
+                            }
                         } else {
                             data.fill(0);
                         }
@@ -4822,6 +2973,21 @@ fn vcpu_run_loop(
                             for &byte in data {
                                 dev.write(offset, byte);
                             }
+                        } else if crate::pci::PciBus::handles_port(addr) {
+                            mmio_registry.lock().unwrap().pio_write(addr, data);
+                        } else if addr == I8042_COMMAND_PORT
+                            && data.first() == Some(&I8042_RESET_PULSE)
+                        {
+                            // `reboot=k` without ACPI: the kernel pulses
+                            // the i8042 reset line, then would jump to the
+                            // BIOS reset vector — and there is no BIOS, so
+                            // it would run zeros forever (CHALLENGES #308).
+                            // The pulse is the reboot; end the guest here.
+                            log::info!(
+                                "vCPU {cpu_index} guest reset through the keyboard controller \
+                                 after {exit_count} exits"
+                            );
+                            break;
                         }
                     }
                     VcpuExit::Hlt => {
@@ -5649,6 +3815,7 @@ fn sync_dir_to_guest(
 #[cfg(kani)]
 mod verification {
     use super::*;
+    use crate::mem_layout::MMIO_HOLE_START;
 
     /// A clipped `SEEK_DATA` extent stays inside its page-aligned RAM
     /// slot, is page-aligned, and covers every byte of the extent that

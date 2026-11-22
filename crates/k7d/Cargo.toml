@@ -32,6 +32,9 @@ thiserror.workspace = true
 # Resume every paused VM even when a warp (or a test's assert) unwinds
 # mid-cluster.
 scopeguard = "=1.2.0"
+# Userspace ext4 reader for `bls`: the installed disk's /boot is parsed,
+# never mounted on the host.
+ext4-view = { version = "=1.0.0", features = ["std"] }
 
 [features]
 default = []

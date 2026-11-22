@@ -383,3 +383,13 @@ $(REFERENCE_DIR)/virtiofsd:
 
 $(REFERENCE_DIR)/cubesandbox:
 	git clone --depth 1 https://github.com/tencentcloud/CubeSandbox.git $@
+
+# Rust code per design bucket (VMM core / fork / clock / daemon / shim).
+# Pure Python, runs locally. Fails on any .rs file the manifest misses.
+.PHONY: loc loc-firecracker
+loc:
+	python3 utils/loc.py
+
+# The same count over Firecracker's matching core (README "Size").
+loc-firecracker: $(REFERENCE_DIR)/firecracker
+	python3 utils/loc.py --firecracker $(REFERENCE_DIR)/firecracker

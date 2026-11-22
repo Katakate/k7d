@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # Install k7d from a release tarball layout (run from the extracted dir).
-# Version: 0.9.0
+# Version: 0.10.0
 set -euo pipefail
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 PREFIX="${PREFIX:-/usr/local}"
 BIN_DIR="${PREFIX}/bin"
 SHARE_DIR="${PREFIX}/share/k7d"
 UNIT_PATH="/etc/systemd/system/k7d.service"
 WITH_K3S=0
+WITH_CRIO=0
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--with-k3s] [--prefix DIR]
+Usage: ./install.sh [--with-k3s] [--with-crio] [--prefix DIR]
 
 Installs k7d + containerd-shim-k7-v1 to $PREFIX/bin (default /usr/local),
+plus the same binary as containerd-shim-k7-v2 (CRI-O 1.32-1.36 only exec
+vm runtimes named containerd-shim-*-v2),
 guest kernel/initramfs to $PREFIX/share/k7d, k7d-mount-disks to
 /usr/local/libexec, and a systemd unit (from k7d.service.in) that sets
 K7D_KERNEL / K7D_INITRD + RUST_LOG=info + LimitNOFILE=524288 plus the
@@ -22,6 +25,8 @@ capability bounding set and ProtectSystem=strict.
 
   --with-k3s   Also register RuntimeClass k7 and k7-fc in k3s/containerd
                (config-v3.toml.tmpl blocks; no BinaryName options).
+  --with-crio  Also register k7 and k7-fc as CRI-O vm runtimes
+               (/etc/crio/crio.conf.d/50-k7.conf) and restart crio.
   --prefix DIR Install prefix (default: /usr/local)
 EOF
 }
@@ -29,6 +34,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-k3s) WITH_K3S=1; shift ;;
+    --with-crio) WITH_CRIO=1; shift ;;
     --prefix) PREFIX="$2"; BIN_DIR="${PREFIX}/bin"; SHARE_DIR="${PREFIX}/share/k7d"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 1 ;;
@@ -53,6 +59,8 @@ echo "==> installing binaries to $BIN_DIR"
 install -d "$BIN_DIR"
 install -m 755 "$HERE/k7d" "$BIN_DIR/k7d"
 install -m 755 "$HERE/containerd-shim-k7-v1" "$BIN_DIR/containerd-shim-k7-v1"
+# containerd resolves io.containerd.k7.v1 to the -v1 name; keep it.
+install -m 755 "$HERE/containerd-shim-k7-v1" "$BIN_DIR/containerd-shim-k7-v2"
 
 echo "==> installing guest assets to $SHARE_DIR"
 install -d "$SHARE_DIR"
@@ -161,6 +169,34 @@ done
 echo "==> k7d ${VERSION} running (socket=/run/k7d/k7d.sock)"
 echo "==> try: k7d doctor && k7d quickstart"
 
+if [[ "$WITH_CRIO" -eq 1 ]]; then
+  if ! command -v crio >/dev/null 2>&1; then
+    echo "--with-crio: crio is not installed on this host" >&2
+    exit 1
+  fi
+  mkdir -p /etc/k7d /etc/crio/crio.conf.d
+  printf 'backend = "firecracker"\n' > /etc/k7d/shim-k7-fc.toml
+  echo "==> writing /etc/crio/crio.conf.d/50-k7.conf (runtime_type vm)"
+  # The -v2 name: CRI-O 1.32-1.36 reject vm runtimes not named
+  # containerd-shim-*-v2 at config load. Same binary as -v1.
+  cat >/etc/crio/crio.conf.d/50-k7.conf <<EOF
+[crio.runtime.runtimes.k7]
+runtime_path = "${BIN_DIR}/containerd-shim-k7-v2"
+runtime_type = "vm"
+runtime_root = "/run/k7"
+privileged_without_host_devices = true
+
+[crio.runtime.runtimes.k7-fc]
+runtime_path = "${BIN_DIR}/containerd-shim-k7-v2"
+runtime_type = "vm"
+runtime_root = "/run/k7-fc"
+runtime_config_path = "/etc/k7d/shim-k7-fc.toml"
+privileged_without_host_devices = true
+EOF
+  systemctl restart crio
+  echo "==> CRI-O runtimes k7 and k7-fc registered; apply RuntimeClass k7 (handler k7) and k7-fc (handler k7-fc)"
+fi
+
 if [[ "$WITH_K3S" -eq 1 ]]; then
   CONFIG=/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
   if [[ ! -f "$CONFIG" ]]; then
@@ -253,7 +289,7 @@ overhead:
 EOF
   kubectl get runtimeclass k7 k7-fc
   echo "==> k3s RuntimeClass k7 and k7-fc ready"
-else
+elif [[ "$WITH_CRIO" -eq 0 ]]; then
   cat <<EOF
 
 k7d ${VERSION} installed. To register with k3s later, re-run:

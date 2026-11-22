@@ -140,6 +140,9 @@ pub const ETC_FILE_WHITELIST: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/et
 /// And anything under the containerd / k3s sandbox directories is
 /// `etc/resolv.conf`, `etc/hostname`, or `/dev/shm` (all either
 /// handled by the CRI rewrite pass or intentionally dropped).
+/// CRI-O's equivalent is `overlay-containers/<id>/userdata/` under its
+/// default run root (`shm`, `resolv.conf`, `hostname`, `passwd`,
+/// `run/secrets`) and graph root (`.containerenv`).
 ///
 /// Filtering by exclusion via this list is the same heuristic
 /// kata-containers uses to distinguish user hostPaths from CRI
@@ -148,6 +151,9 @@ const CRI_INTERNAL_SOURCE_PREFIXES: &[&str] = &[
     "/var/lib/kubelet/pods/",
     "/var/lib/rancher/k3s/",
     "/run/k3s/",
+    "/run/containers/storage/overlay-containers/",
+    "/var/run/containers/storage/overlay-containers/",
+    "/var/lib/containers/storage/overlay-containers/",
 ];
 
 /// Substring that marks a kubelet **plugin volume** materialization
@@ -1584,6 +1590,17 @@ mod tests {
         )));
         assert!(is_cri_internal_source(Path::new(
             "/run/k3s/containerd/io.containerd.grpc.v1.cri/sandboxes/xyz/shm"
+        )));
+        for leaf in ["shm", "passwd", "run/secrets"] {
+            assert!(is_cri_internal_source(Path::new(&format!(
+                "/run/containers/storage/overlay-containers/xyz/userdata/{leaf}"
+            ))));
+        }
+        assert!(is_cri_internal_source(Path::new(
+            "/var/lib/containers/storage/overlay-containers/xyz/userdata/.containerenv"
+        )));
+        assert!(!is_cri_internal_source(Path::new(
+            "/var/lib/containers/storage/volumes/data"
         )));
     }
 

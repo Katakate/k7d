@@ -106,6 +106,11 @@ pub struct ProcessState {
     pub terminal: bool,
     /// `$TERM` from the OCI process spec env (PTY execs).
     pub term: String,
+    /// Created and not yet started, so `State` answers CREATED. Only
+    /// CRI-O bundles set it: CRI-O refuses `Start` unless `State` says
+    /// created, and containerd's restart reconcile has only ever seen
+    /// RUNNING from this shim.
+    pub created: bool,
 }
 
 /// Per-container state.

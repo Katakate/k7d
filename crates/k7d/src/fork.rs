@@ -11,12 +11,13 @@ use kvm_bindings::{
     KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VcpuFd};
+use serde::{Deserialize, Serialize};
 
 use crate::devices::{create_serial_device_with_trigger, PipeSerialDevice, SerialTrigger};
 use crate::network::{ClusterNetwork, TapDevice, TapNetBackend};
 use crate::snapshot::{CpuState, KvmClockState, SnapshotError, VmState};
 use crate::virtio_mmio::{
-    restore_queues, MmioDevice, MmioDeviceRegistry, VirtioBackend, VIRTIO_ID_VSOCK,
+    attach_device, restore_queues, MmioDeviceRegistry, Placement, VirtioBackend, VIRTIO_ID_VSOCK,
 };
 use crate::vm::{Vm, VmError};
 use crate::vsock::VhostVsockBackend;
@@ -26,6 +27,31 @@ const VIRTIO_ID_NET: u32 = 1;
 /// Virtio device-type ID for `virtio-blk` (matches `crate::block::VIRTIO_ID_BLOCK`).
 const VIRTIO_ID_BLOCK: u32 = 2;
 const VIRTIO_ID_FS: u32 = 26;
+
+/// Rebuild an in-process virtio-blk backend against a snapshot's queue
+/// state: replay the negotiated features, seed the worker counters from
+/// the guest's own rings (CHALLENGES.md #27), activate against `irq_evt`.
+fn restore_blk_backend(
+    host_path: &Path,
+    readonly: bool,
+    mem_host_addr: u64,
+    mem_span: u64,
+    dev_state: &crate::virtio_mmio::MmioDeviceState,
+    irq_evt: &vmm_sys_util::eventfd::EventFd,
+) -> Result<crate::block::BlockBackend, String> {
+    let mut blk_backend =
+        crate::block::BlockBackend::new(host_path, readonly, mem_host_addr, mem_span)
+            .map_err(|e| format!("blk backend: {e}"))?;
+    let queues = restore_queues(&dev_state.queues, blk_backend.max_queue_size());
+    blk_backend.ack_features(dev_state.acked_features);
+    blk_backend
+        .seed_indices_from_guest(&queues)
+        .map_err(|e| format!("blk seed: {e}"))?;
+    blk_backend
+        .activate(&queues, irq_evt)
+        .map_err(|e| format!("blk activate: {e}"))?;
+    Ok(blk_backend)
+}
 
 /// Errors specific to restore/fork operations.
 #[derive(Debug, thiserror::Error)]
@@ -209,14 +235,22 @@ fn reflink_file(src: &Path, dst: &Path) -> Result<(), ForkError> {
 /// consume physical RAM. This makes restore effectively O(1) regardless
 /// of VM memory size.
 pub fn restore_vm(snapshot_dir: &Path) -> Result<Vm, RestoreError> {
-    restore_vm_inner(snapshot_dir, None, None)
+    restore_vm_inner(snapshot_dir, None, None, ClockMode::Wall)
+}
+
+/// Like [`restore_vm`], choosing how kvmclock treats the at-rest gap.
+///
+/// [`ClockMode::Wall`] is what [`restore_vm`] does. [`ClockMode::Frozen`]
+/// does not add the time the snapshot spent at rest.
+pub fn restore_vm_with_clock(snapshot_dir: &Path, clock: ClockMode) -> Result<Vm, RestoreError> {
+    restore_vm_inner(snapshot_dir, None, None, clock)
 }
 
 /// Like [`restore_vm`] but reattaches a pre-built TAP for the virtio-net
 /// MMIO slot — used by [`Vm::prepare_fork_source`] to preserve the source's
 /// network identity through the cold-snapshot/restore boot-strap.
 pub fn restore_vm_with_tap(snapshot_dir: &Path, tap: TapDevice) -> Result<Vm, RestoreError> {
-    restore_vm_inner(snapshot_dir, Some(tap), None)
+    restore_vm_inner(snapshot_dir, Some(tap), None, ClockMode::Wall)
 }
 
 /// Like [`restore_vm_with_tap`] but restores onto a **caller-chosen
@@ -234,7 +268,7 @@ pub(crate) fn restore_vm_preserving_cid(
     tap: Option<TapDevice>,
     cid: u64,
 ) -> Result<Vm, RestoreError> {
-    restore_vm_inner(snapshot_dir, tap, Some(cid))
+    restore_vm_inner(snapshot_dir, tap, Some(cid), ClockMode::Wall)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -242,6 +276,7 @@ fn restore_vm_inner(
     snapshot_dir: &Path,
     tap: Option<TapDevice>,
     forced_cid: Option<u64>,
+    clock: ClockMode,
 ) -> Result<Vm, RestoreError> {
     let start = std::time::Instant::now();
 
@@ -367,13 +402,14 @@ fn restore_vm_inner(
 
     // Create one vCPU per captured CpuState and restore each (CPUID →
     // SREGS → XCRS → XSAVE → REGS → LAPIC → MSRs → MP_STATE last).
-    let vcpu_fds = create_and_restore_vcpus(
+    let (vcpu_fds, at_rest_ms) = create_and_restore_vcpus(
         &kvm,
         &vm_fd,
         &cpu_states,
         irqchip_state.as_ref(),
         bundle.kvmclock.as_ref(),
         bundle.dilation,
+        clock,
     )?;
 
     // Fresh CID by default (concurrent restores from one snapshot must
@@ -401,74 +437,62 @@ fn restore_vm_inner(
     let mut guest_ip_for_vm: Option<Ipv4Addr> = None;
     // Virtio-blk rebuild bookkeeping: device order == config order.
     let mut blk_idx: usize = 0;
+    let rebuild = RestoreError::Kvm;
     for dev_state in &device_states {
+        let placement = Placement::of_state(dev_state).map_err(RestoreError::InvalidSnapshot)?;
         if dev_state.device_type == VIRTIO_ID_VSOCK {
-            let irq = dev_state.irq;
-            let base = dev_state.base_addr;
-
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
-            let irq_evt = Arc::new(irq_evt);
-
-            let mut vsock_backend = VhostVsockBackend::new(new_cid, mem_host_addr, mem_span)
-                .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
-
-            // Pre-activate with saved queue state and correct vring base indices.
-            let queues = restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
-            vsock_backend
-                .activate_with_bases(&queues, &irq_evt, mem_host_addr)
-                .map_err(|e| RestoreError::Kvm(format!("vsock activate: {e}")))?;
-
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(vsock_backend));
-            dev.set_vhost(true);
-            dev.restore_state(dev_state);
+            let dev = attach_device(
+                &vm_fd,
+                &mmio_registry,
+                placement,
+                Some(dev_state),
+                |irq_evt| {
+                    let mut vsock_backend =
+                        VhostVsockBackend::new(new_cid, mem_host_addr, mem_span)
+                            .map_err(|e| format!("vsock backend: {e}"))?;
+                    // Pre-activate with saved queue state and correct vring base indices.
+                    let queues = restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
+                    vsock_backend
+                        .activate_with_bases(&queues, irq_evt, mem_host_addr)
+                        .map_err(|e| format!("vsock activate: {e}"))?;
+                    Ok(vsock_backend)
+                },
+            )
+            .map_err(rebuild)?;
 
             // Signal the event queue IRQ so the guest driver processes the
             // TRANSPORT_RESET event that was injected during snapshot.
             // This makes the driver tear down stale connections and allow
             // new ones via the accept loop. (Mirrors Firecracker's kick.)
-            dev.trigger_vring_irq();
-
-            let mmio_dev = Arc::new(Mutex::new(dev));
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+            dev.lock().unwrap().trigger_vring_irq();
 
             has_vsock = true;
         } else if dev_state.device_type == VIRTIO_ID_NET {
             let Some(net_tap) = tap_slot.take() else {
                 continue;
             };
-            let irq = dev_state.irq;
-            let base = dev_state.base_addr;
-
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
-            let irq_evt = Arc::new(irq_evt);
-
-            let mut net_backend =
-                TapNetBackend::new(net_tap.mac(), net_tap.fd(), mem_host_addr, mem_span);
-            let queues = restore_queues(&dev_state.queues, net_backend.max_queue_size());
-            net_backend.ack_features(dev_state.acked_features);
-            // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
-            net_backend
-                .seed_indices_from_guest(&queues)
-                .map_err(|e| RestoreError::Kvm(format!("net seed: {e}")))?;
-            net_backend
-                .activate(&queues, &irq_evt)
-                .map_err(|e| RestoreError::Kvm(format!("net activate: {e}")))?;
-
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(net_backend));
-            dev.set_vhost(true);
-            dev.restore_state(dev_state);
-            dev.trigger_vring_irq();
-
-            let mmio_dev = Arc::new(Mutex::new(dev));
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+            let dev = attach_device(
+                &vm_fd,
+                &mmio_registry,
+                placement,
+                Some(dev_state),
+                |irq_evt| {
+                    let mut net_backend =
+                        TapNetBackend::new(net_tap.mac(), net_tap.fd(), mem_host_addr, mem_span);
+                    let queues = restore_queues(&dev_state.queues, net_backend.max_queue_size());
+                    net_backend.ack_features(dev_state.acked_features);
+                    // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
+                    net_backend
+                        .seed_indices_from_guest(&queues)
+                        .map_err(|e| format!("net seed: {e}"))?;
+                    net_backend
+                        .activate(&queues, irq_evt)
+                        .map_err(|e| format!("net activate: {e}"))?;
+                    Ok(net_backend)
+                },
+            )
+            .map_err(rebuild)?;
+            dev.lock().unwrap().trigger_vring_irq();
 
             guest_ip_for_vm = Some(net_tap.guest_ip());
             tap_for_vm = Some(net_tap);
@@ -487,39 +511,24 @@ fn restore_vm_inner(
             };
             blk_idx += 1;
 
-            let irq = dev_state.irq;
-            let base = dev_state.base_addr;
-
-            let irq_evt =
-                crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-            vm_fd
-                .register_irqfd(&irq_evt, irq)
-                .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
-            let irq_evt = Arc::new(irq_evt);
-
-            let mut blk_backend = crate::block::BlockBackend::new(
-                &cfg.host_path,
-                cfg.readonly,
-                mem_host_addr,
-                mem_span,
+            let dev = attach_device(
+                &vm_fd,
+                &mmio_registry,
+                placement,
+                Some(dev_state),
+                |irq_evt| {
+                    restore_blk_backend(
+                        &cfg.host_path,
+                        cfg.readonly,
+                        mem_host_addr,
+                        mem_span,
+                        dev_state,
+                        irq_evt,
+                    )
+                },
             )
-            .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
-            let queues = restore_queues(&dev_state.queues, blk_backend.max_queue_size());
-            blk_backend.ack_features(dev_state.acked_features);
-            blk_backend
-                .seed_indices_from_guest(&queues)
-                .map_err(|e| RestoreError::Kvm(format!("blk seed: {e}")))?;
-            blk_backend
-                .activate(&queues, &irq_evt)
-                .map_err(|e| RestoreError::Kvm(format!("blk activate: {e}")))?;
-
-            let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(blk_backend));
-            dev.set_vhost(true);
-            dev.restore_state(dev_state);
-            dev.trigger_vring_irq();
-
-            let mmio_dev = Arc::new(Mutex::new(dev));
-            mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+            .map_err(rebuild)?;
+            dev.lock().unwrap().trigger_vring_irq();
         }
     }
 
@@ -559,7 +568,7 @@ fn restore_vm_inner(
     )])
     .map_err(|e| RestoreError::Kvm(format!("create guest memory: {e}")))?;
 
-    Ok(Vm::from_restored_with_memory(
+    let mut vm = Vm::from_restored_with_memory(
         kvm,
         vm_fd,
         vcpu_fds,
@@ -585,7 +594,9 @@ fn restore_vm_inner(
         Vec::new(),
         bundle.block_devices.clone(),
         bundle.dilation,
-    ))
+    );
+    vm.set_clock_at_rest_ms(at_rest_ms);
+    Ok(vm)
 }
 
 /// Put a restored VM on the time dilation its source ran at. Must run
@@ -641,7 +652,8 @@ fn create_and_restore_vcpus(
     irqchip: Option<&crate::snapshot::IrqChipState>,
     kvmclock: Option<&KvmClockState>,
     dilation: u32,
-) -> Result<Vec<VcpuFd>, RestoreError> {
+    clock: ClockMode,
+) -> Result<(Vec<VcpuFd>, u64), RestoreError> {
     if cpu_states.is_empty() {
         return Err(RestoreError::InvalidSnapshot(
             "snapshot holds no vCPU state".into(),
@@ -689,9 +701,42 @@ fn create_and_restore_vcpus(
         }
         vcpu_fds.push(vcpu_fd);
     }
-    restore_kvmclock(vm_fd, kvmclock, dilation)?;
-    Ok(vcpu_fds)
+    let at_rest_ms = restore_kvmclock(vm_fd, kvmclock, dilation, clock)?;
+    Ok((vcpu_fds, at_rest_ms))
 }
+
+/// How a restore rebases the guest kvmclock.
+///
+/// `wall` is today's behavior and the default: `KVM_SET_CLOCK` is the
+/// captured reading plus the wall time the snapshot spent at rest,
+/// scaled by the VM's dilation. `frozen` does not add that gap, so
+/// guest time stands still. A frozen guest disagrees with the real
+/// world: certificates that expired while it was paused still look
+/// valid inside it, and a certificate it issued can look not-yet-valid
+/// to a client on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockMode {
+    /// Add the at-rest gap. The guest wakes at real now.
+    #[default]
+    Wall,
+    /// Do not add the at-rest gap.
+    Frozen,
+}
+
+impl ClockMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wall => "wall",
+            Self::Frozen => "frozen",
+        }
+    }
+}
+
+/// Guest-time gap past which a wall-clock resume warns that kubelet,
+/// etcd, and `OpenShift` certificates may have expired. Informational:
+/// the resume is not refused.
+const AT_REST_CERT_WARN_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
 /// Put the restored VM's kvmclock back where the guest left it, plus
 /// the wall time the snapshot spent at rest.
@@ -704,11 +749,16 @@ fn create_and_restore_vcpus(
 /// life of the source VM.
 ///
 /// Handing back `clock_ns + at_rest` instead of just `clock_ns` is what
-/// makes the guest's wall clock *correct* rather than merely monotonic:
-/// the guest derived `CLOCK_REALTIME` once at boot from the kvmclock
-/// wall-clock page and has advanced it by this clock ever since, so a
-/// template restored an hour after it was minted otherwise wakes up an
-/// hour behind — and it has no RTC to notice with.
+/// makes the guest's wall clock *correct* rather than merely monotonic
+/// ([`ClockMode::Wall`], the default): the guest derived `CLOCK_REALTIME`
+/// once at boot from the kvmclock wall-clock page and has advanced it by
+/// this clock ever since, so a template restored an hour after it was
+/// minted otherwise wakes up an hour behind — and it has no RTC to notice
+/// with. [`ClockMode::Frozen`] passes `at_rest = 0` through the same
+/// `KVM_SET_CLOCK`: time stood still.
+///
+/// The returned value is the guest-time gap in milliseconds
+/// (`wall_gap × dilation`), whether or not that gap was added.
 ///
 /// The forward jump is the same event as a host suspend, which is what
 /// the `KVM_KVMCLOCK_CTRL` above tells the guest to expect.
@@ -725,13 +775,14 @@ fn restore_kvmclock(
     vm_fd: &kvm_ioctls::VmFd,
     kvmclock: Option<&KvmClockState>,
     dilation: u32,
-) -> Result<(), RestoreError> {
+    clock: ClockMode,
+) -> Result<u64, RestoreError> {
     let Some(state) = kvmclock else {
         log::warn!(
             "restore: snapshot carries no kvmclock reading (taken before the guest ran kvmclock); \
              leaving the restored guest's clock where the capture left it"
         );
-        return Ok(());
+        return Ok(0);
     };
     let now_ns = crate::snapshot::host_unix_nanos()
         .map_err(|e| RestoreError::Kvm(format!("read host wall clock: {e}")))?;
@@ -742,11 +793,16 @@ fn restore_kvmclock(
             state.host_unix_ns - now_ns
         );
     }
-    let at_rest_ns = now_ns
-        .saturating_sub(state.host_unix_ns)
-        .saturating_mul(u64::from(dilation));
+    // One branch. `wall` adds the gap (today's rebase). `frozen` leaves
+    // the captured reading alone — there is no second clock.
+    let wall_gap_ns = now_ns.saturating_sub(state.host_unix_ns);
+    let guest_advance_ns = wall_gap_ns.saturating_mul(u64::from(dilation));
+    let applied_ns = match clock {
+        ClockMode::Frozen => 0,
+        ClockMode::Wall => guest_advance_ns,
+    };
     let data = kvm_bindings::kvm_clock_data {
-        clock: state.clock_ns.saturating_add(at_rest_ns),
+        clock: state.clock_ns.saturating_add(applied_ns),
         // Flags are an input only for KVM_CLOCK_REALTIME, which asks
         // KVM to pair the value with a host TSC reading we do not have.
         flags: 0,
@@ -755,12 +811,22 @@ fn restore_kvmclock(
     vm_fd
         .set_clock(&data)
         .map_err(|e| RestoreError::Kvm(format!("KVM_SET_CLOCK: {e}")))?;
+    let reported_ms = guest_advance_ns / 1_000_000;
+    if clock == ClockMode::Wall && guest_advance_ns >= AT_REST_CERT_WARN_NS {
+        let days = guest_advance_ns / AT_REST_CERT_WARN_NS;
+        log::warn!(
+            "restore: guest advanced {days}d ({reported_ms}ms); kubelet, etcd, and OpenShift \
+             certificates may now be expired — see docs/resuming-a-lab-after-a-long-pause.md"
+        );
+    }
     log::info!(
-        "restore: kvmclock resumed at {}ns ({}ms of guest time at rest, dilation x{dilation})",
+        "restore: kvmclock resumed at {}ns ({}ms of guest time at rest, dilation x{dilation}, \
+         clock {})",
         data.clock,
-        at_rest_ns / 1_000_000
+        reported_ms,
+        clock.as_str(),
     );
-    Ok(())
+    Ok(reported_ms)
 }
 
 /// Restore one vCPU's CPUID: from the snapshot when captured (exact CPU
@@ -1431,7 +1497,15 @@ pub fn restore_vm_from_state(
         fork_id,
         force_full_dump,
     )?;
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, fork_id, None, fork_mem_file, dilation)
+    build_vm_from_state_and_mem_inner(
+        state,
+        fork_mem_addr,
+        fork_id,
+        None,
+        fork_mem_file,
+        dilation,
+        ClockMode::Wall,
+    )
 }
 
 /// Like [`restore_vm_from_state`] but reattaches a pre-built TAP for the
@@ -1465,6 +1539,7 @@ pub fn restore_vm_from_state_with_tap(
         Some(tap),
         fork_mem_file,
         dilation,
+        ClockMode::Wall,
     )
 }
 
@@ -2227,7 +2302,27 @@ pub fn build_vm_from_state_and_mem(
     fork_mem_addr: u64,
     log_tag: &str,
 ) -> Result<Vm, ForkError> {
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, None, None, None)
+    build_vm_from_state_and_mem_inner(
+        state,
+        fork_mem_addr,
+        log_tag,
+        None,
+        None,
+        None,
+        ClockMode::Wall,
+    )
+}
+
+/// Like [`build_vm_from_state_and_mem`], choosing how kvmclock treats
+/// the at-rest gap. Forks do not use this: a warm fork of a running
+/// source has nothing to freeze, and passes [`ClockMode::Wall`].
+pub fn build_vm_from_state_and_mem_with_clock(
+    state: &VmState,
+    fork_mem_addr: u64,
+    log_tag: &str,
+    clock: ClockMode,
+) -> Result<Vm, ForkError> {
+    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, None, None, None, clock)
 }
 
 /// Same as [`build_vm_from_state_and_mem`] but reattaches a pre-built TAP
@@ -2242,7 +2337,15 @@ pub fn build_vm_from_state_and_mem_with_tap(
     log_tag: &str,
     tap: TapDevice,
 ) -> Result<Vm, ForkError> {
-    build_vm_from_state_and_mem_inner(state, fork_mem_addr, log_tag, Some(tap), None, None)
+    build_vm_from_state_and_mem_inner(
+        state,
+        fork_mem_addr,
+        log_tag,
+        Some(tap),
+        None,
+        None,
+        ClockMode::Wall,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2253,6 +2356,7 @@ fn build_vm_from_state_and_mem_inner(
     tap: Option<TapDevice>,
     fork_mem_file: Option<fs::File>,
     dilation: Option<u32>,
+    clock: ClockMode,
 ) -> Result<Vm, ForkError> {
     let start = std::time::Instant::now();
     // `mem_size` is guest RAM; the mapping and every guest-physical bound
@@ -2324,13 +2428,14 @@ fn build_vm_from_state_and_mem_inner(
         // Create one vCPU per captured CpuState and restore each (CPUID
         // → SREGS → XCRS → XSAVE → REGS → LAPIC → MSRs → MP_STATE last,
         // then KVM_KVMCLOCK_CTRL and the VM-scoped kvmclock).
-        let vcpu_fds = create_and_restore_vcpus(
+        let (vcpu_fds, at_rest_ms) = create_and_restore_vcpus(
             &kvm,
             &vm_fd,
             &state.cpus,
             Some(&state.irqchip),
             state.kvmclock.as_ref(),
             state.dilation,
+            clock,
         )?;
 
         // Inject TRANSPORT_RESET into the FORK's memory only. The source is
@@ -2362,34 +2467,30 @@ fn build_vm_from_state_and_mem_inner(
         // the reflinked copy).
         let mut blk_idx: usize = 0;
         let mut fork_block_devices: Vec<crate::vm::BlockConfig> = Vec::new();
+        let rebuild = |e: String| ForkError::Restore(RestoreError::Kvm(e));
         for dev_state in &state.devices {
+            let placement = Placement::of_state(dev_state)
+                .map_err(|e| ForkError::Restore(RestoreError::InvalidSnapshot(e)))?;
             if dev_state.device_type == VIRTIO_ID_VSOCK {
-                let irq = dev_state.irq;
-                let base = dev_state.base_addr;
-
-                let irq_evt =
-                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-                vm_fd
-                    .register_irqfd(&irq_evt, irq)
-                    .map_err(|e| RestoreError::Kvm(format!("register irqfd for vsock: {e}")))?;
-                let irq_evt = Arc::new(irq_evt);
-
-                let mut vsock_backend = VhostVsockBackend::new(new_cid, fork_mem_addr, mem_span)
-                    .map_err(|e| RestoreError::Kvm(format!("vsock backend: {e}")))?;
-
-                let queues = restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
-                vsock_backend
-                    .activate_with_bases(&queues, &irq_evt, fork_mem_addr)
-                    .map_err(|e| RestoreError::Kvm(format!("vsock activate: {e}")))?;
-
-                let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(vsock_backend));
-                dev.set_vhost(true);
-                dev.restore_state(dev_state);
-
-                dev.trigger_vring_irq();
-
-                let mmio_dev = Arc::new(Mutex::new(dev));
-                mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+                let dev = attach_device(
+                    &vm_fd,
+                    &mmio_registry,
+                    placement,
+                    Some(dev_state),
+                    |irq_evt| {
+                        let mut vsock_backend =
+                            VhostVsockBackend::new(new_cid, fork_mem_addr, mem_span)
+                                .map_err(|e| format!("vsock backend: {e}"))?;
+                        let queues =
+                            restore_queues(&dev_state.queues, vsock_backend.max_queue_size());
+                        vsock_backend
+                            .activate_with_bases(&queues, irq_evt, fork_mem_addr)
+                            .map_err(|e| format!("vsock activate: {e}"))?;
+                        Ok(vsock_backend)
+                    },
+                )
+                .map_err(rebuild)?;
+                dev.lock().unwrap().trigger_vring_irq();
                 has_vsock = true;
             } else if dev_state.device_type == VIRTIO_ID_NET {
                 // Re-attach the (already-configured) TAP. The guest's virtio-net
@@ -2403,36 +2504,30 @@ fn build_vm_from_state_and_mem_inner(
                     continue;
                 };
 
-                let irq = dev_state.irq;
-                let base = dev_state.base_addr;
-
-                let irq_evt =
-                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-                vm_fd
-                    .register_irqfd(&irq_evt, irq)
-                    .map_err(|e| RestoreError::Kvm(format!("register irqfd for net: {e}")))?;
-                let irq_evt = Arc::new(irq_evt);
-
-                let mut net_backend =
-                    TapNetBackend::new(tap.mac(), tap.fd(), fork_mem_addr, mem_span);
-                let queues = restore_queues(&dev_state.queues, net_backend.max_queue_size());
-                // Replay the driver's feature-negotiation outcome from the snapshot.
-                net_backend.ack_features(dev_state.acked_features);
-                // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
-                net_backend
-                    .seed_indices_from_guest(&queues)
-                    .map_err(|e| RestoreError::Kvm(format!("net seed: {e}")))?;
-                net_backend
-                    .activate(&queues, &irq_evt)
-                    .map_err(|e| RestoreError::Kvm(format!("net activate: {e}")))?;
-
-                let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(net_backend));
-                dev.set_vhost(true);
-                dev.restore_state(dev_state);
-                dev.trigger_vring_irq();
-
-                let mmio_dev = Arc::new(Mutex::new(dev));
-                mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+                let dev = attach_device(
+                    &vm_fd,
+                    &mmio_registry,
+                    placement,
+                    Some(dev_state),
+                    |irq_evt| {
+                        let mut net_backend =
+                            TapNetBackend::new(tap.mac(), tap.fd(), fork_mem_addr, mem_span);
+                        let queues =
+                            restore_queues(&dev_state.queues, net_backend.max_queue_size());
+                        // Replay the driver's feature-negotiation outcome from the snapshot.
+                        net_backend.ack_features(dev_state.acked_features);
+                        // Guest rings survived the snapshot — seed worker counters or eth0 hangs.
+                        net_backend
+                            .seed_indices_from_guest(&queues)
+                            .map_err(|e| format!("net seed: {e}"))?;
+                        net_backend
+                            .activate(&queues, irq_evt)
+                            .map_err(|e| format!("net activate: {e}"))?;
+                        Ok(net_backend)
+                    },
+                )
+                .map_err(rebuild)?;
+                dev.lock().unwrap().trigger_vring_irq();
 
                 guest_ip_for_vm = Some(tap.guest_ip());
                 tap_for_vm = Some(tap);
@@ -2487,35 +2582,29 @@ fn build_vm_from_state_and_mem_inner(
                 )
                 .map_err(|e| RestoreError::Kvm(format!("respawn virtiofsd (tag={fs_tag}): {e}")))?;
 
-                let irq = dev_state.irq;
-                let base = dev_state.base_addr;
-                let irq_evt =
-                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-                vm_fd
-                    .register_irqfd(&irq_evt, irq)
-                    .map_err(|e| RestoreError::Kvm(format!("register irqfd for fs: {e}")))?;
-                let irq_evt = Arc::new(irq_evt);
-
-                let mut fs_backend = crate::virtiofs::VirtioFsBackend::new(
-                    &socket_path,
-                    &fs_tag,
-                    fork_mem_addr,
-                    mem_span,
-                    mem_fd,
+                attach_device(
+                    &vm_fd,
+                    &mmio_registry,
+                    placement,
+                    Some(dev_state),
+                    |irq_evt| {
+                        let mut fs_backend = crate::virtiofs::VirtioFsBackend::new(
+                            &socket_path,
+                            &fs_tag,
+                            fork_mem_addr,
+                            mem_span,
+                            mem_fd,
+                        )
+                        .map_err(|e| format!("fs backend (tag={fs_tag}): {e}"))?;
+                        let queues = restore_queues(&dev_state.queues, fs_backend.max_queue_size());
+                        fs_backend.ack_features(dev_state.acked_features);
+                        fs_backend
+                            .activate_with_bases(&queues, irq_evt, fork_mem_addr)
+                            .map_err(|e| format!("fs activate (tag={fs_tag}): {e}"))?;
+                        Ok(fs_backend)
+                    },
                 )
-                .map_err(|e| RestoreError::Kvm(format!("fs backend (tag={fs_tag}): {e}")))?;
-                let queues = restore_queues(&dev_state.queues, fs_backend.max_queue_size());
-                fs_backend.ack_features(dev_state.acked_features);
-                fs_backend
-                    .activate_with_bases(&queues, &irq_evt, fork_mem_addr)
-                    .map_err(|e| RestoreError::Kvm(format!("fs activate (tag={fs_tag}): {e}")))?;
-
-                let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(fs_backend));
-                dev.set_vhost(true);
-                dev.restore_state(dev_state);
-
-                let mmio_dev = Arc::new(Mutex::new(dev));
-                mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+                .map_err(rebuild)?;
                 virtiofsds.push(vfsd);
             } else if dev_state.device_type == VIRTIO_ID_BLOCK {
                 // Rebuild the in-process virtio-blk backend against the
@@ -2596,38 +2685,24 @@ fn build_vm_from_state_and_mem_inner(
                     dst
                 };
 
-                let irq = dev_state.irq;
-                let base = dev_state.base_addr;
-                let irq_evt =
-                    crate::fdutil::eventfd_cloexec(libc::EFD_NONBLOCK).map_err(RestoreError::Io)?;
-                vm_fd
-                    .register_irqfd(&irq_evt, irq)
-                    .map_err(|e| RestoreError::Kvm(format!("register irqfd for blk: {e}")))?;
-                let irq_evt = Arc::new(irq_evt);
-
-                let mut blk_backend = crate::block::BlockBackend::new(
-                    &host_path,
-                    cfg.readonly,
-                    fork_mem_addr,
-                    mem_span,
+                let dev = attach_device(
+                    &vm_fd,
+                    &mmio_registry,
+                    placement,
+                    Some(dev_state),
+                    |irq_evt| {
+                        restore_blk_backend(
+                            &host_path,
+                            cfg.readonly,
+                            fork_mem_addr,
+                            mem_span,
+                            dev_state,
+                            irq_evt,
+                        )
+                    },
                 )
-                .map_err(|e| RestoreError::Kvm(format!("blk backend: {e}")))?;
-                let queues = restore_queues(&dev_state.queues, blk_backend.max_queue_size());
-                blk_backend.ack_features(dev_state.acked_features);
-                blk_backend
-                    .seed_indices_from_guest(&queues)
-                    .map_err(|e| RestoreError::Kvm(format!("blk seed: {e}")))?;
-                blk_backend
-                    .activate(&queues, &irq_evt)
-                    .map_err(|e| RestoreError::Kvm(format!("blk activate: {e}")))?;
-
-                let mut dev = MmioDevice::new(base, irq, irq_evt, Box::new(blk_backend));
-                dev.set_vhost(true);
-                dev.restore_state(dev_state);
-                dev.trigger_vring_irq();
-
-                let mmio_dev = Arc::new(Mutex::new(dev));
-                mmio_registry.lock().unwrap().add(Arc::clone(&mmio_dev));
+                .map_err(rebuild)?;
+                dev.lock().unwrap().trigger_vring_irq();
 
                 fork_block_devices.push(crate::vm::BlockConfig {
                     host_path,
@@ -2696,6 +2771,7 @@ fn build_vm_from_state_and_mem_inner(
             fork_block_devices,
             child_dilation,
         );
+        vm.set_clock_at_rest_ms(at_rest_ms);
         if let Some(file) = fork_mem_file {
             vm.set_fork_mem_file(file);
         }

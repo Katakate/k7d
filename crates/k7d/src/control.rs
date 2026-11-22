@@ -31,6 +31,7 @@ use crate::guest::{native_vms_mut, AgentEndpoint, Backend, Guest, GuestError};
 use crate::network::{ClusterNetwork, TapDevice};
 use crate::pool::Pool;
 use crate::tree::{NodeInfo, SnapshotTree, TreeBudget, TreeUsage};
+pub use crate::virtio_mmio::Transport;
 use crate::vm::Vm;
 
 /// Default control-socket path when neither `--socket` nor `K7D_SOCKET`
@@ -376,6 +377,13 @@ pub struct VmConfig {
     /// and no virtiofs — those fields are rejected rather than ignored.
     #[serde(default)]
     pub backend: Backend,
+    /// Which bus the guest's virtio devices sit on. Omitted / `"mmio"`
+    /// is virtio-mmio, what every k7d guest so far boots. `"pci"` puts
+    /// them behind a legacy PCI bus for kernels built without
+    /// `CONFIG_VIRTIO_MMIO` (RHCOS); the caller's `cmdline` must then
+    /// drop `pci=off` and keep `noapic`. Native backend only.
+    #[serde(default)]
+    pub transport: Transport,
 }
 
 /// One **named persistent** data disk.
@@ -441,6 +449,7 @@ impl Default for VmConfig {
             network: None,
             dilation: None,
             backend: Backend::default(),
+            transport: Transport::default(),
         }
     }
 }
@@ -940,11 +949,18 @@ pub enum Request {
     },
     /// Resume a suspended node. Members get **fresh vsock CIDs** —
     /// returned in the response.
+    ///
+    /// `clock` defaults to `wall`: the guest wakes at real now.
+    /// `frozen` does not add the time the snapshot spent at rest.
     TreeResume {
         /// Tree identifier.
         tree_id: String,
         /// Node to resume.
         node_id: String,
+        /// `wall` (default) adds the at-rest gap to kvmclock.
+        /// `frozen` leaves the captured reading in place.
+        #[serde(default)]
+        clock: crate::fork::ClockMode,
     },
     /// Delete a node and its whole subtree (disk included).
     TreePrune {
@@ -1445,6 +1461,14 @@ pub enum Response {
         /// Agent endpoints of the resumed members, same order.
         #[serde(default)]
         agent_endpoints: Vec<AgentEndpoint>,
+        /// Guest-time milliseconds the snapshot spent at rest
+        /// (`(now − capture) × dilation`). Reported for `frozen` as
+        /// well — that mode does not add the gap, it only says how
+        /// long the lab sat. The longest member, for a cluster. `0`
+        /// when the snapshot has no kvmclock reading, and for a
+        /// Firecracker resume (that path does not rebase kvmclock).
+        #[serde(default)]
+        at_rest_ms: u64,
     },
     /// Reply to `tree_open`.
     TreeOpened {
@@ -1809,10 +1833,10 @@ impl TreePayload {
         .map_err(|e| format!("tree suspend({node_id}): {e}"))
     }
 
-    fn resume(&mut self, node_id: &String) -> Result<(), String> {
+    fn resume(&mut self, node_id: &String, clock: crate::fork::ClockMode) -> Result<u64, String> {
         match self {
-            Self::Single(t) => t.resume(node_id),
-            Self::Cluster(t) => t.resume(node_id),
+            Self::Single(t) => t.resume_with_clock(node_id, clock),
+            Self::Cluster(t) => t.resume_with_clock(node_id, clock),
         }
         .map_err(|e| format!("tree resume({node_id}): {e}"))
     }
@@ -2412,6 +2436,9 @@ fn deny_fc_unsupported(config: &VmConfig) -> Result<(), String> {
     let unsupported: &[(bool, &'static str)] = &[
         (!config.virtiofs.is_empty(), "virtiofs"),
         (config.dilation.is_some(), "dilation"),
+        // The in-process PCI bus is k7d's own; FC has `--enable-pci`
+        // but that is a different VMM's bus, not this knob.
+        (config.transport != Transport::Mmio, "transport=pci"),
     ];
     for (present, op) in unsupported {
         if *present {
@@ -3473,12 +3500,17 @@ impl Daemon {
                 }
                 resp
             }
-            Request::TreeResume { tree_id, node_id } => {
-                let resp = self.with_tree(&tree_id, |t| match t.resume(&node_id) {
-                    Ok(()) => Response::TreeResumed {
+            Request::TreeResume {
+                tree_id,
+                node_id,
+                clock,
+            } => {
+                let resp = self.with_tree(&tree_id, |t| match t.resume(&node_id, clock) {
+                    Ok(at_rest_ms) => Response::TreeResumed {
                         guest_cids: t.node_cids(&node_id),
                         agent_endpoints: t.node_endpoints(&node_id),
                         node_id: node_id.clone(),
+                        at_rest_ms,
                     },
                     Err(message) => Response::Error { message },
                 });
@@ -4123,7 +4155,8 @@ impl Daemon {
             .kernel(&kernel)
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
-            .vsock(config.vsock);
+            .vsock(config.vsock)
+            .transport(config.transport);
         if let Some(n) = config.dilation {
             builder = builder.dilation(n);
         }
@@ -5424,7 +5457,8 @@ impl Daemon {
             .kernel(&artifacts.kernel)
             .memory_mb(config.memory_mb)
             .vcpus(config.vcpus)
-            .vsock(config.vsock);
+            .vsock(config.vsock)
+            .transport(config.transport);
         if let Some(n) = config.dilation {
             builder = builder.dilation(n);
         }
@@ -7790,6 +7824,13 @@ mod tests {
                 },
                 "dilation",
             ),
+            (
+                VmConfig {
+                    transport: Transport::Pci,
+                    ..VmConfig::default()
+                },
+                "transport=pci",
+            ),
         ] {
             let err = deny_fc_unsupported(&cfg).expect_err("must be refused");
             assert_eq!(
@@ -7811,6 +7852,16 @@ mod tests {
             ..VmConfig::default()
         })
         .expect("scratch and data disks are Firecracker drives");
+    }
+
+    #[test]
+    fn transport_is_optional_and_defaults_to_mmio() {
+        let old: VmConfig = serde_json::from_str(r#"{"memory_mb":256,"vcpus":1}"#).unwrap();
+        assert_eq!(old.transport, Transport::Mmio);
+        let pci: VmConfig =
+            serde_json::from_str(r#"{"memory_mb":256,"vcpus":1,"transport":"pci"}"#).unwrap();
+        assert_eq!(pci.transport, Transport::Pci);
+        assert!(serde_json::from_str::<VmConfig>(r#"{"transport":"isa"}"#).is_err());
     }
 
     #[test]

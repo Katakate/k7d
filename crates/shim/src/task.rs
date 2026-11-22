@@ -53,6 +53,23 @@ const CRI_SANDBOX_MEMORY: &str = "io.kubernetes.cri.sandbox-memory";
 const CRI_SANDBOX_CPU_QUOTA: &str = "io.kubernetes.cri.sandbox-cpu-quota";
 const CRI_SANDBOX_CPU_PERIOD: &str = "io.kubernetes.cri.sandbox-cpu-period";
 
+// CRI-O (`runtime_type = "vm"`) spells the same identity differently.
+// Each is read only when the containerd key above is absent.
+const CRIO_CONTAINER_TYPE: &str = "io.kubernetes.cri-o.ContainerType";
+const CRIO_SANDBOX_ID: &str = "io.kubernetes.cri-o.SandboxID";
+const CRIO_RUNTIME_HANDLER: &str = "io.kubernetes.cri-o.RuntimeHandler";
+/// CRI-O stamps `io.kubernetes.cri-o.ContainerName` on the sandbox only
+/// (as `k8s_POD_…`); a workload's Kubernetes name arrives as this
+/// kubelet label, which CRI-O copies onto the OCI spec verbatim.
+const KUBELET_CONTAINER_NAME: &str = "io.kubernetes.container.name";
+/// Pod-level `LinuxContainerResources` as JSON (`memory_limit_in_bytes`,
+/// `cpu_quota`, `cpu_period`) on the CRI-O sandbox spec. CRI-O main
+/// writes the v2 key; release-1.32 and 1.34 write the v1 key.
+const CRIO_POD_RESOURCES: [&str; 2] = [
+    "pod-linux-resources.crio.io",
+    "io.kubernetes.cri-o.PodLinuxResources",
+];
+
 // k7d cluster-fork annotations.
 const ANN_CLUSTER_ID: &str = "k7d.katakate.org/cluster-id";
 const ANN_FORK_SOURCE_CLUSTER: &str = "k7d.katakate.org/fork-source-cluster";
@@ -314,12 +331,143 @@ pub struct ShimAnnotations {
     /// (`k7` or `k7-fc`). Absent on this node's k3s containerd
     /// (CHALLENGES #228); `ConfigPath` is the fallback.
     pub runtime_handler: Option<String>,
+    /// CRI-O's pod resources JSON ([`CRIO_POD_RESOURCES`]). Raw; parsed
+    /// loudly at sandbox Create ([`apply_crio_pod_resources`]).
+    pub crio_pod_resources: Option<String>,
+    /// The bundle came from CRI-O (it carries [`CRIO_CONTAINER_TYPE`]).
+    pub crio: bool,
+}
+
+/// The init pid of a task, as `Create`, `Start`, `State` and `Delete`
+/// report it. CRI-O's vm runtime reads `/proc/<pid>/stat` for its start
+/// time and keeps probing the pid with `kill(pid, 0)` plus that start
+/// time; a mismatch marks the task dead (an infra task: the sandbox
+/// `NotReady`, so kubelet rebuilds the pod). It must be a live host
+/// process for the pod's lifetime: this shim. containerd gets the
+/// synthetic guest pid.
+fn create_response_pid(crio: bool, synthetic: u32) -> u32 {
+    if crio {
+        std::process::id()
+    } else {
+        synthetic
+    }
+}
+
+/// The systemd slice and scope runc would make of a sandbox's
+/// `linux.cgroupsPath` (`<slice>:<prefix>:<name>`), or `None` for a
+/// cgroupfs-driver path, where systemd never trims a pod's slice.
+fn systemd_scope_of(cgroups_path: &str) -> Option<(String, String)> {
+    let mut parts = cgroups_path.splitn(3, ':');
+    let (slice, prefix, name) = (parts.next()?, parts.next()?, parts.next()?);
+    let unit = if prefix.is_empty() {
+        format!("{name}.scope")
+    } else {
+        format!("{prefix}-{name}.scope")
+    };
+    Some((slice.to_string(), unit))
+}
+
+/// Move this shim into a delegated scope under the CRI-O pod's slice.
+/// A VM sandbox otherwise leaves that slice with no unit in it, and
+/// systemd drops `cpuset` from the besteffort/burstable slice's `subtree_control` the
+/// next time any unit starts (no member asks for it). kubelet's
+/// resync then finds the pod cgroup "missing" and kills the pod.
+/// runc's container scopes carry `Delegate=yes`, which keeps every
+/// controller enabled up the tree; this scope does the same.
+fn join_crio_sandbox_scope(bundle: &str, id: &str) -> Result<(), String> {
+    let spec_path = Path::new(bundle).join("config.json");
+    let spec: serde_json::Value = std::fs::read_to_string(&spec_path)
+        .map_err(|e| e.to_string())
+        .and_then(|d| serde_json::from_str(&d).map_err(|e| e.to_string()))
+        .map_err(|e| format!("read {}: {e}", spec_path.display()))?;
+    let Some(path) = spec.pointer("/linux/cgroupsPath").and_then(|v| v.as_str()) else {
+        return Err(format!("{}: no linux.cgroupsPath", spec_path.display()));
+    };
+    let Some((slice, unit)) = systemd_scope_of(path) else {
+        return Ok(());
+    };
+    let pid = std::process::id().to_string();
+    let desc = format!("k7 sandbox {id}");
+    let out = std::process::Command::new("busctl")
+        .args([
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StartTransientUnit",
+            "ssa(sv)a(sa(sv))",
+            &unit,
+            "fail",
+            "4",
+            "Slice",
+            "s",
+            &slice,
+            "Delegate",
+            "b",
+            "true",
+            "PIDs",
+            "au",
+            "1",
+            &pid,
+            "Description",
+            "s",
+            &desc,
+            "0",
+        ])
+        .output()
+        .map_err(|e| format!("spawn busctl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "systemd StartTransientUnit {unit} in {slice}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    log::info!("joined {slice}/{unit} (pid {pid})");
+    Ok(())
 }
 
 impl ShimAnnotations {
     fn lookup<'a>(annotations: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         annotations.get(key).and_then(serde_json::Value::as_str)
     }
+
+    /// First of `keys` present — the containerd key, then its CRI-O alias.
+    fn lookup_any<'a>(annotations: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+        keys.iter().find_map(|k| Self::lookup(annotations, k))
+    }
+}
+
+/// Size a CRI-O sandbox from its pod resources JSON. containerd's
+/// per-field annotations win whenever any of them is present, so a
+/// containerd pod is never resized by this.
+fn apply_crio_pod_resources(ann: &mut ShimAnnotations) -> Result<(), String> {
+    let Some(raw) = ann.crio_pod_resources.as_deref() else {
+        return Ok(());
+    };
+    if ann.sandbox_memory_bytes.is_some()
+        || ann.sandbox_cpu_quota.is_some()
+        || ann.sandbox_cpu_period.is_some()
+    {
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("CRI-O pod resources annotation {raw:?} is not JSON: {e}"))?;
+    if v.is_null() {
+        return Ok(());
+    }
+    let field = |k: &str| -> Result<Option<i64>, String> {
+        match v.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(n) => n
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| format!("CRI-O pod resources {k}={n} is not an integer")),
+        }
+    };
+    ann.sandbox_memory_bytes = field("memory_limit_in_bytes")?.and_then(|n| u64::try_from(n).ok());
+    ann.sandbox_cpu_quota = field("cpu_quota")?;
+    ann.sandbox_cpu_period = field("cpu_period")?.and_then(|n| u64::try_from(n).ok());
+    Ok(())
 }
 
 /// The k7 shim service.
@@ -363,6 +511,52 @@ pub(crate) fn debug_log_cni(msg: &str) {
                 .unwrap_or(0)
         );
     }
+}
+
+/// Whether a Shutdown for `id` names one of this pod's live workload
+/// containers. CRI-O sends Shutdown with each container's id when it
+/// deletes that container, init containers included — there it means
+/// "this container is done", not "this shim is done". Like the runc
+/// shim, only the sandbox id tears the pod down.
+fn is_live_workload(state: &SandboxState, id: &str) -> bool {
+    state
+        .sandbox_id
+        .as_ref()
+        .is_some_and(|sid| sid != id && state.containers.contains_key(id))
+}
+
+/// Set by `start_shim` on the server child when the runtime gave no
+/// events address (CRI-O): the path of the sink that child serves for
+/// the crate's mandatory publisher dial.
+const EVENT_SINK_ENV: &str = "K7_SHIM_EVENT_SINK";
+
+/// Listen on `path` and drain whatever connects. A sibling shim of the
+/// same pod that already serves it is fine; a stale socket file left by
+/// a dead one is replaced.
+fn serve_event_sink(path: &str) -> std::io::Result<()> {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    if let Some(dir) = Path::new(path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(path).is_ok() {
+                return Ok(());
+            }
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)?
+        }
+        Err(e) => return Err(e),
+    };
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut &conn, &mut std::io::sink());
+            });
+        }
+    });
+    Ok(())
 }
 
 /// Detect a `hostNetwork: true` pod by the absence of the
@@ -469,10 +663,14 @@ fn annotations_from_spec(bundle: &str) -> ShimAnnotations {
     };
 
     ShimAnnotations {
-        container_type: ShimAnnotations::lookup(annotations, CRI_CONTAINER_TYPE)
-            .unwrap_or("container")
-            .to_string(),
-        sandbox_id: ShimAnnotations::lookup(annotations, CRI_SANDBOX_ID).map(str::to_string),
+        container_type: ShimAnnotations::lookup_any(
+            annotations,
+            &[CRI_CONTAINER_TYPE, CRIO_CONTAINER_TYPE],
+        )
+        .unwrap_or("container")
+        .to_string(),
+        sandbox_id: ShimAnnotations::lookup_any(annotations, &[CRI_SANDBOX_ID, CRIO_SANDBOX_ID])
+            .map(str::to_string),
         cluster_id: ShimAnnotations::lookup(annotations, ANN_CLUSTER_ID).map(str::to_string),
         fork_source_cluster: ShimAnnotations::lookup(annotations, ANN_FORK_SOURCE_CLUSTER)
             .map(str::to_string),
@@ -506,8 +704,54 @@ fn annotations_from_spec(bundle: &str) -> ShimAnnotations {
         docker: ShimAnnotations::lookup(annotations, ANN_DOCKER).map(str::to_string),
         docker_disk: ShimAnnotations::lookup(annotations, ANN_DOCKER_DISK).map(str::to_string),
         backend: ShimAnnotations::lookup(annotations, ANN_BACKEND).map(str::to_string),
-        runtime_handler: ShimAnnotations::lookup(annotations, CRI_RUNTIME_HANDLER)
+        runtime_handler: ShimAnnotations::lookup_any(
+            annotations,
+            &[CRI_RUNTIME_HANDLER, CRIO_RUNTIME_HANDLER],
+        )
+        .map(str::to_string),
+        crio_pod_resources: ShimAnnotations::lookup_any(annotations, &CRIO_POD_RESOURCES)
             .map(str::to_string),
+        crio: annotations.get(CRIO_CONTAINER_TYPE).is_some(),
+    }
+}
+
+/// Give a CRI-O workload spec containerd's container-name key, which is
+/// what [`log_container_scratch_placement`] and the guest agent's
+/// per-container scratch lookup read.
+fn alias_crio_container_name(spec: &mut serde_json::Value) {
+    let Some(ann) = spec
+        .get_mut("annotations")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if ann.contains_key(CRI_CONTAINER_NAME)
+        || ann
+            .get(CRIO_CONTAINER_TYPE)
+            .and_then(serde_json::Value::as_str)
+            != Some("container")
+    {
+        return;
+    }
+    if let Some(name) = ann.get(KUBELET_CONTAINER_NAME).cloned() {
+        ann.insert(CRI_CONTAINER_NAME.to_string(), name);
+    }
+}
+
+/// Host directory holding the image when Create carried no snapshotter
+/// mounts: CRI-O's containers/storage has already mounted it at the
+/// absolute `root.path`; direct-bundle callers keep it at
+/// `<bundle>/rootfs`.
+fn unmounted_rootfs_dir(bundle: &str, spec: &serde_json::Value) -> PathBuf {
+    let crio = spec
+        .pointer("/annotations")
+        .is_some_and(|a| a.get(CRIO_CONTAINER_TYPE).is_some());
+    match spec
+        .pointer("/root/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(p) if crio && Path::new(p).is_absolute() => PathBuf::from(p),
+        _ => Path::new(bundle).join("rootfs"),
     }
 }
 
@@ -1517,6 +1761,16 @@ impl shim::asynchronous::Shim for K7Service {
     type T = Self;
 
     async fn new(_runtime_id: &str, args: &shim::Flags, _config: &mut shim::Config) -> Self {
+        // Runs before the crate dials `TTRPC_ADDRESS`, so the sink is
+        // listening by then. A bind failure leaves that dial to fail
+        // loudly on its own.
+        if !args.socket.is_empty() && args.action != "start" && args.action != "delete" {
+            if let Ok(path) = std::env::var(EVENT_SINK_ENV) {
+                if let Err(e) = serve_event_sink(&path) {
+                    debug_log_cni(&format!("event sink {path}: {e}"));
+                }
+            }
+        }
         Self {
             state: Arc::new(Mutex::new(SandboxState::new())),
             bridges: Arc::new(Mutex::new(HashMap::new())),
@@ -1558,7 +1812,19 @@ impl shim::asynchronous::Shim for K7Service {
         let grouping = annotations_from_spec(".")
             .sandbox_id
             .unwrap_or_else(|| opts.id.clone());
-        let address = shim::asynchronous::spawn(opts, &grouping, Vec::new()).await?;
+        // CRI-O's vm runtime hands the shim an empty `TTRPC_ADDRESS`
+        // (it never subscribes to shim events), and the server process
+        // dials that address before it listens. Point it at a sink the
+        // child serves itself.
+        let sink = (opts.ttrpc_address.is_empty()).then(|| {
+            let address = shim::socket_address(&opts.address, &opts.namespace, &grouping);
+            format!("{}.events", address.trim_start_matches("unix://"))
+        });
+        let vars: Vec<(&str, &str)> = sink
+            .as_deref()
+            .map(|s| vec![("TTRPC_ADDRESS", s), (EVENT_SINK_ENV, s)])
+            .unwrap_or_default();
+        let address = shim::asynchronous::spawn(opts, &grouping, vars).await?;
         Ok(address)
     }
 
@@ -1588,11 +1854,16 @@ impl shim::asynchronous::Shim for K7Service {
     }
 
     async fn create_task_service(&self, publisher: RemotePublisher) -> Self::T {
+        // Nothing answers `Forward` on the event sink, so a publisher
+        // aimed at it would wedge its queue; CRI-O reads exits via Wait.
+        let publisher = std::env::var_os(EVENT_SINK_ENV)
+            .is_none()
+            .then(|| Arc::new(publisher));
         Self {
             state: Arc::clone(&self.state),
             bridges: Arc::clone(&self.bridges),
             pty_sessions: Arc::clone(&self.pty_sessions),
-            publisher: Some(Arc::new(publisher)),
+            publisher,
             namespace: self.namespace.clone(),
             id: self.id.clone(),
             usage: self.usage.clone(),
@@ -1737,6 +2008,8 @@ impl Task for K7Service {
                     resp.status = Status::STOPPED.into();
                     resp.exit_status = code as u32;
                     resp.exited_at = now_timestamp();
+                } else if c.init.created {
+                    resp.status = Status::CREATED.into();
                 } else {
                     resp.status = Status::RUNNING.into();
                 }
@@ -1769,8 +2042,16 @@ impl Task for K7Service {
     ) -> TtrpcResult<api::CreateTaskResponse> {
         log::info!("Create: id={} bundle={}", req.id, req.bundle);
 
-        let ann = annotations_from_spec(&req.bundle);
+        let mut ann = annotations_from_spec(&req.bundle);
         let container_type = ann.container_type.clone();
+        let crio = ann.crio;
+        if container_type == "sandbox" {
+            apply_crio_pod_resources(&mut ann).map_err(containerd_shim::Error::Other)?;
+            if crio {
+                join_crio_sandbox_scope(&req.bundle, &req.id)
+                    .map_err(containerd_shim::Error::Other)?;
+            }
+        }
         log::info!(
             "container_type={container_type} cluster_id={:?} fork_source={:?} vm_index={:?} \
              tree_id={:?} tree_source_node_id={:?} for {}",
@@ -2075,6 +2356,9 @@ impl Task for K7Service {
                     // something a pod asks for.
                     dilation: None,
                     backend,
+                    // Pods boot the mmio guest; the PCI bus is for
+                    // kernels without CONFIG_VIRTIO_MMIO (spec: RHCOS).
+                    transport: k7d::control::Transport::Mmio,
                 };
                 // Declare the spare image-slot devices
                 // while the VmConfig is still parked — they must be in
@@ -2170,7 +2454,7 @@ impl Task for K7Service {
                 })?;
             }
 
-            let pid = state.alloc_pid();
+            let pid = create_response_pid(crio, state.alloc_pid());
             state.containers.insert(
                 req.id.clone(),
                 ContainerState {
@@ -2184,6 +2468,7 @@ impl Task for K7Service {
                         args: Vec::new(),
                         terminal: false,
                         term: String::new(),
+                        created: crio,
                     },
                     execs: HashMap::new(),
                 },
@@ -2316,7 +2601,10 @@ impl Task for K7Service {
                 }
             }
 
-            state.containers.get(&req.id).map_or(1, |c| c.init.pid)
+            state.containers.get_mut(&req.id).map_or(1, |c| {
+                c.init.created = false;
+                c.init.pid
+            })
         }; // state lock released here
 
         if let Some((endpoint, exit_code, guest_name)) = exit_watch {
@@ -2638,6 +2926,7 @@ impl Task for K7Service {
                         args: args.clone(),
                         terminal,
                         term: term.clone(),
+                        created: false,
                     },
                 );
             } else {
@@ -2826,6 +3115,14 @@ impl Task for K7Service {
         req: api::ShutdownRequest,
     ) -> TtrpcResult<api::Empty> {
         log::info!("Shutdown requested: id={}", req.id);
+
+        if is_live_workload(&self.state.lock().unwrap(), &req.id) {
+            debug_log_cni(&format!(
+                "Shutdown: {} is a workload of this pod; VM stays up",
+                req.id
+            ));
+            return Ok(api::Empty::new());
+        }
 
         // Shims now group per pod (sandbox-id
         // grouping in start_shim), but a crashed predecessor of the
@@ -3153,7 +3450,8 @@ fn mount_rootfs(
 ///   container rootfs and wasn't covered by the rewrite map
 /// - Strip only confinement the guest cannot honour:
 ///   `cgroupsPath` (host path; runc creates a fresh guest path),
-///   `process.apparmorProfile` (no LSM in `config-minimal`), and
+///   `process.apparmorProfile`, `process.selinuxLabel` and
+///   `linux.mountLabel` (no LSM in `config-minimal`), and
 ///   namespace `path`s (host `/proc/<pid>/ns/*`). Keep
 ///   `linux.seccomp`, `maskedPaths`, and `readonlyPaths` — the
 ///   guest has `CONFIG_SECCOMP_FILTER` and runc links libseccomp
@@ -3345,6 +3643,10 @@ fn fix_oci_config(
     // would make runc fail. Strip rather than invent a no-op.
     if let Some(process) = spec.get_mut("process").and_then(|v| v.as_object_mut()) {
         process.remove("apparmorProfile");
+        process.remove("selinuxLabel");
+    }
+    if let Some(linux) = spec.get_mut("linux").and_then(|v| v.as_object_mut()) {
+        linux.remove("mountLabel");
     }
 
     serde_json::to_string_pretty(&spec)
@@ -3452,6 +3754,21 @@ fn sanitize_guest_resources(
     // when CONFIG_SWAP=n.
     if let Some(serde_json::Value::Object(mem)) = resources.get_mut("memory") {
         mem.remove("swap");
+    }
+    // CONFIG_CGROUP_HUGETLB=n: a zero limit (CRI-O emits one per host
+    // page size) is what a hugetlb-less guest enforces anyway; a real
+    // hugepages request cannot be served.
+    if let Some(limits) = resources.remove("hugepageLimits") {
+        let asks = limits.as_array().is_none_or(|a| {
+            a.iter()
+                .any(|l| l.get("limit").and_then(serde_json::Value::as_u64) != Some(0))
+        });
+        if asks {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("hugepages are not available in the k7 guest: {limits}"),
+            ));
+        }
     }
     let drop_unified = match resources.get_mut("unified") {
         Some(serde_json::Value::Object(unified)) => {
@@ -3875,13 +4192,14 @@ fn workload_create_block(
     let src_config = Path::new(&req.bundle).join("config.json");
     let spec_data = std::fs::read_to_string(&src_config)
         .map_err(|e| format!("read {}: {e}", src_config.display()))?;
-    let spec_val: serde_json::Value = serde_json::from_str(&spec_data)
+    let mut spec_val: serde_json::Value = serde_json::from_str(&spec_data)
         .map_err(|e| format!("parse {}: {e}", src_config.display()))?;
+    alias_crio_container_name(&mut spec_val);
 
     log_container_scratch_placement(state, &req.id, &spec_val);
 
     let cache_dir = Path::new(k7d::erofs::DEFAULT_CACHE_DIR);
-    let guest_root = prepare_rootfs_device(state, req, cache_dir)?;
+    let guest_root = prepare_rootfs_device(state, req, &spec_val, cache_dir)?;
     let etc_to_push = collect_etc_files(state, &spec_val);
     prepare_k7d_disks(state, &spec_val)?;
     prepare_ro_hostpath_images(state, &spec_val, cache_dir)?;
@@ -3974,6 +4292,7 @@ fn log_container_scratch_placement(
 fn prepare_rootfs_device(
     state: &mut SandboxState,
     req: &api::CreateTaskRequest,
+    spec: &serde_json::Value,
     cache_dir: &Path,
 ) -> Result<String, String> {
     let overlay_lower = req.rootfs.iter().find_map(|m| {
@@ -4003,9 +4322,9 @@ fn prepare_rootfs_device(
         // a content walk.
         pack_mounted_rootfs(state, req, cache_dir, None)?
     } else {
-        // Direct-bundle callers (no containerd mounts): pack the
-        // bundle's rootfs dir, content-walk keyed.
-        let dir = Path::new(&req.bundle).join("rootfs");
+        // No snapshotter mounts (direct-bundle callers, CRI-O): pack
+        // the already-mounted image dir, content-walk keyed.
+        let dir = unmounted_rootfs_dir(&req.bundle, spec);
         if !dir.is_dir() {
             return Err(format!(
                 "no rootfs mounts and no {} — cannot resolve the container image",
@@ -4737,6 +5056,11 @@ fn prepare_hostpath_fallback(
         .with_vm_mounts(FALLBACK_MOUNT_RO, FALLBACK_MOUNT_RW);
     pv.rewrites.merge(&state.rewrites);
     let baseline = pv.rewrites.len();
+    let sources: Vec<String> = k7d::volumes::hostpath_mounts_for_workload(spec, &pv.rewrites)
+        .map_err(|e| format!("virtiofs-fallback hostPath wiring: {e}"))?
+        .iter()
+        .map(|m| m.source.display().to_string())
+        .collect();
     pv.add_hostpath_mounts_for_workload(spec)
         .map_err(|e| format!("virtiofs-fallback hostPath wiring: {e}"))?;
     if pv.rewrites.len() == baseline {
@@ -4751,7 +5075,7 @@ fn prepare_hostpath_fallback(
     if state.backend == k7d::guest::Backend::Firecracker {
         pv.cleanup();
         return Err(format!(
-            "{} (backend firecracker has no virtiofs)",
+            "{} (backend firecracker has no virtiofs): {sources:?}",
             k7d::volumes::DENY_VIRTIOFS_FALLBACK_MSG
         ));
     }
@@ -4772,7 +5096,8 @@ fn prepare_hostpath_fallback(
          copy) because virtiofs sessions cannot be CoW-forked"
     );
     debug_log_cni(&format!(
-        "Create: virtiofs fallback for {sandbox_id} ({added} hostPath bind(s)) — slow-fork"
+        "Create: virtiofs fallback for {sandbox_id} ({added} hostPath bind(s)) — slow-fork: \
+         {sources:?}"
     ));
     cfg.virtiofs.push(k7d::control::ShareConfig {
         host_dir: pv.host_volumes_ro.to_string_lossy().into_owned(),
@@ -4888,6 +5213,249 @@ mod tests {
             resolve_backend(&backend_ann(Some("k7-fc"), None), None).unwrap(),
             k7d::guest::Backend::Firecracker
         );
+    }
+
+    fn bundle_with_spec(tag: &str, spec: &serde_json::Value) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("k7d-crio-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), spec.to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn crio_identity_keys_alias_containerd_keys() {
+        let sandbox = bundle_with_spec(
+            "sb",
+            &serde_json::json!({ "annotations": {
+                "io.kubernetes.cri-o.ContainerType": "sandbox",
+                "io.kubernetes.cri-o.SandboxID": "sb1",
+                "io.kubernetes.cri-o.RuntimeHandler": "k7-fc",
+            }}),
+        );
+        let ann = annotations_from_spec(sandbox.to_str().unwrap());
+        assert!(ann.crio);
+        assert_eq!(create_response_pid(ann.crio, 100), std::process::id());
+        assert_eq!(
+            create_response_pid(false, 100),
+            100,
+            "containerd keeps synthetic"
+        );
+        assert_eq!(ann.container_type, "sandbox");
+        assert_eq!(ann.sandbox_id.as_deref(), Some("sb1"));
+        assert_eq!(ann.runtime_handler.as_deref(), Some("k7-fc"));
+        assert_eq!(
+            resolve_backend(&ann, None).unwrap(),
+            k7d::guest::Backend::Firecracker
+        );
+
+        let both = bundle_with_spec(
+            "both",
+            &serde_json::json!({ "annotations": {
+                "io.kubernetes.cri.container-type": "container",
+                "io.kubernetes.cri-o.ContainerType": "sandbox",
+                "io.kubernetes.cri.sandbox-id": "containerd-sb",
+                "io.kubernetes.cri-o.SandboxID": "crio-sb",
+            }}),
+        );
+        let ann = annotations_from_spec(both.to_str().unwrap());
+        assert_eq!(ann.container_type, "container", "containerd key wins");
+        assert_eq!(ann.sandbox_id.as_deref(), Some("containerd-sb"));
+        let _ = std::fs::remove_dir_all(sandbox);
+        let _ = std::fs::remove_dir_all(both);
+    }
+
+    #[test]
+    fn crio_pod_resources_size_the_vm() {
+        for key in CRIO_POD_RESOURCES {
+            let bundle = bundle_with_spec(
+                "res",
+                &serde_json::json!({ "annotations": {
+                    "io.kubernetes.cri-o.ContainerType": "sandbox",
+                    (key): r#"{"cpu_period":100000,"cpu_quota":250000,"memory_limit_in_bytes":536870912}"#,
+                }}),
+            );
+            let mut ann = annotations_from_spec(bundle.to_str().unwrap());
+            apply_crio_pod_resources(&mut ann).unwrap();
+            assert_eq!(
+                vm_sizing_from_annotations(&ann),
+                VmSizing {
+                    memory_mb: 512 + VM_MEMORY_OVERHEAD_MB,
+                    vcpus: 3,
+                    cpu_quota: Some(250_000),
+                    cpu_period: Some(100_000),
+                },
+                "{key}"
+            );
+            let _ = std::fs::remove_dir_all(bundle);
+        }
+    }
+
+    #[test]
+    fn crio_pod_resources_never_override_containerd_sizing() {
+        let mut ann = ShimAnnotations {
+            sandbox_memory_bytes: Some(64 * 1024 * 1024),
+            crio_pod_resources: Some(r#"{"memory_limit_in_bytes":536870912}"#.into()),
+            ..Default::default()
+        };
+        apply_crio_pod_resources(&mut ann).unwrap();
+        assert_eq!(ann.sandbox_memory_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn crio_pod_resources_besteffort_and_garbage() {
+        for raw in ["null", "{}"] {
+            let mut ann = ShimAnnotations {
+                crio_pod_resources: Some(raw.into()),
+                ..Default::default()
+            };
+            apply_crio_pod_resources(&mut ann).unwrap();
+            assert_eq!(
+                vm_sizing_from_annotations(&ann).memory_mb,
+                DEFAULT_VM_MEMORY_MB
+            );
+        }
+        for raw in ["{", r#"{"cpu_quota":"lots"}"#] {
+            let mut ann = ShimAnnotations {
+                crio_pod_resources: Some(raw.into()),
+                ..Default::default()
+            };
+            assert!(apply_crio_pod_resources(&mut ann).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn crio_workload_gets_containerd_container_name() {
+        let mut spec = serde_json::json!({ "annotations": {
+            "io.kubernetes.cri-o.ContainerType": "container",
+            "io.kubernetes.container.name": "builder",
+        }});
+        alias_crio_container_name(&mut spec);
+        assert_eq!(spec["annotations"][CRI_CONTAINER_NAME], "builder");
+
+        let mut sandbox = serde_json::json!({ "annotations": {
+            "io.kubernetes.cri-o.ContainerType": "sandbox",
+            "io.kubernetes.container.name": "POD",
+        }});
+        alias_crio_container_name(&mut sandbox);
+        assert!(sandbox["annotations"].get(CRI_CONTAINER_NAME).is_none());
+
+        let mut containerd = serde_json::json!({ "annotations": {
+            "io.kubernetes.cri.container-name": "app",
+            "io.kubernetes.container.name": "other",
+        }});
+        alias_crio_container_name(&mut containerd);
+        assert_eq!(containerd["annotations"][CRI_CONTAINER_NAME], "app");
+    }
+
+    #[test]
+    fn crio_cgroups_path_names_runcs_scope() {
+        assert_eq!(
+            systemd_scope_of("kubepods-besteffort-podab_cd.slice:crio:0123"),
+            Some((
+                "kubepods-besteffort-podab_cd.slice".into(),
+                "crio-0123.scope".into()
+            ))
+        );
+        assert_eq!(
+            systemd_scope_of("system.slice::k7"),
+            Some(("system.slice".into(), "k7.scope".into()))
+        );
+        assert_eq!(systemd_scope_of("/kubepods/besteffort/podab/0123"), None);
+    }
+
+    #[test]
+    fn crio_rootfs_is_the_absolute_root_path() {
+        let crio = serde_json::json!({
+            "root": { "path": "/var/lib/containers/storage/overlay/abc/merged" },
+            "annotations": { "io.kubernetes.cri-o.ContainerType": "container" },
+        });
+        assert_eq!(
+            unmounted_rootfs_dir("/b", &crio),
+            PathBuf::from("/var/lib/containers/storage/overlay/abc/merged")
+        );
+        let plain = serde_json::json!({ "root": { "path": "/abs/elsewhere" } });
+        assert_eq!(
+            unmounted_rootfs_dir("/b", &plain),
+            PathBuf::from("/b/rootfs")
+        );
+        let relative = serde_json::json!({
+            "root": { "path": "rootfs" },
+            "annotations": { "io.kubernetes.cri-o.ContainerType": "container" },
+        });
+        assert_eq!(
+            unmounted_rootfs_dir("/b", &relative),
+            PathBuf::from("/b/rootfs")
+        );
+    }
+
+    #[test]
+    fn zero_hugepage_limits_are_dropped_and_real_ones_refused() {
+        let zero = serde_json::json!({
+            "hugepageLimits": [{ "pageSize": "2MB", "limit": 0 }, { "pageSize": "1GB", "limit": 0 }],
+            "memory": { "limit": 1 }
+        });
+        let out = sanitize_guest_resources(zero, false).unwrap();
+        assert!(out.get("hugepageLimits").is_none());
+        assert_eq!(out["memory"]["limit"], 1);
+        let real =
+            serde_json::json!({ "hugepageLimits": [{ "pageSize": "2MB", "limit": 2_097_152 }] });
+        assert!(sanitize_guest_resources(real, false).is_err());
+        let garbage = serde_json::json!({ "hugepageLimits": { "limit": 0 } });
+        assert!(sanitize_guest_resources(garbage, false).is_err());
+    }
+
+    fn container_state() -> ContainerState {
+        ContainerState {
+            init: ProcessState {
+                pid: 1,
+                exit_code: Arc::new(Mutex::new(None)),
+                bundle: String::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                stdin: String::new(),
+                args: Vec::new(),
+                terminal: false,
+                term: String::new(),
+                created: false,
+            },
+            execs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn shutdown_of_a_workload_id_keeps_the_pod() {
+        let mut state = SandboxState::new();
+        state.sandbox_id = Some("sb".into());
+        state.containers.insert("sb".into(), container_state());
+        state.containers.insert("init-1".into(), container_state());
+        assert!(is_live_workload(&state, "init-1"));
+        assert!(!is_live_workload(&state, "sb"), "sandbox id tears down");
+        assert!(
+            !is_live_workload(&state, "gone"),
+            "deleted/foreign ids keep their path"
+        );
+        state.sandbox_id = None;
+        assert!(!is_live_workload(&state, "init-1"));
+    }
+
+    #[test]
+    fn event_sink_accepts_and_survives_a_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("k7d-sink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("s").join("abc.events");
+        let path_str = path.to_str().unwrap();
+
+        // A dead shim's socket file: bound, then the listener dropped.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+
+        serve_event_sink(path_str).unwrap();
+        std::os::unix::net::UnixStream::connect(&path).unwrap();
+        // A sibling shim of the same pod finds it live and leaves it.
+        serve_event_sink(path_str).unwrap();
+        std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5257,6 +5825,7 @@ mod tests {
                     "devices": [{ "allow": false, "access": "rwm" }]
                 },
                 "cgroupsPath": "/kubepods/pod123/ctr456",
+                "mountLabel": "system_u:object_r:container_file_t:s0:c1,c2",
                 "seccomp": { "defaultAction": "SCMP_ACT_ERRNO" },
                 "maskedPaths": ["/proc/kcore"],
                 "readonlyPaths": ["/proc/sysrq-trigger"],
@@ -5265,7 +5834,10 @@ mod tests {
                     { "type": "mount" }
                 ]
             },
-            "process": { "apparmorProfile": "cri-containerd.apparmor.d" },
+            "process": {
+                "apparmorProfile": "cri-containerd.apparmor.d",
+                "selinuxLabel": "system_u:system_r:container_t:s0:c1,c2"
+            },
             "mounts": []
         });
         let empty = k7d::volumes::MountRewriteMap::default();
@@ -5303,6 +5875,8 @@ mod tests {
             serde_json::json!(["/proc/sysrq-trigger"])
         );
         assert!(fixed["process"].get("apparmorProfile").is_none());
+        assert!(fixed["process"].get("selinuxLabel").is_none());
+        assert!(fixed["linux"].get("mountLabel").is_none());
         let ns = fixed["linux"]["namespaces"].as_array().unwrap();
         assert_eq!(ns.len(), 2);
         assert!(ns[0].get("path").is_none(), "host namespace path stripped");

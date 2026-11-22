@@ -23,6 +23,8 @@ pub mod autowarp;
 #[cfg(not(feature = "verif"))]
 pub mod block;
 #[cfg(not(feature = "verif"))]
+pub mod bls;
+#[cfg(not(feature = "verif"))]
 pub mod broker;
 #[cfg(not(feature = "verif"))]
 pub mod cgroup;
@@ -66,6 +68,8 @@ pub mod netjail;
 pub mod netns;
 #[cfg(not(feature = "verif"))]
 pub mod network;
+#[cfg(not(feature = "verif"))]
+pub mod pci;
 #[cfg(not(feature = "verif"))]
 pub mod pool;
 #[cfg(not(feature = "verif"))]

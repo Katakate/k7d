@@ -991,14 +991,18 @@ fn main() {
         supervisor.start_docker();
     }
 
+    // On virtio-mmio the devices are named on the cmdline; on
+    // virtio-pci the guest probes the bus and the only trace is the
+    // transport's own `/dev/vsock` (vhost-vsock in the guest).
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let has_vsock_device = cmdline.contains("virtio_mmio.device=");
+    let has_vsock_device =
+        cmdline.contains("virtio_mmio.device=") || std::path::Path::new("/dev/vsock").exists();
     match if has_vsock_device {
         try_vsock_listener(&containers, &supervisor)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no virtio-mmio devices",
+            "no virtio-mmio devices and no /dev/vsock",
         ))
     } {
         Ok(()) => {}

@@ -14,6 +14,7 @@
 //! best-effort style into product code.
 #![allow(dead_code)]
 
+pub mod coreos;
 pub mod ml_platform;
 pub mod tree_fork_budget;
 pub mod ubuntu;

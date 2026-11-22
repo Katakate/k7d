@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-22
+
+k7d runs on OpenShift. The shim is a CRI-O `vm` runtime, a guest's
+virtio devices can sit on a PCI bus, and a single-node OKD 4.22 boots
+inside a k7d VM from its installed disk.
+
+### Added
+
+- CRI-O support: `packaging/install.sh --with-crio` registers `k7` and
+  `k7-fc` as CRI-O `vm` runtimes (`/etc/crio/crio.conf.d/50-k7.conf`)
+  and installs the shim a second time as `containerd-shim-k7-v2`, the
+  name CRI-O 1.32–1.36 require. On OpenShift the shim drops SELinux
+  labels (the guest has no LSM), refuses non-zero `hugepageLimits`, and
+  joins a delegated `crio-<id>.scope` so `cpuset` stays enabled on the
+  QoS slice. Proven on single-node OKD 4.22 (CRI-O 1.35.5) for both
+  `k7` and `k7-fc`.
+- `VmConfig.transport`: `mmio` (default) or `pci`, k7d's own legacy PCI
+  bus with one virtio-pci function per device, for guest kernels built
+  without `CONFIG_VIRTIO_MMIO` (RHCOS, CentOS Stream CoreOS). Native
+  backend only; `k7d-fc` refuses it. k7d can boot a `coreos-installer`
+  disk from the disk itself by reading its GRUB/BLS entries
+  (`k7d::bls`), without firmware or a GRUB binary. On that path a
+  single-node OKD 4.22 installs itself and reaches node `Ready`.
+- `tree_resume` takes `clock`: `wall` (default) wakes the guest at real
+  now, `frozen` leaves out the time the snapshot spent at rest. The
+  response reports `at_rest_ms`, and a `wall` resume after more than
+  about a day logs that cluster certificates may have expired.
+
+### Changed
+
+- The root README is a short, neutral project overview.
+- The size claim is measured, not estimated: `make loc` counts code per
+  design bucket from a manifest that fails on unlisted files, and
+  `make loc-firecracker` applies the same rules to Firecracker. The
+  README's "under 30k lines for the VMM and shim" becomes ~8k for the
+  machine and ~13k with live fork and the clock owner.
+- `vm.rs` and `network.rs` are split by concern (`vm/{mod,clock,fork_ops}.rs`,
+  `network/{mod,virtio_net}.rs`). Pure moves; module paths are unchanged.
+
 ## [0.9.0] — 2026-10-07
 
 Warm-forked pod sandboxes keep their network. Every host-bridge

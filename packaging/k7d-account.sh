@@ -13,6 +13,11 @@
 # home is the state directory it owns. Group `kvm` is what makes /dev/kvm
 # and (with the rule below) /dev/vhost-vsock openable without a capability.
 k7d_create_account() {
+    # CoreOS (RHCOS, SCOS) keeps `kvm` in /usr/lib/group behind
+    # nss-altfiles; getent sees it, useradd/usermod only read /etc/group.
+    if ! grep -q '^kvm:' /etc/group; then
+        getent group kvm >>/etc/group
+    fi
     getent group k7d >/dev/null || groupadd --system k7d
     getent passwd k7d >/dev/null || useradd --system --gid k7d --groups kvm \
         --home-dir /var/lib/k7d --no-create-home --shell /usr/sbin/nologin k7d

@@ -63,6 +63,9 @@ pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 /// Flush request (`fdatasync` the backing file).
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
+/// Device ID string; RHCOS's udev asks every partition for it and
+/// takes "unsupported" for an empty serial.
+pub const VIRTIO_BLK_T_GET_ID: u32 = 8;
 
 // Virtio-blk status codes (written to the request's status byte).
 /// Request completed successfully.
@@ -790,6 +793,7 @@ fn execute_request(
             // guest still sees a successful FLUSH.
             Some((VIRTIO_BLK_S_OK, 0))
         }
+        VIRTIO_BLK_T_GET_ID => Some((VIRTIO_BLK_S_UNSUPP, 0)),
         other => {
             log::warn!("virtio-blk: unsupported request type {other}");
             Some((VIRTIO_BLK_S_UNSUPP, 0))

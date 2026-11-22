@@ -107,7 +107,7 @@ CHALLENGES.md #75.
 ## Verification suite
 
 - `make kani` / `make remote-kani` - Kani bounded model checking of
-  proof harnesses co-located with the `unsafe` code (`vm.rs`,
+  proof harnesses co-located with the `unsafe` code (`vm/`,
   `fork.rs`, `snapshot.rs`, devices). Run after touching unsafe blocks
   or address arithmetic.
 - `make verif-gen && make verif-build` (or `make remote-verif`) - 

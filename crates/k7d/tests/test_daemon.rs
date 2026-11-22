@@ -1186,6 +1186,7 @@ fn test_daemon_tree_lifecycle() {
         &Request::TreeResume {
             tree_id: tree_id.clone(),
             node_id: fork_node.clone(),
+            clock: k7d::fork::ClockMode::Wall,
         },
     ) {
         Response::TreeResumed { guest_cids, .. } => {

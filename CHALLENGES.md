@@ -10635,6 +10635,132 @@ On both backends the shim sent `ForkVm` without the fork pod's CNI netns. Even a
 
 ---
 
+## 304. First virtio-pci boot: the bus was fine, the agent refused to look for vsock
+
+**Symptom:** The first `transport: pci` Ubuntu boot (`test_pci_boot.rs`) enumerated the host bridge and all four virtio-pci functions, bound `virtio-pci` to each, mounted `/dev/vda` as root and the data disk on `/dev/vdb`, configured `eth0` — and then the test timed out waiting for the agent. Serial showed `k7-agent: vsock unavailable (no virtio-mmio devices), falling back to serial`.
+
+**Root cause:** `crates/agent/src/main.rs` gated the vsock listener on `/proc/cmdline` containing `virtio_mmio.device=`. That token was the only way a guest had ever been told about its devices, so "no token" had meant "no vsock" for years. A PCI guest discovers its devices by probing the bus and its cmdline carries no device tokens at all, so the agent concluded there was no vsock while `/dev/vsock` sat there, fully functional. Nothing on the host side looked wrong: the VMM had no error to report because the guest never dialled.
+
+**Fix:** The gate is now `virtio_mmio.device=` on the cmdline **or** `/dev/vsock` present. The mmio path is unchanged; the PCI path finds the transport's own device node. The Ubuntu image key hashes the agent binary, so `node_image()` rebuilt the image on the next run without any manual cache invalidation.
+
+**Reference:** none.
+
+**Time lost:** ~20 minutes, most of it waiting for the 120 s agent ceiling and reading the serial log in the panic message.
+
+---
+
+## 305. RHCOS live boot at Red Hat's 4 GiB floor died with "Ran out of memory when unpacking initrd"
+
+**Symptom:** The first RHCOS 4.22 live boot on the PCI bus (`test_rhcos_boot.rs`: live kernel, live initramfs with the live rootfs appended, 4 GiB RAM) enumerated the bus, bound `virtio-pci`, ran Ignition, then dracut's `coreos-livepxe-rootfs` dropped to emergency mode: `No rootfs image found … Ran out of memory when unpacking initrd filesystem. Ensure your system has at least 2 GiB RAM if booting with coreos.live.rootfs_url, or 4 GiB otherwise.` The guest had 4 GiB.
+
+**Root cause:** Earlier on the console: `Initramfs unpacking failed: write error` and `Memory: 2634724K/4193912K available (… 1555648K reserved)`. The kernel's rootfs is a tmpfs sized at 50% of the RAM it considers available **at that moment**, and the 1.3 GiB appended initrd is still reserved while it is being unpacked. So a 4 GiB guest offers a ~1.3 GiB tmpfs for a 1.1 GiB `root.squashfs` plus the initramfs itself, and the unpack hits ENOSPC. Red Hat's "4 GiB" figure holds on firmware that loads the initrd elsewhere; k7d puts the whole file in guest RAM at the top of the low region, which is the right thing to do and simply counts.
+
+**Fix:** The test boots with 6 GiB. Nothing in k7d changed; the constant's doc comment carries this explanation so the next person does not "fix" it back to 4.
+
+**Reference:** Linux `init/do_mounts.c` (`rootfs` is tmpfs when no `root=` is given), `mm/shmem.c` (`shmem_default_max_blocks` = `totalram_pages() / 2`), `coreos/fedora-coreos-config` `coreos-livepxe-rootfs.sh`.
+
+**Time lost:** ~20 minutes; the dracut message blames RAM and the real line is 500 lines earlier.
+
+---
+
+## 306. The Ignition probe units on ttyS0 went silent after one heartbeat
+
+**Symptom:** With the rootfs unpacked, the same test's Ignition-injected `k7d-probe.service` printed the first half of its output to `/dev/ttyS0` and stopped mid-script; `k7d-heartbeat.service` (a `while :; do echo …; sleep 1; done` loop) produced exactly one line. Both units stayed `active`. `eth0` was configured (the login banner said so), so the ping it was waiting for was not the problem.
+
+**Root cause:** `serial-getty@ttyS0.service` starts a few seconds later and agetty `vhangup()`s the tty. Every fd the probe units held on `/dev/ttyS0` (`StandardOutput=tty`, `TTYPath=/dev/ttyS0`) is hung up from then on; writes fail with EIO and `echo`'s failure does not stop a shell loop, so the processes keep running with nowhere to write. The output after that point does not exist anywhere.
+
+**Fix:** The Ignition config masks `serial-getty@ttyS0.service` (`{"name":"serial-getty@ttyS0.service","mask":true}`). It is a probe console, not a login console. An alternative is to reopen the device per write (`echo … > /dev/ttyS0` inside the loop), which survives the hangup because a fresh open is allowed; masking is simpler and also removes the login banner noise from the serial log the test asserts on.
+
+**Reference:** `agetty(8)` ("agetty … calls vhangup(2)"), `vhangup(2)`.
+
+**Time lost:** ~15 minutes.
+
+---
+
+## 307. RHCOS booted from its installed disk had its address and could not ping the gateway
+
+**Symptom:** `test_rhcos_boot.rs`: after `coreos-installer install --offline` from the live system, the first boot from the disk reached `multi-user.target` in 10 s, enumerated the PCI bus, and NetworkManager gave `eth0` the static `ip=` address the installer had persisted into the BLS entry (`10.200.0.2/24`). The probe then waited its full 90 s for a ping to the bridge gateway and never got one. Same bridge, same `ClusterNetwork`, same gateway that the live boot had pinged a minute earlier.
+
+**Root cause:** Each boot of the disk is a new `Vm`, and the test took a new `net.add_tap()` for each — a new `vm_index`, so a new guest IP (`.3`, `.4`) and MAC. The installed guest kept claiming `.2`, which belonged to the (already deleted) installer TAP. The per-TAP anti-spoof chain (`netjail::TapAntiSpoof`, CHALLENGES above it) drops any frame whose `ip saddr` or ARP sender is not the address assigned to *that* TAP, so every packet the guest sent died at ingress. The address printed inside the guest was right; the host side had re-keyed the identity under it.
+
+**Fix:** A disk-installed guest owns its network identity across reboots the way a physical node does, so the test keeps one `vm_index`: `net.remove_entry(vm_index)` after the previous VM is dropped, then `net.add_tap_at(vm_index)` for the next boot — same IP, same MAC, same anti-spoof rule. Anything that later re-launches an installed node from a tree or pool has to do the same: the identity lives on the disk now, not in the TAP allocator.
+
+**Reference:** `crates/k7d/src/netjail.rs` (`TapAntiSpoof`), `ClusterNetwork::add_tap_at`.
+
+**Time lost:** ~10 minutes (one 4-minute test cycle plus reading the netjail header).
+
+---
+
+## 308. `reboot: Restarting system`, then the guest ran forever
+
+**Symptom:** The disk-boot test asks the installed RHCOS to `systemctl reboot` so the next boot can prove the firstboot stamp is gone and `/var` persisted. systemd shut everything down, the kernel printed `reboot: Restarting system` — and the VM kept running. No triple fault, no exit, nothing more on the console; the test's 120 s wait for the guest to leave timed out. The plan had been that a kernel with no ACPI and `reboot=k` would end in a triple fault, which KVM reports as `KVM_EXIT_SHUTDOWN` and the vCPU loop already turns into an exit.
+
+**Root cause:** That is not the order `native_machine_emergency_restart` (`arch/x86/kernel/reboot.c`) tries things in. `BOOT_KBD` pulses the i8042 reset line (`outb(0xfe, 0x64)`, ten times; k7d ignored the port, `kb_wait`'s status reads got zeros), then goes to `BOOT_EFI` (no-op without EFI), then **`BOOT_BIOS`**: `machine_real_restart` drops to real mode and jumps to the BIOS reset vector at `0xFFFF0`. k7d has no BIOS, so the CPU executes whatever guest RAM holds there, and never comes back to try `BOOT_CF9` or `BOOT_TRIPLE`. Every k7d guest carries `reboot=k`, so a guest-initiated reboot or a `panic=1` reboot has always ended in that silent spin; nobody had asked a guest to reboot before.
+
+**Fix:** The i8042 reset pulse is the reboot. The vCPU `IoOut` arm recognises `0xFE` on port `0x64` (`devices::I8042_COMMAND_PORT` / `I8042_RESET_PULSE`), logs `guest reset through the keyboard controller`, and leaves the run loop the way `KVM_EXIT_SHUTDOWN` does. No keyboard controller is emulated beyond that one command. `Vm::guest_exited()` reports it: true once *any* vCPU left its loop on its own — one is enough, because `stop_other_cpus` parks the other CPUs in `HLT` with interrupts off and, with the in-kernel LAPIC, a halted vCPU never returns from `KVM_RUN` (`__kvm_emulate_halt`), so "all vCPUs exited" would wait forever. The test waits for `guest_exited()`, asserts the kernel's `reboot: Restarting system` line (the only thing that distinguishes a reboot from a crash), drops the VM, re-reads the disk with `DiskBoot::load`, and builds the next one. A reboot is a VM relaunch from the disk — also what a daemon-side "node restart" would be.
+
+**Reference:** `arch/x86/kernel/reboot.c` (`native_machine_emergency_restart`, `machine_real_restart`), `arch/x86/kvm/x86.c` (`__kvm_emulate_halt`).
+
+**Time lost:** ~15 minutes (one test cycle; the serial tail ending in `reboot: Restarting system` named the code path).
+
+---
+
+## 309. The installed OKD node rebooted twice, and the second time it was a different OS
+
+**Symptom:** `test_okd_sno.rs` boots the disk `bootstrap-in-place` wrote and waits for the API. The first boot from the disk left after 58 s (`reboot: Restarting system`), the next after 53 s, and only the third stayed. A loop that boots the disk *once* and then polls `oc` for an hour would have sat on a dead VM; a loop that reuses the `DiskBoot` it read before the first boot would have booted the wrong kernel. And the live phase before that: an `assert_alive` right after the PCI probe failed with "no new heartbeat in 30 s" — the install had already finished and the live system was in its reboot. On a `bootstrap-in-place` node the live system is a ~6 minute installer, and the probe is only reached at the end of a 400 s boot.
+
+**Root cause:** Both reboots are the OS's own. Boot 1 is CoreOS first boot: Ignition applies `master.ign`, and the MCO's `node-image` path (`bootstrap-in-place-post-reboot`) rebases the deployment onto the release's `scos-content` image — a *new* ostree deployment with a *new* kernel (`10.0.20251103-0`, `6.12.0-150.el10` → `10.0.20260806-0`, `6.12.0-254.el10`), then reboots into it. Boot 2 is that image's first boot, which finishes the node-image switch and reboots once more. GRUB would re-read `/boot/loader/entries` each time and find `ostree-2.conf`; k7d has no GRUB, so `DiskBoot::load` *is* the bootloader and has to run again after every exit. The firmware-less disk boot cannot be "read the BLS entry once at install time".
+
+**Fix:** The test treats every `guest_exited()` as "the bootloader runs again": re-read the disk (`DiskBoot::load`), re-create the TAP at the same `vm_index` (CHALLENGES #307), boot, and keep polling `oc` from the bridge netns; cap it at six boots so a reboot loop fails instead of running for the ceiling. The live phase's `assert_alive` is gone — the probe output is the proof the bus works there — and the bootstrap wait panics with the whole console if the guest resets before `install-to-disk.sh` says `Going to reboot`, which is how a failed bootstrap would show (the installer reboots on failure too). The `oc` poll uses `--tls-server-name=api.okd.k7d.test` with `--server=https://<guest-ip>:6443` since nothing on the host resolves the cluster's names; inside the guest `/etc/hosts` carries `api.` and `api-int.` (both Ignition configs, so the bootstrap and the installed node agree). Also recorded here since the user asked: the OKD 4.22 machine OS (CentOS Stream CoreOS 10, both kernels above) is built with `# CONFIG_VIRTIO_MMIO is not set` and `CONFIG_VIRTIO_PCI=y`, same as RHCOS 4.22 — there is no virtio-mmio fallback for an OpenShift-family node, the PCI transport is the only way in.
+
+**Reference:** okd-project/okd (single-node `bootstrapInPlace`), openshift/installer `data/data/bootstrap/bootstrap-in-place/`, openshift/machine-config-operator (`node-image-pull`, `bootstrap-in-place-post-reboot.service`).
+
+**Time lost:** ~45 minutes (three test cycles at 7-12 minutes each).
+
+---
+
+## 310. On CRI-O, every k7 pod lost its sandbox about a minute after Running
+
+**Symptom:** On single-node OKD 4.22 (CRI-O 1.35.5) a `k7-fc` pod reached `2/2 Running`, then ~65 s later kubelet logged `Killing container with a grace period` for every container at once, stopped the sandbox and built a new one (`RESTARTS 2`, sandbox attempt 1). No PLEG event, no probe, no `No ready sandbox` line before it. A `k7` pod did the same, only later. At `-v=4` the kill came from the periodic `SyncLoop (SYNC)` before `computePodActions` ever ran.
+
+**Root cause:** That kill is kubelet's `!pcm.Exists(pod)` branch in `SyncPod`: the pod cgroup is "missing". On cgroup v2, `Exists` also requires every controller kubelet manages in the pod slice's `cgroup.controllers`, and `cpuset` was gone: `kubepods-besteffort.slice/cgroup.subtree_control` had lost it. systemd recomputes controller masks whenever any unit starts (here an unrelated crash-looping container's `crio-*.scope`) and turns off controllers no member unit needs. runc pods keep `cpuset` because each container is a `crio-<id>.scope` with `Delegate=yes`. A `runtime_type = "vm"` sandbox puts no unit in the pod slice, so nothing asked for `cpuset`, and the timing depended on when some other unit started next.
+
+**Fix:** At CRI-O sandbox `Create` the shim moves itself into `crio-<sandbox-id>.scope` under the slice named in `linux.cgroupsPath` (`<slice>:<prefix>:<name>`), with `Delegate=yes`, via `busctl call … StartTransientUnit` (`join_crio_sandbox_scope` in `crates/shim/src/task.rs`). Failure fails `Create`. A cgroupfs-style path is left alone. containerd is untouched.
+
+**Reference:** kubernetes `pkg/kubelet/kubelet.go` (`SyncPod`, `pcm.Exists`), `pkg/kubelet/cm/cgroup_manager_linux.go` (`Validate`), opencontainers/runc `libcontainer/cgroups/systemd` (scope with `Delegate`).
+
+**Time lost:** ~2 hours (kubelet logs nothing at the default verbosity on that path; the first guess was the Firecracker agent).
+
+---
+
+## 311. CRI-O vm runtime: the pid in every reply is a liveness probe
+
+**Symptom:** On OKD, removing one workload container (`crictl rm side`) marked the pod sandbox `NotReady`, and kubelet rebuilt the pod. Earlier, `crictl start` failed with `container init is not in created state: running`.
+
+**Root cause:** CRI-O's vm runtime reads `/proc/<pid>/stat` start time for the pid `Create`/`Start` return and later probes it with `kill(pid, 0)` plus that start time. The shim reported a synthetic guest pid, which on the host is either absent or some unrelated process, so CRI-O decided the infra task had died. Separately, CRI-O refuses `Start` unless `State` says `CREATED`, while the shim always said `RUNNING` (containerd never asked).
+
+**Fix:** For CRI-O bundles every init-task reply carries the shim's own pid (`create_response_pid`), and `ProcessState.created` makes `State` answer `CREATED` until `Start`. containerd keeps the synthetic pid and `RUNNING`.
+
+**Reference:** cri-o/cri-o `internal/oci/runtime_vm.go`.
+
+**Time lost:** ~1 hour.
+
+---
+
+## 312. OpenShift's SELinux leaks into a guest with no LSM
+
+**Symptom:** On OKD the in-guest runc failed with `selinux label is specified in config, but selinux is disabled`; after that, overlay copy-up of the container's `/dev` failed `mknod: EOPNOTSUPP`; then runc failed `open hugetlb.2MB.max: no such file`. CRI-O's own bind mounts under `/run/containers/storage/overlay-containers/<id>/userdata` (and `.containerenv` under `/var/lib/containers/…`) were treated as user hostPaths, so `k7` took the virtiofs fallback and `k7-fc` refused the pod.
+
+**Root cause:** OpenShift sets `process.selinuxLabel` and `linux.mountLabel`; the erofs image built from CRI-O's labelled rootfs carries `security.selinux` xattrs, and overlayfs must copy `security.*` on copy-up (`ovl_must_copy_xattr`), which ext4 rejects without `CONFIG_EXT4_FS_SECURITY`. The kubelet also emits `hugepageLimits` with limit 0, and the guest has no hugetlb cgroup. CRI-O's userdata paths were not in `CRI_INTERNAL_SOURCE_PREFIXES`.
+
+**Fix:** `fix_oci_config` drops both labels; `config-minimal` sets `CONFIG_EXT4_FS_SECURITY=y` (also needed for file capabilities on any runtime); zero `hugepageLimits` are dropped and non-zero ones fail Create; CRI-O's run-root and graph-root container paths are internal mounts.
+
+**Reference:** Linux `fs/overlayfs/copy_up.c`, `fs/ext4/xattr_security.c`.
+
+**Time lost:** ~1.5 hours (four test cycles, one guest kernel rebuild).
+
+---
+
 ## Reference projects and what each taught us
 
 | Project | What we learned |

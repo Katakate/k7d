@@ -34,7 +34,7 @@ between sibling forks of the same tenant.
 Additional limits:
 
 - Single host, Linux x86_64 + KVM only; no cross-node fork yet
-- Young codebase (≤30k LOC VMM + shim); no third-party security audit yet
+- Young codebase (~13k-line VMM, ~45k with daemon, shim and guest agent; `make loc`); no third-party security audit yet
 - Control socket `/run/k7d/k7d.sock` is local Unix — see the section below
 - `k7d` is **two processes** (privilege separation, below). The one that parses
   guest and shim input is uid `k7d` with an empty capability set; the one

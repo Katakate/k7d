@@ -1425,7 +1425,23 @@ impl SnapshotTree {
     }
 
     /// Resume a suspended VM: restore from parent's `base.mem` + this node's delta.
+    ///
+    /// The guest clock is rebased to real now ([`crate::fork::ClockMode::Wall`]).
     pub fn resume(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+        self.resume_with_clock(node_id, crate::fork::ClockMode::Wall)
+            .map(|_| ())
+    }
+
+    /// [`Self::resume`] with an explicit kvmclock rebase.
+    ///
+    /// Returns the guest-time milliseconds the snapshot spent at rest
+    /// (`(now − capture) × dilation`), including when `clock` is
+    /// [`crate::fork::ClockMode::Frozen`] and that gap was not added.
+    pub fn resume_with_clock(
+        &mut self,
+        node_id: &NodeId,
+        clock: crate::fork::ClockMode,
+    ) -> Result<u64, TreeError> {
         let info = self
             .nodes
             .get(node_id)
@@ -1442,7 +1458,7 @@ impl SnapshotTree {
             .join(crate::fc::SUSPEND_META)
             .is_file()
         {
-            return self.resume_fc(node_id);
+            return self.resume_fc(node_id, clock);
         }
 
         // Resume applies exactly one delta.pack onto the nearest
@@ -1497,11 +1513,13 @@ impl SnapshotTree {
             apply_delta(&pack, fork_mem_addr, mem_span, mapped_identity)?
         };
 
-        let mut vm = crate::fork::build_vm_from_state_and_mem(
+        let mut vm = crate::fork::build_vm_from_state_and_mem_with_clock(
             &state,
             fork_mem_addr,
             &format!("resume:{node_id}"),
+            clock,
         )?;
+        let at_rest_ms = vm.clock_at_rest_ms();
         vm.start()?;
         vm.enable_dirty_tracking()?;
         // The pack's pages are exactly this VM's divergence from
@@ -1539,10 +1557,21 @@ impl SnapshotTree {
         }
         self.save_metadata()?;
         log::info!("tree: resumed node '{node_id}'");
-        Ok(())
+        Ok(at_rest_ms)
     }
 
-    fn resume_fc(&mut self, node_id: &NodeId) -> Result<(), TreeError> {
+    fn resume_fc(
+        &mut self,
+        node_id: &NodeId,
+        clock: crate::fork::ClockMode,
+    ) -> Result<u64, TreeError> {
+        if clock == crate::fork::ClockMode::Frozen {
+            return Err(TreeError::Firecracker(
+                "clock \"frozen\" is not implemented for a Firecracker resume; \
+                 this path does not rebase kvmclock"
+                    .into(),
+            ));
+        }
         self.evict_for_incoming_no_exempt(1)?;
         let node_dir = self.node_dir(node_id);
         let fc = crate::fc::FcVm::load_exported(&node_dir, None)?;
@@ -1557,7 +1586,7 @@ impl SnapshotTree {
         }
         self.save_metadata()?;
         log::info!("tree: resumed Firecracker '{node_id}'");
-        Ok(())
+        Ok(0)
     }
 
     /// Permanently delete a node and all its descendants.

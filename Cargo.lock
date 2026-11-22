@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "containerd-shim-k7-v1"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -225,6 +225,21 @@ checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crossbeam"
@@ -438,6 +453,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ext4-view"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecf6379b7cfeace5e109ccc51955afc05f5f7f2466ae0cf2697bda46afd01e6"
+dependencies = [
+ "bitflags 2.11.1",
+ "crc",
 ]
 
 [[package]]
@@ -697,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "k7-agent"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -710,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "k7-replicate"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -723,10 +748,11 @@ dependencies = [
 
 [[package]]
 name = "k7d"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "ext4-view",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -1512,9 +1538,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.51.1"
+version = "1.51.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+checksum = "a13e32eacd0222f9658be2ccbd83b718bfd9bfb0d54b5921913c184cb86124a5"
 dependencies = [
  "bytes",
  "libc",

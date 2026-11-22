@@ -314,6 +314,11 @@ CONFIG_OVERLAY_FS=y
 # ext4 for read-write virtio-blk images (tests) and erofs
 # for the immutable container rootfs images.
 CONFIG_EXT4_FS=y
+# overlayfs copy-up must copy every security.* xattr (ovl_must_copy_xattr)
+# and fails with EOPNOTSUPP when the ext4 upper has no handler for them:
+# file capabilities, and the SELinux labels a CRI-O host leaves on the
+# image tree. Stored raw; the guest has no LSM to read them.
+CONFIG_EXT4_FS_SECURITY=y
 CONFIG_EROFS_FS=y
 # Disk quota support, for ext4 project quotas: bounding one container's
 # writable space on a shared scratch image needs them, and we had to

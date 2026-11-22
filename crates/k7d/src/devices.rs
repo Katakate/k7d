@@ -95,6 +95,13 @@ impl SerialDevice {
 pub const SERIAL_PORT_BASE: u16 = 0x3f8;
 /// COM2 base I/O port (agent communication).
 pub const SERIAL2_PORT_BASE: u16 = 0x2f8;
+/// i8042 keyboard-controller command port. k7d emulates no keyboard
+/// controller; the one command it recognises is the reset pulse
+/// (`0xFE`), which Linux's `reboot=k` path sends before it would jump
+/// to a BIOS reset vector this VMM does not have.
+pub const I8042_COMMAND_PORT: u16 = 0x64;
+/// `outb(0xfe, 0x64)`: pulse the CPU reset line.
+pub const I8042_RESET_PULSE: u8 = 0xfe;
 /// Serial port range size (8 registers).
 pub const SERIAL_PORT_SIZE: u16 = 0x8;
 /// COM1 IRQ line.

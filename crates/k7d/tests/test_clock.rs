@@ -12,6 +12,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k7d::api::AgentClient;
+use k7d::fork::ClockMode;
 use k7d::vm::Vm;
 
 /// How far the guest's wall clock may sit from the host's.
@@ -97,6 +98,33 @@ fn test_clock_correct_across_snapshot_restore_and_fork() {
     drop(vm);
 
     std::thread::sleep(TRANSITION_GAP);
+
+    // `frozen` is the same restore with the at-rest gap left out: the
+    // guest stays at the snapshot instant, so it is about TRANSITION_GAP
+    // behind the host. `wall` (the default, below) still lands on the host.
+    let mut frozen =
+        Vm::restore_with_clock(snapshot_dir.path(), ClockMode::Frozen).expect("frozen restore");
+    frozen.start().expect("frozen VM should start");
+    let mut frozen_agent = frozen
+        .connect_agent(Duration::from_secs(30))
+        .expect("frozen agent should connect");
+    check_clocksource(&mut frozen_agent);
+    let frozen_guest = guest_sh(&mut frozen_agent, "date +%s")
+        .parse::<i64>()
+        .expect("guest `date +%s` prints a number");
+    let frozen_skew = frozen_guest - host_epoch();
+    let gap_secs = i64::try_from(TRANSITION_GAP.as_secs()).expect("gap fits in i64");
+    eprintln!("  guest wall clock after frozen restore: skew {frozen_skew}s");
+    assert!(
+        frozen_skew <= -(gap_secs - MAX_SKEW_SECS),
+        "frozen restore applied the at-rest gap (skew {frozen_skew}s, gap {gap_secs}s)"
+    );
+    assert!(
+        frozen_skew >= -(gap_secs + MAX_SKEW_SECS + 30),
+        "frozen guest clock jumped backwards past the snapshot (skew {frozen_skew}s)"
+    );
+    drop(frozen_agent);
+    frozen.shutdown();
 
     let mut restored = Vm::restore(snapshot_dir.path()).expect("restore");
     restored.start().expect("restored VM should start");

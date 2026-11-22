@@ -169,7 +169,13 @@ impl Pool {
             network,
             dilation,
             backend,
+            transport,
         } = config;
+        // Pooled VMs are pre-booted on virtio-mmio; a bus is a boot-time
+        // property, so a PCI request always cold-boots.
+        if *transport != crate::virtio_mmio::Transport::Mmio {
+            return false;
+        }
         let has_backend = match backend {
             Backend::Native => self.config.native_size > 0,
             Backend::Firecracker => self.config.fc_size > 0,
